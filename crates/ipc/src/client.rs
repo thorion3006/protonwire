@@ -305,7 +305,7 @@ pub fn verify_socket_trusted(path: &Path) -> Result<(), ConnectError> {
 mod tests {
     use super::*;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     use protonwire_frontend_api::VpnState;
 
@@ -363,24 +363,20 @@ mod tests {
         }
     }
 
-    fn spawn_server(dir: &tempfile::TempDir) -> (PathBuf, Arc<AtomicBool>) {
+    fn spawn_server(dir: &tempfile::TempDir) -> crate::test_util::TestServer {
         let handler = Arc::new(EchoHandler {
             version: "test-daemon".into(),
             bus: EventBus::new(),
             seq: AtomicU64::new(0),
         });
-        let server = crate::server::IpcServer::bind(dir.path(), "test.sock").unwrap();
-        let path = server.socket_path().to_owned();
-        let stop = Arc::new(AtomicBool::new(false));
-        let stop2 = Arc::clone(&stop);
-        std::thread::spawn(move || server.serve(handler, stop2));
-        (path, stop)
+        crate::test_util::TestServer::start(dir.path(), "test.sock", handler).unwrap()
     }
 
     #[test]
     fn handshake_ping_and_state_round_trip() {
         let dir = tempfile::tempdir().unwrap();
-        let (path, stop) = spawn_server(&dir);
+        let server = spawn_server(&dir);
+        let path = server.socket_path().to_owned();
         let mut client =
             IpcClient::connect(&path, &test_client_info(), SecurityChecks::dev_unchecked())
                 .unwrap();
@@ -396,25 +392,25 @@ mod tests {
             client.request(Request::GetState).unwrap(),
             RequestResult::State { .. }
         ));
-        stop.store(true, Ordering::SeqCst);
     }
 
     #[test]
     fn error_response_preserves_code() {
         let dir = tempfile::tempdir().unwrap();
-        let (path, stop) = spawn_server(&dir);
+        let server = spawn_server(&dir);
+        let path = server.socket_path().to_owned();
         let mut client =
             IpcClient::connect(&path, &test_client_info(), SecurityChecks::dev_unchecked())
                 .unwrap();
         let err = client.request(Request::Shutdown).unwrap_err();
         assert_eq!(err.code, RpcErrorCode::PermissionDenied);
-        stop.store(true, Ordering::SeqCst);
     }
 
     #[test]
     fn untrusted_socket_rejected_when_checks_strict() {
         let dir = tempfile::tempdir().unwrap();
-        let (path, stop) = spawn_server(&dir);
+        let server = spawn_server(&dir);
+        let path = server.socket_path().to_owned();
         let err = IpcClient::connect(&path, &test_client_info(), SecurityChecks::strict())
             .err()
             .expect("strict checks must reject a non-root socket");
@@ -424,6 +420,5 @@ mod tests {
             }
             other => panic!("expected Untrusted, got {other:?}"),
         }
-        stop.store(true, Ordering::SeqCst);
     }
 }

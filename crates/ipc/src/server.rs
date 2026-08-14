@@ -377,13 +377,12 @@ mod tests {
         }
     }
 
-    fn spawn_server(dir: &tempfile::TempDir, handler: Arc<NullHandler>) -> std::path::PathBuf {
-        let server = IpcServer::bind(dir.path(), "server-test.sock").unwrap();
-        let path = server.socket_path().to_owned();
-        let stop = Arc::new(AtomicBool::new(false));
-        let handler2 = Arc::clone(&handler);
-        std::thread::spawn(move || server.serve(handler2, stop));
-        path
+    fn spawn_server(
+        dir: &tempfile::TempDir,
+        handler: Arc<NullHandler>,
+    ) -> crate::test_util::TestServer {
+        crate::test_util::TestServer::start(dir.path(), "server-test.sock", handler)
+            .expect("test server binds")
     }
 
     fn connect_and_hello(path: &std::path::Path) -> std::os::unix::net::UnixStream {
@@ -415,7 +414,8 @@ mod tests {
             version: "test".into(),
             bus: EventBus::new(),
         });
-        let path = spawn_server(&dir, Arc::clone(&handler));
+        let server = spawn_server(&dir, Arc::clone(&handler));
+        let path = server.socket_path().to_owned();
 
         for _ in 0..8 {
             drop(connect_and_hello(&path));
@@ -442,8 +442,8 @@ mod tests {
             version: "test".into(),
             bus: EventBus::new(),
         });
-        let path = spawn_server(&dir, handler);
-        let mut stream = std::os::unix::net::UnixStream::connect(&path).unwrap();
+        let server = spawn_server(&dir, handler);
+        let mut stream = std::os::unix::net::UnixStream::connect(server.socket_path()).unwrap();
         write_msg(
             &mut stream,
             &ClientMessage::Hello {
@@ -458,6 +458,115 @@ mod tests {
                 assert_eq!(err.supported_version, 1);
             }
             other => panic!("expected HelloError for version 0, got {other:?}"),
+        }
+    }
+
+    /// Characterization (refactorer step 2): the handshake refusals that
+    /// M2's protocol-negotiation work will edit around. Each pins the
+    /// exact wire behavior of `serve_messages` through the public socket.
+    #[test]
+    fn hello_above_ceiling_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let handler = Arc::new(NullHandler {
+            version: "test".into(),
+            bus: EventBus::new(),
+        });
+        let server = spawn_server(&dir, handler);
+        let mut stream = std::os::unix::net::UnixStream::connect(server.socket_path()).unwrap();
+        write_msg(
+            &mut stream,
+            &ClientMessage::Hello {
+                protocol_version: 99,
+                client: info(),
+            },
+        )
+        .unwrap();
+        match read_msg::<_, ServerMessage>(&mut stream).unwrap() {
+            ServerMessage::HelloError(err) => {
+                assert_eq!(err.reason, "unsupported-protocol-version");
+                assert_eq!(err.supported_version, PROTOCOL_VERSION);
+            }
+            other => panic!("expected HelloError for version 99, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn duplicate_hello_is_refused_and_disconnected() {
+        let dir = tempfile::tempdir().unwrap();
+        let handler = Arc::new(NullHandler {
+            version: "test".into(),
+            bus: EventBus::new(),
+        });
+        let server = spawn_server(&dir, handler);
+        let mut stream = connect_and_hello(server.socket_path());
+        write_msg(
+            &mut stream,
+            &ClientMessage::Hello {
+                protocol_version: 1,
+                client: info(),
+            },
+        )
+        .unwrap();
+        match read_msg::<_, ServerMessage>(&mut stream).unwrap() {
+            ServerMessage::HelloError(err) => assert_eq!(err.reason, "duplicate-hello"),
+            other => panic!("expected HelloError for duplicate hello, got {other:?}"),
+        }
+        // The session ends: the next read hits EOF.
+        assert!(matches!(
+            read_msg::<_, ServerMessage>(&mut stream),
+            Err(crate::frame::FrameError::Truncated)
+        ));
+    }
+
+    #[test]
+    fn request_before_hello_is_refused_and_disconnected() {
+        let dir = tempfile::tempdir().unwrap();
+        let handler = Arc::new(NullHandler {
+            version: "test".into(),
+            bus: EventBus::new(),
+        });
+        let server = spawn_server(&dir, handler);
+        let mut stream = std::os::unix::net::UnixStream::connect(server.socket_path()).unwrap();
+        write_msg(
+            &mut stream,
+            &ClientMessage::Request {
+                id: 1,
+                request: Request::GetState,
+            },
+        )
+        .unwrap();
+        match read_msg::<_, ServerMessage>(&mut stream).unwrap() {
+            ServerMessage::HelloError(err) => assert_eq!(err.reason, "request-before-hello"),
+            other => panic!("expected HelloError for early request, got {other:?}"),
+        }
+        assert!(matches!(
+            read_msg::<_, ServerMessage>(&mut stream),
+            Err(crate::frame::FrameError::Truncated)
+        ));
+    }
+
+    #[test]
+    fn negotiated_version_is_min_of_client_and_server() {
+        let dir = tempfile::tempdir().unwrap();
+        let handler = Arc::new(NullHandler {
+            version: "test".into(),
+            bus: EventBus::new(),
+        });
+        let server = spawn_server(&dir, handler);
+        let mut stream = std::os::unix::net::UnixStream::connect(server.socket_path()).unwrap();
+        write_msg(
+            &mut stream,
+            &ClientMessage::Hello {
+                protocol_version: 1,
+                client: info(),
+            },
+        )
+        .unwrap();
+        // A client at the oldest supported version negotiates exactly it;
+        // when PROTOCOL_VERSION grows, offering 1 must still ack 1.
+        match read_msg::<_, ServerMessage>(&mut stream).unwrap() {
+            ServerMessage::HelloAck(ack) => assert_eq!(ack.protocol_version, 1),
+            other => panic!("expected HelloAck, got {other:?}"),
         }
     }
 }

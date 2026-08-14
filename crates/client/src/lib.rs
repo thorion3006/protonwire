@@ -318,7 +318,7 @@ mod checks_tests {
 mod tests {
     use super::*;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     use protonwire_frontend_api::{
         Event, NetworkIntegration, NoticeLevel, PROTOCOL_VERSION, ServerMessage, VpnState,
@@ -380,16 +380,23 @@ mod tests {
         }
     }
 
-    fn spawn_server(dir: &tempfile::TempDir) -> (PathBuf, Arc<PublishingHandler>) {
+    fn spawn_server(
+        dir: &tempfile::TempDir,
+    ) -> (
+        protonwire_ipc::test_util::TestServer,
+        Arc<PublishingHandler>,
+    ) {
         let handler = Arc::new(PublishingHandler {
             bus: EventBus::new(),
             seq: AtomicU64::new(0),
         });
-        let server = protonwire_ipc::server::IpcServer::bind(dir.path(), "sdk.sock").unwrap();
-        let path = server.socket_path().to_owned();
-        let handler2 = Arc::clone(&handler);
-        std::thread::spawn(move || server.serve(handler2, Arc::new(AtomicBool::new(false))));
-        (path, handler)
+        let server = protonwire_ipc::test_util::TestServer::start(
+            dir.path(),
+            "sdk.sock",
+            Arc::clone(&handler),
+        )
+        .expect("test server binds");
+        (server, handler)
     }
 
     fn dev_client(path: &Path) -> ProtonwireClient {
@@ -400,7 +407,8 @@ mod tests {
     #[test]
     fn ping_and_state_work_end_to_end() {
         let dir = tempfile::tempdir().unwrap();
-        let (path, _handler) = spawn_server(&dir);
+        let (server, _handler) = spawn_server(&dir);
+        let path = server.socket_path().to_owned();
         let mut client = dev_client(&path);
         assert_eq!(client.ping().unwrap(), "ping");
         assert_eq!(client.state().unwrap().daemon_version, "test-daemon");
@@ -410,7 +418,8 @@ mod tests {
     #[test]
     fn not_implemented_maps_to_exit_code_one() {
         let dir = tempfile::tempdir().unwrap();
-        let (path, _handler) = spawn_server(&dir);
+        let (server, _handler) = spawn_server(&dir);
+        let path = server.socket_path().to_owned();
         let mut client = dev_client(&path);
         let err = client.disconnect_vpn().unwrap_err();
         assert_eq!(err.exit_code(), 1);
@@ -420,7 +429,8 @@ mod tests {
     #[test]
     fn sequence_gap_triggers_resync() {
         let dir = tempfile::tempdir().unwrap();
-        let (path, handler) = spawn_server(&dir);
+        let (server, handler) = spawn_server(&dir);
+        let path = server.socket_path().to_owned();
         let mut client = dev_client(&path);
         client.connect_vpn(ConnectTarget::Fastest).unwrap();
         // Events 1 (skipped arrival by design) and 2 are in flight; the
@@ -458,7 +468,8 @@ mod tests {
     #[test]
     fn stale_events_are_skipped_without_rewinding() {
         let dir = tempfile::tempdir().unwrap();
-        let (path, handler) = spawn_server(&dir);
+        let (server, handler) = spawn_server(&dir);
+        let path = server.socket_path().to_owned();
         let mut client = dev_client(&path);
 
         let publish = |seq: u64, message: &str| {

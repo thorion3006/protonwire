@@ -10,6 +10,11 @@ repository.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Enables the in-process test fixture (`test_util`) for downstream test
+# builds. Never enabled in release builds.
+test-util = []
+
 [dependencies]
 protonwire-frontend-api = { workspace = true }
 serde = { workspace = true }

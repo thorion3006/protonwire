@@ -18,6 +18,12 @@ pub mod frame;
 pub mod peer;
 pub mod server;
 
+/// In-process test fixture; compiled for this crate's own tests and for
+/// downstream test builds that enable the `test-util` feature. Never part
+/// of a release build.
+#[cfg(any(test, feature = "test-util"))]
+pub mod test_util;
+
 pub use authz::{IpcRole, authorize, required_role};
 pub use bus::EventBus;
 pub use client::{ConnectError, IpcClient, SecurityChecks};
