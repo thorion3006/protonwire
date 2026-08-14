@@ -43,7 +43,11 @@ default-members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+# Floor = lowest VERIFIED toolchain. PRD NFR-42 sets a 1.85 minimum; the
+# Proton registry crates (proton-vpn-netstack, proton-vpn-yaourt) use
+# language features that do not compile before ~1.94: probes of 1.85, 1.88,
+# 1.89, 1.90, and 1.93 all failed (details in docs/spike-2026-08.md).
+rust-version = "1.97"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/thorion3006/protonwire"
 

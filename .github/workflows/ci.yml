@@ -46,11 +46,12 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.85.0
+      - uses: dtolnay/rust-toolchain@1.97.1
       - uses: Swatinem/rust-cache@v2
-      # The workspace compiler floor is 1.85 (PRD NFR-42). If this job
-      # fails because a dependency raised its MSRV, raise the floor in a
-      # dedicated commit with the offending crate documented.
+      # Floor = lowest VERIFIED toolchain (PRD NFR-42's 1.85 minimum is not
+      # reachable: Proton registry crates need ~1.94+; 1.85/1.88/1.89/1.90/
+      # 1.93 probes all failed — see docs/spike-2026-08.md). Re-probe lower
+      # versions at every engine upgrade.
       - run: cargo check --locked --all-targets
 
   xtask:
