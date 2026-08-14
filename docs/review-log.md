@@ -75,3 +75,55 @@ Reviewed at `e51ba21` + in-flight tree.
   with the systemd unit work (M8).
 - Dead-weight items removed: duplicate event-envelope test in the IPC
   client, no-op anchor-bomb assertion in the YAML guard.
+
+## 2026-08-14 — Milestone 1 (structure review, refactorer)
+
+Full sequenced plan delivered; triage below. Executed TDD-first (failing
+test → implementation) once the remaining reviewer reports landed, so
+file:line citations in those reports stayed valid during review.
+
+### Accepted — execute in this order (behavior-preserving, each step
+verified by the full suite + `cargo xtask all`)
+
+1. **Security-check policy consolidation** (~1 h): the
+   `cfg!(debug_assertions) && env == "1"` trust-bypass policy is written
+   three times (SDK `connect_default`, `apps/cli`, `apps/tui`) and is
+   security-relevant — drift risk. One pure `checks_for(flag, debug)` seam
+   in `protonwire-client` with four-case unit tests (the pure seam exists
+   because edition 2024 makes `set_var` `unsafe` and the workspace denies
+   `unsafe_code`); apps stop naming `IpcSecurityChecks` entirely.
+2. **Handshake characterization tests** (~1 h): pin the four
+   `serve_messages` refusals (duplicate-hello, request-before-hello,
+   unsupported-version, negotiated `min(client, server)`) before M2's
+   protocol-negotiation work edits that function; QA asked for the same
+   tests. Hello-timeout stays unpinned (5 s wall-clock test not worth it).
+3. **Shared in-process test fixture** (~1-1.5 h): feature-gated
+   `protonwire-ipc::test_util` (`test-util` feature, never in releases, no
+   new dependencies — PRD 6.1 fixes the member list, so no fixture crate);
+   replaces the copy-pasted `spawn_server` fixtures in `ipc` and `client`
+   test modules before M2's conformance harness copies them a third time.
+4. **`frontend-api/src/proto.rs` split** (hello/rpc/target, root re-exports
+   byte-identical; `schema-gen --check` proves the wire schemas did not
+   move) and **`store/src/config.rs` split** (config/{mod,schema,overlay}):
+   mechanical, lower priority; step 5 skippable if the M2 branch cuts first.
+5. Micro: fold the triple-repeated "unexpected result" `RpcError` in the
+   SDK into one helper (rides with step 1).
+
+### Explicitly not refactoring (with reasons)
+
+- No `Session` type in the IPC server — the function decomposition is
+  right; the gap was tests, not structure.
+- No new fixture crate, no splits of frame/bus/authz/peer (48-124 lines,
+  stable through M8), no `DaemonCore`/`DaemonHandler` reshaping (M4 gets
+  better information first), no `VpnState: Display` unification, no clap
+  in the TUI's two-flag parser.
+
+### Behavior items surfaced (not refactors)
+
+- `apps/cli/src/commands.rs` `daemon start` calls `std::process::exit(1)`
+  inside dispatch, contradicting the module's own no-exit contract —
+  fixed in this round as a defect (return the error; exit mapping already
+  lives in `main`).
+- TUI opens a fresh IPC session every 750 ms refresh instead of holding
+  one and consuming the event stream — queued as an M2 design item with
+  the resync flow, where the event loop gets designed properly.
