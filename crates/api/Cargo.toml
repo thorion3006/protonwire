@@ -1,0 +1,16 @@
+[package]
+name = "protonwire-api"
+description = "Muon adapter: the required Proton API, authentication, session, and alternative-routing layer (PRD 6.5)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+muon = { workspace = true }
+protonwire-frontend-api = { workspace = true }
+thiserror = { workspace = true }

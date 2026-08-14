@@ -1,0 +1,15 @@
+[package]
+name = "protonwire-net"
+description = "Linux network control: TUN ownership, netlink policy routing, DNS modes, and the integration adapters (PRD 6.6, Milestone 5)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+protonwire-frontend-api = { workspace = true }
+thiserror = { workspace = true }
