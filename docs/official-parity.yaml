@@ -1,0 +1,799 @@
+schema_version: 3
+
+baseline:
+  as_of: "2026-08-14"
+  rule: >-
+    Union of Proton VPN service capabilities exposed by maintained official
+    clients when the behavior is technically applicable to Linux or a headless
+    frontend. Platform-specific presentation is not copied literally.
+  implementation_status: planning
+  evidence_status: provisional-capability-inventory
+  release_gate: complete-capability-diff-against-every-pinned-platform-baseline
+  refresh_policy: every-protonwire-release-and-every-protun-or-muon-upgrade
+
+client_contract:
+  architecture_as_of: "2026-08-14"
+  required_v1_clients: [cli, tui, gui]
+  implementations:
+    cli: clap
+    tui: ratatui
+    gui: tauri
+  rule: >-
+    Every required interactive core capability must be exposed through CLI,
+    TUI, and GUI using the shared client SDK. Automation-only formatting and
+    presentation-only desktop or terminal behavior must be explicit exceptions.
+  authoritative_behavior_owner: protonwire-core
+  capability_defaults:
+    interactive_client_surfaces: [cli, tui, gui]
+    override_field: client_exceptions
+    last_evidence_reviewed_at: "2026-08-14"
+    known_semantic_differences: []
+    verified_requires_per_capability_field: verified_at
+
+upstream:
+  protun:
+    version: 2.2.1
+    revision: 12e7755a112f59b7b843da79290b3de25febf653
+    source: https://github.com/ProtonVPN/protun/tree/v2.2.1
+    license: GPL-3.0-or-later
+  muon:
+    version: 2.6.1
+    source: https://rust-registry.proton.me/downloads/muon@2.6.1.crate
+    checksum_sha256: be9ba1f347e00a86119ff6b70d36356cce28c33fd000290cc1254bf4048155de
+    license: unresolved-release-blocker
+    license_evidence: no-license-field-or-license-file-in-source-archive
+  pvpnclient:
+    version: 3.0.3
+    version_constraint_from_protun: ~3.0.1
+    source: https://rust-registry.proton.me/downloads/pvpnclient@3.0.3.crate
+    checksum_sha256: 3c14ef052727e0204ec5e80cf8df50786db38a83b6a6557a188b78a4c264f380
+    license: unresolved-release-blocker
+    license_evidence: no-license-field-or-license-file-in-source-archive
+  official_linux_cli:
+    revision: a7c7abc8d3777f33b8d4c82279bd621258bd810d
+    source: https://github.com/ProtonVPN/proton-vpn-cli
+  official_linux_gui:
+    revision: bd9c406befad847d613ba3fc634b0f0ea9f1a72e
+    source: https://github.com/ProtonVPN/proton-vpn-gtk-app
+  official_linux_api_core:
+    revision: fb35f610fc592ddc181230369dc59855c4f97a04
+    source: https://github.com/ProtonVPN/python-proton-vpn-api-core
+  official_android_app:
+    revision: cc1e29f8acd5f11f63701b48f97410e90fa6a71d
+    source: https://github.com/ProtonVPN/android-app
+  official_windows_app:
+    revision: 4d9ac60d1db5d3f2908498470a9d1646723afcfd
+    branch: master
+    source: https://github.com/ProtonVPN/win-app
+  official_apple_app:
+    revision: 6973fc1f7703314d80cada3eba377766c55710e5
+    branch: develop
+    platforms: [ios, ipados, macos]
+    source: https://github.com/ProtonVPN/ios-mac-app
+
+status_definitions:
+  required: Applicable v1 scope; not yet verified complete.
+  implemented: Implemented but not yet fully parity-verified.
+  verified: Meets PRD parity definition and all referenced tests pass.
+  blocked-upstream: Public and authorized ProTUN, Muon, or Proton API surface is insufficient; approximation is forbidden and referenced tests cover fail-closed behavior only.
+  not-applicable: Platform-only presentation has no Linux/headless equivalent.
+  legacy-excluded: Intentionally outside the Proton Protocols architecture.
+
+sources:
+  protun_repo: https://github.com/ProtonVPN/protun
+  proton_registry: https://rust-registry.proton.me/
+  protocols: https://protonvpn.com/support/how-to-change-vpn-protocols
+  smart_protocol: https://protonvpn.com/blog/smart-protocol
+  features: https://protonvpn.com/features
+  linux_app: https://protonvpn.com/blog/protonvpn-linux-app
+  linux_cli: https://github.com/ProtonVPN/proton-vpn-cli
+  linux_release_notes: https://protonvpn.com/support/release-notes-linux
+  windows_release_notes: https://protonvpn.com/support/release-notes-windows
+  macos_release_notes: https://protonvpn.com/support/release-notes-macos
+  ios_release_notes: https://protonvpn.com/support/release-notes-ios
+  windows_app: https://github.com/ProtonVPN/win-app/tree/4d9ac60d1db5d3f2908498470a9d1646723afcfd
+  apple_app: https://github.com/ProtonVPN/ios-mac-app/tree/6973fc1f7703314d80cada3eba377766c55710e5
+  android_release_notes: https://protonvpn.com/support/release-notes-android
+  android_initial_profiles: https://github.com/ProtonVPN/android-app/blob/cc1e29f8acd5f11f63701b48f97410e90fa6a71d/app/src/main/java/com/protonvpn/android/profiles/usecases/PopulateInitialProfiles.kt
+  android_fastest_exclusion: https://github.com/ProtonVPN/android-app/blob/cc1e29f8acd5f11f63701b48f97410e90fa6a71d/app/src/main/java/com/protonvpn/android/utils/ServerManager.kt
+  android_physical_country: https://github.com/ProtonVPN/android-app/blob/cc1e29f8acd5f11f63701b48f97410e90fa6a71d/app/src/main/java/com/protonvpn/android/appconfig/UserCountry.kt
+  profiles: https://protonvpn.com/support/connection-profiles
+  default_connection: https://protonvpn.com/support/default-connection
+  split_tunneling: https://protonvpn.com/support/protonvpn-split-tunneling
+  kill_switch: https://protonvpn.com/support/what-is-kill-switch
+  advanced_kill_switch: https://protonvpn.com/support/advanced-kill-switch
+  custom_dns: https://protonvpn.com/support/custom-dns
+  netshield: https://protonvpn.com/support/netshield
+  port_forwarding: https://protonvpn.com/support/port-forwarding
+  moderate_nat: https://protonvpn.com/support/moderate-nat
+  accelerator: https://protonvpn.com/support/how-to-use-vpn-accelerator
+  secure_core: https://protonvpn.com/support/secure-core-vpn
+  tor: https://protonvpn.com/support/tor-vpn
+  lan: https://protonvpn.com/support/lan-connections
+  lan_name_resolution: https://protonvpn.com/support/local-dns-devices-by-name
+  free_change_server: https://protonvpn.com/support/change-server-free-plan
+  two_factor: https://protonvpn.com/support/two-factor-authentication
+  sso: https://protonvpn.com/support/sso-using-okta-idp/
+  packet_capture: https://protonvpn.com/support/packet-capture
+  gateway: https://protonvpn.com/support/add-gateway-organization/
+  streamlined_server_lists: https://protonvpn.com/support/streamlined-server-lists
+  un_m49: https://unstats.un.org/unsd/methodology/m49/
+  ratatui: https://ratatui.rs/
+  tauri: https://tauri.app/
+  protonwire_prd: docs/PRD-proton-wire.md
+  protonwire_adr: docs/ADR-0001-monorepo-core-and-clients.md
+  connection_groups_contract: docs/connection-groups.yaml
+  systemd_credentials: https://systemd.io/CREDENTIALS/
+
+capabilities:
+  - id: account.login
+    area: account
+    status: required
+    behavior: Proton account login through Muon without persisting a raw password by default.
+    owner: protonwire-api
+    entitlement: all-authenticated-plans
+    sources: [protun_repo, linux_cli]
+    tests: [T-15, E2E-1, E2E-12]
+
+  - id: account.session
+    area: account
+    status: required
+    behavior: Encrypted session persistence, refresh, expiry recovery, and logout through Muon.
+    owner: protonwire-api
+    entitlement: all-authenticated-plans
+    sources: [protun_repo, linux_cli]
+    tests: [T-10, T-12, T-35, IT-29, IT-30, E2E-1, E2E-25]
+
+  - id: account.credential-lifecycle
+    area: account
+    status: required
+    behavior: >-
+      Separate read-only systemd credential input from writable keyring-agent,
+      TPM2, and encrypted-local session stores; expose durable-write health and
+      never treat LoadCredential as a migration target or replay stale
+      provisioned state over a newer writable session.
+    owner: protonwire-store
+    entitlement: protonwire-added
+    sources: [systemd_credentials, protonwire_prd, protonwire_adr]
+    tests: [T-12, T-35, IT-29, IT-30, E2E-25]
+
+  - id: account.two-factor
+    area: account
+    status: required
+    behavior: TOTP/recovery-code and FIDO2/WebAuthn 2FA plus VPN connection 2FA/jail states.
+    owner: protonwire-api
+    entitlement: account-configured
+    sources: [two_factor, linux_cli, linux_release_notes]
+    tests: [T-15, IT-15, E2E-12, E2E-19]
+
+  - id: account.human-verification
+    area: account
+    status: blocked-upstream
+    behavior: Safe browser handoff and continuation for Proton human-verification challenges.
+    owner: protonwire-api
+    entitlement: challenge-dependent
+    sources: [protun_repo]
+    tests: [T-15, E2E-12]
+    blocker: Pinned Muon 2.6.1 has no public actionable human-verification event or continuation flow.
+
+  - id: account.sso
+    area: account
+    status: blocked-upstream
+    behavior: Proton organization SSO initiation, nonce-bound browser handoff, and session import/fork completion.
+    owner: protonwire-api
+    entitlement: proton-business-organization
+    sources: [sso, apple_app, macos_release_notes]
+    tests: [T-15, E2E-12]
+    blocker: Confirm an authorized public SSO initiation/completion contract and client identifier.
+
+  - id: account.guest-mode
+    area: account
+    status: blocked-upstream
+    behavior: Ephemeral no-account session equivalent to official Android guest mode.
+    owner: protonwire-api
+    entitlement: free
+    sources: [features]
+    tests: [T-15]
+    blocker: Confirm and document a public Muon/API guest-session flow for Linux.
+
+  - id: account.entitlements-and-jails
+    area: account
+    status: required
+    behavior: Plan, organization, disabled-user, pending-invoice, low-plan, and session-limit state.
+    owner: protonwire-api
+    entitlement: all
+    sources: [protun_repo, linux_cli]
+    tests: [T-4, IT-15, E2E-17]
+
+  - id: security.upstream-secret-logging
+    area: security
+    status: required
+    behavior: >-
+      Suppress secret-bearing pinned dependency events before formatting,
+      prohibit production dependency trace, and prove all sinks clean with
+      password/TOTP/FIDO/session/fork/cookie/key canaries.
+    owner: protonwire-daemon
+    entitlement: protonwire-added
+    sources: [protonwire_prd, proton_registry]
+    tests: [T-32, E2E-25]
+
+  - id: protocol.smart
+    area: protocols
+    status: required
+    behavior: ProTUN automatically selects and falls back among eligible transports and ports.
+    owner: protonwire-protocol
+    entitlement: all
+    sources: [protocols, smart_protocol, protun_repo]
+    tests: [T-13, IT-14, E2E-13]
+
+  - id: protocol.wireguard-udp
+    area: protocols
+    status: required
+    behavior: Manual and Smart Protocol WireGuard UDP through ProTUN.
+    owner: protonwire-protocol
+    entitlement: all
+    sources: [protocols, protun_repo]
+    tests: [T-13, IT-14, E2E-13]
+
+  - id: protocol.wireguard-tcp
+    area: protocols
+    status: required
+    behavior: Manual and Smart Protocol WireGuard TCP through ProTUN.
+    owner: protonwire-protocol
+    entitlement: all
+    sources: [protocols, protun_repo]
+    tests: [T-13, IT-14, E2E-13]
+
+  - id: protocol.stealth
+    area: protocols
+    status: required
+    behavior: Manual and Smart Protocol Stealth through ProTUN TLS-port candidates.
+    owner: protonwire-protocol
+    entitlement: all
+    sources: [protocols, protun_repo]
+    tests: [T-13, IT-14, E2E-13]
+
+  - id: protocol.network-change
+    area: protocols
+    status: required
+    behavior: Up, down, and network-switch events reset ProTUN outer sockets safely.
+    owner: protonwire-protocol
+    entitlement: all
+    sources: [protun_repo]
+    tests: [IT-9, IT-14, IT-17, E2E-10]
+
+  - id: protocol.circumvention-routing
+    area: protocols
+    status: required
+    behavior: Distinct Muon alternative API routing and ProTUN LocalAgent circumvention-routing policy.
+    owner: protonwire-protocol
+    entitlement: policy-and-network-dependent
+    sources: [protun_repo, smart_protocol]
+    tests: [T-20, IT-15, E2E-13]
+
+  - id: servers.catalog-and-search
+    area: servers
+    status: required
+    behavior: Cached, searchable logical/physical server catalog with status, load, tier, and features.
+    owner: protonwire-api
+    entitlement: all
+    sources: [linux_cli, features]
+    tests: [T-4, T-25, T-26, IT-23, E2E-2, E2E-22]
+
+  - id: servers.metadata-refresh-budget
+    area: servers
+    status: required
+    behavior: Single-flight conditional catalog refresh with a hard three-hour automatic minimum, persisted deadline, positive jitter, warned/confirmed manual override, and Proton rate-limit suppression.
+    owner: protonwire-core
+    entitlement: protonwire-added
+    sources: [protonwire_prd]
+    tests: [T-25, T-26, T-27, IT-23, E2E-2, E2E-22]
+
+  - id: servers.fastest-and-random
+    area: servers
+    status: required
+    behavior: Official Fastest by Proton catalog Score and official random/exclusion behavior, with separate explicit ProtonWire balanced/load/measured-latency policies.
+    owner: protonwire-core
+    entitlement: plan-dependent
+    sources: [profiles, default_connection, linux_cli, android_release_notes, android_fastest_exclusion]
+    tests: [T-1, T-16, T-34, E2E-3, E2E-15]
+
+  - id: groups.official-built-ins
+    area: connection-groups
+    status: required
+    behavior: >-
+      Immutable namespaced Fastest, Random, Streaming US, Gaming,
+      Anti-censorship, Max security, and Work/School selectors/presets with
+      pinned official semantics, availability, pins, and copy-to-profile.
+    owner: protonwire-core
+    entitlement: target-and-feature-dependent
+    sources: [android_initial_profiles, profiles, default_connection, connection_groups_contract]
+    tests: [T-28, T-29, IT-24, E2E-23]
+
+  - id: groups.fastest-excluding-my-country
+    area: connection-groups
+    status: required
+    behavior: >-
+      Exclude the known pre-VPN physical country before selecting an eligible
+      Fastest target; fail closed when the country is unavailable.
+    owner: protonwire-core
+    entitlement: plan-dependent
+    sources: [android_fastest_exclusion, android_physical_country, windows_release_notes, connection_groups_contract]
+    tests: [T-29, T-31, IT-24, E2E-23]
+
+  - id: groups.anti-censorship
+    area: connection-groups
+    status: required
+    behavior: >-
+      Official-compatible Anti-censorship preset using Stealth and Fastest
+      selection after excluding the pre-VPN physical country.
+    owner: protonwire-core
+    entitlement: target-and-feature-dependent
+    sources: [android_initial_profiles, android_fastest_exclusion, protun_repo, connection_groups_contract]
+    tests: [T-29, T-31, IT-24, E2E-23]
+
+  - id: groups.regional-fastest
+    area: connection-groups
+    status: required
+    behavior: >-
+      ProtonWire-added Fastest Africa, Asia, Europe, North America, South
+      America, and Oceania over a checksummed UN M49 mapping and the
+      authoritative visible server subset, ranked by Proton score by default,
+      without estimated speed.
+    owner: protonwire-core
+    entitlement: paid-location-selection
+    sources: [un_m49, streamlined_server_lists, connection_groups_contract]
+    tests: [T-28, T-30, T-31, T-33, IT-24, E2E-24]
+
+  - id: groups.cross-client-parity
+    area: connection-groups
+    status: required
+    behavior: >-
+      CLI, Ratatui TUI, and Tauri GUI expose the same group IDs, provenance,
+      availability, detail, connect, pin, and copy-to-profile operations.
+    owner: protonwire-client
+    entitlement: protonwire-added
+    sources: [connection_groups_contract, protonwire_adr, protonwire_prd]
+    tests: [T-24, T-28, IT-21, IT-24, E2E-23, E2E-24]
+
+  - id: servers.location
+    area: servers
+    status: required
+    behavior: Country, state/region, city, and fastest within scope.
+    owner: protonwire-core
+    entitlement: paid-location-selection
+    sources: [profiles, linux_cli]
+    tests: [T-2, E2E-4]
+
+  - id: servers.exact
+    area: servers
+    status: required
+    behavior: Exact logical/physical server selection with no silent fallback.
+    owner: protonwire-core
+    entitlement: paid-location-selection
+    sources: [profiles, linux_cli]
+    tests: [T-3, E2E-5]
+
+  - id: servers.free-change
+    area: servers
+    status: required
+    behavior: Backend-selected random change server and authoritative cooldown countdown.
+    owner: protonwire-api
+    entitlement: free
+    sources: [free_change_server]
+    tests: [T-16, E2E-15]
+
+  - id: servers.secure-core
+    area: special-servers
+    status: required
+    behavior: Fastest/exact entry and exit routing with both hops visible in status.
+    owner: protonwire-core
+    entitlement: paid
+    sources: [secure_core, profiles]
+    tests: [T-11, E2E-6, E2E-14]
+
+  - id: servers.p2p
+    area: special-servers
+    status: required
+    behavior: P2P constraint and P2P-aware port-forwarding selection.
+    owner: protonwire-core
+    entitlement: paid
+    sources: [linux_cli, profiles, port_forwarding]
+    tests: [T-4, E2E-14]
+
+  - id: servers.tor
+    area: special-servers
+    status: required
+    behavior: Tor over VPN server discovery and exact/fastest selection.
+    owner: protonwire-core
+    entitlement: paid
+    sources: [tor, profiles, linux_cli]
+    tests: [T-4, E2E-14]
+
+  - id: servers.streaming
+    area: special-servers
+    status: required
+    behavior: Preserve and expose streaming capability/restriction metadata for selection.
+    owner: protonwire-core
+    entitlement: plan-and-server-dependent
+    sources: [features, protun_repo]
+    tests: [T-4, E2E-17]
+
+  - id: servers.gateway
+    area: special-servers
+    status: required
+    behavior: Organization Gateway and dedicated-server selection and entitlement enforcement.
+    owner: protonwire-api
+    entitlement: proton-business-gateway
+    sources: [gateway, profiles]
+    tests: [T-4, E2E-14]
+
+  - id: profiles.crud-and-types
+    area: profiles
+    status: required
+    behavior: Create, edit, duplicate, and delete Standard, Secure Core, P2P, Tor, Gateway, and connection-group-reference profiles.
+    owner: protonwire-core
+    entitlement: paid
+    sources: [profiles]
+    tests: [T-17, T-28, E2E-16, E2E-23]
+
+  - id: profiles.overrides
+    area: profiles
+    status: required
+    behavior: Per-profile target, protocol, NetShield, NAT, port, LAN, and ProtonWire policy overrides.
+    owner: protonwire-core
+    entitlement: feature-dependent
+    sources: [profiles]
+    tests: [T-17, E2E-16]
+
+  - id: profiles.recents-pins-default
+    area: profiles
+    status: required
+    behavior: Recents, pins, last connection, fastest/random, stable group reference, and profile default connection.
+    owner: protonwire-core
+    entitlement: plan-dependent
+    sources: [profiles, default_connection]
+    tests: [T-17, T-28, E2E-16, E2E-23]
+
+  - id: profiles.connect-and-go
+    area: profiles
+    status: required
+    behavior: Confirmed URL, optional private/incognito browser request, or executable launch as the requesting user after server-confirmed connection.
+    owner: protonwire-frontend-api
+    entitlement: paid
+    sources: [profiles]
+    tests: [T-17, E2E-16]
+
+  - id: profiles.import-export
+    area: profiles
+    status: required
+    behavior: Versioned import/export with validation and explicit confirmation of actions.
+    owner: protonwire-core
+    entitlement: all-local-profiles
+    sources: [profiles]
+    tests: [T-9, T-17, E2E-16]
+
+  - id: protection.kill-switch-standard
+    area: protection
+    status: required
+    behavior: Block non-tunnel traffic after an expected VPN connection fails.
+    owner: protonwire-policy
+    entitlement: all
+    sources: [kill_switch]
+    tests: [T-7, IT-4, E2E-10]
+
+  - id: protection.kill-switch-permanent
+    area: protection
+    status: required
+    behavior: Fail-closed boot, disconnect, daemon-crash, and restart semantics.
+    owner: protonwire-policy
+    entitlement: all
+    sources: [advanced_kill_switch]
+    tests: [T-7, IT-10, IT-17, IT-27]
+
+  - id: protection.dns-and-ipv6-leaks
+    area: protection
+    status: required
+    behavior: DNS stays on a route/firewall-proven policy path, resolver ownership is preserved, and unsupported IPv6 is blocked.
+    owner: protonwire-net
+    entitlement: all
+    sources: [features, custom_dns]
+    tests: [T-6, IT-3, IT-5, IT-26]
+
+  - id: protection.lan
+    area: protection
+    status: required
+    behavior: Explicit LAN allow/block plus configurable network exceptions.
+    owner: protonwire-policy
+    entitlement: all
+    sources: [lan]
+    tests: [IT-6]
+
+  - id: protection.lan-name-resolution
+    area: protection
+    status: required
+    behavior: Opt-in LAN device-name resolution with mDNS/local-resolver exceptions that do not leak ordinary DNS.
+    owner: protonwire-net
+    entitlement: paid
+    sources: [lan, lan_name_resolution]
+    tests: [IT-6]
+
+  - id: protection.auto-connect-reconnect
+    area: protection
+    status: required
+    behavior: Boot auto-connect and fail-closed reconnect after endpoint, uplink, or manager change.
+    owner: protonwire-daemon
+    entitlement: all
+    sources: [linux_app, default_connection]
+    tests: [IT-9, IT-17, E2E-10]
+
+  - id: dns.proton-and-custom
+    area: dns-filtering
+    status: required
+    behavior: Proton DNS and custom IPv4/IPv6 DNS with routed policy and clean restoration.
+    owner: protonwire-net
+    entitlement: custom-dns-paid
+    sources: [custom_dns]
+    tests: [T-6, IT-5]
+
+  - id: dns.netshield-levels
+    area: dns-filtering
+    status: required
+    behavior: Off, malware, ads/trackers/malware, and adult-filter levels through LocalAgent.
+    owner: protonwire-protocol
+    entitlement: plan-dependent
+    sources: [netshield, protun_repo]
+    tests: [T-18, T-20, E2E-7, E2E-17]
+
+  - id: dns.netshield-statistics
+    area: dns-filtering
+    status: required
+    behavior: LocalAgent block counters and data-saved statistics when supplied by the server.
+    owner: protonwire-protocol
+    entitlement: plan-and-server-dependent
+    sources: [netshield, protun_repo]
+    tests: [IT-15, E2E-17]
+
+  - id: options.vpn-accelerator
+    area: connection-options
+    status: required
+    behavior: Request and confirm VPN Accelerator through ProTUN LocalAgent split-TCP state.
+    owner: protonwire-protocol
+    entitlement: plan-dependent
+    sources: [accelerator, protun_repo]
+    tests: [T-20, E2E-17]
+
+  - id: options.nat
+    area: connection-options
+    status: required
+    behavior: Strict and Moderate NAT through LocalAgent random-NAT policy.
+    owner: protonwire-protocol
+    entitlement: paid
+    sources: [moderate_nat, protun_repo]
+    tests: [T-5, T-18, T-20, E2E-17]
+
+  - id: options.port-forwarding
+    area: connection-options
+    status: required
+    behavior: LocalAgent request, P2P selection, NAT-PMP renewal, events, and official-compatible port file.
+    owner: protonwire-pf
+    entitlement: paid
+    sources: [port_forwarding, protun_repo]
+    tests: [T-5, T-18, E2E-8, E2E-17]
+
+  - id: options.ipv6-and-mtu
+    area: connection-options
+    status: required
+    behavior: IPv4/IPv6 tunnel addresses and server-probed MTU with safe IPv6 fallback.
+    owner: protonwire-net
+    entitlement: server-dependent
+    sources: [linux_app, protun_repo]
+    tests: [IT-3, E2E-17]
+
+  - id: split.apps-and-ip
+    area: split-tunneling
+    status: required
+    behavior: Official include/exclude applications and IPv4/IPv6 CIDR behavior.
+    owner: protonwire-policy
+    entitlement: paid
+    sources: [split_tunneling, apple_app, macos_release_notes]
+    tests: [T-8, IT-7, IT-8, E2E-18]
+
+  - id: split.advanced-linux-policy
+    area: split-tunneling
+    status: required
+    behavior: Process, PID, UID, GID, delegated cgroup, port/protocol, and best-effort running-process attachment with existing-socket limitations.
+    owner: protonwire-policy
+    entitlement: protonwire-added
+    sources: [split_tunneling]
+    tests: [T-8, IT-7, IT-8, IT-12, IT-28]
+
+  - id: split.domains
+    area: split-tunneling
+    status: required
+    behavior: TTL-aware domain include/exclude sets with documented DoH/CDN limitations.
+    owner: protonwire-policy
+    entitlement: protonwire-added
+    sources: [split_tunneling]
+    tests: [T-14, IT-11]
+
+  - id: split.kill-switch-coexistence
+    area: split-tunneling
+    status: required
+    behavior: Granular split policy coexists with fail-closed kill switch without silent downgrade.
+    owner: protonwire-policy
+    entitlement: protonwire-added
+    sources: [split_tunneling, kill_switch]
+    tests: [T-7, T-8, IT-4, IT-16]
+
+  - id: diagnostics.connection-details
+    area: diagnostics
+    status: required
+    behavior: Server, load, duration, entry/exit IP, protocol/port, RX/TX, handshake, RTT, and loss.
+    owner: protonwire-protocol
+    entitlement: all
+    sources: [protun_repo, linux_cli]
+    tests: [IT-14, E2E-17]
+
+  - id: diagnostics.packet-capture
+    area: diagnostics
+    status: required
+    behavior: Explicit, bounded, permission-restricted ProTUN packet capture using caller FDs or a fixed safe directory, with stop reasons.
+    owner: protonwire-protocol
+    entitlement: all
+    sources: [packet_capture, protun_repo]
+    tests: [IT-18, IT-28]
+
+  - id: diagnostics.debug-and-crash
+    area: diagnostics
+    status: required
+    behavior: Redacted debug bundles and inspectable opt-in anonymous crash reports.
+    owner: protonwire-daemon
+    entitlement: all
+    sources: [linux_cli]
+    tests: [T-10, E2E-18]
+
+  - id: diagnostics.network-conflict-detection
+    area: diagnostics
+    status: required
+    behavior: Detect competing VPN/TUN, default-route, DNS, firewall, outer-socket, and network-manager conflicts without mutating unowned state.
+    owner: protonwire-net
+    entitlement: all
+    sources: [windows_release_notes, windows_app]
+    tests: [T-21, IT-20]
+
+  - id: diagnostics.connection-feedback
+    area: diagnostics
+    status: blocked-upstream
+    behavior: Per-event opt-in quality feedback with payload preview and privacy redaction through an authorized Muon endpoint.
+    owner: protonwire-frontend-api
+    entitlement: all
+    sources: [windows_release_notes]
+    tests: [T-22, E2E-19]
+    blocker: Confirm an authorized public endpoint, schema, client identifier, and Muon request path.
+
+  - id: clients.single-core-monorepo
+    area: clients
+    status: required
+    behavior: One Cargo workspace and lockfile with protonwire-core as the sole application behavior implementation.
+    owner: protonwire-core
+    entitlement: protonwire-added
+    sources: [protonwire_adr, protonwire_prd]
+    tests: [T-23]
+
+  - id: clients.shared-sdk
+    area: clients
+    status: required
+    behavior: Typed unprivileged SDK for commands, queries, prompts, events, reconnect, and full-state resynchronization.
+    owner: protonwire-client
+    entitlement: protonwire-added
+    sources: [protonwire_adr, protonwire_prd]
+    tests: [T-23, IT-19, IT-21]
+
+  - id: clients.cli
+    area: clients
+    status: required
+    behavior: Complete scriptable CLI with stable output and exit semantics plus all applicable interactive core capabilities.
+    owner: protonwire-cli
+    entitlement: protonwire-added
+    sources: [linux_cli, protonwire_adr, protonwire_prd]
+    tests: [T-24, IT-21, E2E-20]
+
+  - id: clients.ratatui-tui
+    area: clients
+    status: required
+    behavior: First-class keyboard-driven Ratatui client with complete applicable core capability coverage and safe terminal lifecycle.
+    owner: protonwire-tui
+    entitlement: protonwire-added
+    sources: [ratatui, protonwire_adr, protonwire_prd]
+    tests: [T-24, IT-21, IT-22, E2E-20, E2E-21]
+
+  - id: clients.tauri-gui
+    area: clients
+    status: required
+    behavior: Tauri desktop client with complete applicable core capability coverage, bundled assets, and least-privilege webview bridge.
+    owner: protonwire-gui
+    entitlement: protonwire-added
+    sources: [tauri, protonwire_adr, protonwire_prd]
+    tests: [T-24, IT-21, IT-22, E2E-20, E2E-21]
+
+  - id: clients.cross-client-parity
+    area: clients
+    status: required
+    behavior: Generated contract proves CLI, TUI, and GUI use equivalent commands, prompts, state, errors, and confirmations.
+    owner: protonwire-client
+    entitlement: protonwire-added
+    sources: [protonwire_adr, protonwire_prd]
+    tests: [T-24, IT-21, E2E-20]
+
+  - id: integration.native
+    area: linux-integration
+    status: required
+    behavior: Direct netlink/nftables/uplink observation with no NetworkManager or networkd.
+    owner: protonwire-net
+    entitlement: protonwire-added
+    sources: [protun_repo]
+    tests: [IT-16]
+
+  - id: integration.network-manager
+    area: linux-integration
+    status: required
+    behavior: Optional NetworkManager uplink/DNS integration while ProtonWire owns tunnel and policy.
+    owner: protonwire-net
+    entitlement: protonwire-added
+    sources: [linux_app]
+    tests: [IT-16, IT-17]
+
+  - id: integration.systemd-networkd
+    area: linux-integration
+    status: required
+    behavior: Optional networkd/resolved uplink/DNS integration while ProtonWire owns tunnel and policy.
+    owner: protonwire-net
+    entitlement: protonwire-added
+    sources: [protun_repo]
+    tests: [IT-16, IT-17]
+
+  - id: integration.headless-frontend-api
+    area: linux-integration
+    status: required
+    behavior: Full daemon capability surface through root-peer-verified Unix-socket API, per-UID namespaces, and active-tunnel ownership.
+    owner: protonwire-frontend-api
+    entitlement: protonwire-added
+    sources: [linux_cli]
+    tests: [IT-19, IT-21, IT-28]
+
+  - id: integration.nixos
+    area: linux-integration
+    status: required
+    behavior: Reproducible flake module with interactive login and read-only systemd-credential provisioning outside the Nix store.
+    owner: packaging
+    entitlement: protonwire-added
+    sources: [linux_cli, systemd_credentials, protonwire_prd]
+    tests: [T-35, E2E-18, E2E-25]
+
+  - id: legacy.openvpn
+    area: legacy
+    status: legacy-excluded
+    behavior: OpenVPN is not part of the Proton Protocols architecture.
+    owner: none
+    entitlement: not-applicable
+    sources: [protocols]
+    tests: [T-13]
+
+  - id: legacy.ikev2
+    area: legacy
+    status: legacy-excluded
+    behavior: IKEv2 is not part of the Proton Protocols architecture.
+    owner: none
+    entitlement: not-applicable
+    sources: [protocols]
+    tests: [T-13]
+
+  - id: presentation.mobile-tv-browser-ui
+    area: presentation
+    status: not-applicable
+    behavior: Mobile widgets, TV layouts, browser-extension proxy UI, and OS-native settings screens are presentation-only.
+    owner: none
+    entitlement: not-applicable
+    sources: [features]
+    tests: []
