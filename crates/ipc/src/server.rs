@@ -95,9 +95,8 @@ impl IpcServer {
     ///
     /// Each session runs on two threads (reader/dispatcher and writer) and is
     /// fully isolated: a misbehaving client only drops its own session.
-    /// Sessions are bounded ([`MAX_SESSIONS`]), must complete the handshake
-    /// within [`HELLO_DEADLINE`], and cannot pin a writer past
-    /// [`WRITE_TIMEOUT`].
+    /// Sessions are bounded (64), must complete the handshake within 5 s,
+    /// and cannot pin a writer past 10 s.
     pub fn serve<H: RequestHandler + 'static>(&self, handler: Arc<H>, stop: Arc<AtomicBool>) {
         // Poll-accept so shutdown is responsive without signal plumbing here.
         if let Err(e) = self.listener.set_nonblocking(true) {

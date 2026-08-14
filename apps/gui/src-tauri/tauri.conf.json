@@ -25,6 +25,7 @@
   "bundle": {
     "active": true,
     "targets": ["deb"],
-    "category": "Network"
+    "category": "Network",
+    "icon": ["icons/icon.png"]
   }
 }
