@@ -1,0 +1,287 @@
+schema_version: 1
+catalog_revision: "2026-08-14"
+implementation_status: planning
+
+contract:
+  authoritative_owner: protonwire-core
+  required_client_surfaces: [cli, tui, gui]
+  namespaces:
+    proton: Source-pinned official-compatible Proton selector or preset behavior; verification status is tracked separately.
+    protonwire: ProtonWire-added selector or preset behavior.
+  immutable_built_ins: true
+  listing_network_requests: forbidden
+  runtime_definition_precedence:
+    - proton-api
+    - official-client-compat
+    - protonwire
+  allowed_ranking_signals: [proton-score, load, measured-latency, stability, feature-match, history]
+  forbidden_ranking_signals: [estimated-speed, estimated-throughput]
+  ranking_policies:
+    proton-score: Opaque catalog Score ascending after hard filters; official Fastest semantics.
+    balanced: ProtonWire weighted load, measured-latency, stability, feature-match, and history policy.
+    load: Lowest Proton-exposed load after hard filters.
+    latency: Lowest locally measured latency from a bounded on-demand shortlist.
+    random-country-then-server: Uniform eligible country followed by uniform eligible server, unless backend policy controls the choice.
+  official_group_ranking_overrides: forbidden
+  regional_group_ranking_overrides: [proton-score, balanced, load, latency]
+  unavailable_policy: visible-with-structured-reason-and-no-silent-downgrade
+
+physical_country:
+  meaning: Physical country before the VPN connection.
+  precedence:
+    - explicit-request
+    - explicit-config
+    - cached-proton-user-location-from-muon
+  forbidden_sources: [vpn-exit, account-country, locale, timezone, third-party-geolocation]
+  missing_policy: physical-country-required
+  periodic_polling: forbidden
+  on_demand_request_minimum_interval_hours: 3
+  suppression: honor-muon-retry-after-rate-limit-and-block
+
+sources:
+  android_app:
+    revision: cc1e29f8acd5f11f63701b48f97410e90fa6a71d
+    observed_at: "2026-08-14"
+    url: https://github.com/ProtonVPN/android-app
+  android_initial_profiles:
+    url: https://github.com/ProtonVPN/android-app/blob/cc1e29f8acd5f11f63701b48f97410e90fa6a71d/app/src/main/java/com/protonvpn/android/profiles/usecases/PopulateInitialProfiles.kt
+  android_fastest_exclusion:
+    url: https://github.com/ProtonVPN/android-app/blob/cc1e29f8acd5f11f63701b48f97410e90fa6a71d/app/src/main/java/com/protonvpn/android/utils/ServerManager.kt
+  android_physical_country:
+    url: https://github.com/ProtonVPN/android-app/blob/cc1e29f8acd5f11f63701b48f97410e90fa6a71d/app/src/main/java/com/protonvpn/android/appconfig/UserCountry.kt
+  proton_connection_profiles:
+    url: https://protonvpn.com/support/connection-profiles
+  proton_default_connection:
+    url: https://protonvpn.com/support/default-connection
+  proton_windows_release_notes:
+    url: https://protonvpn.com/support/release-notes-windows
+  proton_streamlined_server_lists:
+    url: https://protonvpn.com/support/streamlined-server-lists
+  un_m49:
+    url: https://unstats.un.org/unsd/methodology/m49/
+
+regional_taxonomy:
+  id: un-m49-six-continent-view
+  source: un_m49
+  normalized_country_code: ISO-3166-1-alpha-2
+  vendored_snapshot:
+    required_path: resources/geo/un-m49.csv
+    source_date: null
+    sha256: null
+    status: required-before-implementation-verification
+  unknown_country_policy: unmapped-and-ineligible
+  primary_regions:
+    africa:
+      m49_codes: ["002"]
+    asia:
+      m49_codes: ["142"]
+    europe:
+      m49_codes: ["150"]
+    north-america:
+      kind: composite
+      m49_codes: ["021", "013", "029"]
+      note: Northern America plus Central America and the Caribbean.
+    south-america:
+      m49_codes: ["005"]
+    oceania:
+      m49_codes: ["009"]
+
+groups:
+  - id: "proton:fastest-country"
+    label: Fastest country
+    origin: proton
+    definition_source: official-client-compat
+    immutable: true
+    entitlement: plan-dependent
+    target:
+      kind: fastest
+      connection_type: standard
+    ranking_policy: proton-score
+    overrides: {}
+    sources: [proton_default_connection, proton_connection_profiles]
+
+  - id: "proton:fastest-excluding-my-country"
+    label: Fastest country (excluding my country)
+    origin: proton
+    definition_source: official-client-compat
+    immutable: true
+    entitlement: plan-dependent
+    target:
+      kind: fastest
+      connection_type: standard
+      exclude_physical_country: true
+    ranking_policy: proton-score
+    overrides: {}
+    sources: [android_fastest_exclusion, proton_windows_release_notes]
+
+  - id: "proton:random-country"
+    label: Random country
+    origin: proton
+    definition_source: official-client-compat
+    immutable: true
+    entitlement: plan-dependent
+    target:
+      kind: random
+      connection_type: standard
+      selection_authority: proton-backend-when-required
+    ranking_policy: random-country-then-server
+    overrides: {}
+    sources: [proton_default_connection, proton_windows_release_notes]
+
+  - id: "proton:streaming-us"
+    label: Streaming US
+    origin: proton
+    definition_source: official-client-compat
+    immutable: true
+    entitlement: target-and-feature-dependent
+    target:
+      kind: fastest-in-country
+      connection_type: standard
+      country: US
+    ranking_policy: proton-score
+    overrides:
+      protocol: wireguard-udp
+    sources: [android_initial_profiles]
+
+  - id: "proton:gaming"
+    label: Gaming
+    origin: proton
+    definition_source: official-client-compat
+    immutable: true
+    entitlement: target-and-feature-dependent
+    target:
+      kind: fastest
+      connection_type: standard
+    ranking_policy: proton-score
+    overrides:
+      nat: moderate
+    sources: [android_initial_profiles]
+
+  - id: "proton:anti-censorship"
+    label: Anti-censorship
+    origin: proton
+    definition_source: official-client-compat
+    immutable: true
+    entitlement: target-and-feature-dependent
+    target:
+      kind: fastest
+      connection_type: standard
+      exclude_physical_country: true
+    ranking_policy: proton-score
+    overrides:
+      protocol: stealth
+    sources: [android_initial_profiles, android_fastest_exclusion]
+
+  - id: "proton:max-security"
+    label: Max security
+    origin: proton
+    definition_source: official-client-compat
+    immutable: true
+    entitlement: target-and-feature-dependent
+    target:
+      kind: secure-core
+      entry_country: fastest
+      exit_country: fastest
+    ranking_policy: proton-score
+    overrides:
+      lan_access: block
+    sources: [android_initial_profiles]
+
+  - id: "proton:work-school"
+    label: Work/School
+    origin: proton
+    definition_source: official-client-compat
+    immutable: true
+    entitlement: target-and-feature-dependent
+    target:
+      kind: fastest
+      connection_type: standard
+    ranking_policy: proton-score
+    overrides:
+      protocol: stealth
+      lan_access: block
+    sources: [android_initial_profiles]
+
+  - id: "protonwire:fastest-africa"
+    label: Fastest Africa
+    origin: protonwire
+    definition_source: protonwire
+    immutable: true
+    entitlement: paid-location-selection
+    target:
+      kind: fastest-in-region
+      region: africa
+    ranking_policy: proton-score
+    allowed_ranking_overrides: [balanced, load, latency]
+    overrides: {}
+    sources: [un_m49]
+
+  - id: "protonwire:fastest-asia"
+    label: Fastest Asia
+    origin: protonwire
+    definition_source: protonwire
+    immutable: true
+    entitlement: paid-location-selection
+    target:
+      kind: fastest-in-region
+      region: asia
+    ranking_policy: proton-score
+    allowed_ranking_overrides: [balanced, load, latency]
+    overrides: {}
+    sources: [un_m49]
+
+  - id: "protonwire:fastest-europe"
+    label: Fastest Europe
+    origin: protonwire
+    definition_source: protonwire
+    immutable: true
+    entitlement: paid-location-selection
+    target:
+      kind: fastest-in-region
+      region: europe
+    ranking_policy: proton-score
+    allowed_ranking_overrides: [balanced, load, latency]
+    overrides: {}
+    sources: [un_m49]
+
+  - id: "protonwire:fastest-north-america"
+    label: Fastest North America
+    origin: protonwire
+    definition_source: protonwire
+    immutable: true
+    entitlement: paid-location-selection
+    target:
+      kind: fastest-in-region
+      region: north-america
+    ranking_policy: proton-score
+    allowed_ranking_overrides: [balanced, load, latency]
+    overrides: {}
+    sources: [un_m49]
+
+  - id: "protonwire:fastest-south-america"
+    label: Fastest South America
+    origin: protonwire
+    definition_source: protonwire
+    immutable: true
+    entitlement: paid-location-selection
+    target:
+      kind: fastest-in-region
+      region: south-america
+    ranking_policy: proton-score
+    allowed_ranking_overrides: [balanced, load, latency]
+    overrides: {}
+    sources: [un_m49]
+
+  - id: "protonwire:fastest-oceania"
+    label: Fastest Oceania
+    origin: protonwire
+    definition_source: protonwire
+    immutable: true
+    entitlement: paid-location-selection
+    target:
+      kind: fastest-in-region
+      region: oceania
+    ranking_policy: proton-score
+    allowed_ranking_overrides: [balanced, load, latency]
+    overrides: {}
+    sources: [un_m49]
