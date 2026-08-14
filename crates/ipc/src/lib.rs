@@ -26,6 +26,6 @@ pub mod test_util;
 
 pub use authz::{IpcRole, authorize, required_role};
 pub use bus::EventBus;
-pub use client::{ConnectError, IpcClient, SecurityChecks};
+pub use client::{ConnectError, IpcClient, RequestError, SecurityChecks};
 pub use peer::PeerCredentials;
 pub use server::{RequestHandler, SessionContext};

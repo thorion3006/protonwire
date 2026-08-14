@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use protonwire_frontend_api::{
     ClientInfo, ClientMessage, EventEnvelope, HelloAck, PROTOCOL_VERSION, Request, RequestResult,
-    Response, RpcError, RpcErrorCode, ServerMessage,
+    Response, RpcError, ServerMessage,
 };
 
 use crate::frame::{read_msg, write_msg};
@@ -87,6 +87,21 @@ impl Default for SecurityChecks {
     }
 }
 
+/// Errors from a request: structured RPC refusals versus transport
+/// failures. A [`RequestError::Transport`] poisons the connection — any
+/// stranded bytes desynchronize the stream — so the caller must
+/// re-establish the session (rust-review findings 4+5).
+#[derive(Debug, thiserror::Error)]
+pub enum RequestError {
+    /// The daemon answered with a structured refusal.
+    #[error(transparent)]
+    Rpc(#[from] RpcError),
+    /// The connection is broken, timed out, or desynchronized; the
+    /// session is unusable and must be re-established.
+    #[error("transport failure: {0}")]
+    Transport(String),
+}
+
 /// A connected, handshaken client transport.
 ///
 /// Events that arrive while waiting for a response are buffered and returned
@@ -96,6 +111,7 @@ pub struct IpcClient {
     next_id: u64,
     pending_events: VecDeque<EventEnvelope>,
     timeout: Duration,
+    poisoned: bool,
     ack: HelloAck,
 }
 
@@ -150,6 +166,7 @@ impl IpcClient {
             next_id: 0,
             pending_events: VecDeque::new(),
             timeout,
+            poisoned: false,
             ack: HelloAck {
                 protocol_version: PROTOCOL_VERSION,
                 daemon_version: String::new(),
@@ -166,7 +183,9 @@ impl IpcClient {
         &self.ack
     }
 
-    /// Overrides the per-request read timeout (tests use short values).
+    /// Overrides the per-request timeout (tests use short values). Also
+    /// bounds a whole request: a stream of events cannot keep one alive
+    /// past the deadline.
     pub fn set_timeout(&mut self, timeout: Duration) {
         self.timeout = timeout;
         let _ = self.stream.set_read_timeout(Some(timeout));
@@ -195,37 +214,55 @@ impl IpcClient {
     }
 
     /// Sends a request and blocks for its correlated response.
-    pub fn request(&mut self, request: Request) -> Result<RequestResult, RpcError> {
+    ///
+    /// Any read/write failure, timeout, or protocol desynchronization
+    /// returns [`RequestError::Transport`] and poisons the connection:
+    /// the stream may hold stranded bytes, so every later call fails fast
+    /// until the caller reconnects.
+    pub fn request(&mut self, request: Request) -> Result<RequestResult, RequestError> {
+        if self.poisoned {
+            return Err(RequestError::Transport(
+                "connection unusable after a previous failure; reconnect".into(),
+            ));
+        }
+        let deadline = std::time::Instant::now() + self.timeout;
         let id = self.next_id;
         self.next_id += 1;
-        write_msg(&mut self.stream, &ClientMessage::Request { id, request })
-            .map_err(|e| RpcError::new(RpcErrorCode::Internal, format!("write failed: {e}")))?;
+        write_msg(&mut self.stream, &ClientMessage::Request { id, request }).map_err(|e| {
+            self.poisoned = true;
+            RequestError::Transport(format!("write failed: {e}"))
+        })?;
         loop {
+            if std::time::Instant::now() > deadline {
+                self.poisoned = true;
+                return Err(RequestError::Transport(
+                    "request timed out without a response".into(),
+                ));
+            }
             match read_msg::<_, ServerMessage>(&mut self.stream) {
                 Ok(ServerMessage::Response(response)) => match response {
                     Response::Ok { id: seen, result } if seen == id => return Ok(result),
-                    Response::Error { id: seen, error } if seen == id => return Err(error),
+                    Response::Error { id: seen, error } if seen == id => return Err(error.into()),
                     other => {
-                        return Err(RpcError::new(
-                            RpcErrorCode::Internal,
-                            format!("out-of-order response id {}", other.id()),
-                        ));
+                        self.poisoned = true;
+                        return Err(RequestError::Transport(format!(
+                            "out-of-order response id {}",
+                            other.id()
+                        )));
                     }
                 },
                 Ok(ServerMessage::Event(envelope)) => {
                     self.pending_events.push_back(envelope);
                 }
                 Ok(other) => {
-                    return Err(RpcError::new(
-                        RpcErrorCode::Internal,
-                        format!("unexpected message mid-request: {other:?}"),
-                    ));
+                    self.poisoned = true;
+                    return Err(RequestError::Transport(format!(
+                        "unexpected message mid-request: {other:?}"
+                    )));
                 }
                 Err(e) => {
-                    return Err(RpcError::new(
-                        RpcErrorCode::Internal,
-                        format!("read failed: {e}"),
-                    ));
+                    self.poisoned = true;
+                    return Err(RequestError::Transport(format!("read failed: {e}")));
                 }
             }
         }
@@ -307,7 +344,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use protonwire_frontend_api::VpnState;
+    use protonwire_frontend_api::{RpcErrorCode, VpnState};
 
     use crate::EventBus;
 
@@ -402,8 +439,15 @@ mod tests {
         let mut client =
             IpcClient::connect(&path, &test_client_info(), SecurityChecks::dev_unchecked())
                 .unwrap();
-        let err = client.request(Request::Shutdown).unwrap_err();
-        assert_eq!(err.code, RpcErrorCode::PermissionDenied);
+        match client.request(Request::Shutdown).unwrap_err() {
+            RequestError::Rpc(rpc) => {
+                assert_eq!(
+                    rpc.code,
+                    protonwire_frontend_api::RpcErrorCode::PermissionDenied
+                );
+            }
+            other => panic!("expected an RPC refusal, got {other:?}"),
+        }
     }
 
     #[test]

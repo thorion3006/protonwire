@@ -14,7 +14,7 @@ use protonwire_frontend_api::{
     ClientInfo, ClientSurface, ConnectTarget, DaemonState, EventEnvelope, Request, RequestResult,
     RpcError, RpcErrorCode,
 };
-use protonwire_ipc::{ConnectError, IpcClient, SecurityChecks};
+use protonwire_ipc::{ConnectError, IpcClient, RequestError, SecurityChecks};
 
 /// Re-export so clients never need a direct protonwire-ipc dependency.
 pub use protonwire_ipc::SecurityChecks as IpcSecurityChecks;
@@ -103,6 +103,16 @@ pub struct ProtonwireClient {
     version: &'static str,
 }
 
+/// Maps an IPC transport failure onto the client error surface: a broken
+/// or unresponsive daemon connection is exit 13 (PRD 9.8), with a
+/// reconnect instruction, not a generic exit 1.
+fn transport_failure(message: String) -> ClientError {
+    ClientError::Io(std::io::Error::new(
+        std::io::ErrorKind::ConnectionAborted,
+        message,
+    ))
+}
+
 impl ProtonwireClient {
     /// Connects with production defaults: the socket from
     /// [`SOCKET_ENV`] or [`DEFAULT_SOCKET_PATH`], with strict trust checks.
@@ -153,6 +163,11 @@ impl ProtonwireClient {
         &self.ipc.hello().daemon_version
     }
 
+    /// Overrides the request timeout (tests use short values).
+    pub fn set_request_timeout(&mut self, timeout: std::time::Duration) {
+        self.ipc.set_timeout(timeout);
+    }
+
     /// Liveness probe.
     pub fn ping(&mut self) -> Result<String, ClientError> {
         match self.ipc.request(Request::Ping {
@@ -163,7 +178,8 @@ impl ProtonwireClient {
                 RpcErrorCode::Internal,
                 format!("unexpected ping result: {other:?}"),
             ))),
-            Err(e) => Err(ClientError::Rpc(e)),
+            Err(RequestError::Rpc(rpc)) => Err(ClientError::Rpc(rpc)),
+            Err(RequestError::Transport(message)) => Err(transport_failure(message)),
         }
     }
 
@@ -175,7 +191,8 @@ impl ProtonwireClient {
                 RpcErrorCode::Internal,
                 format!("unexpected state result: {other:?}"),
             ))),
-            Err(e) => Err(ClientError::Rpc(e)),
+            Err(RequestError::Rpc(rpc)) => Err(ClientError::Rpc(rpc)),
+            Err(RequestError::Transport(message)) => Err(transport_failure(message)),
         }
     }
 
@@ -203,7 +220,8 @@ impl ProtonwireClient {
                 RpcErrorCode::Internal,
                 format!("unexpected acknowledgement result: {other:?}"),
             ))),
-            Err(e) => Err(ClientError::Rpc(e)),
+            Err(RequestError::Rpc(rpc)) => Err(ClientError::Rpc(rpc)),
+            Err(RequestError::Transport(message)) => Err(transport_failure(message)),
         }
     }
 
@@ -514,6 +532,68 @@ mod tests {
         .err()
         .expect("connect must fail without a daemon");
         assert_eq!(err.exit_code(), 13);
+    }
+
+    /// Rust-review findings 4+5 (M1.1 redesign): a daemon that completes
+    /// the handshake but never answers a request is a TRANSPORT failure —
+    /// exit 13 (daemon unavailable), not exit 1 (generic) — and after such
+    /// a failure the client must fail fast with a reconnect instruction
+    /// instead of silently retrying a desynchronized stream.
+    #[test]
+    fn unresponsive_daemon_is_transport_failure_and_poisons_the_client() {
+        use std::os::unix::net::UnixListener;
+        use std::time::Instant;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("silent.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        std::thread::spawn(move || {
+            let (mut peer, _) = listener.accept().unwrap();
+            // Complete the handshake, then swallow every request forever.
+            let _ = protonwire_ipc::frame::read_msg::<_, protonwire_frontend_api::ClientMessage>(
+                &mut peer,
+            );
+            let _ = protonwire_ipc::frame::write_msg(
+                &mut peer,
+                &ServerMessage::HelloAck(protonwire_frontend_api::HelloAck {
+                    protocol_version: 1,
+                    daemon_version: "silent".into(),
+                    latest_event_seq: 0,
+                }),
+            );
+            while protonwire_ipc::frame::read_msg::<_, protonwire_frontend_api::ClientMessage>(
+                &mut peer,
+            )
+            .is_ok()
+            {}
+        });
+
+        let mut client = ProtonwireClient::connect_to(
+            &path,
+            ClientSurface::Other,
+            IpcSecurityChecks::dev_unchecked(),
+        )
+        .unwrap();
+        client.set_request_timeout(std::time::Duration::from_millis(150));
+
+        let started = Instant::now();
+        let err = client.state().expect_err("silent daemon must fail");
+        assert_eq!(
+            err.exit_code(),
+            13,
+            "transport failure is daemon-unavailable"
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+
+        // The poisoned client fails fast on the next call.
+        let started = Instant::now();
+        let err = client.state().expect_err("poisoned client must fail");
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        assert_eq!(err.exit_code(), 13);
+        assert!(
+            err.to_string().to_lowercase().contains("reconnect"),
+            "poisoned error should instruct a reconnect, got: {err}"
+        );
     }
 
     /// The full RPC-code → exit-code table against PRD 9.8, so a silent

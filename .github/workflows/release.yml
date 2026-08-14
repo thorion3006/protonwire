@@ -1,0 +1,21 @@
+name: release-gate
+
+# The distribution gate (COPYING.md, PRD NFR-35/OQ-2): the pinned Proton
+# registry crates carry no license, so no binary or source distribution
+# may be published. This workflow makes the blocker ENFORCED, not merely
+# documented: any v* tag fails until docs/LICENSE-CLEARANCE.md exists.
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  release-guard:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Enforce the license-clearance gate
+        run: cargo xtask release-guard
+      # Nothing may follow a failing guard; when clearance exists, the
+      # Milestone 8 release pipeline (SBOM, reproducible build, packages)
+      # replaces this job.

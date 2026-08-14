@@ -244,3 +244,47 @@ reviewer's summary of solid ground is recorded in the commit discussion.
   grows); `StateStore`: parent-dir fsync, `schema_version` check on load;
   store→frontend-api conversion could live in core; client identity
   naming; socket-group comment pointing at PRD 6.3 (M8 packaging).
+
+## 2026-08-15 — M1.1 closeout (refactorer steps + compliance gaps)
+
+### Refactorer steps 1-3 — DONE (TDD where testable)
+
+- **Step 3**: single trust-check policy seam (`checks_for(flag, debug)`
+  pure fn, full input space pinned by test written first; CLI and TUI no
+  longer assemble the policy).
+- **Step 1**: feature-gated `protonwire-ipc::test_util::TestServer`
+  (bind/serve/stop-on-drop) replaces both copy-pasted fixtures; the
+  never-stopped serve-thread bookkeeping died with them.
+- **Step 2**: `serve_messages` pinned by six characterization tests
+  (duplicate-hello, request-before-hello, version above/below bounds,
+  negotiated min, teardown slot release).
+- Step 4 (proto.rs split) and step 5 (config.rs split): deferred to when
+  M2 growth forces them — mechanical, low value today.
+
+### Rust-review #4+#5 (transport redesign) — DONE (TDD: red on both)
+
+`IpcClient::request` now distinguishes `RequestError::Rpc` from
+`RequestError::Transport`: timeouts, I/O failures, and desynchronization
+poison the connection (stranded bytes make the stream unusable), later
+calls fail fast with a reconnect instruction, requests carry an overall
+deadline (event streams can no longer keep one alive), and the SDK maps
+transport failures to exit 13 (daemon unavailable) instead of exit 1.
+
+### Compliance gaps — DONE
+
+- **Gap 2 (release guard)**: `cargo xtask release-guard` fails unless
+  `docs/LICENSE-CLEARANCE.md` exists; `.github/workflows/release.yml`
+  runs it on every `v*` tag — the license blocker is now enforced, not
+  just documented.
+- **Gap 3 (license inventory)**: `cargo xtask license-scan` enumerates
+  the live unlicensed set from `cargo metadata` and fails on drift
+  against the recorded 17-crate baseline (verified matching live); runs
+  in `xtask all`, so engine upgrades cannot silently grow the blocked
+  set.
+- **Gap 4 (SBOM/reproducibility skeletons)**: honest `cargo xtask sbom`
+  stub alongside capability-matrix; disposition recorded here and in
+  packaging/README.md.
+
+Remaining tracked: Gap 5 (0600 file modes, M2 with the credential
+store), the rust-review M2 items above, and the two open human questions
+(branch/tag protection; rsa/Marvin risk-acceptance record).

@@ -138,7 +138,7 @@ pub fn run(root: &Path) -> Result<bool> {
     Ok(reporter.finish(&summary))
 }
 
-fn cargo_metadata(root: &Path) -> Result<Metadata> {
+pub(crate) fn cargo_metadata(root: &Path) -> Result<Metadata> {
     let output = run_cargo(root, &["metadata", "--format-version", "1"])?;
     serde_json::from_str(&output).context("failed to parse `cargo metadata` output")
 }

@@ -12,6 +12,7 @@
 
 mod deps;
 mod groups;
+mod license;
 mod m49;
 mod manifest;
 mod schema_gen;
@@ -30,8 +31,11 @@ subcommands:
   m49-verify             verify resources/geo/un-m49.csv against docs/connection-groups.yaml
   dep-graph              enforce monorepo dependency rules (forbidden edges, lockfiles, wildcards)
   schema-gen [--check]   regenerate (or check) JSON Schemas from protonwire-frontend-api
+  license-scan           unlicensed-package inventory vs the recorded baseline (distribution gate)
+  release-guard          distribution gate: fails while Proton crate licenses are unresolved
+  sbom                   SBOM generation (stub; lands in Milestone 8)
   capability-matrix      client capability matrix (stub; lands in Milestone 8, T-24)
-  all                    run every check above (schema-gen in --check mode)
+  all                    run every check above except release-guard (schema-gen in --check mode)
 ";
 
 fn main() -> ExitCode {
@@ -68,14 +72,22 @@ fn run(args: &[String]) -> Result<bool> {
             capability_matrix_stub();
             Ok(true)
         }
+        Some("license-scan") => license::run(&root),
+        Some("release-guard") => license::release_guard(&root),
+        Some("sbom") => {
+            sbom_stub();
+            Ok(true)
+        }
         Some("all") => {
             let mut ok = true;
             ok &= manifest::run(&root)?;
             ok &= groups::run(&root)?;
             ok &= m49::run(&root)?;
             ok &= deps::run(&root)?;
+            ok &= license::run(&root)?;
             ok &= schema_gen::run(&root, true)?;
             capability_matrix_stub();
+            sbom_stub();
             if ok {
                 println!("PASS [all] every check passed");
             } else {
@@ -93,6 +105,13 @@ fn run(args: &[String]) -> Result<bool> {
 /// Honest stub: the client capability matrix lands in Milestone 8 (T-24).
 fn capability_matrix_stub() {
     println!("STUB: client capability matrix generation lands in Milestone 8 (T-24)");
+}
+
+/// Honest stub: SBOM and reproducible-build tooling land in Milestone 8
+/// (PRD section 18); the audit-policy and license-inventory skeletons
+/// live in CI today.
+fn sbom_stub() {
+    println!("STUB: SBOM + reproducible-build generation lands in Milestone 8 (PRD 18)");
 }
 
 /// The workspace root, derived from this crate's compile-time manifest
