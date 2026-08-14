@@ -117,14 +117,7 @@ impl ProtonwireClient {
         let path = std::env::var(SOCKET_ENV)
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from(DEFAULT_SOCKET_PATH));
-        let dev_unsafe =
-            cfg!(debug_assertions) && std::env::var(DEV_UNSAFE_SOCKET_ENV).as_deref() == Ok("1");
-        let checks = if dev_unsafe {
-            IpcSecurityChecks::dev_unchecked()
-        } else {
-            IpcSecurityChecks::strict()
-        };
-        Self::connect_to(&path, surface, checks)
+        Self::connect_to(&path, surface, security_checks_from_env())
     }
 
     /// Connects to an explicit socket with explicit checks (tests, tooling).
@@ -250,6 +243,75 @@ impl ProtonwireClient {
 
 fn client_identity() -> (&'static str, &'static str) {
     ("protonwire-client", env!("CARGO_PKG_VERSION"))
+}
+
+/// The single trust-check policy (refactorer step 3): the development
+/// bypass requires BOTH a debug build and the env flag; release builds
+/// always run strict checks. Pure so the policy is unit-testable —
+/// edition 2024 makes `std::env::set_var` unsafe and the workspace denies
+/// `unsafe_code`, so the env read stays in the caller.
+pub fn checks_for(dev_flag: Option<&str>, debug_build: bool) -> IpcSecurityChecks {
+    if debug_build && dev_flag == Some("1") {
+        IpcSecurityChecks::dev_unchecked()
+    } else {
+        IpcSecurityChecks::strict()
+    }
+}
+
+/// Resolves the trust checks from [`DEV_UNSAFE_SOCKET_ENV`] for the
+/// current build. Honored in debug builds only.
+pub fn security_checks_from_env() -> IpcSecurityChecks {
+    checks_for(
+        std::env::var(DEV_UNSAFE_SOCKET_ENV).ok().as_deref(),
+        cfg!(debug_assertions),
+    )
+}
+
+/// Connects with an optional socket override and the SDK check policy.
+///
+/// This is the connection entry point apps should use: it resolves the
+/// `PROTONWIRE_SOCKET` override and the (debug-only) bypass in one place,
+/// so clients never assemble the policy themselves.
+pub fn connect_with_socket_override(
+    socket: Option<&Path>,
+    surface: ClientSurface,
+) -> Result<ProtonwireClient, ClientError> {
+    match socket {
+        Some(path) => {
+            let path = std::env::var(SOCKET_ENV)
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| path.to_owned());
+            ProtonwireClient::connect_to(&path, surface, security_checks_from_env())
+        }
+        None => ProtonwireClient::connect_default(surface),
+    }
+}
+
+#[cfg(test)]
+mod checks_tests {
+    use super::*;
+
+    /// The trust-bypass policy, pinned across its full input space so the
+    /// three former copies (SDK, CLI, TUI) cannot drift apart again
+    /// (refactorer step 3).
+    #[test]
+    fn dev_bypass_requires_both_debug_build_and_flag() {
+        let cases = [
+            (Some("1"), true, false), // debug + flag → bypass
+            (Some("1"), false, true), // release + flag → strict
+            (None, true, true),       // debug, no flag → strict
+            (Some("0"), true, true),  // wrong flag value → strict
+            (Some("2"), true, true),  // any non-"1" → strict
+            (None, false, true),      // release, nothing → strict
+        ];
+        for (flag, debug, expect_strict) in cases {
+            let checks = checks_for(flag, debug);
+            assert_eq!(
+                checks.require_root_socket, expect_strict,
+                "flag={flag:?} debug={debug}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

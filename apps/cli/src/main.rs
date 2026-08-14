@@ -51,25 +51,11 @@ fn main() {
 }
 
 /// Connects a client honoring the socket override, or the SDK defaults.
+/// The trust-check policy (including the debug-only bypass) lives in the
+/// SDK, not here (refactorer step 3).
 pub(crate) fn connect(socket: Option<&Path>) -> Result<ProtonwireClient, ClientError> {
-    match socket {
-        Some(path) => ProtonwireClient::connect_to(
-            path,
-            protonwire_frontend_api::ClientSurface::Cli,
-            security_checks(),
-        ),
-        None => ProtonwireClient::connect_default(protonwire_frontend_api::ClientSurface::Cli),
-    }
-}
-
-fn security_checks() -> protonwire_client::IpcSecurityChecks {
-    // The env bypass is honored only in debug builds (mirrors the SDK's
-    // connect_default gate).
-    let dev_unsafe = cfg!(debug_assertions)
-        && std::env::var(protonwire_client::DEV_UNSAFE_SOCKET_ENV).as_deref() == Ok("1");
-    if dev_unsafe {
-        protonwire_client::IpcSecurityChecks::dev_unchecked()
-    } else {
-        protonwire_client::IpcSecurityChecks::strict()
-    }
+    protonwire_client::connect_with_socket_override(
+        socket,
+        protonwire_frontend_api::ClientSurface::Cli,
+    )
 }

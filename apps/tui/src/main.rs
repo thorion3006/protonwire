@@ -111,17 +111,9 @@ fn restore() -> std::io::Result<()> {
 }
 
 fn connect(options: &Options) -> Result<ProtonwireClient, ClientError> {
-    let dev_unsafe = cfg!(debug_assertions)
-        && std::env::var(protonwire_client::DEV_UNSAFE_SOCKET_ENV).as_deref() == Ok("1");
-    let checks = if dev_unsafe {
-        protonwire_client::IpcSecurityChecks::dev_unchecked()
-    } else {
-        protonwire_client::IpcSecurityChecks::strict()
-    };
-    match options.socket.as_deref() {
-        Some(path) => ProtonwireClient::connect_to(path, ClientSurface::Tui, checks),
-        None => ProtonwireClient::connect_default(ClientSurface::Tui),
-    }
+    // Trust-check policy (including the debug-only bypass) lives in the
+    // SDK (refactorer step 3).
+    protonwire_client::connect_with_socket_override(options.socket.as_deref(), ClientSurface::Tui)
 }
 
 fn run(terminal: &mut Term, options: Options) -> Result<(), ClientError> {
