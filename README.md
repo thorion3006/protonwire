@@ -49,12 +49,23 @@ enforces this (PRD NFR-39).
 
 ## Building
 
-Toolchain: Rust ≥ 1.97 (edition 2024) — the Proton registry crates the
-engines depend on do not compile below ~1.94 (probe record in
-`docs/spike-2026-08.md`). A C toolchain is required (`cc`; the engine
-chain builds C code) — on NixOS run `nix shell nixpkgs#gcc` first. The
-Proton sparse registry and the `cargo xtask` alias are configured in
-`.cargo/config.toml`.
+The repo-scoped devshell carries the entire toolchain (rustc 1.97.1,
+cargo, rustfmt, clippy, the gcc linker, cargo-audit, git); no
+system-wide Rust install is needed or used. With direnv it activates on
+entry:
+
+```sh
+direnv allow                # once: toolchain active in every shell here
+PROTONWIRE_GUI=1 direnv allow   # opt in to the webkit2gtk stack:
+                                # cargo check -p protonwire-gui works
+```
+
+Without direnv: `nix-shell` (or `nix-shell --arg gui true`).
+
+Toolchain floor: Rust ≥ 1.97 (edition 2024) — the Proton registry crates
+the engines depend on do not compile below ~1.94 (probe record in
+`docs/spike-2026-08.md`). The Proton sparse registry and the
+`cargo xtask` alias are configured in `.cargo/config.toml`.
 
 ```sh
 cargo build                 # everything except the GUI

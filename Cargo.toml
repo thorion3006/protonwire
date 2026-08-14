@@ -88,10 +88,12 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 nix = { version = "0.31", features = ["socket", "user", "fs", "signal"] }
 zeroize = "1"
 
-# --- Clients --------------------------------------------------------------
+# Clients --------------------------------------------------------------
 clap = { version = "4", features = ["derive"] }
 ratatui = "0.30"
-tauri = { version = "2", default-features = false }
+# `wry` selects the webview runtime; `default-features = false` otherwise
+# leaves Builder<R: Runtime> without a runtime to infer.
+tauri = { version = "2", default-features = false, features = ["wry"] }
 tauri-build = { version = "2", default-features = false }
 
 # --- xtask tooling --------------------------------------------------------

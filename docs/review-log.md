@@ -288,3 +288,25 @@ transport failures to exit 13 (daemon unavailable) instead of exit 1.
 Remaining tracked: Gap 5 (0600 file modes, M2 with the credential
 store), the rust-review M2 items above, and the two open human questions
 (branch/tag protection; rsa/Marvin risk-acceptance record).
+
+## 2026-08-15 — Devshell policy (standing rule)
+
+Build and runtime tools now come exclusively from the repo-scoped
+devshell (`shell.nix`, nixpkgs pinned to the revision carrying the
+verified toolchain): rustc 1.97.1/cargo 1.97.0, rustfmt, clippy, gcc,
+cargo-audit, git; `nix-shell --arg gui true` (or
+`PROTONWIRE_GUI=1 direnv allow`, via the committed `.envrc`) adds the
+webkit2gtk stack so `protonwire-gui` compiles locally too — with it, the
+Tauri shell's missing webview runtime feature (`wry`) was found and
+fixed locally instead of through a 16-minute CI round-trip. No
+system-wide Rust installation is used — the machine's rustup was removed
+entirely at the owner's direction (`rustup self uninstall`; 5.7 GB
+reclaimed), and the session's earlier ad-hoc `nix shell nixpkgs#gcc`
+wrappers are retired.
+
+A flake-based devshell is deliberately NOT shipped: this repository uses
+git's reftable ref storage, which Nix's libgit2 (flake `git+file`
+fetching) cannot read — every available git here (system and nixpkgs,
+all 2.55) predates `git refstorage migrate`. Classic `nix-shell` never
+touches git, so `shell.nix` works today; the flake lands with the M8
+packaging work once nixpkgs/nix catch up.

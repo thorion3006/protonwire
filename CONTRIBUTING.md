@@ -22,17 +22,36 @@ Read the specification set before changing behavior — the PRD is normative:
 4. Findings land in `docs/review-log.md` — fixed now or tracked with a
    milestone.
 
-## Local gates (must be green before push)
+## Development environment
+
+All build and runtime tools come from the repo-scoped devshell
+(`shell.nix`, pinned nixpkgs) — never from system-wide installs. With
+direnv (recommended) it activates on entry:
 
 ```sh
-cargo fmt --all                      # formatting
-cargo clippy --all-targets -- -D warnings
-cargo test                           # 27 test targets
-cargo xtask all                      # parity manifest, groups, M49,
-                                      # dep-graph, schema freshness
+direnv allow                        # core: rustc/cargo/rustfmt/clippy,
+                                    # gcc, cargo-audit, git
+PROTONWIRE_GUI=1 direnv allow       # + webkit2gtk stack for protonwire-gui
 ```
 
-Builds need a C toolchain (`cc`; on NixOS: `nix shell nixpkgs#gcc`).
+Without direnv: `nix-shell` / `nix-shell --arg gui true`.
+
+The shell pins the verified toolchain (rustc 1.97.1); `rust-toolchain.toml`
+is inert inside it (no rustup) and only serves rustup-based contributors
+and CI, which installs its own pinned toolchains. A flake-based devshell
+is blocked until Nix's libgit2 supports this repository's reftable ref
+storage (tracked with the M8 packaging work).
+
+## Local gates (must be green before push; run inside the devshell)
+
+```sh
+cargo fmt --all --check               # formatting
+cargo clippy --all-targets -- -D warnings
+cargo test                            # 27 test targets
+cargo xtask all                       # parity manifest, groups, M49,
+                                       # dep-graph, license inventory,
+                                       # schema freshness
+```
 Toolchain floor: see `rust-toolchain.toml` and the spike record.
 
 ## Repo rules enforced by tooling
