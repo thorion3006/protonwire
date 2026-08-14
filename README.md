@@ -48,8 +48,10 @@ enforces this (PRD NFR-39).
 
 ## Building
 
-Toolchain: Rust ≥ 1.85 (edition 2024), pinned in `rust-toolchain.toml`.
-The Proton sparse registry is configured in `.cargo/config.toml`.
+Toolchain: Rust ≥ 1.97 (edition 2024) — the Proton registry crates the
+engines depend on do not compile below ~1.94 (probe record in
+`docs/spike-2026-08.md`). The Proton sparse registry is configured in
+`.cargo/config.toml`.
 
 ```sh
 cargo build                 # everything except the GUI
@@ -71,9 +73,10 @@ PROTONWIRE_DEV_UNSAFE_SOCKET=1 PROTONWIRE_SOCKET=/run/user/$UID/protonwire/proto
 ```
 
 Production sockets live at `/run/protonwire/protonwire.sock`, and clients
-verify root ownership of the socket and its parent directory; the
-development bypass variable exists exactly for per-user socket directories
-and is never set by packaged units.
+verify root ownership of the socket, its directory, and the connected
+daemon peer. The development bypass variable is honored **only in debug
+builds** and exists for per-user socket directories; release builds always
+run the full checks.
 
 ## License
 
