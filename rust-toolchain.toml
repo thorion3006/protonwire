@@ -1,0 +1,4 @@
+# Development toolchain pin. The workspace compiler floor is Rust 1.85
+# (PRD NFR-42); CI additionally checks every build against exactly 1.85.0.
+[toolchain]
+channel = "1.97.1"
