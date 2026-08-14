@@ -65,9 +65,9 @@ pub enum NetworkIntegrationMode {
     Networkd,
 }
 
-impl From<NetworkIntegrationMode> for protonwire_frontend_api_shim::NetworkIntegration {
+impl From<NetworkIntegrationMode> for protonwire_frontend_api::NetworkIntegration {
     fn from(mode: NetworkIntegrationMode) -> Self {
-        use protonwire_frontend_api_shim::NetworkIntegration as N;
+        use protonwire_frontend_api::NetworkIntegration as N;
         match mode {
             NetworkIntegrationMode::Auto => N::Auto,
             NetworkIntegrationMode::Native => N::Native,
@@ -75,15 +75,6 @@ impl From<NetworkIntegrationMode> for protonwire_frontend_api_shim::NetworkInteg
             NetworkIntegrationMode::Networkd => N::Networkd,
         }
     }
-}
-
-/// A tiny indirection so this crate does not take a frontend-api dependency
-/// just for one enum mapping; the daemon performs the real mapping.
-///
-/// (Implementation detail: declared as a module alias of the frontend API
-/// re-exported through `protonwire-store`'s public docs only.)
-pub mod protonwire_frontend_api_shim {
-    pub use protonwire_frontend_api::NetworkIntegration;
 }
 
 /// Account credential section.
@@ -133,7 +124,7 @@ impl Default for AccountSection {
 }
 
 /// Server-selection section.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct ServerSelectionSection {
     /// Metadata cache policy.
@@ -144,17 +135,6 @@ pub struct ServerSelectionSection {
     pub balanced_weights: BalancedWeights,
     /// Secure Core defaults.
     pub secure_core: SecureCoreSection,
-}
-
-impl Default for ServerSelectionSection {
-    fn default() -> Self {
-        Self {
-            metadata_cache: MetadataCacheSection::default(),
-            latency_probe: LatencyProbeSection::default(),
-            balanced_weights: BalancedWeights::default(),
-            secure_core: SecureCoreSection::default(),
-        }
-    }
 }
 
 /// Metadata cache policy. The refresh interval floor is a hard product rule:
@@ -243,7 +223,7 @@ impl Default for BalancedWeights {
 }
 
 /// Secure Core selection defaults.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct SecureCoreSection {
     /// Secure Core on by default.
@@ -254,17 +234,6 @@ pub struct SecureCoreSection {
     pub excluded_entry_countries: Vec<String>,
     /// Excluded exit countries.
     pub excluded_exit_countries: Vec<String>,
-}
-
-impl Default for SecureCoreSection {
-    fn default() -> Self {
-        Self {
-            enabled_by_default: false,
-            preferred_entry_countries: Vec::new(),
-            excluded_entry_countries: Vec::new(),
-            excluded_exit_countries: Vec::new(),
-        }
-    }
 }
 
 /// Connection-group section.
@@ -344,7 +313,9 @@ pub struct Ipv6Section {
 
 impl Default for Ipv6Section {
     fn default() -> Self {
-        Self { mode: "auto".into() }
+        Self {
+            mode: "auto".into(),
+        }
     }
 }
 
@@ -678,23 +649,15 @@ impl Default for ProfileSelection {
 
 /// Profiles section (system-side defaults; per-UID profiles arrive with
 /// Milestone 6 profile storage).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct ProfilesSection {
     /// The default profile template.
     pub default: ProfileDefault,
 }
 
-impl Default for ProfilesSection {
-    fn default() -> Self {
-        Self {
-            default: ProfileDefault::default(),
-        }
-    }
-}
-
 /// The root system configuration document.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct SystemConfig {
     /// Schema version; 2 per PRD section 10.
@@ -723,6 +686,27 @@ pub struct SystemConfig {
     pub profiles: ProfilesSection,
 }
 
+impl Default for SystemConfig {
+    /// Defaults are a *valid* document: the missing-file path hands them to
+    /// the daemon, so `schema_version` must already satisfy `validate()`.
+    fn default() -> Self {
+        Self {
+            schema_version: Self::EXPECTED_SCHEMA_VERSION,
+            daemon: DaemonSection::default(),
+            account: AccountSection::default(),
+            server_selection: ServerSelectionSection::default(),
+            connection_groups: ConnectionGroupsSection::default(),
+            connection: ConnectionSection::default(),
+            features: FeaturesSection::default(),
+            dns: DnsSection::default(),
+            lan: LanSection::default(),
+            split_tunnel: SplitTunnelSection::default(),
+            auto_connect: AutoConnectSection::default(),
+            profiles: ProfilesSection::default(),
+        }
+    }
+}
+
 impl SystemConfig {
     /// Expected schema version of this generation of the document.
     pub const EXPECTED_SCHEMA_VERSION: u32 = 2;
@@ -732,7 +716,9 @@ impl SystemConfig {
     pub fn load(path: &std::path::Path) -> Result<Self, ConfigLoadError> {
         if !path.exists() {
             tracing::warn!(path = %path.display(), "system configuration not found; using defaults");
-            return Ok(Self::default());
+            let defaults = Self::default();
+            defaults.validate()?;
+            return Ok(defaults);
         }
         let config: Self = yaml::from_path(path)?;
         config.validate()?;
@@ -781,9 +767,13 @@ impl SystemConfig {
             );
         }
         if self.dns.mode == DnsMode::Custom && self.dns.custom_servers.is_empty() {
-            violations.push("dns.mode=custom requires at least one dns.custom_servers entry".to_owned());
+            violations
+                .push("dns.mode=custom requires at least one dns.custom_servers entry".to_owned());
         }
-        if !matches!(self.account.credential_input_source.as_str(), "interactive" | "systemd") {
+        if !matches!(
+            self.account.credential_input_source.as_str(),
+            "interactive" | "systemd"
+        ) {
             violations.push(format!(
                 "account.credential_input_source must be interactive or systemd (found {})",
                 self.account.credential_input_source
@@ -801,7 +791,7 @@ impl SystemConfig {
         if violations.is_empty() {
             Ok(())
         } else {
-            Err(ConfigLoadError::Validation(violations))
+            Err(ConfigLoadError::Validation { violations })
         }
     }
 
@@ -814,6 +804,7 @@ impl SystemConfig {
             ("server_selection.metadata_cache", Authority::System),
             ("server_selection.latency_probe", Authority::System),
             ("server_selection.balanced_weights", Authority::System),
+            ("server_selection.secure_core", Authority::System),
             ("connection_groups", Authority::System),
             ("connection", Authority::System),
             ("dns", Authority::System),
@@ -873,6 +864,10 @@ pub struct UserPresentation {
 
 #[cfg(test)]
 mod tests {
+    // Tests mutate single fields of defaulted documents; struct-update
+    // syntax everywhere would hurt readability here.
+    #![allow(clippy::field_reassign_with_default)]
+
     use super::*;
 
     const PRD_EXAMPLE: &str = include_str!("../../../docs/PRD-proton-wire.md");
@@ -881,7 +876,7 @@ mod tests {
         // Extract the fenced YAML example from PRD section 10 so the typed
         // schema is tested against the document it implements.
         let start = PRD_EXAMPLE
-            .find("### 10. Configuration Schema")
+            .find("## 10. Configuration Schema")
             .expect("section 10 header");
         let rest = &PRD_EXAMPLE[start..];
         let first = rest.find("```yaml\n").expect("yaml fence");
@@ -896,9 +891,15 @@ mod tests {
         config.validate().unwrap();
         assert_eq!(config.schema_version, 2);
         assert_eq!(config.daemon.interface_name, "protonwire0");
-        assert_eq!(config.daemon.network_integration, NetworkIntegrationMode::Auto);
         assert_eq!(
-            config.server_selection.metadata_cache.refresh_interval_hours,
+            config.daemon.network_integration,
+            NetworkIntegrationMode::Auto
+        );
+        assert_eq!(
+            config
+                .server_selection
+                .metadata_cache
+                .refresh_interval_hours,
             3
         );
         assert_eq!(config.features.kill_switch, KillSwitchMode::On);
@@ -914,13 +915,97 @@ mod tests {
     }
 
     #[test]
+    fn load_missing_file_yields_valid_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = SystemConfig::load(&dir.path().join("absent.yaml")).unwrap();
+        assert_eq!(config.schema_version, SystemConfig::EXPECTED_SCHEMA_VERSION);
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn load_invalid_yaml_is_hard_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        std::fs::write(&path, "daemon: [broken\n").unwrap();
+        assert!(matches!(
+            SystemConfig::load(&path),
+            Err(ConfigLoadError::Yaml(_))
+        ));
+    }
+
+    #[test]
+    fn load_invalid_document_reports_violations() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        std::fs::write(&path, "schema_version: 1\n").unwrap();
+        let err = SystemConfig::load(&path).unwrap_err();
+        assert!(err.to_string().contains("schema_version"), "got: {err}");
+    }
+
+    #[test]
+    fn load_valid_document_parses_and_validates() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        std::fs::write(&path, example_config_yaml()).unwrap();
+        let config = SystemConfig::load(&path).unwrap();
+        assert_eq!(config.daemon.interface_name, "protonwire0");
+    }
+
+    #[test]
     fn refresh_interval_floor_enforced() {
         let mut config = SystemConfig::default();
-        config.schema_version = 2;
-        config.server_selection.metadata_cache.refresh_interval_hours = 2;
+        config
+            .server_selection
+            .metadata_cache
+            .refresh_interval_hours = 2;
         let err = config.validate().unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("at least 3"), "got: {msg}");
+    }
+
+    #[test]
+    fn all_violations_reported_together() {
+        let mut config = SystemConfig::default();
+        config.schema_version = 1;
+        config
+            .server_selection
+            .metadata_cache
+            .refresh_interval_hours = 1;
+        config.features.port_forwarding = true;
+        config.features.nat = NatMode::Moderate;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("schema_version"), "got: {err}");
+        assert!(err.contains("at least 3"));
+        assert!(err.contains("moderate"));
+    }
+
+    #[test]
+    fn dns_custom_requires_servers() {
+        let mut config = SystemConfig::default();
+        config.dns.mode = DnsMode::Custom;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("custom_servers"), "got: {err}");
+    }
+
+    #[test]
+    fn bad_credential_source_and_transport_rejected() {
+        let mut config = SystemConfig::default();
+        config.account.credential_input_source = "telepathy".into();
+        config.server_selection.latency_probe.transport = "carrier-pigeon".into();
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("credential_input_source"), "got: {err}");
+        assert!(err.contains("tcp-udp or icmp"), "got: {err}");
+    }
+
+    #[test]
+    fn jitter_ceiling_enforced() {
+        let mut config = SystemConfig::default();
+        config
+            .server_selection
+            .metadata_cache
+            .max_positive_jitter_minutes = 61;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("max_positive_jitter_minutes"), "got: {err}");
     }
 
     #[test]
@@ -970,17 +1055,32 @@ mod tests {
     }
 
     #[test]
+    fn network_integration_mode_maps_to_frontend_enum() {
+        use protonwire_frontend_api::NetworkIntegration as N;
+        let cases: [(NetworkIntegrationMode, N); 4] = [
+            (NetworkIntegrationMode::Auto, N::Auto),
+            (NetworkIntegrationMode::Native, N::Native),
+            (NetworkIntegrationMode::NetworkManager, N::NetworkManager),
+            (NetworkIntegrationMode::Networkd, N::Networkd),
+        ];
+        for (mode, expected) in cases {
+            let mapped: N = mode.into();
+            assert_eq!(mapped, expected);
+        }
+    }
+
+    #[test]
     fn authority_report_has_single_lan_authority() {
         let config = SystemConfig::default();
         let report = config.authority_report();
         assert!(report.contains(&("lan", Authority::System)));
-        // No second LAN field exists anywhere in the authority table.
-        assert_eq!(
-            report
-                .iter()
-                .filter(|(path, _)| path.contains("lan"))
-                .count(),
-            1
-        );
+        // No second LAN field exists anywhere in the authority table; match
+        // the exact segment so unrelated words containing "lan" (as in
+        // "balanced_weights") do not false-positive.
+        let lan_entries = report
+            .iter()
+            .filter(|(path, _)| *path == "lan" || path.starts_with("lan."))
+            .count();
+        assert_eq!(lan_entries, 1);
     }
 }

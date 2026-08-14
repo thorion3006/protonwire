@@ -22,7 +22,8 @@ pub mod state;
 
 pub use event::{Event, EventEnvelope, NoticeLevel};
 pub use proto::{
-    ClientInfo, ClientMessage, ClientSurface, ConnectTarget, HelloAck, HelloError, Request,
-    RequestResult, Response, RpcError, RpcErrorCode, ServerMessage, PROTOCOL_VERSION,
+    ClientInfo, ClientMessage, ClientSurface, ConnectTarget, HelloAck, HelloError,
+    PROTOCOL_VERSION, Request, RequestResult, Response, RpcError, RpcErrorCode, ServerMessage,
+    SpecialClass,
 };
 pub use state::{DaemonState, NetworkIntegration, VpnState};

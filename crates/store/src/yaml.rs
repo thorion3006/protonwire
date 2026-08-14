@@ -101,12 +101,7 @@ mod tests {
         // the parser must materialize it or refuse. Input alone fits the
         // cap, so this asserts the expansion either fails or stays bounded
         // by the 1 MiB cap in a reasonable time.
-        let bomb = format!(
-            "a: &a [{}]\nb: &b [{}, {}]\n",
-            "1,".repeat(64),
-            "*a",
-            "*a"
-        );
+        let bomb = format!("a: &a [{}]\nb: &b [{}, {}]\n", "1,".repeat(64), "*a", "*a");
         let _ = from_str::<serde_norway::Value>(&bomb);
         // No panic and no unbounded memory growth is the success criterion;
         // the hard depth/alias limits are Milestone 2 (T-36).

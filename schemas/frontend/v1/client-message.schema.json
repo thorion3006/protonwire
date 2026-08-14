@@ -1,0 +1,486 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ClientMessage",
+  "description": "A client → daemon message.",
+  "oneOf": [
+    {
+      "description": "First message on a new connection. The daemon replies with\n[`ServerMessage::HelloAck`] or [`ServerMessage::HelloError`].",
+      "type": "object",
+      "properties": {
+        "data": {
+          "type": "object",
+          "properties": {
+            "client": {
+              "$ref": "#/$defs/ClientInfo"
+            },
+            "protocol_version": {
+              "description": "Highest protocol version the client understands.",
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "protocol_version",
+            "client"
+          ]
+        },
+        "type": {
+          "type": "string",
+          "const": "hello"
+        }
+      },
+      "required": [
+        "type",
+        "data"
+      ]
+    },
+    {
+      "description": "A request expecting exactly one [`ServerMessage::Response`].",
+      "type": "object",
+      "properties": {
+        "data": {
+          "type": "object",
+          "properties": {
+            "id": {
+              "description": "Client-side correlation id, echoed in the response.",
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "request": {
+              "$ref": "#/$defs/Request"
+            }
+          },
+          "required": [
+            "id",
+            "request"
+          ]
+        },
+        "type": {
+          "type": "string",
+          "const": "request"
+        }
+      },
+      "required": [
+        "type",
+        "data"
+      ]
+    }
+  ],
+  "$defs": {
+    "ClientInfo": {
+      "description": "Information a client sends about itself during the hello handshake.",
+      "type": "object",
+      "properties": {
+        "name": {
+          "description": "Human-readable client name, for diagnostics only.",
+          "type": "string"
+        },
+        "surface": {
+          "description": "Which first-party surface (or `other`) the client implements.",
+          "$ref": "#/$defs/ClientSurface"
+        },
+        "version": {
+          "description": "Client version string, for diagnostics only.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "version",
+        "surface"
+      ]
+    },
+    "ClientSurface": {
+      "description": "Identifies the kind of client at the other end of the socket.",
+      "oneOf": [
+        {
+          "description": "The `protonwire` command-line interface.",
+          "type": "string",
+          "const": "cli"
+        },
+        {
+          "description": "The `protonwire-tui` Ratatui interface.",
+          "type": "string",
+          "const": "tui"
+        },
+        {
+          "description": "The `protonwire-gui` Tauri interface.",
+          "type": "string",
+          "const": "gui"
+        },
+        {
+          "description": "Any other consumer of the documented IPC API (for example a test\nharness or future third-party integration).",
+          "type": "string",
+          "const": "other"
+        }
+      ]
+    },
+    "ConnectTarget": {
+      "description": "The connection target grammar (PRD 9.2). The daemon validates and resolves\nit; clients only construct it.",
+      "oneOf": [
+        {
+          "description": "`protonwire connect fastest`",
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "fastest"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "description": "`protonwire connect random`",
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "random"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "description": "`connect country <ISO-3166-1-alpha-2>`",
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "country"
+            },
+            "value": {
+              "type": "object",
+              "properties": {
+                "country": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "country"
+              ]
+            }
+          },
+          "required": [
+            "kind",
+            "value"
+          ]
+        },
+        {
+          "description": "`connect state <STATE_OR_REGION>`",
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "state"
+            },
+            "value": {
+              "type": "object",
+              "properties": {
+                "state_or_region": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "state_or_region"
+              ]
+            }
+          },
+          "required": [
+            "kind",
+            "value"
+          ]
+        },
+        {
+          "description": "`connect city <CITY_NAME>`",
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "city"
+            },
+            "value": {
+              "type": "object",
+              "properties": {
+                "city": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "city"
+              ]
+            }
+          },
+          "required": [
+            "kind",
+            "value"
+          ]
+        },
+        {
+          "description": "`connect server <SERVER_NAME>`",
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "server"
+            },
+            "value": {
+              "type": "object",
+              "properties": {
+                "server": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "server"
+              ]
+            }
+          },
+          "required": [
+            "kind",
+            "value"
+          ]
+        },
+        {
+          "description": "`connect p2p` / `connect tor`",
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "special"
+            },
+            "value": {
+              "type": "object",
+              "properties": {
+                "class": {
+                  "$ref": "#/$defs/SpecialClass"
+                }
+              },
+              "required": [
+                "class"
+              ]
+            }
+          },
+          "required": [
+            "kind",
+            "value"
+          ]
+        },
+        {
+          "description": "`connect gateway <GATEWAY_NAME>`",
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "gateway"
+            },
+            "value": {
+              "type": "object",
+              "properties": {
+                "gateway": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "gateway"
+              ]
+            }
+          },
+          "required": [
+            "kind",
+            "value"
+          ]
+        },
+        {
+          "description": "`connect secure-core` with optional entry/exit country constraints.",
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "secure-core"
+            },
+            "value": {
+              "type": "object",
+              "properties": {
+                "entry_country": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "exit_country": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              }
+            }
+          },
+          "required": [
+            "kind",
+            "value"
+          ]
+        },
+        {
+          "description": "`connect group <namespaced-group-id>` (for example `proton:fastest-country`).",
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "group"
+            },
+            "value": {
+              "type": "object",
+              "properties": {
+                "group_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "group_id"
+              ]
+            }
+          },
+          "required": [
+            "kind",
+            "value"
+          ]
+        },
+        {
+          "description": "`connect profile <PROFILE_NAME>`",
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "profile"
+            },
+            "value": {
+              "type": "object",
+              "properties": {
+                "profile": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "profile"
+              ]
+            }
+          },
+          "required": [
+            "kind",
+            "value"
+          ]
+        }
+      ]
+    },
+    "Request": {
+      "description": "Requests the daemon accepts (PRD FR-127). Milestone 1 implements\n`Ping`/`GetState` end to end and returns a typed\n[`RpcErrorCode::NotImplemented`] refusal for the connection lifecycle.",
+      "oneOf": [
+        {
+          "description": "Liveness probe; the daemon echoes the nonce.",
+          "type": "object",
+          "properties": {
+            "method": {
+              "type": "string",
+              "const": "ping"
+            },
+            "params": {
+              "type": "object",
+              "properties": {
+                "nonce": {
+                  "description": "Arbitrary string echoed back in [`RequestResult::Pong`].",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "nonce"
+              ]
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ]
+        },
+        {
+          "description": "Full-state snapshot (the resynchronization primitive).",
+          "type": "object",
+          "properties": {
+            "method": {
+              "type": "string",
+              "const": "get-state"
+            }
+          },
+          "required": [
+            "method"
+          ]
+        },
+        {
+          "description": "Begin a connection. Refused until Milestone 4 wires the ProTUN engine.",
+          "type": "object",
+          "properties": {
+            "method": {
+              "type": "string",
+              "const": "connect"
+            },
+            "params": {
+              "type": "object",
+              "properties": {
+                "target": {
+                  "$ref": "#/$defs/ConnectTarget"
+                }
+              },
+              "required": [
+                "target"
+              ]
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ]
+        },
+        {
+          "description": "Tear down the active connection. Refused until Milestone 4.",
+          "type": "object",
+          "properties": {
+            "method": {
+              "type": "string",
+              "const": "disconnect"
+            }
+          },
+          "required": [
+            "method"
+          ]
+        },
+        {
+          "description": "Stop the daemon. Requires administrator (UID 0) peer credentials.",
+          "type": "object",
+          "properties": {
+            "method": {
+              "type": "string",
+              "const": "shutdown"
+            }
+          },
+          "required": [
+            "method"
+          ]
+        }
+      ]
+    },
+    "SpecialClass": {
+      "description": "Special server classes addressed without a name (PRD 9.2).",
+      "type": "string",
+      "enum": [
+        "p2p",
+        "tor"
+      ]
+    }
+  }
+}

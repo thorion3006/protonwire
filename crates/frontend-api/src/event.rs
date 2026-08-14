@@ -1,7 +1,7 @@
 //! Daemon-pushed events with sequence numbers.
 
-use serde::{Deserialize, Serialize};
 use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 
 use crate::state::VpnState;
 

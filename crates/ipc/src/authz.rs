@@ -20,9 +20,10 @@ pub enum IpcRole {
 /// The role a request requires before the daemon executes it.
 pub fn required_role(request: &Request) -> IpcRole {
     match request {
-        Request::Ping { .. } | Request::GetState | Request::Connect { .. } | Request::Disconnect => {
-            IpcRole::AnyUser
-        }
+        Request::Ping { .. }
+        | Request::GetState
+        | Request::Connect { .. }
+        | Request::Disconnect => IpcRole::AnyUser,
         Request::Shutdown => IpcRole::Admin,
     }
 }
@@ -34,7 +35,10 @@ pub fn authorize(role: IpcRole, peer: &PeerCredentials) -> Result<(), RpcError> 
         IpcRole::Admin if peer.is_root() => Ok(()),
         IpcRole::Admin => Err(RpcError::new(
             RpcErrorCode::PermissionDenied,
-            format!("this request requires administrator (UID 0) credentials; peer UID is {}", peer.uid),
+            format!(
+                "this request requires administrator (UID 0) credentials; peer UID is {}",
+                peer.uid
+            ),
         )),
     }
 }
@@ -44,7 +48,11 @@ mod tests {
     use super::*;
 
     fn peer(uid: u32) -> PeerCredentials {
-        PeerCredentials { uid, gid: 100, pid: Some(4242) }
+        PeerCredentials {
+            uid,
+            gid: 100,
+            pid: Some(4242),
+        }
     }
 
     #[test]
@@ -60,7 +68,9 @@ mod tests {
         for req in [
             Request::Ping { nonce: "n".into() },
             Request::GetState,
-            Request::Connect { target: protonwire_frontend_api::ConnectTarget::Fastest },
+            Request::Connect {
+                target: protonwire_frontend_api::ConnectTarget::Fastest,
+            },
             Request::Disconnect,
         ] {
             assert_eq!(required_role(&req), IpcRole::AnyUser);

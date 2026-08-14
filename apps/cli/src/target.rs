@@ -17,13 +17,19 @@ impl ConnectTargetArgs {
             ))
         };
         let [head, rest @ ..] = words else {
-            return Err(invalid("expected a target such as `fastest` or `country GB`".into()));
+            return Err(invalid(
+                "expected a target such as `fastest` or `country GB`".into(),
+            ));
         };
         match head.as_str() {
             "fastest" if rest.is_empty() => Ok(ConnectTarget::Fastest),
             "random" if rest.is_empty() => Ok(ConnectTarget::Random),
-            "p2p" if rest.is_empty() => Ok(ConnectTarget::Special { class: SpecialClass::P2p }),
-            "tor" if rest.is_empty() => Ok(ConnectTarget::Special { class: SpecialClass::Tor }),
+            "p2p" if rest.is_empty() => Ok(ConnectTarget::Special {
+                class: SpecialClass::P2p,
+            }),
+            "tor" if rest.is_empty() => Ok(ConnectTarget::Special {
+                class: SpecialClass::Tor,
+            }),
             "secure-core" => Ok(ConnectTarget::SecureCore {
                 entry_country: None,
                 exit_country: None,
@@ -33,13 +39,27 @@ impl ConnectTargetArgs {
                     return Err(invalid(format!("`{head}` expects exactly one value")));
                 };
                 Ok(match head.as_str() {
-                    "country" => ConnectTarget::Country { country: value.clone() },
-                    "state" => ConnectTarget::State { state_or_region: value.clone() },
-                    "city" => ConnectTarget::City { city: value.clone() },
-                    "server" => ConnectTarget::Server { server: value.clone() },
-                    "gateway" => ConnectTarget::Gateway { gateway: value.clone() },
-                    "group" => ConnectTarget::Group { group_id: value.clone() },
-                    "profile" => ConnectTarget::Profile { profile: value.clone() },
+                    "country" => ConnectTarget::Country {
+                        country: value.clone(),
+                    },
+                    "state" => ConnectTarget::State {
+                        state_or_region: value.clone(),
+                    },
+                    "city" => ConnectTarget::City {
+                        city: value.clone(),
+                    },
+                    "server" => ConnectTarget::Server {
+                        server: value.clone(),
+                    },
+                    "gateway" => ConnectTarget::Gateway {
+                        gateway: value.clone(),
+                    },
+                    "group" => ConnectTarget::Group {
+                        group_id: value.clone(),
+                    },
+                    "profile" => ConnectTarget::Profile {
+                        profile: value.clone(),
+                    },
                     _ => unreachable!("head matched above"),
                 })
             }
@@ -58,15 +78,26 @@ mod tests {
 
     #[test]
     fn bare_targets_parse() {
-        assert_eq!(ConnectTargetArgs::parse(&words(&["fastest"])).unwrap(), ConnectTarget::Fastest);
-        assert_eq!(ConnectTargetArgs::parse(&words(&["random"])).unwrap(), ConnectTarget::Random);
+        assert_eq!(
+            ConnectTargetArgs::parse(&words(&["fastest"])).unwrap(),
+            ConnectTarget::Fastest
+        );
+        assert_eq!(
+            ConnectTargetArgs::parse(&words(&["random"])).unwrap(),
+            ConnectTarget::Random
+        );
         assert_eq!(
             ConnectTargetArgs::parse(&words(&["p2p"])).unwrap(),
-            ConnectTarget::Special { class: SpecialClass::P2p }
+            ConnectTarget::Special {
+                class: SpecialClass::P2p
+            }
         );
         assert_eq!(
             ConnectTargetArgs::parse(&words(&["secure-core"])).unwrap(),
-            ConnectTarget::SecureCore { entry_country: None, exit_country: None }
+            ConnectTarget::SecureCore {
+                entry_country: None,
+                exit_country: None
+            }
         );
     }
 
@@ -74,15 +105,21 @@ mod tests {
     fn valued_targets_parse() {
         assert_eq!(
             ConnectTargetArgs::parse(&words(&["country", "GB"])).unwrap(),
-            ConnectTarget::Country { country: "GB".into() }
+            ConnectTarget::Country {
+                country: "GB".into()
+            }
         );
         assert_eq!(
             ConnectTargetArgs::parse(&words(&["server", "UK#42"])).unwrap(),
-            ConnectTarget::Server { server: "UK#42".into() }
+            ConnectTarget::Server {
+                server: "UK#42".into()
+            }
         );
         assert_eq!(
             ConnectTargetArgs::parse(&words(&["group", "proton:fastest-country"])).unwrap(),
-            ConnectTarget::Group { group_id: "proton:fastest-country".into() }
+            ConnectTarget::Group {
+                group_id: "proton:fastest-country".into()
+            }
         );
     }
 

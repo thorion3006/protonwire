@@ -54,8 +54,14 @@ mod tests {
     #[test]
     fn system_paths_match_prd() {
         let paths = ConfigPaths::system();
-        assert_eq!(paths.system_config, Path::new("/etc/protonwire/config.yaml"));
-        assert_eq!(paths.state_file, Path::new("/var/lib/protonwire/state.json"));
+        assert_eq!(
+            paths.system_config,
+            Path::new("/etc/protonwire/config.yaml")
+        );
+        assert_eq!(
+            paths.state_file,
+            Path::new("/var/lib/protonwire/state.json")
+        );
         assert_eq!(paths.cache_dir, Path::new("/var/cache/protonwire"));
         assert_eq!(
             paths.socket_path(),

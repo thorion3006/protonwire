@@ -1,0 +1,130 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "RpcError",
+  "description": "Structured RPC error payload.",
+  "type": "object",
+  "properties": {
+    "code": {
+      "description": "Machine-readable code; never localized.",
+      "$ref": "#/$defs/RpcErrorCode"
+    },
+    "details": {
+      "description": "Optional structured details."
+    },
+    "message": {
+      "description": "Human-readable diagnostic message, already redacted.",
+      "type": "string"
+    }
+  },
+  "required": [
+    "code",
+    "message"
+  ],
+  "$defs": {
+    "RpcErrorCode": {
+      "description": "Machine-readable error taxonomy crossing the IPC boundary. Codes align\nwith the PRD 9.8 exit codes where one exists; clients map them directly.",
+      "oneOf": [
+        {
+          "description": "The requested capability is planned but not implemented yet.",
+          "type": "string",
+          "const": "not-implemented"
+        },
+        {
+          "description": "The request parameters failed validation.",
+          "type": "string",
+          "const": "invalid-params"
+        },
+        {
+          "description": "The client requested an unsupported protocol version.",
+          "type": "string",
+          "const": "unsupported-protocol"
+        },
+        {
+          "description": "The authenticated peer is not allowed to perform the request.",
+          "type": "string",
+          "const": "permission-denied"
+        },
+        {
+          "description": "No authenticated session exists for the peer's UID.",
+          "type": "string",
+          "const": "not-authenticated"
+        },
+        {
+          "description": "The account is not entitled to the requested capability.",
+          "type": "string",
+          "const": "entitlement-missing"
+        },
+        {
+          "description": "No server satisfies the requested constraints.",
+          "type": "string",
+          "const": "no-eligible-server"
+        },
+        {
+          "description": "The network is unavailable.",
+          "type": "string",
+          "const": "network-unavailable"
+        },
+        {
+          "description": "The tunnel failed to establish or broke down.",
+          "type": "string",
+          "const": "tunnel-failed"
+        },
+        {
+          "description": "The kill switch could not be enforced.",
+          "type": "string",
+          "const": "kill-switch-failed"
+        },
+        {
+          "description": "DNS could not be configured as requested.",
+          "type": "string",
+          "const": "dns-config-failed"
+        },
+        {
+          "description": "Firewall (nftables) configuration failed.",
+          "type": "string",
+          "const": "firewall-failed"
+        },
+        {
+          "description": "Split-tunnel policy could not be applied.",
+          "type": "string",
+          "const": "split-tunnel-failed"
+        },
+        {
+          "description": "Port forwarding failed.",
+          "type": "string",
+          "const": "port-forwarding-failed"
+        },
+        {
+          "description": "The daemon is busy and the request was not queued.",
+          "type": "string",
+          "const": "daemon-busy"
+        },
+        {
+          "description": "The configuration failed validation.",
+          "type": "string",
+          "const": "config-invalid"
+        },
+        {
+          "description": "The configured credential backend is unavailable.",
+          "type": "string",
+          "const": "credential-backend-unavailable"
+        },
+        {
+          "description": "No Secure Core route satisfies the request.",
+          "type": "string",
+          "const": "secure-core-unavailable"
+        },
+        {
+          "description": "The requested protocol is unavailable.",
+          "type": "string",
+          "const": "protocol-unavailable"
+        },
+        {
+          "description": "An internal daemon error without a more specific code.",
+          "type": "string",
+          "const": "internal"
+        }
+      ]
+    }
+  }
+}

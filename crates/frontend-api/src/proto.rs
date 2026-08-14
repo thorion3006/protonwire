@@ -1,7 +1,7 @@
 //! Wire protocol messages shared by the daemon and every client.
 
-use serde::{Deserialize, Serialize};
 use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 
 use crate::state::DaemonState;
 
@@ -34,6 +34,26 @@ pub struct ClientInfo {
     pub version: String,
     /// Which first-party surface (or `other`) the client implements.
     pub surface: ClientSurface,
+}
+
+impl ClientInfo {
+    /// Returns a sanitized copy with control characters stripped and field
+    /// lengths capped. The daemon applies this before storing or logging
+    /// client-supplied identity, so hello fields cannot forge log lines.
+    pub fn sanitized(&self) -> Self {
+        fn clean(value: &str, max: usize) -> String {
+            value
+                .chars()
+                .filter(|c| !c.is_control())
+                .take(max)
+                .collect()
+        }
+        Self {
+            name: clean(&self.name, 64),
+            version: clean(&self.version, 32),
+            surface: self.surface,
+        }
+    }
 }
 
 /// The connection target grammar (PRD 9.2). The daemon validates and resolves
@@ -80,7 +100,7 @@ pub enum SpecialClass {
 
 /// A client → daemon message.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[serde(tag = "type", rename_all = "kebab-case")]
+#[serde(tag = "type", content = "data", rename_all = "kebab-case")]
 pub enum ClientMessage {
     /// First message on a new connection. The daemon replies with
     /// [`ServerMessage::HelloAck`] or [`ServerMessage::HelloError`].
@@ -98,8 +118,12 @@ pub enum ClientMessage {
 }
 
 /// A daemon → client message.
+///
+/// Adjacently tagged (`type` + `data`) so nested tagged enums such as
+/// [`Response`] keep their own discriminant without colliding with this
+/// one on the wire.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[serde(tag = "type", rename_all = "kebab-case")]
+#[serde(tag = "type", content = "data", rename_all = "kebab-case")]
 pub enum ServerMessage {
     /// Successful handshake reply.
     HelloAck(HelloAck),
@@ -298,8 +322,10 @@ mod tests {
             json,
             serde_json::json!({
                 "type": "request",
-                "id": 7,
-                "request": { "method": "ping", "params": { "nonce": "abc" } }
+                "data": {
+                    "id": 7,
+                    "request": { "method": "ping", "params": { "nonce": "abc" } }
+                }
             })
         );
     }
@@ -345,10 +371,38 @@ mod tests {
         let json = serde_json::to_string(&msg).unwrap();
         let back: ClientMessage = serde_json::from_str(&json).unwrap();
         match back {
-            ClientMessage::Hello { protocol_version, .. } => {
+            ClientMessage::Hello {
+                protocol_version, ..
+            } => {
                 assert_eq!(protocol_version, PROTOCOL_VERSION)
             }
             other => panic!("unexpected message: {other:?}"),
         }
+    }
+
+    #[test]
+    fn client_info_sanitizes_control_characters_and_caps_length() {
+        let info = ClientInfo {
+            name: "fake\r\nAug 14 root: connection established by root".into(),
+            version: "1.2.3\x1b[31m".into(),
+            surface: ClientSurface::Other,
+        };
+        let clean = info.sanitized();
+        assert!(!clean.name.contains('\n') && !clean.name.contains('\r'));
+        assert!(!clean.version.contains('\x1b'));
+        assert!(clean.name.chars().count() <= 64);
+        let long = "x".repeat(200);
+        assert_eq!(
+            ClientInfo {
+                name: long.clone(),
+                version: long,
+                surface: ClientSurface::Other,
+            }
+            .sanitized()
+            .name
+            .chars()
+            .count(),
+            64
+        );
     }
 }

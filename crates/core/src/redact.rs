@@ -141,7 +141,8 @@ impl<W: Write> LineScrubWriter<W> {
         if self.line.is_empty() {
             return Ok(());
         }
-        let scrubbed = scrub(&String::from_utf8_lossy(&self.line));
+        let decoded = String::from_utf8_lossy(&self.line);
+        let scrubbed = scrub(&decoded);
         self.inner.write_all(scrubbed.as_bytes())?;
         self.line.clear();
         Ok(())
@@ -156,8 +157,8 @@ pub fn init_tracing(env_filter: bool) {
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
 
-    let fmt_layer = tracing_subscriber::fmt::layer()
-        .with_writer(RedactingMakeWriter::new(std::io::stdout));
+    let fmt_layer =
+        tracing_subscriber::fmt::layer().with_writer(RedactingMakeWriter::new(std::io::stdout));
     let subscriber = tracing_subscriber::registry().with(fmt_layer);
     if env_filter {
         let filter = tracing_subscriber::EnvFilter::try_from_default_env()
@@ -175,9 +176,11 @@ pub fn init_tracing_filtered(default_level: &str) {
     use tracing_subscriber::util::SubscriberInitExt;
 
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_level.to_owned()));
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_level));
     tracing_subscriber::registry()
-        .with(tracing_subscriber::fmt::layer().with_writer(RedactingMakeWriter::new(std::io::stdout)))
+        .with(
+            tracing_subscriber::fmt::layer().with_writer(RedactingMakeWriter::new(std::io::stdout)),
+        )
         .with(filter)
         .init();
 }

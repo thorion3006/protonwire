@@ -1,0 +1,274 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ConnectTarget",
+  "description": "The connection target grammar (PRD 9.2). The daemon validates and resolves\nit; clients only construct it.",
+  "oneOf": [
+    {
+      "description": "`protonwire connect fastest`",
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "fastest"
+        }
+      },
+      "required": [
+        "kind"
+      ]
+    },
+    {
+      "description": "`protonwire connect random`",
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "random"
+        }
+      },
+      "required": [
+        "kind"
+      ]
+    },
+    {
+      "description": "`connect country <ISO-3166-1-alpha-2>`",
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "country"
+        },
+        "value": {
+          "type": "object",
+          "properties": {
+            "country": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "country"
+          ]
+        }
+      },
+      "required": [
+        "kind",
+        "value"
+      ]
+    },
+    {
+      "description": "`connect state <STATE_OR_REGION>`",
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "state"
+        },
+        "value": {
+          "type": "object",
+          "properties": {
+            "state_or_region": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "state_or_region"
+          ]
+        }
+      },
+      "required": [
+        "kind",
+        "value"
+      ]
+    },
+    {
+      "description": "`connect city <CITY_NAME>`",
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "city"
+        },
+        "value": {
+          "type": "object",
+          "properties": {
+            "city": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "city"
+          ]
+        }
+      },
+      "required": [
+        "kind",
+        "value"
+      ]
+    },
+    {
+      "description": "`connect server <SERVER_NAME>`",
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "server"
+        },
+        "value": {
+          "type": "object",
+          "properties": {
+            "server": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "server"
+          ]
+        }
+      },
+      "required": [
+        "kind",
+        "value"
+      ]
+    },
+    {
+      "description": "`connect p2p` / `connect tor`",
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "special"
+        },
+        "value": {
+          "type": "object",
+          "properties": {
+            "class": {
+              "$ref": "#/$defs/SpecialClass"
+            }
+          },
+          "required": [
+            "class"
+          ]
+        }
+      },
+      "required": [
+        "kind",
+        "value"
+      ]
+    },
+    {
+      "description": "`connect gateway <GATEWAY_NAME>`",
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "gateway"
+        },
+        "value": {
+          "type": "object",
+          "properties": {
+            "gateway": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "gateway"
+          ]
+        }
+      },
+      "required": [
+        "kind",
+        "value"
+      ]
+    },
+    {
+      "description": "`connect secure-core` with optional entry/exit country constraints.",
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "secure-core"
+        },
+        "value": {
+          "type": "object",
+          "properties": {
+            "entry_country": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "exit_country": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        }
+      },
+      "required": [
+        "kind",
+        "value"
+      ]
+    },
+    {
+      "description": "`connect group <namespaced-group-id>` (for example `proton:fastest-country`).",
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "group"
+        },
+        "value": {
+          "type": "object",
+          "properties": {
+            "group_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "group_id"
+          ]
+        }
+      },
+      "required": [
+        "kind",
+        "value"
+      ]
+    },
+    {
+      "description": "`connect profile <PROFILE_NAME>`",
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "profile"
+        },
+        "value": {
+          "type": "object",
+          "properties": {
+            "profile": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "profile"
+          ]
+        }
+      },
+      "required": [
+        "kind",
+        "value"
+      ]
+    }
+  ],
+  "$defs": {
+    "SpecialClass": {
+      "description": "Special server classes addressed without a name (PRD 9.2).",
+      "type": "string",
+      "enum": [
+        "p2p",
+        "tor"
+      ]
+    }
+  }
+}

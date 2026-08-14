@@ -5,12 +5,12 @@
 //! policies, and feature reconciliation attach here in later milestones
 //! behind the adapter traits living in their own crates.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use protonwire_frontend_api::{
-    DaemonState, Event, EventEnvelope, NetworkIntegration, NoticeLevel, Request, RequestResult,
-    RpcError, VpnState, PROTOCOL_VERSION,
+    DaemonState, Event, EventEnvelope, NetworkIntegration, NoticeLevel, PROTOCOL_VERSION, Request,
+    RequestResult, RpcError, VpnState,
 };
 use protonwire_store::config::SystemConfig;
 
@@ -51,7 +51,11 @@ struct CoreInner {
 
 impl DaemonCore {
     /// Creates the core in the disconnected state.
-    pub fn new(version: impl Into<String>, config: Arc<SystemConfig>, sink: Arc<dyn EventSink>) -> Self {
+    pub fn new(
+        version: impl Into<String>,
+        config: Arc<SystemConfig>,
+        sink: Arc<dyn EventSink>,
+    ) -> Self {
         Self {
             version: version.into(),
             config,
@@ -86,45 +90,42 @@ impl DaemonCore {
             protocol_version: PROTOCOL_VERSION,
             daemon_version: self.version.clone(),
             vpn_state: inner.vpn_state,
-            network_integration: self.config.daemon.network_integration,
+            network_integration: self.config.daemon.network_integration.into(),
             active_owner_uid: inner.active_owner_uid,
         }
     }
 
     /// Executes one authenticated request (after IPC-level authorization).
+    ///
+    /// `_peer_uid` is the authenticated requesting UID; per-UID ownership
+    /// enforcement keys off it once the Milestone 4 engine records real
+    /// connection owners.
     pub fn handle_request(
         &self,
-        peer_uid: u32,
+        _peer_uid: u32,
         request: Request,
     ) -> Result<RequestResult, RpcError> {
         match request {
             Request::Ping { nonce } => Ok(RequestResult::Pong { nonce }),
-            Request::GetState => Ok(RequestResult::State { state: self.state() }),
-            Request::Connect { target } => {
-                // Record the requesting user as the prospective owner even
-                // though the tunnel engine is not wired yet, so ownership
-                // semantics are visible from Milestone 1.
-                {
-                    let mut inner = self.inner.lock().expect("core lock");
-                    match inner.active_owner_uid {
-                        None => inner.active_owner_uid = Some(peer_uid),
-                        Some(owner) if owner == peer_uid => {}
-                        Some(owner) => {
-                            return Err(CoreError::PermissionDenied(format!(
-                                "UID {owner} owns the active connection; an administrator must transfer ownership"
-                            ))
-                            .into_rpc())
-                        }
-                    }
-                }
+            Request::GetState => Ok(RequestResult::State {
+                state: self.state(),
+            }),
+            Request::Connect { .. } => {
+                // No state is committed on a failing path: an unprivileged
+                // peer must not be able to claim the host-global owner slot
+                // with a request that cannot succeed (security review
+                // finding: owner squatting). Owner recording activates with
+                // the Milestone 4 engine, which sets it only after the
+                // transition to Connecting is confirmed; cross-UID refusal
+                // then keys off that real owner.
                 Err(CoreError::NotImplemented("tunnel connect lands in milestone 4").into_rpc())
             }
-            Request::Disconnect => Err(
-                CoreError::NotImplemented("tunnel disconnect lands in milestone 4").into_rpc()
-            ),
+            Request::Disconnect => {
+                Err(CoreError::NotImplemented("tunnel disconnect lands in milestone 4").into_rpc())
+            }
             Request::Shutdown => {
                 // Intercepted by the daemon (admin-gated) before reaching core.
-                Err(CoreError::Internal("shutdown must be handled by the daemon").into_rpc())
+                Err(CoreError::Internal("shutdown must be handled by the daemon".into()).into_rpc())
             }
         }
     }
@@ -152,7 +153,7 @@ impl DaemonCore {
 
     /// The configured network integration mode as exposed in status.
     pub fn network_integration(&self) -> NetworkIntegration {
-        self.config.daemon.network_integration
+        self.config.daemon.network_integration.into()
     }
 
     fn emit(&self, event: Event) {
@@ -194,26 +195,45 @@ mod tests {
     }
 
     #[test]
-    fn connect_is_refused_but_records_owner() {
+    fn connect_refused_without_committing_owner_state() {
         let (core, _) = core();
         let err = core
-            .handle_request(1000, Request::Connect { target: protonwire_frontend_api::ConnectTarget::Fastest })
+            .handle_request(
+                1000,
+                Request::Connect {
+                    target: protonwire_frontend_api::ConnectTarget::Fastest,
+                },
+            )
             .unwrap_err();
-        assert_eq!(err.code, protonwire_frontend_api::RpcErrorCode::NotImplemented);
-        assert_eq!(core.state().active_owner_uid, Some(1000));
-
-        // Same UID retries fine; a different UID is refused.
-        assert!(core.handle_request(1000, Request::Connect { target: protonwire_frontend_api::ConnectTarget::Fastest }).is_err());
+        assert_eq!(
+            err.code,
+            protonwire_frontend_api::RpcErrorCode::NotImplemented
+        );
+        // No owner was recorded: a failed request must not squat the
+        // host-global owner slot (any subsequent user is equally free to
+        // request, and status shows no owner).
+        assert_eq!(core.state().active_owner_uid, None);
         let err = core
-            .handle_request(2000, Request::Connect { target: protonwire_frontend_api::ConnectTarget::Fastest })
+            .handle_request(
+                2000,
+                Request::Connect {
+                    target: protonwire_frontend_api::ConnectTarget::Fastest,
+                },
+            )
             .unwrap_err();
-        assert_eq!(err.code, protonwire_frontend_api::RpcErrorCode::PermissionDenied);
+        assert_eq!(
+            err.code,
+            protonwire_frontend_api::RpcErrorCode::NotImplemented
+        );
     }
 
     #[test]
     fn ping_and_state_answer() {
         let (core, _) = core();
-        match core.handle_request(0, Request::Ping { nonce: "x".into() }).unwrap() {
+        match core
+            .handle_request(0, Request::Ping { nonce: "x".into() })
+            .unwrap()
+        {
             RequestResult::Pong { nonce } => assert_eq!(nonce, "x"),
             other => panic!("unexpected: {other:?}"),
         }

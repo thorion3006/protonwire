@@ -1,0 +1,22 @@
+[package]
+name = "xtask"
+description = "Repository validation and generated-contract tooling (cargo xtask)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_norway = { workspace = true }
+schemars = { workspace = true }
+cargo_metadata = { workspace = true }
+toml = { workspace = true }
+sha2 = { workspace = true }
+protonwire-frontend-api = { workspace = true }

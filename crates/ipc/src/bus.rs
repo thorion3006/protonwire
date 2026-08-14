@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{mpsc, Mutex};
+use std::sync::{Mutex, mpsc};
 
 use protonwire_frontend_api::ServerMessage;
 
@@ -96,11 +96,14 @@ mod tests {
         let (_, rx2) = bus.subscribe();
         for seq in 0..(SESSION_QUEUE_LEN + 8) {
             bus.publish(event_message(seq as u64));
+            // Keep the second session draining so it stays subscribed.
+            while rx2.try_recv().is_ok() {}
         }
         // The stuck session was evicted...
         assert_eq!(bus.session_count(), 1);
         bus.unsubscribe(id);
-        // ...while the healthy session still receives its first message.
+        // ...while the healthy session kept receiving throughout, and the
+        // stuck session's queue holds its bounded backlog.
         assert!(rx.try_recv().is_ok());
         drop(rx2);
     }

@@ -79,7 +79,7 @@ fn parse_args() -> Options {
     Options { socket }
 }
 
-type Backend = ratatui::crossterm::backend::CrosstermBackend<std::io::Stdout>;
+type Backend = ratatui::backend::CrosstermBackend<std::io::Stdout>;
 type Term = Terminal<Backend>;
 
 fn setup_terminal() -> std::io::Result<Term> {
@@ -88,8 +88,10 @@ fn setup_terminal() -> std::io::Result<Term> {
     let mut stdout = std::io::stdout();
     execute!(stdout, terminal::EnterAlternateScreen)?;
     Terminal::with_options(
-        ratatui::crossterm::backend::CrosstermBackend::new(stdout),
-        TerminalOptions { viewport: Viewport::Fullscreen },
+        ratatui::backend::CrosstermBackend::new(stdout),
+        TerminalOptions {
+            viewport: Viewport::Fullscreen,
+        },
     )
 }
 
@@ -100,8 +102,8 @@ fn restore() -> std::io::Result<()> {
 }
 
 fn connect(options: &Options) -> Result<ProtonwireClient, ClientError> {
-    let dev_unsafe =
-        std::env::var(protonwire_client::DEV_UNSAFE_SOCKET_ENV).as_deref() == Ok("1");
+    let dev_unsafe = cfg!(debug_assertions)
+        && std::env::var(protonwire_client::DEV_UNSAFE_SOCKET_ENV).as_deref() == Ok("1");
     let checks = if dev_unsafe {
         protonwire_client::IpcSecurityChecks::dev_unchecked()
     } else {
@@ -109,11 +111,6 @@ fn connect(options: &Options) -> Result<ProtonwireClient, ClientError> {
     };
     match options.socket.as_deref() {
         Some(path) => ProtonwireClient::connect_to(path, ClientSurface::Tui, checks),
-        None if dev_unsafe => ProtonwireClient::connect_to(
-            std::path::Path::new(protonwire_client::DEFAULT_SOCKET_PATH),
-            ClientSurface::Tui,
-            checks,
-        ),
         None => ProtonwireClient::connect_default(ClientSurface::Tui),
     }
 }
@@ -125,13 +122,19 @@ fn run(mut terminal: Term, options: Options) -> Result<(), ClientError> {
     loop {
         if last_refresh.elapsed() >= REFRESH {
             last_refresh = Instant::now();
-            snapshot = Some(connect(&options).and_then(|mut c| c.state()).map_err(|e| e.to_string()));
+            snapshot = Some(
+                connect(&options)
+                    .and_then(|mut c| c.state())
+                    .map_err(|e| e.to_string()),
+            );
         }
         terminal
             .draw(|frame| render(frame, snapshot.as_ref(), &notice))
             .map_err(ClientError::Io)?;
         while ratatui::crossterm::event::poll(POLL).map_err(ClientError::Io)? {
-            if let TermEvent::Key(key) = ratatui::crossterm::event::read().map_err(ClientError::Io)? {
+            if let TermEvent::Key(key) =
+                ratatui::crossterm::event::read().map_err(ClientError::Io)?
+            {
                 if key.kind != KeyEventKind::Press {
                     continue;
                 }
@@ -189,12 +192,12 @@ fn render(
     frame.render_widget(paragraph, area);
 }
 
-fn key_value<'a>(key: &str, value: &'a str) -> Line<'a> {
+fn key_value(key: &str, value: &str) -> Line<'static> {
     Line::from(vec![
         Span::styled(
             format!("{key:<20}"),
             Style::default().add_modifier(Modifier::BOLD),
         ),
-        Span::raw(value),
+        Span::raw(value.to_owned()),
     ])
 }

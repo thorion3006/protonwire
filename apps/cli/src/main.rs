@@ -18,7 +18,11 @@ use protonwire_client::{ClientError, ProtonwireClient};
 
 /// Global options shared by every subcommand.
 #[derive(Debug, Parser)]
-#[command(name = "protonwire", version, about = "ProtonWire — Proton VPN control plane for Linux")]
+#[command(
+    name = "protonwire",
+    version,
+    about = "ProtonWire — Proton VPN control plane for Linux"
+)]
 struct Cli {
     /// Daemon socket path (default: $PROTONWIRE_SOCKET or
     /// /run/protonwire/protonwire.sock).
@@ -42,7 +46,7 @@ fn main() {
             e.exit_code()
         }
     };
-    std::process::exit(code);
+    std::process::exit(i32::from(code));
 }
 
 /// Connects a client honoring the socket override, or the SDK defaults.
@@ -58,7 +62,11 @@ pub(crate) fn connect(socket: Option<&Path>) -> Result<ProtonwireClient, ClientE
 }
 
 fn security_checks() -> protonwire_client::IpcSecurityChecks {
-    if std::env::var(protonwire_client::DEV_UNSAFE_SOCKET_ENV).as_deref() == Ok("1") {
+    // The env bypass is honored only in debug builds (mirrors the SDK's
+    // connect_default gate).
+    let dev_unsafe = cfg!(debug_assertions)
+        && std::env::var(protonwire_client::DEV_UNSAFE_SOCKET_ENV).as_deref() == Ok("1");
+    if dev_unsafe {
         protonwire_client::IpcSecurityChecks::dev_unchecked()
     } else {
         protonwire_client::IpcSecurityChecks::strict()

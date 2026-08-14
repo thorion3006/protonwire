@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 
 use protonwire_frontend_api::{
     ClientInfo, ClientSurface, ConnectTarget, DaemonState, EventEnvelope, Request, RequestResult,
-    RpcError, RpcErrorCode, PROTOCOL_VERSION,
+    RpcError, RpcErrorCode,
 };
 use protonwire_ipc::{ConnectError, IpcClient, SecurityChecks};
 
@@ -26,7 +26,8 @@ pub const DEFAULT_SOCKET_PATH: &str = "/run/protonwire/protonwire.sock";
 pub const SOCKET_ENV: &str = "PROTONWIRE_SOCKET";
 
 /// Environment variable that disables the root-socket trust checks for
-/// development sockets. Never honored implicitly; only set by developers.
+/// development sockets. Honored **only in debug builds**; release builds
+/// always perform the full checks.
 pub const DEV_UNSAFE_SOCKET_ENV: &str = "PROTONWIRE_DEV_UNSAFE_SOCKET";
 
 /// Errors surfaced to clients.
@@ -104,17 +105,24 @@ pub struct ProtonwireClient {
 
 impl ProtonwireClient {
     /// Connects with production defaults: the socket from
-    /// [`SOCKET_ENV`] or [`DEFAULT_SOCKET_PATH`], with strict trust checks
-    /// (relaxed only when [`DEV_UNSAFE_SOCKET_ENV`] is set).
+    /// [`SOCKET_ENV`] or [`DEFAULT_SOCKET_PATH`], with strict trust checks.
+    ///
+    /// [`DEV_UNSAFE_SOCKET_ENV`] relaxes the trust checks only in debug
+    /// builds (`cfg!(debug_assertions)`); release builds always verify the
+    /// root-owned socket and root daemon peer. Tests and tooling that need
+    /// the relaxation in release builds pass
+    /// [`IpcSecurityChecks::dev_unchecked()`] explicitly via
+    /// [`ProtonwireClient::connect_to`].
     pub fn connect_default(surface: ClientSurface) -> Result<Self, ClientError> {
         let path = std::env::var(SOCKET_ENV)
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from(DEFAULT_SOCKET_PATH));
-        let dev_unsafe = std::env::var(DEV_UNSAFE_SOCKET_ENV).as_deref() == Ok("1");
+        let dev_unsafe =
+            cfg!(debug_assertions) && std::env::var(DEV_UNSAFE_SOCKET_ENV).as_deref() == Ok("1");
         let checks = if dev_unsafe {
-            SecurityChecks::dev_unchecked()
+            IpcSecurityChecks::dev_unchecked()
         } else {
-            SecurityChecks::strict()
+            IpcSecurityChecks::strict()
         };
         Self::connect_to(&path, surface, checks)
     }
@@ -154,7 +162,9 @@ impl ProtonwireClient {
 
     /// Liveness probe.
     pub fn ping(&mut self) -> Result<String, ClientError> {
-        match self.ipc.request(Request::Ping { nonce: "ping".into() }) {
+        match self.ipc.request(Request::Ping {
+            nonce: "ping".into(),
+        }) {
             Ok(RequestResult::Pong { nonce }) => Ok(nonce),
             Ok(other) => Err(ClientError::Rpc(RpcError::new(
                 RpcErrorCode::Internal,
@@ -235,10 +245,12 @@ fn client_identity() -> (&'static str, &'static str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-    use protonwire_frontend_api::{Event, NoticeLevel, NetworkIntegration, VpnState};
+    use protonwire_frontend_api::{
+        Event, NetworkIntegration, NoticeLevel, PROTOCOL_VERSION, ServerMessage, VpnState,
+    };
     use protonwire_ipc::EventBus;
 
     struct PublishingHandler {
@@ -296,15 +308,12 @@ mod tests {
         }
     }
 
-    use protonwire_frontend_api::ServerMessage;
-
     fn spawn_server(dir: &tempfile::TempDir) -> (PathBuf, Arc<PublishingHandler>) {
         let handler = Arc::new(PublishingHandler {
             bus: EventBus::new(),
             seq: AtomicU64::new(0),
         });
-        let server =
-            protonwire_ipc::server::IpcServer::bind(dir.path(), "sdk.sock").unwrap();
+        let server = protonwire_ipc::server::IpcServer::bind(dir.path(), "sdk.sock").unwrap();
         let path = server.socket_path().to_owned();
         let handler2 = Arc::clone(&handler);
         std::thread::spawn(move || server.serve(handler2, Arc::new(AtomicBool::new(false))));
@@ -345,7 +354,10 @@ mod tests {
         // Events 1 (skipped arrival by design) and 2 are in flight; the
         // client sees 2 first because 1 was "lost" — expect a resync.
         match client.next_event().unwrap() {
-            ClientEvent::Resynchronized { state, resumed_at_seq } => {
+            ClientEvent::Resynchronized {
+                state,
+                resumed_at_seq,
+            } => {
                 assert_eq!(resumed_at_seq, 2);
                 assert_eq!(state.daemon_version, "test-daemon");
             }
@@ -372,9 +384,46 @@ mod tests {
         let err = ProtonwireClient::connect_to(
             Path::new("/nonexistent/protonwire.sock"),
             ClientSurface::Cli,
-            SecurityChecks::dev_unchecked(),
+            IpcSecurityChecks::dev_unchecked(),
         )
-        .unwrap_err();
+        .err()
+        .expect("connect must fail without a daemon");
         assert_eq!(err.exit_code(), 13);
+    }
+
+    /// The full RPC-code → exit-code table against PRD 9.8, so a silent
+    /// mapping rot fails here instead of in a user's script.
+    #[test]
+    fn rpc_exit_code_table_matches_prd_9_8() {
+        use RpcErrorCode as C;
+        let table = [
+            (C::NotImplemented, 1u8),
+            (C::InvalidParams, 2),
+            (C::NotAuthenticated, 3),
+            (C::EntitlementMissing, 4),
+            (C::NoEligibleServer, 5),
+            (C::NetworkUnavailable, 6),
+            (C::TunnelFailed, 7),
+            (C::KillSwitchFailed, 8),
+            (C::DnsConfigFailed, 9),
+            (C::FirewallFailed, 10),
+            (C::SplitTunnelFailed, 11),
+            (C::PortForwardingFailed, 12),
+            (C::DaemonBusy, 1),
+            (C::UnsupportedProtocol, 1),
+            (C::ConfigInvalid, 15),
+            (C::CredentialBackendUnavailable, 16),
+            (C::SecureCoreUnavailable, 17),
+            (C::ProtocolUnavailable, 18),
+            (C::Internal, 1),
+            (C::PermissionDenied, 14),
+        ];
+        for (code, expected) in table {
+            assert_eq!(
+                rpc_exit_code(code),
+                expected,
+                "wrong exit code for {code:?}"
+            );
+        }
     }
 }

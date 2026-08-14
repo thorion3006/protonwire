@@ -13,11 +13,12 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use protonwire_frontend_api::{
-    ClientInfo, ClientMessage, EventEnvelope, HelloAck, Request, RequestResult, Response,
-    RpcError, ServerMessage, PROTOCOL_VERSION,
+    ClientInfo, ClientMessage, EventEnvelope, HelloAck, PROTOCOL_VERSION, Request, RequestResult,
+    Response, RpcError, RpcErrorCode, ServerMessage,
 };
 
 use crate::frame::{read_msg, write_msg};
+use crate::peer::PeerCredentials;
 
 /// Default request timeout.
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -105,33 +106,59 @@ impl IpcClient {
         client: &ClientInfo,
         checks: SecurityChecks,
     ) -> Result<Self, ConnectError> {
+        Self::connect_with_timeout(path, client, checks, DEFAULT_REQUEST_TIMEOUT)
+    }
+
+    /// [`IpcClient::connect`] with an explicit handshake/request timeout
+    /// (tests use short values).
+    pub fn connect_with_timeout(
+        path: &Path,
+        client: &ClientInfo,
+        checks: SecurityChecks,
+        timeout: Duration,
+    ) -> Result<Self, ConnectError> {
         if checks.require_root_socket {
+            // Defense in depth: the filesystem checks race the connect, so
+            // the authoritative check is the kernel-captured SO_PEERCRED of
+            // the *connected* stream — the daemon peer must be root.
             verify_socket_trusted(path)?;
         }
         let stream = UnixStream::connect(path).map_err(|source| ConnectError::Unreachable {
             path: path.to_owned(),
             source,
         })?;
+        if checks.require_root_socket {
+            let peer = PeerCredentials::of(&stream).map_err(|e| ConnectError::Untrusted {
+                path: path.to_owned(),
+                reason: format!("peer credentials unavailable: {e}"),
+            })?;
+            if !peer.is_root() {
+                return Err(ConnectError::Untrusted {
+                    path: path.to_owned(),
+                    reason: format!("daemon peer UID {} is not root", peer.uid),
+                });
+            }
+        }
         stream
-            .set_read_timeout(Some(DEFAULT_REQUEST_TIMEOUT))
+            .set_read_timeout(Some(timeout))
             .map_err(|source| ConnectError::Unreachable {
                 path: path.to_owned(),
                 source,
             })?;
-        let mut client = Self {
+        let mut transport = Self {
             stream,
             next_id: 0,
             pending_events: VecDeque::new(),
-            timeout: DEFAULT_REQUEST_TIMEOUT,
+            timeout,
             ack: HelloAck {
                 protocol_version: PROTOCOL_VERSION,
                 daemon_version: String::new(),
                 latest_event_seq: 0,
             },
         };
-        let ack = client.handshake(client_info_cloned(client))?;
-        client.ack = ack;
-        Ok(client)
+        let ack = transport.handshake(client.clone())?;
+        transport.ack = ack;
+        Ok(transport)
     }
 
     /// The daemon's hello acknowledgement.
@@ -146,15 +173,16 @@ impl IpcClient {
     }
 
     fn handshake(&mut self, client: ClientInfo) -> Result<HelloAck, ConnectError> {
-        write_msg(&mut self.stream, &ClientMessage::Hello {
-            protocol_version: PROTOCOL_VERSION,
-            client,
-        })
+        write_msg(
+            &mut self.stream,
+            &ClientMessage::Hello {
+                protocol_version: PROTOCOL_VERSION,
+                client,
+            },
+        )
         .map_err(|e| ConnectError::Protocol(e.to_string()))?;
         match read_msg::<_, ServerMessage>(&mut self.stream) {
-            Ok(ServerMessage::HelloAck(ack)) if ack.protocol_version <= PROTOCOL_VERSION => {
-                Ok(ack)
-            }
+            Ok(ServerMessage::HelloAck(ack)) if ack.protocol_version <= PROTOCOL_VERSION => Ok(ack),
             Ok(ServerMessage::HelloError(err)) => Err(ConnectError::HandshakeRefused {
                 supported_version: err.supported_version,
                 reason: err.reason,
@@ -175,19 +203,13 @@ impl IpcClient {
         loop {
             match read_msg::<_, ServerMessage>(&mut self.stream) {
                 Ok(ServerMessage::Response(response)) => match response {
-                    Response::Ok {
-                        id: seen,
-                        result,
-                    } if seen == id => return Ok(result),
-                    Response::Error {
-                        id: seen,
-                        error,
-                    } if seen == id => return Err(error),
+                    Response::Ok { id: seen, result } if seen == id => return Ok(result),
+                    Response::Error { id: seen, error } if seen == id => return Err(error),
                     other => {
                         return Err(RpcError::new(
                             RpcErrorCode::Internal,
                             format!("out-of-order response id {}", other.id()),
-                        ))
+                        ));
                     }
                 },
                 Ok(ServerMessage::Event(envelope)) => {
@@ -197,13 +219,13 @@ impl IpcClient {
                     return Err(RpcError::new(
                         RpcErrorCode::Internal,
                         format!("unexpected message mid-request: {other:?}"),
-                    ))
+                    ));
                 }
                 Err(e) => {
                     return Err(RpcError::new(
                         RpcErrorCode::Internal,
                         format!("read failed: {e}"),
-                    ))
+                    ));
                 }
             }
         }
@@ -214,23 +236,15 @@ impl IpcClient {
         if let Some(envelope) = self.pending_events.pop_front() {
             return Ok(envelope);
         }
-        loop {
-            match read_msg::<_, ServerMessage>(&mut self.stream) {
-                Ok(ServerMessage::Event(envelope)) => return Ok(envelope),
-                Ok(other) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("unexpected message while awaiting event: {other:?}"),
-                    ))
-                }
-                Err(e) => return Err(map_frame_error(e)),
-            }
+        match read_msg::<_, ServerMessage>(&mut self.stream) {
+            Ok(ServerMessage::Event(envelope)) => Ok(envelope),
+            Ok(other) => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unexpected message while awaiting event: {other:?}"),
+            )),
+            Err(e) => Err(map_frame_error(e)),
         }
     }
-}
-
-fn client_info_cloned(client: &ClientInfo) -> ClientInfo {
-    client.clone()
 }
 
 fn map_frame_error(e: crate::frame::FrameError) -> io::Error {
@@ -243,6 +257,7 @@ fn map_frame_error(e: crate::frame::FrameError) -> io::Error {
 /// Verifies the daemon socket is root-owned and lives in a root-owned,
 /// non-group/world-writable directory.
 pub fn verify_socket_trusted(path: &Path) -> Result<(), ConnectError> {
+    use std::os::unix::fs::FileTypeExt;
     let meta = std::fs::metadata(path).map_err(|source| ConnectError::Unreachable {
         path: path.to_owned(),
         source,
@@ -260,15 +275,10 @@ pub fn verify_socket_trusted(path: &Path) -> Result<(), ConnectError> {
         });
     }
     let parent = path.parent().unwrap_or(Path::new("/"));
-    let parent_meta =
-        std::fs::metadata(parent)
-            .map_err(|source| ConnectError::Untrusted {
-                path: path.to_owned(),
-                reason: format!(
-                    "parent directory {} unreadable: {source}",
-                    parent.display()
-                ),
-            })?;
+    let parent_meta = std::fs::metadata(parent).map_err(|source| ConnectError::Untrusted {
+        path: path.to_owned(),
+        reason: format!("parent directory {} unreadable: {source}", parent.display()),
+    })?;
     if parent_meta.uid() != 0 {
         return Err(ConnectError::Untrusted {
             path: path.to_owned(),
@@ -294,12 +304,12 @@ pub fn verify_socket_trusted(path: &Path) -> Result<(), ConnectError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-    use protonwire_frontend_api::{
-        Event, NoticeLevel, VpnState,
-    };
+    use protonwire_frontend_api::{Event, NoticeLevel, VpnState};
+
+    use crate::EventBus;
 
     struct EchoHandler {
         version: String,
@@ -353,7 +363,7 @@ mod tests {
         }
     }
 
-    fn spawn_server(dir: &std::path::TempDir) -> (PathBuf, Arc<AtomicBool>) {
+    fn spawn_server(dir: &tempfile::TempDir) -> (PathBuf, Arc<AtomicBool>) {
         let handler = Arc::new(EchoHandler {
             version: "test-daemon".into(),
             bus: EventBus::new(),
@@ -375,7 +385,10 @@ mod tests {
             IpcClient::connect(&path, &test_client_info(), SecurityChecks::dev_unchecked())
                 .unwrap();
         assert_eq!(client.hello().daemon_version, "test-daemon");
-        match client.request(Request::Ping { nonce: "n1".into() }).unwrap() {
+        match client
+            .request(Request::Ping { nonce: "n1".into() })
+            .unwrap()
+        {
             RequestResult::Pong { nonce } => assert_eq!(nonce, "n1"),
             other => panic!("unexpected result: {other:?}"),
         }
@@ -402,8 +415,9 @@ mod tests {
     fn untrusted_socket_rejected_when_checks_strict() {
         let dir = tempfile::tempdir().unwrap();
         let (path, stop) = spawn_server(&dir);
-        let err =
-            IpcClient::connect(&path, &test_client_info(), SecurityChecks::strict()).unwrap_err();
+        let err = IpcClient::connect(&path, &test_client_info(), SecurityChecks::strict())
+            .err()
+            .expect("strict checks must reject a non-root socket");
         match err {
             ConnectError::Untrusted { reason, .. } => {
                 assert!(reason.contains("root") || reason.contains("writable"));

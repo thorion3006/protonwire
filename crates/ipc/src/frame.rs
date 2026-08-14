@@ -5,8 +5,8 @@
 
 use std::io::{Read, Write};
 
-use serde::de::DeserializeOwned;
 use serde::Serialize;
+use serde::de::DeserializeOwned;
 
 /// Upper bound for a single frame payload (1 MiB).
 pub const MAX_FRAME_LEN: usize = 1 << 20;
@@ -106,7 +106,7 @@ mod tests {
     #[test]
     fn truncated_frame_detected() {
         let mut buf = Vec::new();
-        write_msg(&mut buf, &serde_json::json!([1u8; 64])).unwrap();
+        write_msg(&mut buf, &serde_json::json!(vec![1u8; 64])).unwrap();
         buf.truncate(buf.len() - 10);
         let err = read_frame(&mut buf.as_slice()).unwrap_err();
         assert!(matches!(err, FrameError::Truncated));

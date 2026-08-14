@@ -1,10 +1,9 @@
 //! `SO_PEERCRED` peer credential lookup.
 
 use std::io;
-use std::os::fd::AsFd;
 use std::os::unix::net::UnixStream;
 
-use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
+use nix::sys::socket::{getsockopt, sockopt};
 
 /// Credentials of the process on the other end of a Unix socket.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -20,12 +19,12 @@ pub struct PeerCredentials {
 impl PeerCredentials {
     /// Reads the peer credentials of a connected Unix stream socket.
     pub fn of(stream: &UnixStream) -> io::Result<Self> {
-        let creds = getsockopt(stream.as_fd(), PeerCredentials)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        let creds = getsockopt(stream, sockopt::PeerCredentials).map_err(io::Error::other)?;
         Ok(Self {
             uid: creds.uid(),
             gid: creds.gid(),
-            pid: creds.pid(),
+            // PID 0 means "not available" in the kernel ucred contract.
+            pid: (creds.pid() > 0).then_some(creds.pid()),
         })
     }
 

@@ -16,9 +16,9 @@ pub mod state;
 pub mod yaml;
 
 pub use config::{
-    Authority, DnsMode, KillSwitchMode, LanPolicy, NetShieldLevel, NatMode, OutputFormat,
+    Authority, DnsMode, KillSwitchMode, LanPolicy, NatMode, NetShieldLevel, OutputFormat,
     SystemConfig, UserOverlay,
 };
 pub use paths::ConfigPaths;
 pub use state::{StateFile, StateStore};
-pub use yaml::{from_slice, from_str, YamlError};
+pub use yaml::{YamlError, from_slice, from_str};

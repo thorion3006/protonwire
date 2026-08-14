@@ -2,7 +2,10 @@
 
 use schemars::schema_for;
 
-use crate::{ClientMessage, ConnectTarget, DaemonState, Event, EventEnvelope, Request, RequestResult, Response, RpcError, RpcErrorCode, ServerMessage};
+use crate::{
+    ClientMessage, ConnectTarget, DaemonState, Event, EventEnvelope, Request, RequestResult,
+    Response, RpcError, RpcErrorCode, ServerMessage,
+};
 
 /// Named root schemas emitted by the generator, in stable order.
 pub fn root_schemas() -> Vec<(&'static str, schemars::Schema)> {

@@ -18,7 +18,7 @@ pub mod frame;
 pub mod peer;
 pub mod server;
 
-pub use authz::{authorize, required_role, IpcRole};
+pub use authz::{IpcRole, authorize, required_role};
 pub use bus::EventBus;
 pub use client::{ConnectError, IpcClient, SecurityChecks};
 pub use peer::PeerCredentials;

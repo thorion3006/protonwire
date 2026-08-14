@@ -1,7 +1,7 @@
 //! Daemon state view models consumed by all clients.
 
-use serde::{Deserialize, Serialize};
 use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 
 /// High-level VPN state machine states.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -15,6 +15,17 @@ pub enum VpnState {
     Connected,
     /// A teardown is in progress.
     Disconnecting,
+}
+
+impl std::fmt::Display for VpnState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            VpnState::Disconnected => "disconnected",
+            VpnState::Connecting => "connecting",
+            VpnState::Connected => "connected",
+            VpnState::Disconnecting => "disconnecting",
+        })
+    }
 }
 
 /// Host network integration mode (PRD 6.6). ProtonWire always owns the tunnel

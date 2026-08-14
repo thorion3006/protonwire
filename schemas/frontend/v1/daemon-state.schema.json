@@ -1,0 +1,93 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "DaemonState",
+  "description": "Full daemon state snapshot — the authoritative view clients resynchronize\nagainst (PRD FR-127D). Connection details (server, tunnel statistics,\nrequested-vs-applied features) join this struct in Milestone 4+ as additive\noptional fields with a protocol minor version bump.",
+  "type": "object",
+  "properties": {
+    "active_owner_uid": {
+      "description": "UID of the user who owns the active or most recent connection attempt,\nif any.",
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint32",
+      "minimum": 0
+    },
+    "daemon_version": {
+      "description": "Daemon build version.",
+      "type": "string"
+    },
+    "network_integration": {
+      "description": "Configured network integration mode (the configured value in Milestone\n1; the resolved adapter once Milestone 5 lands).",
+      "$ref": "#/$defs/NetworkIntegration"
+    },
+    "protocol_version": {
+      "description": "Protocol version the daemon speaks.",
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    },
+    "vpn_state": {
+      "description": "Current VPN state.",
+      "$ref": "#/$defs/VpnState"
+    }
+  },
+  "required": [
+    "protocol_version",
+    "daemon_version",
+    "vpn_state",
+    "network_integration"
+  ],
+  "$defs": {
+    "NetworkIntegration": {
+      "description": "Host network integration mode (PRD 6.6). ProtonWire always owns the tunnel\nand privacy policy; the mode only controls uplink observation and DNS\ncooperation.",
+      "oneOf": [
+        {
+          "description": "Pick NetworkManager or systemd-networkd when either owns the default\nuplink, otherwise native.",
+          "type": "string",
+          "const": "auto"
+        },
+        {
+          "description": "Observe netlink directly.",
+          "type": "string",
+          "const": "native"
+        },
+        {
+          "description": "Cooperate with NetworkManager.",
+          "type": "string",
+          "const": "network-manager"
+        },
+        {
+          "description": "Cooperate with systemd-networkd.",
+          "type": "string",
+          "const": "networkd"
+        }
+      ]
+    },
+    "VpnState": {
+      "description": "High-level VPN state machine states.",
+      "oneOf": [
+        {
+          "description": "No tunnel exists.",
+          "type": "string",
+          "const": "disconnected"
+        },
+        {
+          "description": "A connection attempt is in progress.",
+          "type": "string",
+          "const": "connecting"
+        },
+        {
+          "description": "A tunnel is up.",
+          "type": "string",
+          "const": "connected"
+        },
+        {
+          "description": "A teardown is in progress.",
+          "type": "string",
+          "const": "disconnecting"
+        }
+      ]
+    }
+  }
+}

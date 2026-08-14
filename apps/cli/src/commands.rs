@@ -3,8 +3,8 @@
 use std::path::Path;
 
 use clap::Subcommand;
-use protonwire_client::{ClientError, ProtonwireClient};
-use protonwire_frontend_api::DaemonState;
+use protonwire_client::ClientError;
+use protonwire_frontend_api::{DaemonState, RpcError, RpcErrorCode};
 
 use crate::{connect, target::ConnectTargetArgs};
 
@@ -148,12 +148,22 @@ pub enum DebugSub {
 type RunResult = Result<(), ClientError>;
 
 /// Runs one command. `no_input` gates interactive prompts (FR-127E).
+///
+/// Every path returns a typed error (mapped to PRD 9.8 exit codes by
+/// `main`); nothing exits the process from in here, so the dispatch stays
+/// unit-testable.
 pub fn run(command: &Command, socket: Option<&Path>, no_input: bool) -> RunResult {
     let _ = no_input; // prompts arrive with Milestone 2 login flows
     match command {
         Command::Status { json } => status(socket, *json),
         Command::Daemon { sub } => daemon(sub, socket),
-        Command::Connect { target, by, protocol, dry_run, json } => {
+        Command::Connect {
+            target,
+            by,
+            protocol,
+            dry_run,
+            json,
+        } => {
             let _ = (by, protocol, dry_run, json);
             let target = ConnectTargetArgs::parse(target)?;
             connect_command(socket, target)
@@ -163,14 +173,14 @@ pub fn run(command: &Command, socket: Option<&Path>, no_input: bool) -> RunResul
             client.disconnect_vpn()
         }
         // Everything else is declared surface with an honest refusal.
-        cmd if planned(cmd) => {
-            eprintln!(
-                "protonwire: `{}` is not implemented in milestone 1 (planned: {})",
+        cmd if planned(cmd) => Err(ClientError::Rpc(RpcError::new(
+            RpcErrorCode::NotImplemented,
+            format!(
+                "`{}` is not implemented in milestone 1 (planned: {})",
                 command_name(cmd),
                 planned_milestone(cmd),
-            );
-            std::process::exit(1);
-        }
+            ),
+        ))),
         _ => unreachable!("all commands are either implemented or planned"),
     }
 }
@@ -193,7 +203,7 @@ fn status(socket: Option<&Path>, json: bool) -> RunResult {
 /// `network_integration` with daemon metadata. Server, tunnel, and feature
 /// sections join when the ProTUN engine lands (Milestone 4) — additive
 /// fields, minor protocol bump.
-fn status_json(state: &DaemonState) -> String {
+pub(crate) fn status_json(state: &DaemonState) -> String {
     let mut document = serde_json::json!({
         "state": state.vpn_state,
         "network_integration": state.network_integration.as_str(),
@@ -208,12 +218,17 @@ fn status_json(state: &DaemonState) -> String {
 
 fn print_status_human(state: &DaemonState) {
     println!("State:                {}", state.vpn_state);
-    println!("Network integration:  {}", state.network_integration.as_str());
+    println!(
+        "Network integration:  {}",
+        state.network_integration.as_str()
+    );
     if let Some(owner) = state.active_owner_uid {
         println!("Connection owner UID: {owner}");
     }
-    println!("Daemon:               {} (protocol {})",
-        state.daemon_version, state.protocol_version);
+    println!(
+        "Daemon:               {} (protocol {})",
+        state.daemon_version, state.protocol_version
+    );
 }
 
 fn daemon(sub: &DaemonSub, socket: Option<&Path>) -> RunResult {
@@ -243,7 +258,10 @@ fn daemon(sub: &DaemonSub, socket: Option<&Path>) -> RunResult {
     }
 }
 
-fn connect_command(socket: Option<&Path>, target: protonwire_frontend_api::ConnectTarget) -> RunResult {
+fn connect_command(
+    socket: Option<&Path>,
+    target: protonwire_frontend_api::ConnectTarget,
+) -> RunResult {
     let mut client = connect(socket)?;
     client.connect_vpn(target)
 }

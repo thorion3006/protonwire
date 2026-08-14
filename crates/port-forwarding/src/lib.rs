@@ -19,7 +19,7 @@ pub enum LeaseState {
         port: u16,
     },
     /// Renewal failed and the lease is expiring.
-        Expiring,
+    Expiring,
 }
 
 /// The port-forwarding surface core programs against (Milestone 6).
@@ -49,9 +49,6 @@ mod tests {
     #[test]
     fn lease_states_are_distinct() {
         assert_ne!(LeaseState::Inactive, LeaseState::Requesting);
-        assert_ne!(
-            LeaseState::Active { port: 12345 },
-            LeaseState::Expiring
-        );
+        assert_ne!(LeaseState::Active { port: 12345 }, LeaseState::Expiring);
     }
 }
