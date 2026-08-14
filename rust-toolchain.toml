@@ -1,4 +1,5 @@
-# Development toolchain pin. The workspace compiler floor is Rust 1.85
-# (PRD NFR-42); CI additionally checks every build against exactly 1.85.0.
+# Development toolchain pin. The workspace floor is the lowest *verified*
+# toolchain, 1.97 (the Proton registry crates do not compile below ~1.94;
+# probe record in docs/spike-2026-08.md). The CI msrv job pins 1.97.1.
 [toolchain]
 channel = "1.97.1"

@@ -5,8 +5,9 @@
 //! exposes exactly one command (`daemon_state`); connection lifecycle,
 //! selection, profiles, and settings commands join with their SDK
 //! counterparts in later milestones. The webview loads bundled local assets
-//! only, under a restrictive CSP, with no generic shell, filesystem,
-//! process, or network bridge.
+//! only, under a restrictive CSP (inline styles permitted for the bundled
+//! shell's own markup), with no generic shell, filesystem, process, or
+//! network bridge.
 
 use protonwire_client::{ClientError, ProtonwireClient};
 use protonwire_frontend_api::ClientSurface;

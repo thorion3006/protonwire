@@ -33,17 +33,20 @@ struct Options {
 
 fn main() {
     let options = parse_args();
-    let terminal = match setup_terminal() {
+    let mut terminal = match setup_terminal() {
         Ok(t) => t,
         Err(e) => {
             eprintln!("protonwire-tui: cannot initialize terminal: {e}");
             std::process::exit(1);
         }
     };
-    // From here on, every exit path restores the terminal first.
-    let result = run(terminal, options);
+    // From here on, EVERY exit path restores the terminal: ratatui's own
+    // Drop only restores the cursor, not raw mode or the alternate screen,
+    // so normal quit must restore explicitly (rust-review finding 3,
+    // FR-127F).
+    let result = run(&mut terminal, options);
+    let _ = restore();
     if let Err(e) = result {
-        let _ = restore();
         eprintln!("protonwire-tui: {e}");
         std::process::exit(1);
     }
@@ -65,7 +68,13 @@ fn parse_args() -> Options {
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "--socket" => socket = args.next().map(PathBuf::from),
+            "--socket" => match args.next() {
+                Some(value) => socket = Some(PathBuf::from(value)),
+                None => {
+                    eprintln!("protonwire-tui: --socket requires a value");
+                    std::process::exit(2);
+                }
+            },
             "--version" => {
                 println!("protonwire-tui {}", env!("CARGO_PKG_VERSION"));
                 std::process::exit(0);
@@ -115,7 +124,7 @@ fn connect(options: &Options) -> Result<ProtonwireClient, ClientError> {
     }
 }
 
-fn run(mut terminal: Term, options: Options) -> Result<(), ClientError> {
+fn run(terminal: &mut Term, options: Options) -> Result<(), ClientError> {
     let mut last_refresh = Instant::now() - REFRESH;
     let mut snapshot: Option<Result<DaemonState, String>> = None;
     let mut notice = String::new();

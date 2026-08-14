@@ -749,10 +749,21 @@ impl SystemConfig {
             ));
         }
         let weights = &self.server_selection.balanced_weights;
-        let sum = weights.load + weights.latency + weights.stability + weights.feature_match;
-        if (sum - 1.0).abs() > 0.001 {
+        let weight_values = [
+            weights.load,
+            weights.latency,
+            weights.stability,
+            weights.feature_match,
+        ];
+        let sum: f32 = weight_values.iter().sum();
+        // NaN comparisons are false, so an explicit finiteness check is
+        // required or `.nan` weights slip through (rust-review finding 6).
+        if !weight_values.iter().all(|w| w.is_finite())
+            || weight_values.iter().any(|w| *w < 0.0)
+            || (sum - 1.0).abs() > 0.001
+        {
             violations.push(format!(
-                "server_selection.balanced_weights must sum to 1.0 (found {sum:.4})"
+                "server_selection.balanced_weights must be finite, non-negative, and sum to 1.0 (found {sum:.4})"
             ));
         }
         if self.server_selection.latency_probe.background_scan {
@@ -1028,8 +1039,23 @@ mod tests {
     #[test]
     fn balanced_weights_must_sum_to_one() {
         let mut config = SystemConfig::default();
-        config.schema_version = 2;
         config.server_selection.balanced_weights.latency = 0.9;
+        assert!(config.validate().is_err());
+    }
+
+    /// Rust-review finding 6: NaN defeats `(sum - 1.0).abs() > 0.001` (all
+    /// NaN comparisons are false) and negative weights summing to 1.0 are
+    /// nonsense — both must be rejected.
+    #[test]
+    fn non_finite_and_negative_weights_rejected() {
+        let mut config = SystemConfig::default();
+        config.server_selection.balanced_weights.latency = f32::NAN;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("finite"), "got: {err}");
+
+        let mut config = SystemConfig::default();
+        config.server_selection.balanced_weights.load = -0.1;
+        config.server_selection.balanced_weights.latency = 0.5;
         assert!(config.validate().is_err());
     }
 

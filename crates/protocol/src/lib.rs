@@ -70,15 +70,8 @@ pub enum ProtocolError {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
-    /// FR-27/OQ-15: the hardcoded integration addresses must match the
-    /// pinned pvpnclient values until ProTUN negotiates them itself.
-    #[test]
-    fn tun_integration_addresses_are_pinned() {
-        assert_eq!(tun_contract::IPV4_ADDRESS, "10.2.0.2/32");
-        assert_eq!(tun_contract::IPV4_GATEWAY, "10.2.0.1");
-        assert_eq!(tun_contract::IPV6_ADDRESS, "2a07:b944::2:2/128");
-        assert_eq!(tun_contract::IPV6_GATEWAY, "2a07:b944::2:1");
-    }
+    // No assertion lives here yet: the FR-27/OQ-15 contract is asserted by
+    // the Milestone 4 adapter conformance test against the pinned
+    // pvpnclient source; a local constants-equal-identical-literals test
+    // would be a change detector with no mutation coverage.
 }

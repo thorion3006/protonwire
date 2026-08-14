@@ -282,10 +282,10 @@ fn check_capabilities(doc: &Manifest) -> Vec<String> {
 
     let mut seen = BTreeSet::new();
     for (index, capability) in capabilities.iter().enumerate() {
-        if let Some(id) = &capability.id {
-            if !seen.insert(id.clone()) {
-                violations.push(format!("duplicate capability id `{id}`"));
-            }
+        if let Some(id) = &capability.id
+            && !seen.insert(id.clone())
+        {
+            violations.push(format!("duplicate capability id `{id}`"));
         }
         violations.extend(check_capability(index, capability, &statuses, &sources));
     }

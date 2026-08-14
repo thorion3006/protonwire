@@ -30,7 +30,7 @@ impl ConnectTargetArgs {
             "tor" if rest.is_empty() => Ok(ConnectTarget::Special {
                 class: SpecialClass::Tor,
             }),
-            "secure-core" => Ok(ConnectTarget::SecureCore {
+            "secure-core" if rest.is_empty() => Ok(ConnectTarget::SecureCore {
                 entry_country: None,
                 exit_country: None,
             }),
@@ -131,5 +131,15 @@ mod tests {
         assert!(ConnectTargetArgs::parse(&words(&["warp"])).is_err());
         let err = ConnectTargetArgs::parse(&words(&["warp"])).unwrap_err();
         assert_eq!(err.exit_code(), 2, "invalid arguments exit code");
+    }
+
+    /// Rust-review nit: `secure-core GB` silently parsed to a bare
+    /// SecureCore target; bare targets must reject trailing words like
+    /// every other bare form (entry/exit selection arrives as flags in a
+    /// later milestone).
+    #[test]
+    fn secure_core_rejects_trailing_words() {
+        assert!(ConnectTargetArgs::parse(&words(&["secure-core", "GB"])).is_err());
+        assert!(ConnectTargetArgs::parse(&words(&["secure-core"])).is_ok());
     }
 }

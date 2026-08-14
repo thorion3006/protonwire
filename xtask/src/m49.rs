@@ -206,20 +206,20 @@ pub(crate) fn verify_csv(bytes: &[u8], mapping: &BTreeMap<String, String>) -> Cs
                 .violations
                 .push(format!("row {row}: duplicate ISO code `{iso}`"));
         }
-        if let Some(previous) = &previous_iso {
-            if previous.as_str() >= iso {
-                outcome.violations.push(format!(
-                    "row {row}: rows must be sorted ascending by ISO code (`{iso}` follows `{previous}`)"
-                ));
-            }
+        if let Some(previous) = &previous_iso
+            && previous.as_str() >= iso
+        {
+            outcome.violations.push(format!(
+                "row {row}: rows must be sorted ascending by ISO code (`{iso}` follows `{previous}`)"
+            ));
         }
         previous_iso = Some(iso.to_string());
-        if let Some(expected) = expected_region {
-            if region != expected.as_str() {
-                outcome.violations.push(format!(
-                    "row {row}: region `{region}` does not match m49_region_code `{code}` (expected `{expected}`)"
-                ));
-            }
+        if let Some(expected) = expected_region
+            && region != expected.as_str()
+        {
+            outcome.violations.push(format!(
+                "row {row}: region `{region}` does not match m49_region_code `{code}` (expected `{expected}`)"
+            ));
         }
         if name.trim().is_empty() {
             outcome

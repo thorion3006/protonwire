@@ -131,24 +131,33 @@ impl DaemonCore {
     }
 
     /// Transitions the VPN state, sequencing and publishing the event.
+    ///
+    /// Mutation, sequence allocation, and publication all happen under one
+    /// hold of the state lock: concurrent emitters serialize there, so the
+    /// order events reach the sink always matches their sequence numbers
+    /// and `from`/`to` stay coherent (rust-review finding 2 — publishing
+    /// after unlock allowed inversions that broke the monotonic-`seq`
+    /// contract the client resync logic relies on).
     pub fn set_vpn_state(&self, to: VpnState) {
-        let from = {
-            let mut inner = self.inner.lock().expect("core lock");
-            let from = inner.vpn_state;
-            inner.vpn_state = to;
-            from
-        };
-        if from != to {
-            self.emit(Event::StateChanged { from, to });
+        let mut inner = self.inner.lock().expect("core lock");
+        let from = inner.vpn_state;
+        if from == to {
+            return;
         }
+        inner.vpn_state = to;
+        self.emit_locked(Event::StateChanged { from, to }, &mut inner);
     }
 
     /// Publishes a notice.
     pub fn notice(&self, level: NoticeLevel, message: impl Into<String>) {
-        self.emit(Event::Notice {
-            level,
-            message: message.into(),
-        });
+        let mut inner = self.inner.lock().expect("core lock");
+        self.emit_locked(
+            Event::Notice {
+                level,
+                message: message.into(),
+            },
+            &mut inner,
+        );
     }
 
     /// The configured network integration mode as exposed in status.
@@ -156,7 +165,10 @@ impl DaemonCore {
         self.config.daemon.network_integration.into()
     }
 
-    fn emit(&self, event: Event) {
+    /// Allocates the next sequence number and publishes. The `_proof`
+    /// guard parameter makes the single-lock hold a compile-time property:
+    /// every emitter holds `inner` across allocation and publication.
+    fn emit_locked(&self, event: Event, _proof: &mut std::sync::MutexGuard<'_, CoreInner>) {
         let seq = self.seq.fetch_add(1, Ordering::SeqCst) + 1;
         self.sink.publish(EventEnvelope { seq, event });
     }
@@ -192,6 +204,43 @@ mod tests {
         assert_eq!(events[0].seq, 1);
         assert!(matches!(events[0].event, Event::StateChanged { .. }));
         assert_eq!(events[1].seq, 2);
+    }
+
+    /// Regression (rust-review finding 2): with several threads emitting
+    /// concurrently, publication order must always match sequence order —
+    /// an inversion makes clients see a fake gap and rewind their cursor.
+    #[test]
+    fn concurrent_emissions_publish_in_sequence_order() {
+        let (core, recorded) = core();
+        let core = Arc::new(core);
+        let threads: Vec<_> = (0..4)
+            .map(|t| {
+                let core = Arc::clone(&core);
+                std::thread::spawn(move || {
+                    for i in 0..250 {
+                        if (t + i) % 3 == 0 {
+                            core.notice(NoticeLevel::Info, "tick");
+                        } else {
+                            core.set_vpn_state(VpnState::Connecting);
+                            core.set_vpn_state(VpnState::Disconnecting);
+                        }
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        let events = recorded.lock().unwrap();
+        assert!(!events.is_empty());
+        for pair in events.windows(2) {
+            assert!(
+                pair[0].seq < pair[1].seq,
+                "publish order inverted: seq {} was published after seq {}",
+                pair[1].seq,
+                pair[0].seq
+            );
+        }
     }
 
     #[test]

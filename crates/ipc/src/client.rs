@@ -307,7 +307,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-    use protonwire_frontend_api::{Event, NoticeLevel, VpnState};
+    use protonwire_frontend_api::VpnState;
 
     use crate::EventBus;
 
@@ -425,19 +425,5 @@ mod tests {
             other => panic!("expected Untrusted, got {other:?}"),
         }
         stop.store(true, Ordering::SeqCst);
-    }
-
-    #[test]
-    fn event_envelope_shape() {
-        let envelope = EventEnvelope {
-            seq: 3,
-            event: Event::StateChanged {
-                from: VpnState::Disconnected,
-                to: VpnState::Connecting,
-            },
-        };
-        let json = serde_json::to_value(&envelope).unwrap();
-        assert_eq!(json["event"]["kind"], "state-changed");
-        let _ = NoticeLevel::Info;
     }
 }

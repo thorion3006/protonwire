@@ -12,8 +12,9 @@ use std::sync::{Mutex, mpsc};
 use protonwire_frontend_api::ServerMessage;
 
 /// Per-session outbound queue capacity. Small on purpose: a lagging client
-/// must resync rather than buffer unboundedly.
-const SESSION_QUEUE_LEN: usize = 256;
+/// must resync rather than buffer unboundedly. Shared with the session
+/// writer channel so both bounds stay identical.
+pub(crate) const SESSION_QUEUE_LEN: usize = 256;
 
 /// Fan-out registry of live sessions.
 #[derive(Debug, Default)]

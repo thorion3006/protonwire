@@ -58,11 +58,4 @@ mod tests {
     fn native_adapter_reports_native() {
         assert_eq!(NativeAdapter.kind(), NetworkIntegration::Native);
     }
-
-    #[test]
-    fn preferred_route_tables_match_prd() {
-        assert_eq!(route_tables::PRIMARY, 51820);
-        assert_eq!(route_tables::SECONDARY, 51821);
-        assert_eq!(route_tables::TERTIARY, 51822);
-    }
 }

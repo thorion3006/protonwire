@@ -14,10 +14,6 @@ use cargo_metadata::{Metadata, Package};
 
 use crate::Reporter;
 
-/// `cargo` may not be on PATH in every environment; fall back to the known
-/// local rustup/CARGO_HOME location.
-const FALLBACK_CARGO: &str = "/home/parthiban/.local/share/cargo/bin/cargo";
-
 /// Frontends and the client SDK must reach the service only through
 /// `protonwire-client`; never the engines or deep crates directly.
 const CLIENT_SIDE: &[&str] = &[
@@ -111,6 +107,17 @@ pub fn run(root: &Path) -> Result<bool> {
             ));
         }
     }
+    // The lockfile must be UNDER VERSION CONTROL, not merely present on
+    // disk: PRD 6.5 makes it the resolution authority for the lockless
+    // ProTUN pin, and a developer-global gitignore entry (a common Rust
+    // setup) silently excludes it otherwise (FR-127A).
+    if !lockfile_tracked_by_git(root) {
+        lockfile_violations.push(
+            "Cargo.lock exists on disk but is NOT tracked by git — add a \
+             `!Cargo.lock` negation to the repo .gitignore and commit it"
+                .to_string(),
+        );
+    }
     reporter.rule("single workspace Cargo.lock", &lockfile_violations);
 
     let mut wildcard_violations = Vec::new();
@@ -137,8 +144,15 @@ fn cargo_metadata(root: &Path) -> Result<Metadata> {
 }
 
 fn run_cargo(root: &Path, args: &[&str]) -> Result<String> {
-    for binary in ["cargo", FALLBACK_CARGO] {
-        match Command::new(binary).args(args).current_dir(root).output() {
+    // `cargo` from PATH first, then $CARGO_HOME/bin/cargo for setups where
+    // the cargo bin directory is not on PATH (rust-review nit: no
+    // developer-machine absolute paths in the repo).
+    let mut candidates: Vec<String> = vec!["cargo".to_string()];
+    if let Ok(cargo_home) = std::env::var("CARGO_HOME") {
+        candidates.push(format!("{cargo_home}/bin/cargo"));
+    }
+    for binary in candidates {
+        match Command::new(&binary).args(args).current_dir(root).output() {
             Ok(output) if output.status.success() => {
                 return String::from_utf8(output.stdout).with_context(|| {
                     format!("`{binary} {}` produced non-UTF-8 output", args.join(" "))
@@ -159,7 +173,7 @@ fn run_cargo(root: &Path, args: &[&str]) -> Result<String> {
         }
     }
     Err(anyhow!(
-        "no usable cargo binary found; tried `cargo` and `{FALLBACK_CARGO}`"
+        "no usable cargo binary found; tried `cargo` on PATH and `$CARGO_HOME/bin/cargo`"
     ))
 }
 
@@ -212,6 +226,21 @@ pub(crate) fn find_lock_files(dir: &Path) -> Vec<PathBuf> {
     walk_for_lock_files(dir, &mut found);
     found.sort();
     found
+}
+
+/// Whether git tracks the root `Cargo.lock`. A developer-global gitignore
+/// commonly excludes Rust lockfiles for libraries; for this application
+/// workspace the committed lockfile is the resolution authority, so its
+/// absence from the index is a supply-chain regression (FR-127A).
+pub(crate) fn lockfile_tracked_by_git(root: &Path) -> bool {
+    let output = std::process::Command::new("git")
+        .arg("ls-files")
+        .arg("--error-unmatch")
+        .arg("--")
+        .arg("Cargo.lock")
+        .current_dir(root)
+        .output();
+    matches!(output, Ok(out) if out.status.success())
 }
 
 fn walk_for_lock_files(dir: &Path, found: &mut Vec<PathBuf>) {

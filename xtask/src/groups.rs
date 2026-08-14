@@ -511,17 +511,17 @@ fn check_group(
         }
     }
 
-    if let Some(target) = &group.target {
-        if target.kind.as_deref() == Some("fastest-in-region") {
-            match target.region.as_deref() {
-                Some(region) if regions.contains(region) => {}
-                Some(region) => violations.push(format!(
-                    "{label}: target.region `{region}` is not a primary region"
-                )),
-                None => violations.push(format!(
-                    "{label}: fastest-in-region targets must define target.region"
-                )),
-            }
+    if let Some(target) = &group.target
+        && target.kind.as_deref() == Some("fastest-in-region")
+    {
+        match target.region.as_deref() {
+            Some(region) if regions.contains(region) => {}
+            Some(region) => violations.push(format!(
+                "{label}: target.region `{region}` is not a primary region"
+            )),
+            None => violations.push(format!(
+                "{label}: fastest-in-region targets must define target.region"
+            )),
         }
     }
 

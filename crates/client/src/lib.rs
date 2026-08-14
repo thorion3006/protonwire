@@ -216,20 +216,30 @@ impl ProtonwireClient {
 
     /// Blocks for the next event; transparently resynchronizes after a
     /// sequence gap and returns [`ClientEvent::Resynchronized`] instead of
-    /// silently losing state (PRD FR-127D).
+    /// silently losing state (PRD FR-127D). Stale or duplicate sequence
+    /// numbers (daemon restart, reordering) are skipped without rewinding
+    /// the cursor (rust-review finding 9).
     pub fn next_event(&mut self) -> Result<ClientEvent, ClientError> {
-        let envelope = self.ipc.next_event()?;
-        let expected = self.last_seq.map_or(envelope.seq, |last| last + 1);
-        if envelope.seq > expected {
-            let state = self.state()?;
+        loop {
+            let envelope = self.ipc.next_event()?;
+            let expected = self.last_seq.map_or(envelope.seq, |last| last + 1);
+            if envelope.seq > expected {
+                let state = self.state()?;
+                self.last_seq = Some(envelope.seq);
+                return Ok(ClientEvent::Resynchronized {
+                    state,
+                    resumed_at_seq: envelope.seq,
+                });
+            }
+            if envelope.seq < expected {
+                // Already seen: drop it and keep waiting. Delivering it
+                // would rewind the cursor and make the next genuine event
+                // look like a gap.
+                continue;
+            }
             self.last_seq = Some(envelope.seq);
-            return Ok(ClientEvent::Resynchronized {
-                state,
-                resumed_at_seq: envelope.seq,
-            });
+            return Ok(ClientEvent::Event(envelope));
         }
-        self.last_seq = Some(envelope.seq);
-        Ok(ClientEvent::Event(envelope))
     }
 
     /// Identity reported by the SDK in the hello handshake.
@@ -376,6 +386,48 @@ mod tests {
         match client.next_event().unwrap() {
             ClientEvent::Event(envelope) => assert_eq!(envelope.seq, 3),
             ClientEvent::Resynchronized { .. } => panic!("unexpected resync"),
+        }
+    }
+
+    /// Regression (rust-review finding 9): a stale or duplicate sequence
+    /// number must be skipped, never delivered and never allowed to rewind
+    /// the cursor (a rewind makes the next genuine event look like a gap
+    /// and triggers a spurious resync).
+    #[test]
+    fn stale_events_are_skipped_without_rewinding() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, handler) = spawn_server(&dir);
+        let mut client = dev_client(&path);
+
+        let publish = |seq: u64, message: &str| {
+            handler.bus.publish(ServerMessage::Event(EventEnvelope {
+                seq,
+                event: Event::Notice {
+                    level: NoticeLevel::Info,
+                    message: message.into(),
+                },
+            }));
+        };
+
+        publish(1, "fresh");
+        match client.next_event().unwrap() {
+            ClientEvent::Event(envelope) => assert_eq!(envelope.seq, 1),
+            ClientEvent::Resynchronized { .. } => panic!("unexpected resync"),
+        }
+
+        // A stale duplicate (already-seen seq) arrives, then a fresh event.
+        publish(1, "stale duplicate");
+        publish(2, "fresh after stale");
+        match client.next_event().unwrap() {
+            ClientEvent::Event(envelope) => {
+                assert_eq!(envelope.seq, 2, "stale event must be skipped");
+                let notice = match envelope.event {
+                    Event::Notice { message, .. } => message,
+                    other => panic!("expected notice, got {other:?}"),
+                };
+                assert_eq!(notice, "fresh after stale");
+            }
+            ClientEvent::Resynchronized { .. } => panic!("stale event must not trigger resync"),
         }
     }
 

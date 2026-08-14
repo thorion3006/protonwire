@@ -8,8 +8,9 @@ transport. ProtonWire is a local VPN control plane — not a wrapper around
 clients (CLI, Ratatui TUI, Tauri GUI) speaking one versioned Unix-socket
 frontend API.
 
-Status: **Milestone 1 (Foundation) in progress** on `feat/m1-foundation`.
-The authoritative specification set is:
+Status: **Milestone 1 (Foundation) complete** on `feat/m1-foundation`;
+next: Milestone 2 (Muon API, authentication, server cache). The
+authoritative specification set is:
 
 - `docs/PRD-proton-wire.md` — the product requirements (normative)
 - `docs/ADR-0001-monorepo-core-and-clients.md` — the architecture decision
@@ -50,7 +51,9 @@ enforces this (PRD NFR-39).
 
 Toolchain: Rust ≥ 1.97 (edition 2024) — the Proton registry crates the
 engines depend on do not compile below ~1.94 (probe record in
-`docs/spike-2026-08.md`). The Proton sparse registry is configured in
+`docs/spike-2026-08.md`). A C toolchain is required (`cc`; the engine
+chain builds C code) — on NixOS run `nix shell nixpkgs#gcc` first. The
+Proton sparse registry and the `cargo xtask` alias are configured in
 `.cargo/config.toml`.
 
 ```sh
@@ -67,10 +70,14 @@ a default member.
 ## Running (development)
 
 ```sh
-protonwire-daemon --socket-dir /run/user/$UID/protonwire   # unprivileged dev socket
-PROTONWIRE_DEV_UNSAFE_SOCKET=1 PROTONWIRE_SOCKET=/run/user/$UID/protonwire/protonwire.sock \
-  protonwire status
+cargo run -p protonwire-daemon -- --socket-dir /run/user/$UID/protonwire  # unprivileged dev socket
+PROTONWIRE_DEV_UNSAFE_SOCKET=1 \
+  PROTONWIRE_SOCKET=/run/user/$UID/protonwire/protonwire.sock \
+  cargo run -p protonwire-cli -- status
 ```
+
+Stop the dev daemon with Ctrl+C (a stale socket is detected and removed by
+the next start) or, as root, `protonwire daemon stop`.
 
 Production sockets live at `/run/protonwire/protonwire.sock`, and clients
 verify root ownership of the socket, its directory, and the connected

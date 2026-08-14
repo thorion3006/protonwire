@@ -3,3 +3,7 @@
 # only from this file, not from Cargo.toml.
 [registries.proton]
 index = "sparse+https://rust-registry.proton.me/index/"
+
+# `cargo xtask <subcommand>` (PRD-referenced invocation form).
+[alias]
+xtask = "run -p xtask --"

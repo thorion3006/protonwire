@@ -73,8 +73,9 @@ jobs:
         with:
           tool: cargo-audit
       # Flags known-vulnerable versions in the committed lockfile,
-      # including the pinned Proton crates.
-      - run: cargo audit
+      # including the pinned Proton crates. --file makes policy application
+      # explicit rather than relying on discovery from the repo root.
+      - run: cargo audit --file .cargo/audit.toml
 
   doc:
     runs-on: ubuntu-24.04

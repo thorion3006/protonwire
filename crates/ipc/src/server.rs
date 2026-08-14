@@ -179,7 +179,7 @@ fn handle_session<H: RequestHandler>(stream: UnixStream, handler: Arc<H>, stop: 
         warn!("set_write_timeout failed: {e}");
         return;
     }
-    let (writer_tx, writer_rx) = mpsc::sync_channel::<ServerMessage>(256);
+    let (writer_tx, writer_rx) = mpsc::sync_channel::<ServerMessage>(crate::bus::SESSION_QUEUE_LEN);
     let write_stream = stream;
     let writer = std::thread::spawn(move || {
         let mut write_half = write_stream;
@@ -218,7 +218,14 @@ fn handle_session<H: RequestHandler>(stream: UnixStream, handler: Arc<H>, stop: 
     };
 
     let result = serve_messages(&mut read_half, &writer_tx, &handler, &peer, &stop);
+    // Teardown order is load-bearing: dropping our sender alone is not
+    // enough — the forwarder holds a clone — so we must unsubscribe BEFORE
+    // joining. Unsubscribe closes the bus sender, which ends the forwarder,
+    // which drops the last writer-sender clone, which ends the writer.
+    // Joining first deadlocks and leaks the session slot plus both threads
+    // (rust-review finding 1).
     drop(writer_tx);
+    drop(_guard);
     let _ = writer.join();
     let _ = event_forward.join();
     debug!(uid = peer.uid, outcome = ?result, "session closed");
@@ -264,7 +271,7 @@ fn serve_messages(
                     }));
                     return Ok(());
                 }
-                if protocol_version > PROTOCOL_VERSION {
+                if protocol_version > PROTOCOL_VERSION || protocol_version < 1 {
                     let _ = writer_tx.send(ServerMessage::HelloError(HelloError {
                         supported_version: PROTOCOL_VERSION,
                         reason: "unsupported-protocol-version".into(),
@@ -273,12 +280,20 @@ fn serve_messages(
                 }
                 let client = client.sanitized();
                 info!(uid = peer.uid, name = %client.name, "client connected");
-                let _ = writer_tx.send(ServerMessage::HelloAck(HelloAck {
-                    // Speak the highest version both sides support.
-                    protocol_version: protocol_version.min(PROTOCOL_VERSION),
-                    daemon_version: handler.daemon_version().to_owned(),
-                    latest_event_seq: handler.latest_event_seq(),
-                }));
+                if writer_tx
+                    .send(ServerMessage::HelloAck(HelloAck {
+                        // Speak the highest version both sides support.
+                        protocol_version: protocol_version.min(PROTOCOL_VERSION),
+                        daemon_version: handler.daemon_version().to_owned(),
+                        latest_event_seq: handler.latest_event_seq(),
+                    }))
+                    .is_err()
+                {
+                    // The writer is gone; a client waiting on the ack would
+                    // otherwise hang until its own timeout (rust-review
+                    // finding 11).
+                    return Ok(());
+                }
                 client_info = Some(client);
                 hello_done = true;
             }
@@ -315,4 +330,134 @@ fn dispatch(
 ) -> Result<RequestResult, RpcError> {
     authorize(required_role(&request), &ctx.peer)?;
     handler.handle(ctx, request)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::frame::{read_msg, write_msg};
+    use protonwire_frontend_api::{ClientInfo, ClientSurface, Request};
+
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    struct NullHandler {
+        version: String,
+        bus: EventBus,
+    }
+
+    impl RequestHandler for NullHandler {
+        fn daemon_version(&self) -> &str {
+            &self.version
+        }
+        fn latest_event_seq(&self) -> u64 {
+            0
+        }
+        fn handle(
+            &self,
+            _ctx: &SessionContext,
+            request: Request,
+        ) -> Result<RequestResult, RpcError> {
+            let _ = request;
+            Err(RpcError::new(
+                protonwire_frontend_api::RpcErrorCode::NotImplemented,
+                "test handler",
+            ))
+        }
+        fn event_bus(&self) -> &EventBus {
+            &self.bus
+        }
+    }
+
+    fn info() -> ClientInfo {
+        ClientInfo {
+            name: "server-test".into(),
+            version: "0".into(),
+            surface: ClientSurface::Other,
+        }
+    }
+
+    fn spawn_server(dir: &tempfile::TempDir, handler: Arc<NullHandler>) -> std::path::PathBuf {
+        let server = IpcServer::bind(dir.path(), "server-test.sock").unwrap();
+        let path = server.socket_path().to_owned();
+        let stop = Arc::new(AtomicBool::new(false));
+        let handler2 = Arc::clone(&handler);
+        std::thread::spawn(move || server.serve(handler2, stop));
+        path
+    }
+
+    fn connect_and_hello(path: &std::path::Path) -> std::os::unix::net::UnixStream {
+        let mut stream = std::os::unix::net::UnixStream::connect(path).unwrap();
+        write_msg(
+            &mut stream,
+            &ClientMessage::Hello {
+                protocol_version: 1,
+                client: info(),
+            },
+        )
+        .unwrap();
+        // Wait for the ack so the session is fully established.
+        match read_msg::<_, ServerMessage>(&mut stream).unwrap() {
+            ServerMessage::HelloAck(_) => stream,
+            other => panic!("expected hello ack, got {other:?}"),
+        }
+    }
+
+    /// Regression (rust-review finding 1): every ended session must
+    /// release its bus slot and session threads. The pre-fix teardown
+    /// joined the writer before unsubscribing, deadlocking on the
+    /// forwarder's sender clone — leaking a slot and two threads per
+    /// session until MAX_SESSIONS wedged the daemon permanently.
+    #[test]
+    fn ended_sessions_release_their_bus_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let handler = Arc::new(NullHandler {
+            version: "test".into(),
+            bus: EventBus::new(),
+        });
+        let path = spawn_server(&dir, Arc::clone(&handler));
+
+        for _ in 0..8 {
+            drop(connect_and_hello(&path));
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while handler.event_bus().session_count() != 0 {
+            assert!(
+                Instant::now() < deadline,
+                "sessions leaked: {} slot(s) still subscribed after all clients \
+                 disconnected — teardown is deadlocked again",
+                handler.event_bus().session_count()
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    /// Finding 10: the handshake must reject versions below the oldest
+    /// supported protocol (1), not ack them into a lie.
+    #[test]
+    fn hello_below_oldest_supported_version_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let handler = Arc::new(NullHandler {
+            version: "test".into(),
+            bus: EventBus::new(),
+        });
+        let path = spawn_server(&dir, handler);
+        let mut stream = std::os::unix::net::UnixStream::connect(&path).unwrap();
+        write_msg(
+            &mut stream,
+            &ClientMessage::Hello {
+                protocol_version: 0,
+                client: info(),
+            },
+        )
+        .unwrap();
+        match read_msg::<_, ServerMessage>(&mut stream).unwrap() {
+            ServerMessage::HelloError(err) => {
+                assert_eq!(err.reason, "unsupported-protocol-version");
+                assert_eq!(err.supported_version, 1);
+            }
+            other => panic!("expected HelloError for version 0, got {other:?}"),
+        }
+    }
 }

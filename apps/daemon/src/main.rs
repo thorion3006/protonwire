@@ -31,17 +31,14 @@ struct Args {
     /// IPC socket directory (default: /run/protonwire).
     #[arg(long)]
     socket_dir: Option<PathBuf>,
-    /// Daemon state file (default: /var/lib/protonwire/state.json).
+    /// Log level filter (overrides `daemon.log_level` from the config;
+    /// RUST_LOG overrides both).
     #[arg(long)]
-    state_file: Option<PathBuf>,
-    /// Log level filter (default: info; RUST_LOG overrides).
-    #[arg(long, default_value = "info")]
-    log_level: String,
+    log_level: Option<String>,
 }
 
 fn main() {
     let args = Args::parse();
-    init_tracing_filtered(&args.log_level);
 
     let mut paths = ConfigPaths::system();
     if let Some(config) = &args.config {
@@ -50,10 +47,11 @@ fn main() {
     if let Some(socket_dir) = &args.socket_dir {
         paths.socket_dir = socket_dir.clone();
     }
-    if let Some(state_file) = &args.state_file {
-        paths.state_file = state_file.clone();
-    }
 
+    // Configuration is loaded before tracing initializes so that
+    // `daemon.log_level` from the config applies (rust-review finding 7);
+    // a `--log-level` flag wins over the config, and RUST_LOG wins over
+    // both. Load failures predate the logger and go to stderr.
     let config = match SystemConfig::load(&paths.system_config) {
         Ok(config) => Arc::new(config),
         Err(e) => {
@@ -61,6 +59,11 @@ fn main() {
             std::process::exit(15); // PRD 9.8: config validation failed
         }
     };
+    let level = args
+        .log_level
+        .clone()
+        .unwrap_or_else(|| config.daemon.log_level.clone());
+    init_tracing_filtered(&level);
 
     let bus = Arc::new(protonwire_ipc::EventBus::new());
     let core = Arc::new(protonwire_core::DaemonCore::new(

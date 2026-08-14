@@ -233,13 +233,11 @@ fn print_status_human(state: &DaemonState) {
 
 fn daemon(sub: &DaemonSub, socket: Option<&Path>) -> RunResult {
     match sub {
-        DaemonSub::Start => {
-            eprintln!(
-                "protonwire: the daemon is started by its systemd unit (packaged in milestone 8); \
-                 for development run `protonwire-daemon` directly"
-            );
-            std::process::exit(1);
-        }
+        DaemonSub::Start => Err(ClientError::Rpc(RpcError::new(
+            RpcErrorCode::NotImplemented,
+            "the daemon is started by its systemd unit (packaged in milestone 8); \
+             for development run `protonwire-daemon` directly",
+        ))),
         DaemonSub::Stop => {
             let mut client = connect(socket)?;
             client.shutdown_daemon()
@@ -320,5 +318,58 @@ fn planned_milestone(command: &Command) -> &'static str {
         }
         Command::Split => "milestone 7 — split tunneling",
         _ => unreachable!("implemented commands do not reach planned_milestone"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn status_json_shape_matches_prd_118_subset() {
+        let state = DaemonState {
+            protocol_version: 1,
+            daemon_version: "0.1.0".into(),
+            vpn_state: protonwire_frontend_api::VpnState::Disconnected,
+            network_integration: protonwire_frontend_api::NetworkIntegration::Auto,
+            active_owner_uid: None,
+        };
+        let document: serde_json::Value = serde_json::from_str(&status_json(&state)).unwrap();
+        assert_eq!(document["state"], "disconnected");
+        assert_eq!(document["network_integration"], "auto");
+        assert_eq!(document["daemon_version"], "0.1.0");
+        assert_eq!(document["protocol_version"], 1);
+        assert!(document.get("active_owner_uid").is_none());
+
+        let owned = DaemonState {
+            active_owner_uid: Some(1000),
+            ..state
+        };
+        let document: serde_json::Value = serde_json::from_str(&status_json(&owned)).unwrap();
+        assert_eq!(document["active_owner_uid"], 1000);
+    }
+
+    /// The dispatch contract: `run` returns errors; it never exits the
+    /// process. `daemon start` must be an error like every other refusal
+    /// (red phase observed as the whole test binary exiting 1).
+    #[test]
+    fn daemon_start_returns_error_instead_of_exiting() {
+        let err = run(
+            &Command::Daemon {
+                sub: DaemonSub::Start,
+            },
+            None,
+            true,
+        )
+        .expect_err("daemon start must return an error, not exit");
+        assert_eq!(err.exit_code(), 1);
+        assert!(err.to_string().contains("systemd unit"));
+    }
+
+    #[test]
+    fn planned_commands_return_typed_refusals() {
+        let err = run(&Command::Login, None, true).expect_err("refusal");
+        assert_eq!(err.exit_code(), 1);
+        assert!(err.to_string().contains("milestone 2"));
     }
 }
