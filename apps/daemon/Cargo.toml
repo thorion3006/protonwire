@@ -1,0 +1,23 @@
+[package]
+name = "protonwire-daemon"
+description = "ProtonWire privileged host: a thin root daemon around protonwire-core serving the frontend API over a Unix socket (PRD 6.1)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "protonwire-daemon"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+protonwire-core = { workspace = true }
+protonwire-frontend-api = { workspace = true }
+protonwire-ipc = { workspace = true }
+protonwire-store = { workspace = true }
+clap = { workspace = true }
+tracing = { workspace = true }

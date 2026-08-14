@@ -168,6 +168,20 @@ pub fn init_tracing(env_filter: bool) {
     }
 }
 
+/// Initializes global tracing with redaction and a caller-supplied default
+/// level that applies when `RUST_LOG` is unset.
+pub fn init_tracing_filtered(default_level: &str) {
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_level.to_owned()));
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::fmt::layer().with_writer(RedactingMakeWriter::new(std::io::stdout)))
+        .with(filter)
+        .init();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -12,5 +12,5 @@ pub mod redact;
 pub mod state;
 
 pub use error::CoreError;
-pub use redact::{init_tracing, scrub, RedactingMakeWriter, SecretString};
+pub use redact::{init_tracing, init_tracing_filtered, scrub, RedactingMakeWriter, SecretString};
 pub use state::{DaemonCore, EventSink, EventSinkFn};

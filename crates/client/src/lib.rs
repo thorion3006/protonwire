@@ -16,6 +16,9 @@ use protonwire_frontend_api::{
 };
 use protonwire_ipc::{ConnectError, IpcClient, SecurityChecks};
 
+/// Re-export so clients never need a direct protonwire-ipc dependency.
+pub use protonwire_ipc::SecurityChecks as IpcSecurityChecks;
+
 /// Default production socket path (PRD 6.3).
 pub const DEFAULT_SOCKET_PATH: &str = "/run/protonwire/protonwire.sock";
 
@@ -55,11 +58,8 @@ impl ClientError {
 pub fn rpc_exit_code(code: RpcErrorCode) -> u8 {
     use RpcErrorCode as C;
     match code {
-        C::NotImplemented
-        | C::InvalidParams
-        | C::UnsupportedProtocol
-        | C::DaemonBusy
-        | C::Internal => 1,
+        C::NotImplemented | C::UnsupportedProtocol | C::DaemonBusy | C::Internal => 1,
+        C::InvalidParams => 2,
         C::PermissionDenied => 14,
         C::NotAuthenticated => 3,
         C::EntitlementMissing => 4,
@@ -184,6 +184,13 @@ impl ProtonwireClient {
     /// Requests a disconnect (Milestone 4 implements it server-side).
     pub fn disconnect_vpn(&mut self) -> Result<(), ClientError> {
         self.ack(Request::Disconnect)
+    }
+
+    /// Requests a daemon shutdown. The daemon serves this only to
+    /// administrator (UID 0) peers; other callers receive a
+    /// `PermissionDenied` RPC error.
+    pub fn shutdown_daemon(&mut self) -> Result<(), ClientError> {
+        self.ack(Request::Shutdown)
     }
 
     fn ack(&mut self, request: Request) -> Result<(), ClientError> {

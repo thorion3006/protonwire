@@ -1,0 +1,20 @@
+[package]
+name = "protonwire-tui"
+description = "protonwire-tui — keyboard-only Ratatui client (PRD 9.9, FR-127F)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "protonwire-tui"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+protonwire-client = { workspace = true }
+protonwire-frontend-api = { workspace = true }
+ratatui = { workspace = true }
