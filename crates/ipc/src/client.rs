@@ -341,7 +341,14 @@ impl IpcClient {
                     "cannot apply request deadline: {e}"
                 )));
             }
-            let outcome = self.reader.read_msg::<ServerMessage>();
+            // Codec-level deadline (final review pass): the socket timeout
+            // above bounds one SYSCALL, so a daemon dribbling the response
+            // one byte per sub-timeout keeps every read succeeding and
+            // would stretch the frame past the whole-request deadline —
+            // the same gap round 3 closed for handshake/next_event. The
+            // deadline-aware read fails mid-frame, and the Err arm below
+            // classifies a post-deadline TimedOut as the request timeout.
+            let outcome = self.reader.read_msg_within::<ServerMessage>(deadline);
             // Restore the whole-request timeout for callers between loops
             // (next_event reads with it once request returns).
             let _ = self.stream.set_read_timeout(Some(self.timeout));
@@ -861,6 +868,86 @@ mod tests {
         assert!(
             started.elapsed() < Duration::from_secs(2),
             "the refusal must be immediate, not a blocked write"
+        );
+    }
+
+    /// Final review pass (both reviewers): the request loop's read was
+    /// plain `read_msg`, bounded only by the per-syscall socket timeout —
+    /// the exact gap consolidated round 3 closed for the handshake and
+    /// next_event. A daemon dribbling the response frame faster than that
+    /// timeout keeps every read succeeding, so `request()` stayed pinned
+    /// past its whole-request deadline. The read must be bounded at the
+    /// codec level.
+    #[test]
+    fn request_is_bounded_against_an_ever_dribbling_daemon() {
+        use std::io::Write;
+        use std::os::unix::net::UnixListener;
+        use std::time::{Duration, Instant};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dribble-response.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        std::thread::spawn(move || {
+            let Ok((mut peer, _)) = listener.accept() else {
+                return;
+            };
+            let _ = crate::frame::read_msg::<_, ClientMessage>(&mut peer);
+            let _ = crate::frame::write_msg(
+                &mut peer,
+                &ServerMessage::HelloAck(protonwire_frontend_api::HelloAck {
+                    protocol_version: 1,
+                    daemon_version: "dribbler".into(),
+                    latest_event_seq: 0,
+                }),
+            );
+            // Swallow the request, then announce a plausible frame length
+            // and dribble payload bytes forever: no single read ever hits
+            // the socket timeout.
+            let _ = crate::frame::read_msg::<_, ClientMessage>(&mut peer);
+            let announced = 60_000u32.to_be_bytes();
+            let _ = peer.write_all(&announced);
+            let _ = peer.flush();
+            let mut byte = b'x';
+            loop {
+                if peer.write_all(&[byte]).is_err() {
+                    break;
+                }
+                let _ = peer.flush();
+                byte = byte.wrapping_add(1);
+                std::thread::sleep(Duration::from_millis(25));
+            }
+        });
+
+        let mut client = IpcClient::connect_with_timeout(
+            &path,
+            &test_client_info(),
+            SecurityChecks::dev_unchecked(),
+            Duration::from_millis(300),
+        )
+        .unwrap();
+
+        let started = Instant::now();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let worker = std::thread::spawn(move || {
+            let outcome = client.request(Request::Ping { nonce: "p".into() });
+            let _ = done_tx.send(());
+            outcome
+        });
+        assert!(
+            done_rx.recv_timeout(Duration::from_secs(2)).is_ok(),
+            "request() is pinned by a dribbled response frame despite the deadline"
+        );
+        let err = worker
+            .join()
+            .unwrap()
+            .expect_err("the dribble must expire the request");
+        assert!(
+            matches!(err, RequestError::Transport(_)),
+            "expiry is a transport failure, got {err:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the expiry must arrive at the request deadline, not after a full frame"
         );
     }
 
