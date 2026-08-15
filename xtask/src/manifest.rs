@@ -157,6 +157,18 @@ fn check_status_definitions(doc: &Manifest) -> Vec<String> {
             violations.push(format!("status_definitions is missing `{status}`"));
         }
     }
+    // Codex PR review round 2, finding 5: the vocabulary is frozen, not
+    // merely minimal. check_capabilities builds its accepted set from ALL
+    // definition keys, so an extra definition silently legalizes invented
+    // statuses for capabilities (`waived`, ...) — exactly the drift the
+    // fixed parity-state vocabulary exists to prevent.
+    let frozen: BTreeSet<&str> = REQUIRED_STATUSES.iter().copied().collect();
+    let defined: BTreeSet<&str> = definitions.keys().map(String::as_str).collect();
+    for status in defined.difference(&frozen) {
+        violations.push(format!(
+            "status_definitions contains `{status}`, which is outside the frozen vocabulary {REQUIRED_STATUSES:?}"
+        ));
+    }
     violations
 }
 
@@ -521,6 +533,42 @@ capabilities:
         fs::remove_file(&path).ok();
     }
 
+    /// Codex PR review round 2, finding 5 (P2): status_definitions only
+    /// had to CONTAIN the six frozen statuses — extra invented ones were
+    /// allowed, and check_capabilities built its accepted set from all
+    /// definition keys, so a `waived` status with capabilities assigned
+    /// to it passed manifest-validate, drifting past the fixed parity
+    /// vocabulary the gate claims to enforce.
+    #[test]
+    fn status_definitions_must_match_the_frozen_vocabulary_exactly() {
+        // An extra definition alone is vocabulary drift...
+        let yaml = good_manifest_yaml().replacen(
+            "  legacy-excluded: l\n",
+            "  legacy-excluded: l\n  waived: w\n",
+            1,
+        );
+        let path = temp_yaml("extra-status", &yaml);
+        assert!(
+            !validate(&path).unwrap(),
+            "an extra status definition must fail the gate"
+        );
+        fs::remove_file(&path).ok();
+
+        // ...and capabilities cannot flee to invented statuses either.
+        let yaml = good_manifest_yaml()
+            .replacen(
+                "  legacy-excluded: l\n",
+                "  legacy-excluded: l\n  waived: w\n",
+                1,
+            )
+            .replacen("    status: required", "    status: waived", 1);
+        let path = temp_yaml("waived-cap", &yaml);
+        assert!(
+            !validate(&path).unwrap(),
+            "a capability using an invented status must fail the gate"
+        );
+        fs::remove_file(&path).ok();
+    }
     #[test]
     fn verified_without_evidence_fails() {
         let yaml = good_manifest_yaml().replacen(
