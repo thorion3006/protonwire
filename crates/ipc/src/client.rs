@@ -233,13 +233,37 @@ impl IpcClient {
             RequestError::Transport(format!("write failed: {e}"))
         })?;
         loop {
-            if std::time::Instant::now() > deadline {
+            let now = std::time::Instant::now();
+            if now > deadline {
                 self.poisoned = true;
                 return Err(RequestError::Transport(
                     "request timed out without a response".into(),
                 ));
             }
-            match read_msg::<_, ServerMessage>(&mut self.stream) {
+            // Bound THIS read by the remaining budget (Codex PR review
+            // finding 9): the socket timeout is the full self.timeout, so
+            // an event arriving near the deadline would otherwise let the
+            // next read block a whole extra timeout past it. A zero
+            // remainder is the deadline itself (a zero SO_RCVTIMEO means
+            // "block forever" on Linux, so it must not reach the socket).
+            let remaining = deadline.saturating_duration_since(now);
+            if remaining.is_zero() {
+                self.poisoned = true;
+                return Err(RequestError::Transport(
+                    "request timed out without a response".into(),
+                ));
+            }
+            if let Err(e) = self.stream.set_read_timeout(Some(remaining)) {
+                self.poisoned = true;
+                return Err(RequestError::Transport(format!(
+                    "cannot apply request deadline: {e}"
+                )));
+            }
+            let outcome = read_msg::<_, ServerMessage>(&mut self.stream);
+            // Restore the whole-request timeout for callers between loops
+            // (next_event reads with it once request returns).
+            let _ = self.stream.set_read_timeout(Some(self.timeout));
+            match outcome {
                 Ok(ServerMessage::Response(response)) => match response {
                     Response::Ok { id: seen, result } if seen == id => return Ok(result),
                     Response::Error { id: seen, error } if seen == id => return Err(error.into()),
@@ -262,14 +286,35 @@ impl IpcClient {
                 }
                 Err(e) => {
                     self.poisoned = true;
-                    return Err(RequestError::Transport(format!("read failed: {e}")));
+                    let message = if std::time::Instant::now() >= deadline {
+                        // The deadline-bounded read expired: report it as
+                        // the request timeout it is, not a generic I/O
+                        // failure.
+                        "request timed out without a response".to_owned()
+                    } else {
+                        format!("read failed: {e}")
+                    };
+                    return Err(RequestError::Transport(message));
                 }
             }
         }
     }
 
     /// Returns the next buffered or socket event, blocking until one arrives.
+    ///
+    /// Fails fast on a poisoned transport (Codex PR review finding 10),
+    /// exactly like [`IpcClient::request`]: after a timeout, I/O failure,
+    /// or desynchronization the stream may hold stranded bytes, so an
+    /// event-loop caller must get its reconnect instruction immediately
+    /// instead of blocking for the socket timeout or consuming a stranded
+    /// late response.
     pub fn next_event(&mut self) -> io::Result<EventEnvelope> {
+        if self.poisoned {
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "connection unusable after a previous failure; reconnect",
+            ));
+        }
         if let Some(envelope) = self.pending_events.pop_front() {
             return Ok(envelope);
         }
@@ -464,5 +509,127 @@ mod tests {
             }
             other => panic!("expected Untrusted, got {other:?}"),
         }
+    }
+
+    /// A scripted daemon-side peer: handshakes, then answers one request
+    /// with an Event after `event_delay` and never responds.
+    struct EventThenSilencePeer;
+
+    impl EventThenSilencePeer {
+        fn spawn(dir: &tempfile::TempDir, event_delay: std::time::Duration) -> std::path::PathBuf {
+            use std::os::unix::net::{UnixListener, UnixStream};
+            let path = dir.path().join("eventful.sock");
+            let listener = UnixListener::bind(&path).unwrap();
+            let delay = event_delay;
+            std::thread::spawn(move || {
+                let Ok((mut peer, _)) = listener.accept() else {
+                    return;
+                };
+                let _ = crate::frame::read_msg::<_, ClientMessage>(&mut peer);
+                let _ = crate::frame::write_msg(
+                    &mut peer,
+                    &ServerMessage::HelloAck(protonwire_frontend_api::HelloAck {
+                        protocol_version: 1,
+                        daemon_version: "eventful".into(),
+                        latest_event_seq: 0,
+                    }),
+                );
+                // Answer the request with an event after the delay, then
+                // swallow everything forever.
+                let _ = crate::frame::read_msg::<_, ClientMessage>(&mut peer);
+                std::thread::sleep(delay);
+                let _ = crate::frame::write_msg(
+                    &mut peer,
+                    &ServerMessage::Event(protonwire_frontend_api::EventEnvelope {
+                        seq: 1,
+                        event: protonwire_frontend_api::Event::Notice {
+                            level: protonwire_frontend_api::NoticeLevel::Info,
+                            message: "mid-request".into(),
+                        },
+                    }),
+                );
+                while crate::frame::read_msg::<_, ClientMessage>(&mut peer).is_ok() {}
+            });
+            path
+        }
+    }
+
+    /// Codex PR review finding 9 (P2): the request loop's per-read timeout
+    /// was the full `self.timeout`, so an event arriving shortly before the
+    /// deadline made the NEXT read block up to a whole extra timeout — an
+    /// event at 9.9 s of a 10 s request could hold the caller to ~19.9 s.
+    /// Each read must be bounded by the deadline's remaining duration.
+    #[test]
+    fn request_deadline_bounds_every_read_not_just_the_first() {
+        use std::time::{Duration, Instant};
+
+        let dir = tempfile::tempdir().unwrap();
+        let timeout = Duration::from_secs(1);
+        let path = EventThenSilencePeer::spawn(&dir, Duration::from_millis(400));
+        let mut client = IpcClient::connect_with_timeout(
+            &path,
+            &test_client_info(),
+            SecurityChecks::dev_unchecked(),
+            timeout,
+        )
+        .unwrap();
+
+        let started = Instant::now();
+        let err = client
+            .request(Request::Ping { nonce: "p".into() })
+            .expect_err("silent after one event must time out");
+        let elapsed = started.elapsed();
+        assert!(
+            matches!(err, RequestError::Transport(_)),
+            "timeout is a transport failure, got {err:?}"
+        );
+        // The event at 0.4 s must not buy the (silent) read a full extra
+        // second: pre-fix the call returned at ~1.4 s.
+        assert!(
+            elapsed < timeout + Duration::from_millis(200),
+            "request overran its deadline: {elapsed:?} (timeout {timeout:?})"
+        );
+    }
+
+    /// Codex PR review finding 10 (P2): next_event must fail fast once the
+    /// transport is poisoned, exactly like request — otherwise a caller
+    /// returning to its event loop after a failed request blocks for the
+    /// full socket timeout or consumes a stranded late response.
+    #[test]
+    fn next_event_fails_fast_after_poisoning() {
+        use std::time::{Duration, Instant};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = EventThenSilencePeer::spawn(&dir, Duration::from_millis(400));
+        let mut client = IpcClient::connect_with_timeout(
+            &path,
+            &test_client_info(),
+            SecurityChecks::dev_unchecked(),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+
+        let err = client
+            .request(Request::Ping { nonce: "p".into() })
+            .expect_err("silent peer must poison the transport");
+        assert!(matches!(err, RequestError::Transport(_)));
+
+        // A long timeout from here on: the fail-fast must NOT depend on the
+        // socket timeout. Pre-fix this call blocked for the full 10 s.
+        client.set_timeout(Duration::from_secs(10));
+        let started = Instant::now();
+        let err = client
+            .next_event()
+            .expect_err("poisoned transport must fail fast in next_event");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "next_event blocked {elapsed:?} on a poisoned transport",
+            elapsed = started.elapsed()
+        );
+        assert!(
+            err.to_string().to_lowercase().contains("reconnect"),
+            "error should instruct a reconnect, got: {err}"
+        );
+        assert_eq!(err.kind(), std::io::ErrorKind::ConnectionAborted);
     }
 }
