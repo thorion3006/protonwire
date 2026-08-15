@@ -31,6 +31,9 @@ pub enum Authority {
 pub struct DaemonSection {
     /// IPC socket path override (system authority).
     pub socket_path: Option<String>,
+    /// Group the IPC socket is chowned to so unprivileged clients can
+    /// reach it (system authority; unset means no chown).
+    pub socket_group: Option<String>,
     /// TUN interface name.
     pub interface_name: String,
     /// Log verbosity.
@@ -43,6 +46,7 @@ impl Default for DaemonSection {
     fn default() -> Self {
         Self {
             socket_path: None,
+            socket_group: None,
             interface_name: "protonwire0".into(),
             log_level: "info".into(),
             network_integration: NetworkIntegrationMode::Auto,
@@ -960,6 +964,28 @@ mod tests {
         std::fs::write(&path, example_config_yaml()).unwrap();
         let config = SystemConfig::load(&path).unwrap();
         assert_eq!(config.daemon.interface_name, "protonwire0");
+    }
+
+    /// pr-champion WO-7 (PRD 6.3): `daemon.socket_group` names the group
+    /// the daemon chowns its socket to so unprivileged clients can reach
+    /// it. It sits beside `socket_path`, defaults to unset (no chown), and
+    /// is system authority like its neighbor.
+    #[test]
+    fn daemon_socket_group_parses_and_defaults_to_unset() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        std::fs::write(
+            &path,
+            "schema_version: 2\ndaemon:\n  socket_group: protonwire-clients\n",
+        )
+        .unwrap();
+        let config = SystemConfig::load(&path).unwrap();
+        config.validate().unwrap();
+        assert_eq!(
+            config.daemon.socket_group.as_deref(),
+            Some("protonwire-clients")
+        );
+        assert!(SystemConfig::default().daemon.socket_group.is_none());
     }
 
     #[test]

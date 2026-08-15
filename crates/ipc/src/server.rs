@@ -102,8 +102,38 @@ impl IpcServer {
     ///
     /// Creates the directory if missing, refuses to displace a live daemon's
     /// socket, and removes a stale socket file left by an unclean shutdown.
-    /// The socket is created with mode `0o660`.
+    /// The socket is created with mode `0o660`. See
+    /// [`IpcServer::bind_with_group`] for the client-group chown a root
+    /// daemon needs on top of that mode.
     pub fn bind(socket_dir: &Path, socket_name: &str) -> io::Result<Self> {
+        Self::bind_with_group(socket_dir, socket_name, None)
+    }
+
+    /// [`IpcServer::bind`] with the socket additionally chowned to `group`.
+    ///
+    /// PRD 6.3: a root daemon creates the socket root:root, and the 0o660
+    /// mode alone then admits no unprivileged client. With a group
+    /// configured the socket is chowned to that group's gid (owner
+    /// untouched) right after the mode is applied, so members of the group
+    /// can connect. An unresolvable group name fails loudly — a daemon
+    /// started with a typo'd group is a daemon nobody can reach.
+    pub fn bind_with_group(
+        socket_dir: &Path,
+        socket_name: &str,
+        group: Option<&str>,
+    ) -> io::Result<Self> {
+        Self::bind_with_resolved(socket_dir, socket_name, group, &resolve_group_gid)
+    }
+
+    /// The bind path with an injectable group resolver (tests map the
+    /// resolution error surface without a group database; production goes
+    /// through [`IpcServer::bind_with_group`]).
+    fn bind_with_resolved(
+        socket_dir: &Path,
+        socket_name: &str,
+        group: Option<&str>,
+        resolver: &dyn Fn(&str) -> io::Result<Option<nix::unistd::Gid>>,
+    ) -> io::Result<Self> {
         std::fs::create_dir_all(socket_dir)?;
         let socket_path = socket_dir.join(socket_name);
         if socket_path.exists() {
@@ -112,6 +142,11 @@ impl IpcServer {
         }
         let listener = UnixListener::bind(&socket_path)?;
         set_socket_mode(&socket_path)?;
+        if let Some(name) = group {
+            let gid = resolver(name)?
+                .ok_or_else(|| io::Error::other(format!("socket group `{name}` does not exist")))?;
+            chown_socket_group(&socket_path, name, gid)?;
+        }
         info!(path = %socket_path.display(), "IPC server bound");
         Ok(Self {
             listener,
@@ -309,6 +344,19 @@ fn ensure_not_live(socket_path: &Path) -> io::Result<()> {
 fn set_socket_mode(socket_path: &Path) -> io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o660))
+}
+
+/// Resolves a group name to its gid through the system group database.
+fn resolve_group_gid(name: &str) -> io::Result<Option<nix::unistd::Gid>> {
+    nix::unistd::Group::from_name(name)
+        .map(|group| group.map(|g| g.gid))
+        .map_err(|e| io::Error::other(format!("cannot look up group `{name}`: {e}")))
+}
+
+/// Chowns the bound socket to `gid`, leaving its owner alone.
+fn chown_socket_group(socket_path: &Path, name: &str, gid: nix::unistd::Gid) -> io::Result<()> {
+    nix::unistd::chown(socket_path, None, Some(gid))
+        .map_err(|e| io::Error::other(format!("cannot chown socket to group `{name}`: {e}")))
 }
 
 /// Serves one client connection until EOF, error, or daemon shutdown.
@@ -1390,6 +1438,110 @@ mod tests {
             "live socket must abort bind, got: {err}"
         );
         drop(listener);
+    }
+
+    /// pr-champion WO-7 (PRD 6.3): bind() chmods the socket 0o660 but
+    /// never chgrps it, so a root daemon leaves the socket root:root and
+    /// every unprivileged client eats EACCES. `bind_with_group` must
+    /// chown to the configured group's gid — and an unresolvable name
+    /// must fail loudly rather than start a daemon nobody can reach.
+    #[test]
+    fn bind_with_group_fails_loud_on_an_unknown_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = IpcServer::bind_with_group(
+            dir.path(),
+            "nope.sock",
+            Some("protonwire-no-such-group-3f9a"),
+        )
+        .map(|_| ())
+        .expect_err("an unresolvable group must abort bind");
+        assert!(
+            err.to_string().contains("does not exist"),
+            "fail-loud error must name the problem, got: {err}"
+        );
+    }
+
+    /// A resolver failure (group database unreadable, say) maps to an
+    /// io::Error instead of a panic or a silent skip.
+    #[test]
+    fn bind_with_group_maps_resolver_failures() {
+        let dir = tempfile::tempdir().unwrap();
+        let err =
+            IpcServer::bind_with_resolved(dir.path(), "boom.sock", Some("clients"), &|_name| {
+                Err(io::Error::other("group database on fire"))
+            })
+            .map(|_| ())
+            .expect_err("a resolver failure must abort bind");
+        assert!(
+            err.to_string().contains("group database on fire"),
+            "got: {err}"
+        );
+    }
+
+    /// Without a configured group nothing is resolved or chowned: the
+    /// socket keeps the process group and the 0o660 mode.
+    #[test]
+    fn bind_without_a_group_never_resolves_or_chowns() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let server = IpcServer::bind_with_resolved(dir.path(), "plain.sock", None, &|_| {
+            panic!("no group configured: the resolver must not run")
+        })
+        .unwrap();
+        let meta = std::fs::metadata(server.socket_path()).unwrap();
+        assert_eq!(meta.gid(), nix::unistd::getgid().as_raw());
+        assert_eq!(meta.mode() & 0o777, 0o660);
+    }
+
+    /// The resolved gid flows to a real chown (mode still 0o660). The
+    /// injected gid is the process's own primary group: POSIX lets any
+    /// user chgrp a file it owns to a group it belongs to, so this
+    /// exercises the chown path unprivileged. (Environments that run the
+    /// suite inside a restricted user namespace — where supplementary
+    /// gids are unmapped and chown to them answers EINVAL — still admit
+    /// the primary gid; a FOREIGN group is the root-gated test below.)
+    #[test]
+    fn bind_with_group_applies_the_resolved_gid() {
+        use std::os::unix::fs::MetadataExt;
+
+        let gid = nix::unistd::getgid();
+        let dir = tempfile::tempdir().unwrap();
+        let server =
+            IpcServer::bind_with_resolved(dir.path(), "grouped.sock", Some("clients"), &|_| {
+                Ok(Some(gid))
+            })
+            .unwrap();
+        let meta = std::fs::metadata(server.socket_path()).unwrap();
+        assert_eq!(meta.gid(), gid.as_raw());
+        assert_eq!(meta.mode() & 0o777, 0o660);
+    }
+
+    /// Root-gated integration (mirroring the root-gated arm of
+    /// `only_connection_refused_authorizes_unlinking_a_stale_socket`):
+    /// only root may chown to a group it does not belong to, so the full
+    /// production path — real resolver against the group database, real
+    /// chown — runs when the suite executes as root and skips otherwise.
+    #[test]
+    fn bind_with_group_chowns_to_a_real_group_when_root() {
+        use std::os::unix::fs::MetadataExt;
+
+        if !nix::unistd::getuid().is_root() {
+            return;
+        }
+        let group = nix::unistd::Group::from_name("nogroup")
+            .expect("nogroup resolves")
+            .expect("nogroup exists");
+        let dir = tempfile::tempdir().unwrap();
+        let server = IpcServer::bind_with_group(dir.path(), "clients.sock", Some("nogroup"))
+            .expect("root binds with a real group");
+        let meta = std::fs::metadata(server.socket_path()).unwrap();
+        assert_eq!(
+            meta.gid(),
+            group.gid.as_raw(),
+            "socket must be chowned to the configured group"
+        );
+        assert_eq!(meta.mode() & 0o777, 0o660);
     }
 
     /// pr-champion WO-4: `serve_with` pushed a `SessionWorker` per accepted

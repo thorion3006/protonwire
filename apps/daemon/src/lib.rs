@@ -14,7 +14,9 @@ use std::path::{Path, PathBuf};
 /// the `--socket-dir` CLI override wins, then the config document's
 /// `daemon.socket_path` (split into directory and name), then the default
 /// `ConfigPaths` location. Pure so the precedence is unit-testable —
-/// `main` only wires it into [`protonwire_ipc::server::IpcServer::bind`].
+/// `main` only wires it into
+/// [`protonwire_ipc::server::IpcServer::bind_with_group`] (with
+/// `daemon.socket_group` alongside, pr-champion WO-7).
 pub fn resolve_bind_location(
     cli_socket_dir: Option<&Path>,
     config_socket_path: Option<&str>,

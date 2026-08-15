@@ -67,8 +67,11 @@ fn main() {
 
     // Codex PR review finding 4: capture daemon.socket_path before `config`
     // moves into the core; binding applies it with --socket-dir > config >
-    // default precedence (see resolve_bind_location).
+    // default precedence (see resolve_bind_location). daemon.socket_group
+    // rides along (pr-champion WO-7): the socket is chowned to that group
+    // so unprivileged clients can reach a root-owned socket (PRD 6.3).
     let config_socket_path = config.daemon.socket_path.clone();
+    let config_socket_group = config.daemon.socket_group.clone();
     let bus = Arc::new(protonwire_ipc::EventBus::new());
     let core = Arc::new(protonwire_core::DaemonCore::new(
         env!("CARGO_PKG_VERSION"),
@@ -81,7 +84,11 @@ fn main() {
         &paths.socket_dir,
         &paths.socket_name,
     );
-    let server = match protonwire_ipc::server::IpcServer::bind(&socket_dir, &socket_name) {
+    let server = match protonwire_ipc::server::IpcServer::bind_with_group(
+        &socket_dir,
+        &socket_name,
+        config_socket_group.as_deref(),
+    ) {
         Ok(server) => server,
         Err(e) => {
             eprintln!(
