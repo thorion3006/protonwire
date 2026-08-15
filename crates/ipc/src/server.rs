@@ -36,7 +36,7 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 /// a handler that blocks) would otherwise hold `serve()` open indefinitely.
 /// Three write ceilings: one blocked final write, one slow poll loop, and
 /// one in-flight dispatch each get a full chance to finish.
-const DRAIN_CEILING: Duration = Duration::from_secs(3 * WRITE_TIMEOUT.as_secs());
+const DRAIN_CEILING: Duration = WRITE_TIMEOUT.saturating_mul(3);
 
 /// Timing budgets for one `serve()` invocation. Production uses the
 /// defaults; tests inject shrunk values so drain and dribble scenarios run
@@ -79,8 +79,8 @@ pub trait RequestHandler: Send + Sync {
     ///
     /// Bounded-dispatch contract: `handle` runs on the session's dispatch
     /// thread and must return promptly — well inside the 10 s
-    /// [`WRITE_TIMEOUT`] ceiling. The server enforces an overall
-    /// [`DRAIN_CEILING`] on shutdown draining: a handler still running past
+    /// WRITE_TIMEOUT ceiling. The server enforces an overall
+    /// DRAIN_CEILING on shutdown draining: a handler still running past
     /// it gets its session socket forced down and its worker detached, so a
     /// blocking `handle` cannot pin `serve()` (but leaks its thread —
     /// long work belongs on a background task, with the response queued
@@ -136,7 +136,7 @@ impl IpcServer {
     /// example — are flushed to their sockets first (Codex PR review round
     /// 2, finding 4). A caller that exits when this returns therefore
     /// cannot lose a final response to process teardown. Draining is
-    /// bounded overall by [`DRAIN_CEILING`] (3× the 10 s write ceiling):
+    /// bounded overall by DRAIN_CEILING (3× the 10 s write ceiling):
     /// a session still owing data past it has its socket forced down and
     /// its worker detached, because `SO_SNDTIMEO` bounds each write
     /// syscall — not the shutdown join — and a slow-dribbling peer (or a
@@ -216,7 +216,7 @@ impl IpcServer {
         }
         for session in sessions {
             if session.join.is_finished() {
-                let _ = session.join;
+                let _ = session.join.join();
                 continue;
             }
             // Past the ceiling the straggler is forced down and detached:
