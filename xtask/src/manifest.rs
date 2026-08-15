@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
 
 use crate::{Reporter, expect_value, is_capability_id, is_git_revision, is_sha256_hex, is_test_id};
@@ -239,16 +239,33 @@ struct LockDocument {
 
 impl Lockfile {
     /// Parses lockfile text (`[[package]]` entries, format v3/v4).
+    ///
+    /// Duplicate `(name, version)` entries are a hard error (sec-auditor,
+    /// consolidated round 3, item I): the checksum lookups key on that
+    /// pair, and two sources resolving the same pair make "the" checksum
+    /// whichever entry the collector saw last — an ambiguity the digest
+    /// comparison cannot detect. Rejecting forces a human to reconcile
+    /// the lockfile instead of the gate guessing.
     fn parse(text: &str) -> Result<Self> {
         let doc: LockDocument =
             toml::from_str(text).with_context(|| "failed to parse Cargo.lock")?;
-        Ok(Self {
-            checksums: doc
-                .packages
-                .into_iter()
-                .filter_map(|package| Some(((package.name, package.version), package.checksum?)))
-                .collect(),
-        })
+        let mut checksums = BTreeMap::new();
+        let mut seen = BTreeSet::new();
+        for package in doc.packages {
+            let key = (package.name.clone(), package.version.clone());
+            if !seen.insert(key) {
+                return Err(anyhow!(
+                    "Cargo.lock lists {} {} more than once — duplicate \
+                     (name, version) entries make the checksum ambiguous",
+                    package.name,
+                    package.version,
+                ));
+            }
+            if let Some(checksum) = package.checksum {
+                checksums.insert((package.name, package.version), checksum);
+            }
+        }
+        Ok(Self { checksums })
     }
 
     /// Reads and parses the lockfile at `path`.
@@ -648,6 +665,20 @@ capabilities:
         );
         fs::remove_file(&path).ok();
 
+        // QA mutation gap (item G5): the symmetric tamper on the pvpnclient
+        // digest — the muon case passing does not prove this branch.
+        let yaml = good_manifest_yaml().replacen(
+            "3c14ef052727e0204ec5e80cf8df50786db38a83b6a6557a188b78a4c264f380",
+            "3c14ef052727e0204ec5e80cf8df50786db38a83b6a6557a188b78a4c264f381",
+            1,
+        );
+        let path = temp_yaml("checksum-pvpn", &yaml);
+        assert!(
+            !validate(&path, &good_lock()).unwrap(),
+            "a tampered pvpnclient digest must fail the gate too, not just muon's"
+        );
+        fs::remove_file(&path).ok();
+
         // The untampered manifest agrees with the lockfile and passes.
         let path = temp_yaml("checksum-ok", &good_manifest_yaml());
         assert!(
@@ -665,6 +696,30 @@ capabilities:
             "an unverifiable checksum must fail, not pass vacuously"
         );
         fs::remove_file(&path).ok();
+    }
+
+    /// Sec-auditor (consolidated round 3, item I): the parsed lockfile map
+    /// keyed (name, version) silently OVERWROTE duplicates, so a lockfile
+    /// carrying two entries for the same package+version (different
+    /// sources) would resolve "the" checksum to whichever landed last —
+    /// a supply-chain ambiguity the digest comparison cannot see. Parsing
+    /// must reject duplicate (name, version) entries outright.
+    #[test]
+    fn duplicate_lock_entries_are_rejected_at_parse() {
+        // The same package+version twice (a second source, no checksum):
+        // indistinguishable from the real entry by the map key alone.
+        let duplicated = format!(
+            "{}\n[[package]]\nname = \"muon\"\nversion = \"2.6.1\"\nsource = \"git+https://example.com/muon?rev=deadbeef\"\n",
+            good_lockfile_text()
+        );
+        let outcome = Lockfile::parse(&duplicated);
+        assert!(
+            outcome.is_err(),
+            "a duplicate (name, version) lockfile entry must fail the parse, \
+             not silently overwrite the checksum the gate compares against"
+        );
+        // The fixture without the duplicate still parses.
+        assert!(Lockfile::parse(&good_lockfile_text()).is_ok());
     }
 
     #[test]
