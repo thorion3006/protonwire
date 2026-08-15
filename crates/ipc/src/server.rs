@@ -93,12 +93,21 @@ impl IpcServer {
     /// fully isolated: a misbehaving client only drops its own session.
     /// Sessions are bounded (64), must complete the handshake within 5 s,
     /// and cannot pin a writer past 10 s.
+    ///
+    /// Returning implies every session has DRAINED: responses queued before
+    /// the stop flag — an administrator Shutdown acknowledgement, for
+    /// example — are flushed to their sockets first (Codex PR review round
+    /// 2, finding 4). A caller that exits when this returns therefore
+    /// cannot lose a final response to process teardown. Draining is
+    /// bounded per session by the 250 ms read poll and the 10 s write
+    /// ceiling.
     pub fn serve<H: RequestHandler + 'static>(&self, handler: Arc<H>, stop: Arc<AtomicBool>) {
         // Poll-accept so shutdown is responsive without signal plumbing here.
         if let Err(e) = self.listener.set_nonblocking(true) {
             warn!("cannot switch accept loop to nonblocking mode: {e}");
             return;
         }
+        let mut sessions: Vec<std::thread::JoinHandle<()>> = Vec::new();
         while !stop.load(Ordering::SeqCst) {
             match self.listener.accept() {
                 Ok((stream, _)) => {
@@ -113,13 +122,13 @@ impl IpcServer {
                     }
                     let handler = Arc::clone(&handler);
                     let stop = Arc::clone(&stop);
-                    std::thread::spawn(move || {
+                    sessions.push(std::thread::spawn(move || {
                         if let Err(e) = std::panic::catch_unwind(AssertUnwindSafe(|| {
                             handle_session(stream, handler, stop)
                         })) {
                             warn!("IPC session panicked and was dropped: {e:?}");
                         }
-                    });
+                    }));
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                     std::thread::sleep(READ_POLL);
@@ -129,6 +138,16 @@ impl IpcServer {
                     std::thread::sleep(READ_POLL);
                 }
             }
+        }
+        // Codex PR review round 2, finding 4: the session workers are
+        // detached from the accept loop, and a handler can publish the
+        // stop flag BEFORE its response is queued (the Shutdown path).
+        // Returning without joining let the daemon's main exit while a
+        // writer still owed its client a final acknowledgement. Joining
+        // every session makes serve()'s return mean "all sessions torn
+        // down and their queued responses flushed".
+        for session in sessions {
+            let _ = session.join();
         }
     }
 }
@@ -811,6 +830,104 @@ mod tests {
     /// signal (ECONNREFUSED) may authorize unlinking the socket file. Any
     /// other connect failure (descriptor exhaustion, EACCES, ...) is
     /// inconclusive: unlinking then leaves a live daemon unreachable while
+
+    /// Codex PR review round 2, finding 4 (P2): an administrator Shutdown
+    /// sets the stop flag BEFORE the session queues its acknowledgement.
+    /// The accept loop observes the flag and returns, and the daemon's
+    /// main exits with the detached session workers dying mid-flush —
+    /// `protonwire daemon stop` can report a transport failure for a
+    /// shutdown that succeeded. serve() must not return until every
+    /// session has drained, so a caller that exits on its return cannot
+    /// lose a queued final response.
+    #[test]
+    fn serve_returns_only_after_sessions_flushed_their_final_responses() {
+        use std::time::{Duration, Instant};
+
+        /// Mirrors DaemonHandler's Shutdown ordering: the stop flag is
+        /// published BEFORE the response is returned, and the handler is
+        /// slow to answer so the accept loop observes the flag while the
+        /// session is still mid-dispatch.
+        struct StopThenSlowPong {
+            bus: Arc<EventBus>,
+            stop: Arc<AtomicBool>,
+        }
+        impl RequestHandler for StopThenSlowPong {
+            fn daemon_version(&self) -> &str {
+                "test"
+            }
+            fn latest_event_seq(&self) -> u64 {
+                0
+            }
+            fn handle(
+                &self,
+                _ctx: &SessionContext,
+                request: Request,
+            ) -> Result<RequestResult, RpcError> {
+                match request {
+                    Request::Ping { nonce } => {
+                        self.stop.store(true, Ordering::SeqCst);
+                        std::thread::sleep(Duration::from_millis(900));
+                        Ok(RequestResult::Pong { nonce })
+                    }
+                    _ => Err(RpcError::new(
+                        protonwire_frontend_api::RpcErrorCode::NotImplemented,
+                        "test handler",
+                    )),
+                }
+            }
+            fn event_bus(&self) -> &EventBus {
+                &self.bus
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let bus = Arc::new(EventBus::new());
+        let stop = Arc::new(AtomicBool::new(false));
+        let handler = Arc::new(StopThenSlowPong {
+            bus: Arc::clone(&bus),
+            stop: Arc::clone(&stop),
+        });
+        let server = IpcServer::bind(dir.path(), "drain.sock").unwrap();
+        let path = server.socket_path().to_owned();
+        let served = std::thread::spawn(move || server.serve(handler, stop));
+
+        let mut stream = connect_and_hello(&path);
+        write_msg(
+            &mut stream,
+            &ClientMessage::Request {
+                id: 42,
+                request: Request::Ping {
+                    nonce: "stop".into(),
+                },
+            },
+        )
+        .unwrap();
+
+        // The accept loop sees the flag within one READ_POLL (~250 ms)
+        // while the handler still sleeps — pre-fix, serve() returned with
+        // the acknowledgement not even queued.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !served.is_finished() {
+            assert!(
+                Instant::now() < deadline,
+                "serve() did not return after the stop flag"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert_eq!(
+            bus.active_sessions(),
+            0,
+            "serve() returned while a session was still draining — its \
+             queued response can be lost to process exit"
+        );
+        // The guarantee `protonwire daemon stop` depends on: the
+        // acknowledgement is on the wire before the caller proceeds.
+        match read_msg::<_, ServerMessage>(&mut stream).unwrap() {
+            ServerMessage::Response(response) => assert_eq!(response.id(), 42),
+            other => panic!("expected the drained acknowledgement, got {other:?}"),
+        }
+        let _ = served.join();
+    }
     /// another instance binds the same path.
     #[test]
     fn only_connection_refused_authorizes_unlinking_a_stale_socket() {
