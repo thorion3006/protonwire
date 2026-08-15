@@ -161,6 +161,12 @@ impl IpcServer {
         }
         let mut sessions: Vec<SessionWorker> = Vec::new();
         while !stop.load(Ordering::SeqCst) {
+            // Reap before (potentially) accepting again: the list only
+            // grows otherwise, and a client that reconnects on a cadence
+            // (the TUI retries every 750 ms) leaves one dead worker per
+            // attempt — ~115k handles a day held until shutdown
+            // (pr-champion WO-4).
+            reap_finished(&mut sessions);
             match self.listener.accept() {
                 Ok((stream, _)) => {
                     // Reserve the session slot ATOMICALLY, before the worker
@@ -250,6 +256,27 @@ impl Drop for IpcServer {
 struct SessionWorker {
     join: std::thread::JoinHandle<()>,
     stream: std::sync::Weak<UnixStream>,
+}
+
+/// Joins and removes session workers whose threads have finished.
+///
+/// `serve_with` pushes one [`SessionWorker`] per accepted connection and
+/// calls this from the top of every accept-loop iteration, so the list
+/// holds only the sessions still being served. Joining a handle whose
+/// thread already reported [`std::thread::JoinHandle::is_finished`]
+/// returns immediately, so this never blocks on a live session — and the
+/// shutdown drain below is unaffected: a worker joined here is gone from
+/// the list before the drain phase ever looks at it.
+fn reap_finished(sessions: &mut Vec<SessionWorker>) {
+    let mut index = 0;
+    while index < sessions.len() {
+        if sessions[index].join.is_finished() {
+            let finished = sessions.remove(index);
+            let _ = finished.join.join();
+        } else {
+            index += 1;
+        }
+    }
 }
 
 /// Whether a connect failure definitively identifies a stale socket file
@@ -1334,6 +1361,67 @@ mod tests {
             "live socket must abort bind, got: {err}"
         );
         drop(listener);
+    }
+
+    /// pr-champion WO-4: `serve_with` pushed a `SessionWorker` per accepted
+    /// connection and nothing ever shrank the list until shutdown. A client
+    /// that reconnects on a cadence (the TUI retries every 750 ms) leaves
+    /// one dead `JoinHandle` plus weak stream pointer per connection —
+    /// roughly 115k/day of handle bookkeeping held for the daemon's whole
+    /// lifetime. The accept loop must reap finished workers as it goes,
+    /// while the shutdown drain semantics stay unchanged (only finished
+    /// workers leave; the ceiling phase never sees one it already joined).
+    #[test]
+    fn reap_finished_joins_and_removes_ended_workers() {
+        let mut sessions: Vec<SessionWorker> = Vec::new();
+        // One still-serving worker whose handle must survive the reap.
+        let live_done = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&live_done);
+        sessions.push(SessionWorker {
+            join: std::thread::spawn(move || {
+                while !flag.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }),
+            stream: std::sync::Weak::new(),
+        });
+        // N short-lived workers holding weak handles on streams that are
+        // already gone (Weak::new()), like sessions the drain phase will
+        // never need to force down.
+        for _ in 0..8 {
+            sessions.push(SessionWorker {
+                join: std::thread::spawn(|| ()),
+                stream: std::sync::Weak::new(),
+            });
+        }
+        // Let every short-lived worker finish; the live one must not.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while sessions.iter().filter(|s| !s.join.is_finished()).count() > 1 {
+            assert!(
+                Instant::now() < deadline,
+                "short-lived workers never finished"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        reap_finished(&mut sessions);
+        assert_eq!(
+            sessions.len(),
+            1,
+            "the reap must keep the worker that is still serving"
+        );
+        assert!(!sessions[0].join.is_finished());
+        // Once the live worker ends, the next reap empties the list.
+        live_done.store(true, Ordering::SeqCst);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !sessions[0].join.is_finished() {
+            assert!(Instant::now() < deadline, "live worker never finished");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        reap_finished(&mut sessions);
+        assert!(
+            sessions.is_empty(),
+            "the reap must join and remove every ended worker"
+        );
     }
 
     fn connect_error(path: &Path) -> io::Error {
