@@ -93,15 +93,30 @@ type Term = Terminal<Backend>;
 
 fn setup_terminal() -> std::io::Result<Term> {
     install_panic_hook();
+    // Each mutation is rolled back if a LATER step fails (Codex PR review
+    // finding 8): `?` on EnterAlternateScreen or Terminal construction
+    // returned to main with raw mode still on (or stuck on the alternate
+    // screen) and no Term existing, so main's restore() never ran and the
+    // user's shell was left broken. Explicit matches, not `?`, so every
+    // completed step is undone on the way out.
     terminal::enable_raw_mode()?;
     let mut stdout = std::io::stdout();
-    execute!(stdout, terminal::EnterAlternateScreen)?;
-    Terminal::with_options(
+    if let Err(e) = execute!(stdout, terminal::EnterAlternateScreen) {
+        let _ = terminal::disable_raw_mode();
+        return Err(e);
+    }
+    match Terminal::with_options(
         ratatui::backend::CrosstermBackend::new(stdout),
         TerminalOptions {
             viewport: Viewport::Fullscreen,
         },
-    )
+    ) {
+        Ok(term) => Ok(term),
+        Err(e) => {
+            let _ = restore();
+            Err(e)
+        }
+    }
 }
 
 fn restore() -> std::io::Result<()> {
