@@ -31,7 +31,7 @@ subcommands:
   m49-verify             verify resources/geo/un-m49.csv against docs/connection-groups.yaml
   dep-graph              enforce monorepo dependency rules (forbidden edges, lockfiles, wildcards)
   schema-gen [--check]   regenerate (or check) JSON Schemas from protonwire-frontend-api
-  license-scan           unlicensed-package inventory vs the recorded baseline (distribution gate)
+  license-scan           license inventory: unlicensed-baseline drift + GPL-3 compatibility (NFR-35)
   release-guard          distribution gate: fails while Proton crate licenses are unresolved
   sbom                   SBOM generation (stub; lands in Milestone 8)
   capability-matrix      client capability matrix (stub; lands in Milestone 8, T-24)
