@@ -139,16 +139,30 @@ impl Drop for IpcServer {
     }
 }
 
+/// Whether a connect failure definitively identifies a stale socket file
+/// and therefore authorizes removing it (Codex PR review finding 11).
+///
+/// `ECONNREFUSED` is the only such signal: a stream socket with no
+/// listener refuses immediately. Every other failure (descriptor
+/// exhaustion, `EACCES`, ...) is inconclusive — the socket may belong to
+/// a live but unreachable daemon — and must abort startup instead of
+/// unlinking it and letting a second daemon bind the same path.
+fn authorizes_unlink(e: &io::Error) -> bool {
+    e.kind() == io::ErrorKind::ConnectionRefused
+}
+
 /// Refuses to remove a socket another daemon is actively serving.
 fn ensure_not_live(socket_path: &Path) -> io::Result<()> {
-    // Local Unix sockets connect immediately; a refused or failed connect
-    // means no live listener owns the path.
+    // Local Unix sockets connect immediately; only a REFUSED connect
+    // proves no live listener owns the path. Inconclusive errors are
+    // returned so `bind` fails loudly instead of unlinking.
     match UnixStream::connect(socket_path) {
         Ok(_) => Err(io::Error::other(format!(
             "another daemon is serving {}",
             socket_path.display()
         ))),
-        Err(_) => Ok(()),
+        Err(e) if authorizes_unlink(&e) => Ok(()),
+        Err(e) => Err(e),
     }
 }
 
@@ -706,5 +720,64 @@ mod tests {
             Ok(ServerMessage::Response(response)) => assert_eq!(response.id(), 7),
             other => panic!("expected a correlated response, got {other:?}"),
         }
+    }
+    /// Codex PR review finding 11 (P2): only a definitive stale-socket
+    /// signal (ECONNREFUSED) may authorize unlinking the socket file. Any
+    /// other connect failure (descriptor exhaustion, EACCES, ...) is
+    /// inconclusive: unlinking then leaves a live daemon unreachable while
+    /// another instance binds the same path.
+    #[test]
+    fn only_connection_refused_authorizes_unlinking_a_stale_socket() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // A stale socket (listener dropped, file left behind) is removable.
+        let dir = tempfile::tempdir().unwrap();
+        let stale = dir.path().join("stale.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&stale).unwrap();
+        drop(listener);
+        assert!(authorizes_unlink(&connect_error(&stale)));
+
+
+        // An inconclusive failure (EACCES with the parent dir closed to us;
+        // meaningful only for non-root test users) must NOT authorize it.
+        if !nix::unistd::getuid().is_root() {
+            let closed = dir.path().join("closed");
+            std::fs::create_dir(&closed).unwrap();
+            let socket = closed.join("s.sock");
+            let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+            std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(0o000)).unwrap();
+            let verdict = authorizes_unlink(&connect_error(&socket));
+            std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(0o700)).unwrap();
+            drop(listener);
+            assert!(
+                !verdict,
+                "EACCES is inconclusive and must abort startup, not unlink"
+            );
+        }
+    }
+
+    /// End-to-end bind behavior for the two clear outcomes.
+    #[test]
+    fn bind_refuses_live_and_replaces_stale_sockets() {
+        let dir = tempfile::tempdir().unwrap();
+        // Stale: listener gone, file remains.
+        let stale_dir = dir.path().join("a");
+        std::fs::create_dir(&stale_dir).unwrap();
+        drop(std::os::unix::net::UnixListener::bind(stale_dir.join("s.sock")).unwrap());
+        assert!(IpcServer::bind(&stale_dir, "s.sock").is_ok());
+        // Live: a serving listener owns the path.
+        let live_dir = dir.path().join("b");
+        std::fs::create_dir(&live_dir).unwrap();
+        let listener = std::os::unix::net::UnixListener::bind(live_dir.join("s.sock")).unwrap();
+        let err = IpcServer::bind(&live_dir, "s.sock").map(|_| ()).expect_err("live socket must abort bind");
+        assert!(
+            err.to_string().contains("another daemon"),
+            "live socket must abort bind, got: {err}"
+        );
+        drop(listener);
+    }
+
+    fn connect_error(path: &Path) -> io::Error {
+        UnixStream::connect(path).expect_err("connect against a socket file must fail or succeed")
     }
 }

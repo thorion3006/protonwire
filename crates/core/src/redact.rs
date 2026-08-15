@@ -9,13 +9,15 @@
 //!    that dependencies stringify into messages (the Muon/ProTUN leak path
 //!    called out by FR-7P).
 //!
-//! Registered values are held only to power scrubbing, are capped in count,
-//! and are zeroized on drop.
+//! Registered values are tracked by lifetime: an ALIVE secret is always
+//! scrubbable and dead ones fall out of the registry (no count cap can age
+//! a live token out of scrubbing — Codex PR review finding 12), and every
+//! value is zeroized when its last handle drops.
 
 use std::borrow::Cow;
-use std::collections::VecDeque;
 use std::io::{self, Write};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+
 
 use zeroize::Zeroizing;
 
@@ -26,29 +28,55 @@ pub const REDACTED: &str = "[redacted]";
 /// aggressively (for example a 2-char fragment would mangle ordinary words).
 const MIN_SECRET_LEN: usize = 4;
 
-/// Maximum number of retained secrets; registration beyond this evicts the
-/// oldest.
-const MAX_SECRETS: usize = 256;
+/// Lifetime-aware registry: weak references to the secret values, so a
+/// value is scrubbable exactly as long as at least one handle (a
+/// [`SecretString`] or [`SecretHandle`]) keeps it alive.
+static REGISTRY: Mutex<Vec<std::sync::Weak<Zeroizing<String>>>> = Mutex::new(Vec::new());
 
-static REGISTRY: Mutex<VecDeque<Zeroizing<String>>> = Mutex::new(VecDeque::new());
-
-/// Registers a secret value for scrubbing.
-pub fn register_secret(value: &str) {
-    if value.len() < MIN_SECRET_LEN {
-        return;
+/// Prunes dead weak entries, then registers `value` and returns the strong
+/// handle that keeps it scrubbable.
+fn register(value: &str) -> Arc<Zeroizing<String>> {
+    let secret = Arc::new(Zeroizing::new(value.to_owned()));
+    if value.len() >= MIN_SECRET_LEN {
+        let mut registry = REGISTRY.lock().expect("secret registry lock");
+        registry.retain(|weak| weak.strong_count() > 0);
+        registry.push(Arc::downgrade(&secret));
     }
-    let mut registry = REGISTRY.lock().expect("secret registry lock");
-    if registry.len() >= MAX_SECRETS {
-        registry.pop_front();
-    }
-    registry.push_back(Zeroizing::new(value.to_owned()));
+    secret
 }
 
-/// Replaces every occurrence of a registered secret with [`REDACTED`].
+/// Registers a secret value for scrubbing and returns the handle that
+/// keeps it registered.
+///
+/// Dropping every handle to the value removes it from scrubbing — hold the
+/// handle for exactly as long as the value may appear in logs. Prefer
+/// [`SecretString`], which is its own handle.
+#[must_use = "dropping the handle unregisters the secret; hold it for as long as the value may appear in logs"]
+pub fn register_secret(value: &str) -> SecretHandle {
+    SecretHandle(register(value))
+}
+
+/// Handle keeping one registered secret value scrubbable.
+#[derive(Clone)]
+pub struct SecretHandle(Arc<Zeroizing<String>>);
+
+impl SecretHandle {
+    /// Read access for the deliberate consumer.
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Replaces every occurrence of a registered (still alive) secret with
+/// [`REDACTED`].
 pub fn scrub(input: &str) -> Cow<'_, str> {
-    let registry = REGISTRY.lock().expect("secret registry lock");
+    let mut registry = REGISTRY.lock().expect("secret registry lock");
+    registry.retain(|weak| weak.strong_count() > 0);
     let mut output: Option<String> = None;
-    for secret in registry.iter() {
+    for weak in registry.iter() {
+        let Some(secret) = weak.upgrade() else {
+            continue;
+        };
         if input.contains(secret.as_str()) {
             let target = output.as_deref().unwrap_or(input);
             output = Some(target.replace(secret.as_str(), REDACTED));
@@ -58,15 +86,16 @@ pub fn scrub(input: &str) -> Cow<'_, str> {
 }
 
 /// A zeroizing, redacting-on-format secret string.
+///
+/// The value is registered for log scrubbing for exactly the secret's
+/// lifetime (clones share one registration).
 #[derive(Clone)]
-pub struct SecretString(Zeroizing<String>);
+pub struct SecretString(Arc<Zeroizing<String>>);
 
 impl SecretString {
     /// Creates a secret and registers its value for log scrubbing.
     pub fn new(value: impl Into<String>) -> Self {
-        let value: String = value.into();
-        register_secret(&value);
-        Self(Zeroizing::new(value))
+        Self(register(&value.into()))
     }
 
     /// Read access for the deliberate consumer.
@@ -74,7 +103,6 @@ impl SecretString {
         &self.0
     }
 }
-
 impl std::fmt::Debug for SecretString {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(REDACTED)
@@ -222,7 +250,7 @@ mod tests {
 
     #[test]
     fn scrub_removes_registered_values() {
-        register_secret("hunter2supersecret");
+        let _keep = register_secret("hunter2supersecret");
         let out = scrub("login failed for hunter2supersecret at t=1");
         assert_eq!(out, "login failed for [redacted] at t=1");
     }
@@ -240,7 +268,7 @@ mod tests {
 
     #[test]
     fn short_values_are_not_registered() {
-        register_secret("ab");
+        let _keep = register_secret("ab");
         assert_eq!(scrub("abc"), "abc");
     }
 
@@ -251,7 +279,7 @@ mod tests {
             inner: buffer.clone(),
             line: Vec::new(),
         };
-        register_secret("s3cr3t-value");
+        let _keep = register_secret("s3cr3t-value");
         writer
             .write_all(b"info: session s3cr3t-value accepted\nnext line\n")
             .unwrap();
@@ -268,10 +296,54 @@ mod tests {
             inner: buffer.clone(),
             line: Vec::new(),
         };
-        register_secret("part-secret-99");
+        let _keep = register_secret("part-secret-99");
         writer.write_all(b"partial part-secret-99").unwrap();
         assert!(buffer.string().is_empty());
         writer.flush().unwrap();
         assert!(buffer.string().contains("[redacted]"));
+    }
+}
+
+#[cfg(test)]
+mod registry_lifetime_tests {
+    use super::*;
+
+    /// Codex PR review finding 12 (P2): the FIFO cap (256) evicted the
+    /// OLDEST registration even when its SecretString was still alive and
+    /// in active use — a long-running daemon that refreshed tokens more
+    /// than 256 times would log an early, still-active token verbatim.
+    /// An alive secret must stay scrubbable regardless of how many other
+    /// secrets were registered since.
+    #[test]
+    fn alive_secret_stays_scrubbable_past_any_registration_cap() {
+        let first = SecretString::new("tok-alive-anchor-0001");
+        const OLD_FIFO_CAP: usize = 256; // the pre-fix registry size
+        for i in 0..(OLD_FIFO_CAP + 64) {
+            // Churn secrets that die immediately.
+            let _ = SecretString::new(format!("tok-churn-{i:04}"));
+        }
+        let leaked = format!("header Authorization={}", first.expose());
+        assert_eq!(
+            scrub(&leaked),
+            "header Authorization=[redacted]",
+            "a live secret must never age out of the registry"
+        );
+    }
+
+    /// The flip side: once the last handle is dropped, the value stops
+    /// being scrubbed — the registry cannot grow without bound.
+    #[test]
+    fn dropped_secret_stops_being_scrubbed() {
+        fn leak() {
+            let secret = SecretString::new("tok-volatile-9876");
+            assert_eq!(scrub(secret.expose()), REDACTED);
+        }
+        leak(); // the secret dies on return
+        let _ = SecretString::new("tok-prune-trigger"); // prunes dead entries
+        assert_eq!(
+            scrub("x tok-volatile-9876 y"),
+            "x tok-volatile-9876 y",
+            "a dropped secret must fall out of the registry"
+        );
     }
 }

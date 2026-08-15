@@ -517,7 +517,7 @@ mod tests {
 
     impl EventThenSilencePeer {
         fn spawn(dir: &tempfile::TempDir, event_delay: std::time::Duration) -> std::path::PathBuf {
-            use std::os::unix::net::{UnixListener, UnixStream};
+            use std::os::unix::net::UnixListener;
             let path = dir.path().join("eventful.sock");
             let listener = UnixListener::bind(&path).unwrap();
             let delay = event_delay;
