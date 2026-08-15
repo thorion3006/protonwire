@@ -600,9 +600,18 @@ regional_taxonomy:
 groups:
 "
         .to_string();
-        for i in 0..8 {
+        for id in [
+            "proton:fastest-country",
+            "proton:fastest-excluding-my-country",
+            "proton:random-country",
+            "proton:streaming-us",
+            "proton:gaming",
+            "proton:anti-censorship",
+            "proton:max-security",
+            "proton:work-school",
+        ] {
             yaml.push_str(&format!(
-                "  - id: \"proton:g{i}\"\n    definition_source: official-client-compat\n    immutable: true\n    ranking_policy: proton-score\n    overrides: {{}}\n    sources: [docs]\n    target: {{kind: fastest}}\n"
+                "  - id: \"{id}\"\n    definition_source: official-client-compat\n    immutable: true\n    ranking_policy: proton-score\n    overrides: {{}}\n    sources: [docs]\n    target: {{kind: fastest}}\n"
             ));
         }
         for region in [
@@ -702,10 +711,24 @@ groups:
     }
 
     #[test]
+    fn renamed_group_id_violates() {
+        // The count check alone lets a renamed canonical id through; the
+        // v1 catalog's id set itself must be pinned.
+        let yaml =
+            good_groups_yaml().replacen("proton:fastest-country", "proton:fastest-nation", 1);
+        let path = temp_yaml("renamed-id", &yaml);
+        assert!(
+            !validate(&path).unwrap(),
+            "a renamed canonical group id must fail validation"
+        );
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
     fn unknown_override_key_fails() {
         let yaml = good_groups_yaml().replacen(
-            "  - id: \"proton:g0\"\n    definition_source: official-client-compat\n    immutable: true\n    ranking_policy: proton-score\n    overrides: {}",
-            "  - id: \"proton:g0\"\n    definition_source: official-client-compat\n    immutable: true\n    ranking_policy: proton-score\n    overrides: {color: red}",
+            "  - id: \"proton:fastest-country\"\n    definition_source: official-client-compat\n    immutable: true\n    ranking_policy: proton-score\n    overrides: {}",
+            "  - id: \"proton:fastest-country\"\n    definition_source: official-client-compat\n    immutable: true\n    ranking_policy: proton-score\n    overrides: {color: red}",
             1,
         );
         let path = temp_yaml("override-key", &yaml);

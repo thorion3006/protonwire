@@ -117,6 +117,43 @@ mod parse_tests {
         }
     }
 
+    /// Review finding: PRD documents `protonwire servers refresh [--yes]`
+    /// (~789-790, ~2059), but `refresh` was a positional SetTrue flag, so
+    /// clap's debug asserts panicked on parse — the documented invocation
+    /// crashed instead of reaching the milestone-2 refusal.
+    #[test]
+    fn servers_refresh_parses_as_documented_subcommand() {
+        let cli = Cli::try_parse_from(["protonwire", "servers", "refresh"])
+            .expect("`servers refresh` must parse (PRD 9.4)");
+        match cli.command {
+            Command::Servers {
+                sub: Some(commands::ServersSub::Refresh { yes }),
+            } => assert!(!yes),
+            other => panic!("expected Servers refresh, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["protonwire", "servers", "refresh", "--yes"])
+            .expect("`servers refresh --yes` must parse (PRD 9.4)");
+        match cli.command {
+            Command::Servers {
+                sub: Some(commands::ServersSub::Refresh { yes }),
+            } => assert!(yes, "--yes must be accepted"),
+            other => panic!("expected Servers refresh, got {other:?}"),
+        }
+    }
+
+    /// The bare `servers` listing keeps parsing and refuses with its
+    /// planned milestone, subcommand or not.
+    #[test]
+    fn bare_servers_still_parses() {
+        let cli =
+            Cli::try_parse_from(["protonwire", "servers"]).expect("bare `servers` must parse");
+        match cli.command {
+            Command::Servers { sub: None } => {}
+            other => panic!("expected bare Servers, got {other:?}"),
+        }
+    }
+
     /// Select keeps the same target grammar; a future option must not be
     /// swallowed by it either.
     #[test]

@@ -65,8 +65,8 @@ pub enum Command {
     },
     /// List servers from the cached catalog (Milestone 2).
     Servers {
-        /// Force a catalog refresh (warned + confirmed; Milestone 2).
-        refresh: bool,
+        #[command(subcommand)]
+        sub: Option<ServersSub>,
     },
     /// List connection groups (Milestone 3).
     Group,
@@ -120,6 +120,18 @@ pub enum CredentialsSub {
     },
     /// Drop any stored password.
     ForgetPassword,
+}
+
+/// `protonwire servers` subcommands (PRD 9.4 manual refresh examples).
+#[derive(Debug, Subcommand)]
+pub enum ServersSub {
+    /// Force a catalog refresh (warned + confirmed; Milestone 2).
+    Refresh {
+        /// Skip the refresh confirmation prompt. The refresh-budget
+        /// warning is still printed when the refresh lands (PRD ~791).
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 /// `protonwire daemon` subcommands.
@@ -285,7 +297,10 @@ fn command_name(command: &Command) -> String {
         Command::Integration => "integration".into(),
         Command::ChangeServer => "change-server".into(),
         Command::Reconnect => "reconnect".into(),
-        Command::Servers { .. } => "servers".into(),
+        Command::Servers { sub: None } => "servers".into(),
+        Command::Servers {
+            sub: Some(ServersSub::Refresh { .. }),
+        } => "servers refresh".into(),
         Command::Group => "group".into(),
         Command::Select { .. } => "select".into(),
         Command::Config => "config".into(),
@@ -371,6 +386,31 @@ mod tests {
     fn planned_commands_return_typed_refusals() {
         let err = run(&Command::Login, None, true).expect_err("refusal");
         assert_eq!(err.exit_code(), 1);
+        assert!(err.to_string().contains("milestone 2"));
+    }
+
+    /// The documented `protonwire servers refresh [--yes]` (PRD ~789-790)
+    /// must reach the milestone-2 refusal — before the subcommand fix it
+    /// panicked in clap's debug asserts and never dispatched at all.
+    #[test]
+    fn servers_refresh_returns_milestone2_refusal() {
+        for yes in [false, true] {
+            let err = run(
+                &Command::Servers {
+                    sub: Some(ServersSub::Refresh { yes }),
+                },
+                None,
+                true,
+            )
+            .expect_err("servers refresh must refuse in milestone 1");
+            assert_eq!(err.exit_code(), 1);
+            let message = err.to_string();
+            assert!(message.contains("`servers refresh`"), "in: {message}");
+            assert!(message.contains("milestone 2"), "in: {message}");
+        }
+
+        let err = run(&Command::Servers { sub: None }, None, true)
+            .expect_err("bare servers must refuse in milestone 1");
         assert!(err.to_string().contains("milestone 2"));
     }
 }
