@@ -310,3 +310,36 @@ fetching) cannot read — every available git here (system and nixpkgs,
 all 2.55) predates `git refstorage migrate`. Classic `nix-shell` never
 touches git, so `shell.nix` works today; the flake lands with the M8
 packaging work once nixpkgs/nix catch up.
+
+## 2026-08-15 — Codex PR review (PR #3)
+
+The Codex bot reviewed PR #3 with 15 inline findings (2x P1, 13x P2).
+All 15 were accepted as genuine defects after verification — each maps
+to a fix commit with red-first TDD evidence in its message (read them
+with `git log origin/feat/m1-foundation..HEAD --format=full`). The two
+transport P2s share one commit (same request/response path), and the
+redact commit also carries the stale-socket classification.
+
+| # | Sev | Finding (anchor) | Verdict | Commit |
+|---|-----|------------------|---------|--------|
+| 1 | P1 | Keep lagging sessions subscribed after a full queue (`crates/ipc/src/bus.rs:48`) | Fixed @ 3173f64 | retain-on-Full, drop only on Disconnected; red: `lagging_session_stays_subscribed_and_receives_later_events` |
+| 2 | P1 | Reserve a session slot before spawning the worker (`crates/ipc/src/server.rs:112`) | Fixed @ b411595 | atomic `try_reserve_session` before spawn + drop-guard; red: 192-connection burst measured 69 live sessions vs the 64 cap |
+| 3 | P1 | Pass Cargo.lock rather than the audit policy to `--file` (`.github/workflows/ci.yml:78`) | Fixed @ c932bf2 | plain `cargo audit` from the root; before/after evidence in the message (0 vs 760 crate dependencies scanned) |
+| 4 | P2 | Apply `daemon.socket_path` before binding (`apps/daemon/src/main.rs:76`) | Fixed @ 63ab27b | pure `resolve_bind_location` (--socket-dir > config > default); red: precedence test did not compile |
+| 5 | P2 | Preserve partial frame bytes across polling timeouts (`crates/ipc/src/frame.rs:72`) | Fixed @ 0e601cf | stateful `FrameReader` retains prefix/payload progress; red: 3-byte prefix + 750 ms stall desynced the session |
+| 6 | P2 | Let explicit socket flags override the environment (`crates/client/src/lib.rs:301`) | Fixed @ 41dbe70 | pure `resolve_socket_path` (Some(path) > env > default); red: precedence test did not compile |
+| 7 | P2 | Parse connect options after target words (`apps/cli/src/commands.rs:36`) | Fixed @ 468b3a0 | dropped `trailing_var_arg` from Connect/Select; red: `connect country GB --by latency` landed `--by` in `target` |
+| 8 | P2 | Restore the terminal when setup fails partway (`apps/tui/src/main.rs:99`) | Fixed @ 3b2503d | per-step rollback (raw mode, alternate screen, Terminal); no test — needs a real tty, defensive fix per the standing exception |
+| 9 | P2 | Bound each response read by the remaining deadline (`crates/ipc/src/client.rs:242`) | Fixed @ 6d00e20 | every read gets `deadline.saturating_duration_since(now)`; red: ~1.4 s elapsed against a 1 s timeout |
+| 10 | P2 | Fail event reads fast after the transport is poisoned (`crates/ipc/src/client.rs:275`) | Fixed @ 6d00e20 (same commit as #9) | `next_event` now checks `poisoned` first; red: it returned the stranded late response |
+| 11 | P2 | Preserve a live socket on inconclusive connect errors (`crates/ipc/src/server.rs:150`) | Fixed @ e610265 | `authorizes_unlink` accepts only `ECONNREFUSED`; inconclusive errors abort startup; red: `only_connection_refused_authorizes_unlinking_a_stale_socket` |
+| 12 | P2 | Keep active secrets registered for redaction (`crates/core/src/redact.rs:43`) | Fixed @ e610265 (same commit as #11) | Weak-reference registry, no cap; red: anchor secret still scrubbable after 320 churned registrations |
+| 13 | P2 | Give concurrent state saves unique temporary files (`crates/store/src/state.rs:97`) | Fixed @ 4e40fec | per-save atomic counter in the temp name; red: 8x25 concurrent saves panicked on the shared inode |
+| 14 | P2 | Reject obsolete files in the generated schema directory (`xtask/src/schema_gen.rs:56`) | Fixed @ 1ce17e6 | `check_dir` reports `.json` files outside `root_schemas()`; red: obsolete file passed `--check` silently |
+| 15 | P2 | Scan the root workspace dependency versions (`xtask/src/deps.rs:130`) | Fixed @ 769e4d7 | `wildcard_versions` walks `[workspace]->dependencies`; `run()` scans the root `Cargo.toml`; red: root wildcard passed unseen |
+
+No findings were rejected and none deferred: every item was either a
+demonstrable correctness bug (1, 2, 4, 5, 6, 7, 9, 10, 11, 12, 13), a
+gate that protected nothing (3, 14, 15), or a broken terminal-lifecycle
+guarantee (8). Full per-finding rationale and test names live in the
+commit messages; the consolidated verdict comment is posted on PR #3.
