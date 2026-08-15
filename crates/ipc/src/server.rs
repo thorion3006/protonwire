@@ -871,18 +871,40 @@ mod tests {
     /// could dribble for hours while holding a reserved session slot.
     /// The hello-phase read must fail once the deadline passes even while
     /// bytes keep arriving.
+    ///
+    /// QA robustness (consolidated round 3, item H): the deadline is
+    /// injected at 500 ms and the dribble runs 25 ms/byte — the same
+    /// behavioral claim at a tenth of the wall clock and far more tolerant
+    /// of a loaded test machine (the margin between the dribble pace and
+    /// the deadline is what the assertion needs, not absolute seconds).
     #[test]
     fn hello_deadline_holds_against_a_steady_byte_dribble() {
         use std::io::Write;
         use std::time::{Duration, Instant};
+
+        const DRIBBLE_MS_PER_BYTE: u64 = 25;
+        let hello_deadline = Duration::from_millis(500);
 
         let dir = tempfile::tempdir().unwrap();
         let handler = Arc::new(NullHandler {
             version: "test".into(),
             bus: EventBus::new(),
         });
-        let server = spawn_server(&dir, handler);
-        let stream = std::os::unix::net::UnixStream::connect(server.socket_path()).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let server = IpcServer::bind(dir.path(), "dribble.sock").unwrap();
+        let stop_flag = Arc::clone(&stop);
+        std::thread::spawn(move || {
+            server.serve_with(
+                handler,
+                stop_flag,
+                ServeBudgets {
+                    hello_deadline,
+                    ..ServeBudgets::default()
+                },
+            )
+        });
+        let stream =
+            std::os::unix::net::UnixStream::connect(dir.path().join("dribble.sock")).unwrap();
         let mut read_half = stream.try_clone().unwrap();
         let mut write_half = stream;
 
@@ -895,11 +917,11 @@ mod tests {
             },
         )
         .unwrap();
-        // One byte every 100 ms completes this frame in well over double
-        // HELLO_DEADLINE, and no single read ever hits the 250 ms poll
-        // timeout — the exact shape of the claimed dribble.
+        // The dribble would complete this frame in well over double the
+        // deadline, and no single read ever hits the 250 ms poll timeout —
+        // the exact shape of the claimed dribble.
         assert!(
-            frame.len() as u64 * 100 > HELLO_DEADLINE.as_millis() as u64 * 2,
+            frame.len() as u64 * DRIBBLE_MS_PER_BYTE > hello_deadline.as_millis() as u64 * 2,
             "fixture frame must out-dribble the deadline"
         );
 
@@ -909,19 +931,19 @@ mod tests {
                     break; // the server hung up mid-dribble
                 }
                 let _ = write_half.flush();
-                std::thread::sleep(Duration::from_millis(100));
+                std::thread::sleep(Duration::from_millis(DRIBBLE_MS_PER_BYTE));
             }
         });
 
         read_half
-            .set_read_timeout(Some(Duration::from_secs(7)))
+            .set_read_timeout(Some(Duration::from_secs(3)))
             .unwrap();
         let started = Instant::now();
         match read_msg::<_, ServerMessage>(&mut read_half) {
             Ok(ServerMessage::HelloError(err)) => {
                 assert_eq!(err.reason, "hello-timeout");
                 assert!(
-                    started.elapsed() < HELLO_DEADLINE + Duration::from_secs(2),
+                    started.elapsed() < hello_deadline + Duration::from_secs(1),
                     "refusal arrived well past the deadline"
                 );
             }
@@ -933,6 +955,7 @@ mod tests {
             Err(crate::frame::FrameError::Truncated)
         ));
         dribbler.join().unwrap();
+        stop.store(true, Ordering::SeqCst);
     }
 
     /// Codex PR review round 2, finding 4 (P2): an administrator Shutdown
