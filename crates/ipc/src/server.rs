@@ -1,12 +1,13 @@
 //! Daemon-side IPC server: bind, authenticate, dispatch, fan out events.
 
 use std::io;
+use std::net::Shutdown;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use protonwire_frontend_api::{
     ClientInfo, ClientMessage, HelloAck, HelloError, PROTOCOL_VERSION, Request, RequestResult,
@@ -30,6 +31,33 @@ const HELLO_DEADLINE: Duration = Duration::from_secs(5);
 /// its session instead of pinning a writer thread forever.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Overall ceiling on post-stop draining. `SO_SNDTIMEO` bounds each WRITE
+/// syscall, not the shutdown join: a session that keeps dribbling reads (or
+/// a handler that blocks) would otherwise hold `serve()` open indefinitely.
+/// Three write ceilings: one blocked final write, one slow poll loop, and
+/// one in-flight dispatch each get a full chance to finish.
+const DRAIN_CEILING: Duration = Duration::from_secs(3 * WRITE_TIMEOUT.as_secs());
+
+/// Timing budgets for one `serve()` invocation. Production uses the
+/// defaults; tests inject shrunk values so drain and dribble scenarios run
+/// in milliseconds instead of wall-clock seconds (QA robustness round 3).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ServeBudgets {
+    /// Window in which a connection must complete the hello handshake.
+    pub(crate) hello_deadline: Duration,
+    /// Overall ceiling on draining sessions after the stop flag is set.
+    pub(crate) drain_ceiling: Duration,
+}
+
+impl Default for ServeBudgets {
+    fn default() -> Self {
+        Self {
+            hello_deadline: HELLO_DEADLINE,
+            drain_ceiling: DRAIN_CEILING,
+        }
+    }
+}
+
 /// What a session knows about its authenticated client.
 #[derive(Debug, Clone)]
 pub struct SessionContext {
@@ -48,6 +76,15 @@ pub trait RequestHandler: Send + Sync {
     fn latest_event_seq(&self) -> u64;
 
     /// Executes one authenticated request.
+    ///
+    /// Bounded-dispatch contract: `handle` runs on the session's dispatch
+    /// thread and must return promptly — well inside the 10 s
+    /// [`WRITE_TIMEOUT`] ceiling. The server enforces an overall
+    /// [`DRAIN_CEILING`] on shutdown draining: a handler still running past
+    /// it gets its session socket forced down and its worker detached, so a
+    /// blocking `handle` cannot pin `serve()` (but leaks its thread —
+    /// long work belongs on a background task, with the response queued
+    /// when it completes).
     fn handle(&self, ctx: &SessionContext, request: Request) -> Result<RequestResult, RpcError>;
 
     /// Event fan-out shared with the session loops.
@@ -99,15 +136,30 @@ impl IpcServer {
     /// example — are flushed to their sockets first (Codex PR review round
     /// 2, finding 4). A caller that exits when this returns therefore
     /// cannot lose a final response to process teardown. Draining is
-    /// bounded per session by the 250 ms read poll and the 10 s write
-    /// ceiling.
+    /// bounded overall by [`DRAIN_CEILING`] (3× the 10 s write ceiling):
+    /// a session still owing data past it has its socket forced down and
+    /// its worker detached, because `SO_SNDTIMEO` bounds each write
+    /// syscall — not the shutdown join — and a slow-dribbling peer (or a
+    /// blocking handler, see [`RequestHandler::handle`]) would otherwise
+    /// pin `serve()` indefinitely.
     pub fn serve<H: RequestHandler + 'static>(&self, handler: Arc<H>, stop: Arc<AtomicBool>) {
+        self.serve_with(handler, stop, ServeBudgets::default());
+    }
+
+    /// [`IpcServer::serve`] with injectable timing budgets (tests shrink
+    /// them; production always goes through the defaults).
+    pub(crate) fn serve_with<H: RequestHandler + 'static>(
+        &self,
+        handler: Arc<H>,
+        stop: Arc<AtomicBool>,
+        budgets: ServeBudgets,
+    ) {
         // Poll-accept so shutdown is responsive without signal plumbing here.
         if let Err(e) = self.listener.set_nonblocking(true) {
             warn!("cannot switch accept loop to nonblocking mode: {e}");
             return;
         }
-        let mut sessions: Vec<std::thread::JoinHandle<()>> = Vec::new();
+        let mut sessions: Vec<SessionWorker> = Vec::new();
         while !stop.load(Ordering::SeqCst) {
             match self.listener.accept() {
                 Ok((stream, _)) => {
@@ -120,15 +172,24 @@ impl IpcServer {
                         debug!("session limit reached; dropping new connection");
                         continue; // dropping `stream` closes it
                     }
+                    // The socket is owned by the session worker; the drain
+                    // loop below keeps only a weak handle so a session that
+                    // outlives the ceiling can still be forced down.
+                    let stream = Arc::new(stream);
+                    let session_stream = Arc::downgrade(&stream);
                     let handler = Arc::clone(&handler);
                     let stop = Arc::clone(&stop);
-                    sessions.push(std::thread::spawn(move || {
+                    let join = std::thread::spawn(move || {
                         if let Err(e) = std::panic::catch_unwind(AssertUnwindSafe(|| {
-                            handle_session(stream, handler, stop)
+                            handle_session(stream, handler, stop, budgets.hello_deadline)
                         })) {
                             warn!("IPC session panicked and was dropped: {e:?}");
                         }
-                    }));
+                    });
+                    sessions.push(SessionWorker {
+                        join,
+                        stream: session_stream,
+                    });
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                     std::thread::sleep(READ_POLL);
@@ -139,6 +200,7 @@ impl IpcServer {
                 }
             }
         }
+        let drain_deadline = Instant::now() + budgets.drain_ceiling;
         // Codex PR review round 2, finding 4: the session workers are
         // detached from the accept loop, and a handler can publish the
         // stop flag BEFORE its response is queued (the Shutdown path).
@@ -146,8 +208,29 @@ impl IpcServer {
         // writer still owed its client a final acknowledgement. Joining
         // every session makes serve()'s return mean "all sessions torn
         // down and their queued responses flushed".
+        while sessions.iter().any(|session| !session.join.is_finished()) {
+            if Instant::now() >= drain_deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
         for session in sessions {
-            let _ = session.join();
+            if session.join.is_finished() {
+                let _ = session.join;
+                continue;
+            }
+            // Past the ceiling the straggler is forced down and detached:
+            // the shutdown errors its blocked writer (and ends the client's
+            // wait) instead of waiting out a dribbling peer, while a worker
+            // stuck inside a blocking handler is abandoned to finish (or
+            // leak its thread) on its own — serve() must return regardless.
+            // An expired weak handle needs no forcing: the session already
+            // released its socket.
+            if let Some(stream) = session.stream.upgrade() {
+                warn!("drain ceiling exceeded; forcing a session socket down");
+                let _ = stream.shutdown(Shutdown::Both);
+            }
+            drop(session.join);
         }
     }
 }
@@ -156,6 +239,17 @@ impl Drop for IpcServer {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.socket_path);
     }
+}
+
+/// One accepted session as seen from the accept loop: its worker thread
+/// plus a weak handle on the session socket, so the drain phase can force
+/// a straggler down once the ceiling passes. The handle is deliberately
+/// WEAK — the session worker owns the socket, and holding a strong
+/// reference here would keep the fd open (and the client without its EOF)
+/// until the whole server stops.
+struct SessionWorker {
+    join: std::thread::JoinHandle<()>,
+    stream: std::sync::Weak<UnixStream>,
 }
 
 /// Whether a connect failure definitively identifies a stale socket file
@@ -191,7 +285,12 @@ fn set_socket_mode(socket_path: &Path) -> io::Result<()> {
 }
 
 /// Serves one client connection until EOF, error, or daemon shutdown.
-fn handle_session<H: RequestHandler>(stream: UnixStream, handler: Arc<H>, stop: Arc<AtomicBool>) {
+fn handle_session<H: RequestHandler>(
+    stream: Arc<UnixStream>,
+    handler: Arc<H>,
+    stop: Arc<AtomicBool>,
+    hello_deadline: Duration,
+) {
     // The session slot the accept loop reserved is released on EVERY exit
     // path — early rejects below, dispatcher panics (the serve loop's
     // catch_unwind drops this guard during unwind), and normal teardown
@@ -211,14 +310,15 @@ fn handle_session<H: RequestHandler>(stream: UnixStream, handler: Arc<H>, stop: 
         warn!("set_read_timeout failed: {e}");
         return;
     };
-    let Ok(read_half) = stream.try_clone() else {
+    let Ok(mut read_half) = stream.try_clone() else {
         warn!("session rejected: socket clone failed");
         return;
     };
-    let mut read_half = read_half;
 
-    // Writer thread owns the write half exclusively; a write timeout bounds
-    // how long a non-reading peer can pin it.
+    // Writer thread owns a socket handle exclusively; a write timeout bounds
+    // how long a non-reading peer can pin it. Socket options are shared with
+    // every clone of the socket, so the timeouts set here govern the reader
+    // and the drain handle alike.
     if let Err(e) = stream.set_write_timeout(Some(WRITE_TIMEOUT)) {
         warn!("set_write_timeout failed: {e}");
         return;
@@ -226,7 +326,7 @@ fn handle_session<H: RequestHandler>(stream: UnixStream, handler: Arc<H>, stop: 
     let (writer_tx, writer_rx) = mpsc::sync_channel::<ServerMessage>(crate::bus::SESSION_QUEUE_LEN);
     let write_stream = stream;
     let writer = std::thread::spawn(move || {
-        let mut write_half = write_stream;
+        let mut write_half = &*write_stream;
         for message in writer_rx {
             if write_msg(&mut write_half, &message).is_err() {
                 break;
@@ -261,7 +361,14 @@ fn handle_session<H: RequestHandler>(stream: UnixStream, handler: Arc<H>, stop: 
         })
     };
 
-    let result = serve_messages(&mut read_half, &writer_tx, &handler, &peer, &stop);
+    let result = serve_messages(
+        &mut read_half,
+        &writer_tx,
+        &handler,
+        &peer,
+        &stop,
+        hello_deadline,
+    );
     // Teardown order is load-bearing: dropping our sender alone is not
     // enough — the forwarder holds a clone — so we must unsubscribe BEFORE
     // joining. Unsubscribe closes the bus sender, which ends the forwarder,
@@ -282,13 +389,14 @@ fn serve_messages(
     handler: &Arc<impl RequestHandler>,
     peer: &PeerCredentials,
     stop: &AtomicBool,
+    hello_deadline: Duration,
 ) -> Result<(), FrameError> {
     let mut reader = FrameReader::new(read_half);
-    let connected_at = std::time::Instant::now();
+    let connected_at = Instant::now();
     let mut hello_done = false;
     let mut client_info = None;
     while !stop.load(Ordering::SeqCst) {
-        if !hello_done && connected_at.elapsed() > HELLO_DEADLINE {
+        if !hello_done && connected_at.elapsed() > hello_deadline {
             let _ = writer_tx.send(ServerMessage::HelloError(HelloError {
                 supported_version: PROTOCOL_VERSION,
                 reason: "hello-timeout".into(),
@@ -307,7 +415,7 @@ fn serve_messages(
         let message = match if hello_done {
             reader.read_msg::<ClientMessage>()
         } else {
-            reader.read_msg_within::<ClientMessage>(connected_at + HELLO_DEADLINE)
+            reader.read_msg_within::<ClientMessage>(connected_at + hello_deadline)
         } {
             Ok(m) => m,
             Err(FrameError::Io(e))
@@ -925,6 +1033,229 @@ mod tests {
         let _ = served.join();
     }
 
+    /// Consolidated round 3 (rust-reviewer + sec-auditor, item A): the
+    /// round-2 drain fix joined every session worker, but `SO_SNDTIMEO`
+    /// bounds each WRITE syscall — not the join. A handshaken session
+    /// whose client never reads and whose final response exceeds the
+    /// socket buffers pins the join for the full 10 s write ceiling, and a
+    /// future blocking handler would pin it forever. Draining needs an
+    /// overall ceiling: past it, the straggler's socket is forced down
+    /// and the join abandoned.
+    #[test]
+    fn serve_returns_within_the_drain_ceiling_when_a_writer_is_pinned() {
+        use std::time::{Duration, Instant};
+
+        /// Stop-then-pong, but the pong is far larger than the socket
+        /// buffers of a client that never reads.
+        struct StopThenHugePong {
+            bus: Arc<EventBus>,
+            stop: Arc<AtomicBool>,
+        }
+        impl RequestHandler for StopThenHugePong {
+            fn daemon_version(&self) -> &str {
+                "test"
+            }
+            fn latest_event_seq(&self) -> u64 {
+                0
+            }
+            fn handle(
+                &self,
+                _ctx: &SessionContext,
+                request: Request,
+            ) -> Result<RequestResult, RpcError> {
+                match request {
+                    Request::Ping { nonce } => {
+                        self.stop.store(true, Ordering::SeqCst);
+                        std::thread::sleep(Duration::from_millis(200));
+                        Ok(RequestResult::Pong { nonce })
+                    }
+                    _ => Err(RpcError::new(
+                        protonwire_frontend_api::RpcErrorCode::NotImplemented,
+                        "test handler",
+                    )),
+                }
+            }
+            fn event_bus(&self) -> &EventBus {
+                &self.bus
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let bus = Arc::new(EventBus::new());
+        let stop = Arc::new(AtomicBool::new(false));
+        let handler = Arc::new(StopThenHugePong {
+            bus: Arc::clone(&bus),
+            stop: Arc::clone(&stop),
+        });
+        let server = IpcServer::bind(dir.path(), "drain-pin.sock").unwrap();
+        let path = server.socket_path().to_owned();
+        let ceiling = Duration::from_millis(600);
+        let served = std::thread::spawn(move || {
+            server.serve_with(
+                handler,
+                stop,
+                ServeBudgets {
+                    drain_ceiling: ceiling,
+                    ..ServeBudgets::default()
+                },
+            )
+        });
+
+        // Handshake normally, then shrink our receive buffer and never read
+        // again: the ~0.86 MiB pong cannot fit and pins the session writer.
+        let mut stream = connect_and_hello(&path);
+        set_rcvbuf(&stream, 4096);
+        write_msg(
+            &mut stream,
+            &ClientMessage::Request {
+                id: 7,
+                request: Request::Ping {
+                    nonce: "x".repeat(900_000),
+                },
+            },
+        )
+        .unwrap();
+
+        // Pre-fix, serve() waited out the writer's full 10 s write ceiling
+        // (or forever for a blocked handler); the bound must be the
+        // injected drain ceiling plus polling slack.
+        let started = Instant::now();
+        while !served.is_finished() {
+            assert!(
+                Instant::now() < started + ceiling + Duration::from_secs(2),
+                "serve() is pinned past the drain ceiling by a blocked writer"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert!(
+            started.elapsed() < ceiling + Duration::from_secs(2),
+            "serve() overran the drain ceiling: {} ms",
+            started.elapsed().as_millis()
+        );
+        let _ = served.join();
+    }
+
+    /// QA mutation gap (item G7): the drain must join EVERY owing session,
+    /// not just the most recent one. With N sessions each owing a final
+    /// response at stop time, serve()'s return must find all of them torn
+    /// down — a join-the-last mutation returns with the slower sessions
+    /// still draining, losing their queued responses to process exit.
+    #[test]
+    fn serve_drains_every_owing_session_not_just_the_last() {
+        use std::time::{Duration, Instant};
+
+        /// Answers pings after a per-request delay; the delay shrinks with
+        /// the request id so the FIRST session is the slowest to drain.
+        struct SlowPongById {
+            bus: Arc<EventBus>,
+        }
+        impl RequestHandler for SlowPongById {
+            fn daemon_version(&self) -> &str {
+                "test"
+            }
+            fn latest_event_seq(&self) -> u64 {
+                0
+            }
+            fn handle(
+                &self,
+                _ctx: &SessionContext,
+                request: Request,
+            ) -> Result<RequestResult, RpcError> {
+                match request {
+                    Request::Ping { nonce } => {
+                        let delay = match nonce.parse::<u64>() {
+                            Ok(id) => Duration::from_millis(900 - 200 * id),
+                            Err(_) => Duration::from_millis(100),
+                        };
+                        std::thread::sleep(delay);
+                        Ok(RequestResult::Pong { nonce })
+                    }
+                    _ => Err(RpcError::new(
+                        protonwire_frontend_api::RpcErrorCode::NotImplemented,
+                        "test handler",
+                    )),
+                }
+            }
+            fn event_bus(&self) -> &EventBus {
+                &self.bus
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let bus = Arc::new(EventBus::new());
+        let stop = Arc::new(AtomicBool::new(false));
+        let handler = Arc::new(SlowPongById {
+            bus: Arc::clone(&bus),
+        });
+        let server = IpcServer::bind(dir.path(), "drain-multi.sock").unwrap();
+        let path = server.socket_path().to_owned();
+        let stop_flag = Arc::clone(&stop);
+        let served = std::thread::spawn(move || server.serve(handler, stop_flag));
+
+        // Connect every client BEFORE any handshake so the accept loop
+        // picks all four up in one burst (sequential connects would
+        // quantize on its 250 ms poll and blur who drains last).
+        const SESSIONS: usize = 4;
+        let mut streams: Vec<std::os::unix::net::UnixStream> = (0..SESSIONS)
+            .map(|_| std::os::unix::net::UnixStream::connect(&path).unwrap())
+            .collect();
+        for (id, stream) in streams.iter_mut().enumerate() {
+            write_msg(
+                stream,
+                &ClientMessage::Hello {
+                    protocol_version: 1,
+                    client: info(),
+                },
+            )
+            .unwrap();
+            match read_msg::<_, ServerMessage>(stream).unwrap() {
+                ServerMessage::HelloAck(_) => {}
+                other => panic!("expected hello ack, got {other:?}"),
+            }
+            write_msg(
+                stream,
+                &ClientMessage::Request {
+                    id: id as u64,
+                    request: Request::Ping {
+                        nonce: id.to_string(),
+                    },
+                },
+            )
+            .unwrap();
+        }
+        // Every ping is dispatched and sleeping before the flag drops, so
+        // all four sessions owe their pong at stop time; the first (900 ms
+        // delay) is the last to drain, the fourth (300 ms) the first.
+        std::thread::sleep(Duration::from_millis(400));
+        stop.store(true, Ordering::SeqCst);
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !served.is_finished() {
+            assert!(
+                Instant::now() < deadline,
+                "serve() did not return after stop"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert_eq!(
+            bus.active_sessions(),
+            0,
+            "serve() returned while sessions were still draining — a \
+             join-the-last mutation loses their queued final responses"
+        );
+        for (id, stream) in streams.iter_mut().enumerate() {
+            match read_msg::<_, ServerMessage>(stream).unwrap() {
+                ServerMessage::Response(response) => assert_eq!(
+                    response.id(),
+                    id as u64,
+                    "each owing session must flush its own acknowledgement"
+                ),
+                other => panic!("expected a drained response, got {other:?}"),
+            }
+        }
+        let _ = served.join();
+    }
+
     /// Codex PR review finding 11 (P2): only a definitive stale-socket
     /// signal (ECONNREFUSED) may authorize unlinking the socket file. Any
     /// other connect failure (descriptor exhaustion, EACCES, ...) is
@@ -984,5 +1315,13 @@ mod tests {
 
     fn connect_error(path: &Path) -> io::Error {
         UnixStream::connect(path).expect_err("connect against a socket file must fail or succeed")
+    }
+
+    /// Shrinks a stream's `SO_RCVBUF` (std exposes no UnixStream helper) so
+    /// a frame a few hundred KiB long cannot fit without the peer reading —
+    /// host-independent blocking regardless of kernel buffer defaults.
+    fn set_rcvbuf(stream: &UnixStream, bytes: usize) {
+        nix::sys::socket::setsockopt(stream, nix::sys::socket::sockopt::RcvBuf, &bytes)
+            .expect("SO_RCVBUF applies");
     }
 }
