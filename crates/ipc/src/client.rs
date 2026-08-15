@@ -633,10 +633,6 @@ mod tests {
         );
     }
 
-    /// Codex PR review finding 10 (P2): next_event must fail fast once the
-    /// transport is poisoned, exactly like request — otherwise a caller
-    /// returning to its event loop after a failed request blocks for the
-
     /// Codex PR review round 2, finding 7 (P2): round 1 bounded every READ
     /// by the request deadline, but the write side had no timeout at all.
     /// A handshaken peer that stops reading pins `write_all` once the
@@ -700,6 +696,10 @@ mod tests {
             "the failed write must return at the deadline, not hang"
         );
     }
+
+    /// Codex PR review finding 10 (P2): next_event must fail fast once the
+    /// transport is poisoned, exactly like request — otherwise a caller
+    /// returning to its event loop after a failed request blocks for the
     /// full socket timeout or consumes a stranded late response.
     #[test]
     fn next_event_fails_fast_after_poisoning() {

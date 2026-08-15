@@ -826,10 +826,6 @@ mod tests {
         ));
         dribbler.join().unwrap();
     }
-    /// Codex PR review finding 11 (P2): only a definitive stale-socket
-    /// signal (ECONNREFUSED) may authorize unlinking the socket file. Any
-    /// other connect failure (descriptor exhaustion, EACCES, ...) is
-    /// inconclusive: unlinking then leaves a live daemon unreachable while
 
     /// Codex PR review round 2, finding 4 (P2): an administrator Shutdown
     /// sets the stop flag BEFORE the session queues its acknowledgement.
@@ -928,6 +924,11 @@ mod tests {
         }
         let _ = served.join();
     }
+
+    /// Codex PR review finding 11 (P2): only a definitive stale-socket
+    /// signal (ECONNREFUSED) may authorize unlinking the socket file. Any
+    /// other connect failure (descriptor exhaustion, EACCES, ...) is
+    /// inconclusive: unlinking then leaves a live daemon unreachable while
     /// another instance binds the same path.
     #[test]
     fn only_connection_refused_authorizes_unlinking_a_stale_socket() {
