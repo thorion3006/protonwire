@@ -295,6 +295,14 @@ impl IpcClient {
         // that stops reading pins write_all once the socket buffers fill
         // (frames may be nearly MAX_FRAME_LEN), which would otherwise
         // block past the whole-request guarantee set_timeout documents.
+        // The ceiling itself is the socket-wide SO_SNDTIMEO that
+        // connect/set_timeout already applied (consolidated round 3, item
+        // C: the two request-local re-arms were mutation-verified inert —
+        // the write happens once at request start, where the remaining
+        // budget differs from self.timeout only by microseconds). What
+        // stays load-bearing is the zero-budget guard: a zero remainder
+        // must not reach the write path, because a zero SO_SNDTIMEO means
+        // "block forever" on Linux, not "fail immediately".
         let write_budget = deadline.saturating_duration_since(std::time::Instant::now());
         if write_budget.is_zero() {
             self.poisoned = true;
@@ -302,16 +310,7 @@ impl IpcClient {
                 "request timed out without a response".into(),
             ));
         }
-        if let Err(e) = self.stream.set_write_timeout(Some(write_budget)) {
-            self.poisoned = true;
-            return Err(RequestError::Transport(format!(
-                "cannot apply request deadline: {e}"
-            )));
-        }
-        let write_outcome = write_msg(&mut self.stream, &ClientMessage::Request { id, request });
-        // Restore the whole-request write ceiling between loops.
-        let _ = self.stream.set_write_timeout(Some(self.timeout));
-        write_outcome.map_err(|e| {
+        write_msg(&mut self.stream, &ClientMessage::Request { id, request }).map_err(|e| {
             self.poisoned = true;
             RequestError::Transport(format!("write failed: {e}"))
         })?;
@@ -724,6 +723,13 @@ mod tests {
     /// A handshaken peer that stops reading pins `write_all` once the
     /// socket buffers fill — and frames may be nearly MAX_FRAME_LEN — so
     /// `set_timeout`'s whole-request guarantee did not bound the request.
+    ///
+    /// Consolidated round 3, item D (rust-reviewer + qa-engineer): the
+    /// deaf peer's receive buffer is pinned to 4 KiB (std exposes no
+    /// UnixStream helper, hence the nix setsockopt) so the ~0.86 MiB
+    /// frame blocks regardless of the host's kernel buffer defaults, and
+    /// the assertion holds on the Transport-vs-timing contract — the
+    /// "write failed" wording is informational.
     #[test]
     fn request_write_is_bounded_by_the_deadline() {
         use std::os::unix::net::UnixListener;
@@ -737,6 +743,8 @@ mod tests {
             let Ok((mut peer, _)) = listener.accept() else {
                 return;
             };
+            nix::sys::socket::setsockopt(&peer, nix::sys::socket::sockopt::RcvBuf, &4096usize)
+                .expect("SO_RCVBUF applies");
             let _ = crate::frame::read_msg::<_, ClientMessage>(&mut peer);
             let _ = crate::frame::write_msg(
                 &mut peer,
@@ -773,13 +781,86 @@ mod tests {
         let outcome = worker.join().unwrap();
         match outcome {
             Err(RequestError::Transport(message)) => {
-                assert!(message.contains("write"), "got: {message}");
+                // Informational only: the load-bearing contract is the
+                // Transport kind plus the timing bound below.
+                eprintln!("bounded write failure reports: {message}");
             }
             other => panic!("expected a transport failure, got {other:?}"),
         }
         assert!(
             started.elapsed() < Duration::from_secs(2),
             "the failed write must return at the deadline, not hang"
+        );
+    }
+
+    /// QA mutation gap (item G6): the zero-budget guard's failure mode is a
+    /// HANG, not a wrong result. With a deadline already expired at the
+    /// write (a sub-microsecond timeout makes `deadline - now` saturate to
+    /// zero), the request must refuse to write at all — a zero-duration
+    /// SO_SNDTIMEO means "block forever" on Linux, so without the guard
+    /// the 0.86 MiB frame into a never-reading 4 KiB peer pins the
+    /// caller indefinitely.
+    #[test]
+    fn request_refuses_to_write_when_the_budget_is_already_zero() {
+        use std::os::unix::net::UnixListener;
+        use std::time::{Duration, Instant};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("zero-budget.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        std::thread::spawn(move || {
+            let Ok((mut peer, _)) = listener.accept() else {
+                return;
+            };
+            nix::sys::socket::setsockopt(&peer, nix::sys::socket::sockopt::RcvBuf, &4096usize)
+                .expect("SO_RCVBUF applies");
+            let _ = crate::frame::read_msg::<_, ClientMessage>(&mut peer);
+            let _ = crate::frame::write_msg(
+                &mut peer,
+                &ServerMessage::HelloAck(protonwire_frontend_api::HelloAck {
+                    protocol_version: 1,
+                    daemon_version: "deaf".into(),
+                    latest_event_seq: 0,
+                }),
+            );
+            std::thread::sleep(Duration::from_secs(30));
+        });
+
+        let mut client = IpcClient::connect_with_timeout(
+            &path,
+            &test_client_info(),
+            SecurityChecks::dev_unchecked(),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        // A sub-microsecond timeout: the deadline is (all but certainly)
+        // in the past by the time the write budget is computed.
+        client.set_timeout(Duration::from_nanos(1));
+        let started = Instant::now();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let worker = std::thread::spawn(move || {
+            let outcome = client.request(Request::Ping {
+                nonce: "x".repeat(900_000),
+            });
+            let _ = done_tx.send(());
+            outcome
+        });
+        assert!(
+            done_rx.recv_timeout(Duration::from_secs(2)).is_ok(),
+            "a zero write budget hung the request — the guard is gone"
+        );
+        match worker.join().unwrap() {
+            Err(RequestError::Transport(message)) => {
+                assert!(
+                    message.contains("timed out"),
+                    "expected the deadline refusal, got: {message}"
+                );
+            }
+            other => panic!("expected a transport failure, got {other:?}"),
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the refusal must be immediate, not a blocked write"
         );
     }
 
