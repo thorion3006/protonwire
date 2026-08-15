@@ -89,10 +89,15 @@ struct Capability {
 }
 
 pub fn run(root: &Path) -> Result<bool> {
-    validate(&root.join("docs").join("official-parity.yaml"))
+    // The committed lockfile is the resolution authority the recorded
+    // upstream digests are compared against (Codex PR review round 2,
+    // finding 6): an unreadable or unparseable Cargo.lock is a hard
+    // error, not a skipped rule.
+    let lock = Lockfile::read(&root.join("Cargo.lock"))?;
+    validate(&root.join("docs").join("official-parity.yaml"), &lock)
 }
 
-fn validate(path: &Path) -> Result<bool> {
+fn validate(path: &Path, lock: &Lockfile) -> Result<bool> {
     let text =
         fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
     let doc: Manifest = serde_norway::from_str(&text)
@@ -108,7 +113,7 @@ fn validate(path: &Path) -> Result<bool> {
         "status_definitions completeness",
         &check_status_definitions(&doc),
     );
-    reporter.rule("upstream pins", &check_upstream(&doc));
+    reporter.rule("upstream pins", &check_upstream(&doc, lock));
     reporter.rule("capabilities", &check_capabilities(&doc));
 
     let total = doc.capabilities.as_ref().map_or(0, Vec::len);
@@ -171,6 +176,23 @@ fn check_status_definitions(doc: &Manifest) -> Vec<String> {
     }
     violations
 }
+/// The recorded upstream digest must EQUAL the lockfile's checksum for the
+/// pinned version (Codex PR review round 2, finding 6): the lockfile is the
+/// resolution authority, so a well-formed-but-different digest in the
+/// manifest is supply-chain drift the hex-shape check cannot detect. A
+/// missing lockfile entry fails rather than passing vacuously.
+fn expect_lock_checksum(recorded: Option<&str>, locked: Option<&str>, what: &str) -> Vec<String> {
+    match (recorded, locked) {
+        (Some(recorded), Some(locked)) if recorded == locked => Vec::new(),
+        (Some(recorded), Some(locked)) => vec![format!(
+            "{what} `{recorded}` disagrees with the Cargo.lock checksum `{locked}`"
+        )],
+        (Some(_), None) => vec![format!(
+            "{what} cannot be verified: Cargo.lock records no checksum for the pinned version"
+        )],
+        (None, _) => vec![format!("{what} is missing")],
+    }
+}
 
 fn expect_checksum(actual: Option<&str>, what: &str) -> Option<String> {
     match actual {
@@ -192,7 +214,60 @@ fn expect_revision(actual: Option<&str>, what: &str) -> Option<String> {
     }
 }
 
-fn check_upstream(doc: &Manifest) -> Vec<String> {
+/// The committed root lockfile — the resolution authority the recorded
+/// upstream digests are compared against (Codex PR review round 2,
+/// finding 6; PRD 6.5 makes Cargo.lock authoritative for the pins).
+struct Lockfile {
+    /// `(name, version)` → checksum, for packages that carry one (path
+    /// and git dependencies record none).
+    checksums: BTreeMap<(String, String), String>,
+}
+
+#[derive(Deserialize)]
+struct LockPackage {
+    name: String,
+    version: String,
+    #[serde(default)]
+    checksum: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct LockDocument {
+    #[serde(default, rename = "package")]
+    packages: Vec<LockPackage>,
+}
+
+impl Lockfile {
+    /// Parses lockfile text (`[[package]]` entries, format v3/v4).
+    fn parse(text: &str) -> Result<Self> {
+        let doc: LockDocument =
+            toml::from_str(text).with_context(|| "failed to parse Cargo.lock")?;
+        Ok(Self {
+            checksums: doc
+                .packages
+                .into_iter()
+                .filter_map(|package| Some(((package.name, package.version), package.checksum?)))
+                .collect(),
+        })
+    }
+
+    /// Reads and parses the lockfile at `path`.
+    fn read(path: &Path) -> Result<Self> {
+        let text = fs::read_to_string(path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        Self::parse(&text)
+    }
+
+    /// The checksum recorded for `name` at `version`, if the lockfile
+    /// entry carries one.
+    fn checksum(&self, name: &str, version: &str) -> Option<&str> {
+        self.checksums
+            .get(&(name.to_owned(), version.to_owned()))
+            .map(String::as_str)
+    }
+}
+
+fn check_upstream(doc: &Manifest, lock: &Lockfile) -> Vec<String> {
     let mut violations = Vec::new();
     let Some(upstream) = &doc.upstream else {
         return vec!["upstream is missing".to_string()];
@@ -225,6 +300,11 @@ fn check_upstream(doc: &Manifest) -> Vec<String> {
                 entry.checksum_sha256.as_deref(),
                 "upstream.muon.checksum_sha256",
             ));
+            violations.extend(expect_lock_checksum(
+                entry.checksum_sha256.as_deref(),
+                lock.checksum("muon", "2.6.1"),
+                "upstream.muon.checksum_sha256",
+            ));
         }
         None => violations.push("upstream.muon is missing".to_string()),
     }
@@ -238,6 +318,11 @@ fn check_upstream(doc: &Manifest) -> Vec<String> {
             ));
             violations.extend(expect_checksum(
                 entry.checksum_sha256.as_deref(),
+                "upstream.pvpnclient.checksum_sha256",
+            ));
+            violations.extend(expect_lock_checksum(
+                entry.checksum_sha256.as_deref(),
+                lock.checksum("pvpnclient", "3.0.3"),
                 "upstream.pvpnclient.checksum_sha256",
             ));
         }
@@ -442,6 +527,31 @@ fn status_counts(doc: &Manifest) -> BTreeMap<String, usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// A minimal lockfile fixture matching the good manifest's pins — the
+    /// real Cargo.lock carries the same two checksums for muon 2.6.1 and
+    /// pvpnclient 3.0.3 (Proton sparse-registry entries).
+    fn good_lockfile_text() -> String {
+        "\
+version = 4
+
+[[package]]
+name = \"muon\"
+version = \"2.6.1\"
+source = \"sparse+https://rust-registry.proton.me/index/\"
+checksum = \"be9ba1f347e00a86119ff6b70d36356cce28c33fd000290cc1254bf4048155de\"
+
+[[package]]
+name = \"pvpnclient\"
+version = \"3.0.3\"
+source = \"sparse+https://rust-registry.proton.me/index/\"
+checksum = \"3c14ef052727e0204ec5e80cf8df50786db38a83b6a6557a188b78a4c264f380\"
+"
+        .to_string()
+    }
+
+    fn good_lock() -> Lockfile {
+        Lockfile::parse(&good_lockfile_text()).unwrap()
+    }
 
     fn good_manifest_yaml() -> String {
         "\
@@ -511,8 +621,48 @@ capabilities:
     fn good_manifest_passes() {
         let path = temp_yaml("good", &good_manifest_yaml());
         assert!(
-            validate(&path).unwrap(),
+            validate(&path, &good_lock()).unwrap(),
             "expected the good fixture to pass"
+        );
+        fs::remove_file(&path).ok();
+    }
+    /// Codex PR review round 2, finding 6 (P2): the muon/pvpnclient
+    /// checksums were only SHAPE-checked (64 lowercase hex characters), so
+    /// replacing either recorded digest with any other well-formed value
+    /// passed manifest-validate even when it disagreed with the pinned
+    /// checksum in Cargo.lock — the resolution authority (PRD 6.5). The
+    /// gate must compare the recorded digests against the lockfile.
+    #[test]
+    fn upstream_checksums_must_match_the_lockfile() {
+        // A well-formed but wrong muon digest is tampering the shape check
+        // cannot see (last hex digit flipped).
+        let yaml = good_manifest_yaml().replacen(
+            "be9ba1f347e00a86119ff6b70d36356cce28c33fd000290cc1254bf4048155de",
+            "be9ba1f347e00a86119ff6b70d36356cce28c33fd000290cc1254bf4048155df",
+            1,
+        );
+        let path = temp_yaml("checksum", &yaml);
+        assert!(
+            !validate(&path, &good_lock()).unwrap(),
+            "a digest that disagrees with Cargo.lock must fail the gate"
+        );
+        fs::remove_file(&path).ok();
+
+        // The untampered manifest agrees with the lockfile and passes.
+        let path = temp_yaml("checksum-ok", &good_manifest_yaml());
+        assert!(
+            validate(&path, &good_lock()).unwrap(),
+            "the matching fixture must still pass"
+        );
+        fs::remove_file(&path).ok();
+
+        // A lockfile without the pinned package cannot verify the digest:
+        // the gate must fail rather than pass vacuously.
+        let empty = Lockfile::parse("version = 4\n").unwrap();
+        let path = temp_yaml("checksum-empty", &good_manifest_yaml());
+        assert!(
+            !validate(&path, &empty).unwrap(),
+            "an unverifiable checksum must fail, not pass vacuously"
         );
         fs::remove_file(&path).ok();
     }
@@ -521,7 +671,7 @@ capabilities:
     fn wrong_schema_version_fails() {
         let yaml = good_manifest_yaml().replacen("schema_version: 3", "schema_version: 2", 1);
         let path = temp_yaml("version", &yaml);
-        assert!(!validate(&path).unwrap());
+        assert!(!validate(&path, &good_lock()).unwrap());
         fs::remove_file(&path).ok();
     }
 
@@ -529,7 +679,7 @@ capabilities:
     fn tampered_proton_pin_fails() {
         let yaml = good_manifest_yaml().replacen("revision: 12e7755a", "revision: not-th", 1);
         let path = temp_yaml("pin", &yaml);
-        assert!(!validate(&path).unwrap());
+        assert!(!validate(&path, &good_lock()).unwrap());
         fs::remove_file(&path).ok();
     }
 
@@ -549,7 +699,7 @@ capabilities:
         );
         let path = temp_yaml("extra-status", &yaml);
         assert!(
-            !validate(&path).unwrap(),
+            !validate(&path, &good_lock()).unwrap(),
             "an extra status definition must fail the gate"
         );
         fs::remove_file(&path).ok();
@@ -564,7 +714,7 @@ capabilities:
             .replacen("    status: required", "    status: waived", 1);
         let path = temp_yaml("waived-cap", &yaml);
         assert!(
-            !validate(&path).unwrap(),
+            !validate(&path, &good_lock()).unwrap(),
             "a capability using an invented status must fail the gate"
         );
         fs::remove_file(&path).ok();
@@ -577,7 +727,7 @@ capabilities:
             1,
         );
         let path = temp_yaml("verified", &yaml);
-        assert!(!validate(&path).unwrap());
+        assert!(!validate(&path, &good_lock()).unwrap());
         fs::remove_file(&path).ok();
     }
 
@@ -589,7 +739,7 @@ capabilities:
             1,
         );
         let path = temp_yaml("blocked", &yaml);
-        assert!(!validate(&path).unwrap());
+        assert!(!validate(&path, &good_lock()).unwrap());
         fs::remove_file(&path).ok();
     }
 
@@ -767,13 +917,13 @@ capabilities:
             sources: None,
             capabilities: None,
         };
-        assert!(check_upstream(&doc).is_empty());
+        assert!(check_upstream(&doc, &good_lock()).is_empty());
 
         if let Some(upstream) = doc.upstream.as_mut() {
             upstream.get_mut("official_linux_cli").unwrap().revision = Some("short".to_string());
         }
         assert!(
-            check_upstream(&doc)
+            check_upstream(&doc, &good_lock())
                 .iter()
                 .any(|v| v.contains("official_linux_cli"))
         );
