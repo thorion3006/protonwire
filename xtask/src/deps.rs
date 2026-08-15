@@ -22,6 +22,13 @@ const CLIENT_SIDE: &[&str] = &[
     "protonwire-gui",
     "protonwire-client",
 ];
+/// The three frontend applications. They reach the daemon ONLY through
+/// `protonwire-client`: a direct `protonwire-ipc` edge would bypass the
+/// SDK's socket trust policy, protocol negotiation, and resynchronization
+/// (Codex PR review round 2, finding 8). `protonwire-client` itself is not
+/// in this class — speaking IPC is its job.
+const FRONTEND_APPS: &[&str] = &["protonwire-cli", "protonwire-tui", "protonwire-gui"];
+
 const DEEP_DEPS: &[&str] = &[
     "protonwire-core",
     "protonwire-net",
@@ -199,6 +206,20 @@ pub(crate) fn forbidden_edges(member: &str, deps: &[&str]) -> Vec<String> {
             }
         }
     }
+    // The SDK is the boundary: the apps may not speak IPC directly, or
+    // they would sidestep its trust policy, negotiation, and resync
+    // (Codex PR review round 2, finding 8). protonwire-ipc therefore
+    // cannot live in DEEP_DEPS — the SDK legitimately depends on it —
+    // and gets its own frontend-only rule instead.
+    if FRONTEND_APPS.contains(&member) {
+        for dep in deps {
+            if *dep == "protonwire-ipc" {
+                violations.push(format!(
+                    "{member} -> protonwire-ipc is forbidden: frontends talk to the daemon only through protonwire-client (T-23)"
+                ));
+            }
+        }
+    }
     if CORE_SIDE.contains(&member) {
         for dep in deps {
             if FRONTEND_TECH.contains(dep) {
@@ -349,6 +370,23 @@ mod tests {
         assert!(!forbidden_edges("protonwire-gui", &["protonwire-net"]).is_empty());
         assert!(!forbidden_edges("protonwire-client", &["protun"]).is_empty());
         assert!(forbidden_edges("protonwire-client", &["protonwire-ipc", "anyhow"]).is_empty());
+    }
+    /// Codex PR review round 2, finding 8 (P2): the gate put the three
+    /// frontend apps and protonwire-client in one CLIENT_SIDE class, so
+    /// protonwire-ipc could not be forbidden there (the SDK legitimately
+    /// depends on it) — a direct CLI/TUI/GUI dependency on protonwire-ipc
+    /// passed dep-graph, bypassing the SDK's trust policy, protocol
+    /// negotiation, and resynchronization.
+    #[test]
+    fn frontends_cannot_depend_on_ipc_directly() {
+        for app in ["protonwire-cli", "protonwire-tui", "protonwire-gui"] {
+            assert!(
+                !forbidden_edges(app, &["protonwire-ipc", "anyhow"]).is_empty(),
+                "{app} must not reach protonwire-ipc directly"
+            );
+        }
+        // The SDK remains the one client-side crate allowed to speak IPC.
+        assert!(forbidden_edges("protonwire-client", &["protonwire-ipc"]).is_empty());
     }
 
     #[test]
