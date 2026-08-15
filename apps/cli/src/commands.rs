@@ -32,7 +32,7 @@ pub enum Command {
     Connect {
         /// Target words, for example: fastest | country GB | server UK#42 |
         /// group proton:fastest-country (PRD 9.2).
-        #[arg(value_name = "TARGET", trailing_var_arg = true, required = true)]
+        #[arg(value_name = "TARGET", required = true)]
         target: Vec<String>,
 
         /// Ranking policy (official|balanced|load|latency; PRD 9.3).
@@ -72,7 +72,7 @@ pub enum Command {
     Group,
     /// Resolve a target without connecting (Milestone 3).
     Select {
-        #[arg(value_name = "TARGET", trailing_var_arg = true, required = true)]
+        #[arg(value_name = "TARGET", required = true)]
         target: Vec<String>,
     },
     /// Show or set configuration (Milestone 2 for overlays).
