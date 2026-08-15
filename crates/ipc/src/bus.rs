@@ -1,15 +1,13 @@
 //! In-daemon event fan-out to connected sessions.
 //!
 //! Sessions subscribe with a bounded queue. A session whose queue overflows
-//! Sessions subscribe with a bounded queue. A session whose queue overflows
 //! keeps its subscription: the overflow is dropped, and the next sequence
 //! number after the queue drains lets the client detect the gap and
 //! resynchronize with a `GetState` request — the documented recovery path
 //! (PRD FR-127D). No event is ever blocking.
-//! documented recovery path (PRD FR-127D). No event is ever blocking.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, mpsc};
 
 use protonwire_frontend_api::ServerMessage;
@@ -19,11 +17,22 @@ use protonwire_frontend_api::ServerMessage;
 /// writer channel so both bounds stay identical.
 pub(crate) const SESSION_QUEUE_LEN: usize = 256;
 
+/// Maximum simultaneously served sessions; connections beyond this are
+/// accepted and immediately closed to drain the backlog.
+///
+/// Enforced by an atomically reserved slot counter owned by the bus,
+/// claimed BEFORE a connection's worker is spawned: a check against the
+/// subscriber count races a concurrent accept burst, because the new
+/// connection only registers once the spawned thread runs (Codex PR
+/// review finding 2).
+pub const MAX_SESSIONS: usize = 64;
+
 /// Fan-out registry of live sessions.
 #[derive(Debug, Default)]
 pub struct EventBus {
     sessions: Mutex<HashMap<u64, mpsc::SyncSender<ServerMessage>>>,
     next_session: AtomicU64,
+    reserved: AtomicUsize,
 }
 
 impl EventBus {
@@ -43,6 +52,32 @@ impl EventBus {
     /// Removes a session.
     pub fn unsubscribe(&self, id: u64) {
         self.sessions.lock().expect("event bus lock").remove(&id);
+    }
+
+    /// Atomically claims one of the [`MAX_SESSIONS`] session slots.
+    ///
+    /// Returns `false` (without claiming) when the server is at its
+    /// ceiling. The caller MUST pair every `true` with
+    /// [`EventBus::release_session`] on session end — `handle_session`'s
+    /// drop guard does.
+    pub fn try_reserve_session(&self) -> bool {
+        match self.reserved.fetch_add(1, Ordering::SeqCst) {
+            n if n < MAX_SESSIONS => true,
+            _ => {
+                self.reserved.fetch_sub(1, Ordering::SeqCst);
+                false
+            }
+        }
+    }
+
+    /// Releases a slot claimed by [`EventBus::try_reserve_session`].
+    pub fn release_session(&self) {
+        self.reserved.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    /// Number of currently reserved session slots (diagnostics and tests).
+    pub fn active_sessions(&self) -> usize {
+        self.reserved.load(Ordering::SeqCst)
     }
 
     /// Pushes a message to every live session queue.
@@ -151,5 +186,21 @@ mod tests {
         bus.publish(event_message(1));
         assert_eq!(bus.session_count(), 0);
         bus.unsubscribe(id);
+    }
+
+    /// Codex PR review finding 2: the slot counter enforces the ceiling
+    /// atomically and only a successful claim counts.
+    #[test]
+    fn session_slots_are_reserved_up_to_the_ceiling_only() {
+        let bus = EventBus::new();
+        for _ in 0..MAX_SESSIONS {
+            assert!(bus.try_reserve_session());
+        }
+        assert!(!bus.try_reserve_session());
+        assert!(!bus.try_reserve_session());
+        assert_eq!(bus.active_sessions(), MAX_SESSIONS);
+        bus.release_session();
+        assert!(bus.try_reserve_session());
+        assert_eq!(bus.active_sessions(), MAX_SESSIONS);
     }
 }

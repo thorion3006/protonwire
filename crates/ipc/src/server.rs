@@ -15,7 +15,7 @@ use protonwire_frontend_api::{
 use tracing::{debug, info, warn};
 
 use crate::authz::{authorize, required_role};
-use crate::bus::EventBus;
+use crate::bus::{EventBus, MAX_SESSIONS};
 use crate::frame::{FrameError, read_msg, write_msg};
 use crate::peer::PeerCredentials;
 
@@ -29,10 +29,6 @@ const HELLO_DEADLINE: Duration = Duration::from_secs(5);
 /// Ceiling on blocked writes to one client; a peer that stops reading loses
 /// its session instead of pinning a writer thread forever.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// Maximum simultaneously served sessions; connections beyond this are
-/// accepted and immediately closed to drain the backlog.
-const MAX_SESSIONS: usize = 64;
 
 /// What a session knows about its authenticated client.
 #[derive(Debug, Clone)]
@@ -106,7 +102,12 @@ impl IpcServer {
         while !stop.load(Ordering::SeqCst) {
             match self.listener.accept() {
                 Ok((stream, _)) => {
-                    if handler.event_bus().session_count() >= MAX_SESSIONS {
+                    // Reserve the session slot ATOMICALLY, before the worker
+                    // is spawned: checking the subscriber count here races a
+                    // concurrent burst, because the connection only
+                    // registers once the spawned thread runs (Codex PR
+                    // review finding 2).
+                    if !handler.event_bus().try_reserve_session() {
                         debug!("session limit reached; dropping new connection");
                         continue; // dropping `stream` closes it
                     }
@@ -158,6 +159,17 @@ fn set_socket_mode(socket_path: &Path) -> io::Result<()> {
 
 /// Serves one client connection until EOF, error, or daemon shutdown.
 fn handle_session<H: RequestHandler>(stream: UnixStream, handler: Arc<H>, stop: Arc<AtomicBool>) {
+    // The session slot the accept loop reserved is released on EVERY exit
+    // path — early rejects below, dispatcher panics (the serve loop's
+    // catch_unwind drops this guard during unwind), and normal teardown
+    // (Codex PR review finding 2).
+    struct ReleaseSlotOnDrop<'a>(&'a EventBus);
+    impl Drop for ReleaseSlotOnDrop<'_> {
+        fn drop(&mut self) {
+            self.0.release_session();
+        }
+    }
+    let _slot = ReleaseSlotOnDrop(handler.event_bus());
     let Ok(peer) = PeerCredentials::of(&stream) else {
         debug!("session rejected: peer credentials unavailable");
         return;
@@ -430,6 +442,76 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(25));
         }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while handler.event_bus().active_sessions() != 0 {
+            assert!(
+                Instant::now() < deadline,
+                "session slots leaked: {} still reserved after all clients \
+                 disconnected",
+                handler.event_bus().active_sessions()
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    /// Codex PR review finding 2 (P1): MAX_SESSIONS was checked against
+    /// bus.session_count() only after the connection was accepted and the
+    /// worker spawned, so a concurrent burst — none of the spawned threads
+    /// having subscribed yet — sailed past the 64-session ceiling. The cap
+    /// must hold under a burst, not only sequentially.
+    #[test]
+    fn concurrent_connection_burst_never_exceeds_the_session_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let handler = Arc::new(NullHandler {
+            version: "test".into(),
+            bus: EventBus::new(),
+        });
+        let server = spawn_server(&dir, Arc::clone(&handler));
+        let path = server.socket_path().to_owned();
+
+        // 3x the cap, all connecting at once and never handshaking: every
+        // accepted connection occupies a session until the 5 s hello
+        // deadline, so the live count is directly observable. The sockets
+        // stay open (held in `streams`) for the whole measurement.
+        const BURST: usize = MAX_SESSIONS * 3;
+        let (tx, rx) = mpsc::channel::<std::os::unix::net::UnixStream>();
+        let connect_error = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        for _ in 0..BURST {
+            let path = path.clone();
+            let tx = tx.clone();
+            let connect_error = Arc::clone(&connect_error);
+            std::thread::spawn(move || match std::os::unix::net::UnixStream::connect(&path) {
+                Ok(stream) => {
+                    let _ = tx.send(stream);
+                }
+                Err(_) => {
+                    connect_error.fetch_add(1, Ordering::SeqCst);
+                }
+            });
+        }
+        drop(tx);
+        let mut streams = Vec::new();
+        while let Ok(stream) = rx.recv() {
+            streams.push(stream);
+        }
+        assert_eq!(
+            connect_error.load(Ordering::SeqCst),
+            0,
+            "the burst must fit the listen backlog"
+        );
+
+        // Accept-loop drain plus session setup, still well inside the 5 s
+        // hello deadline that keeps unhandshaken sessions alive.
+        std::thread::sleep(Duration::from_millis(750));
+        let live = handler.event_bus().session_count();
+        let reserved = handler.event_bus().active_sessions();
+        assert!(
+            live <= MAX_SESSIONS && reserved <= MAX_SESSIONS,
+            "session ceiling violated under a concurrent burst: {live} live / \
+             {reserved} reserved sessions, cap is {MAX_SESSIONS}"
+        );
+        drop(server);
+        drop(streams);
     }
 
     /// Finding 10: the handshake must reject versions below the oldest
