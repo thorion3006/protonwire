@@ -24,9 +24,11 @@ Read the specification set before changing behavior — the PRD is normative:
 
 ## Development environment
 
-All build and runtime tools come from the repo-scoped devshell
-(`shell.nix`, pinned nixpkgs) — never from system-wide installs. With
-direnv (recommended) it activates on entry:
+The repository builds on any mainstream Linux distro (CI runs stock
+Ubuntu); pick one of two supported paths:
+
+**Nix devshell (recommended, reproducible)** — with direnv it activates
+on entry:
 
 ```sh
 direnv allow                        # core: rustc/cargo/rustfmt/clippy,
@@ -34,7 +36,12 @@ direnv allow                        # core: rustc/cargo/rustfmt/clippy,
 PROTONWIRE_GUI=1 direnv allow       # + webkit2gtk stack for protonwire-gui
 ```
 
-Without direnv: `nix-shell` / `nix-shell --arg gui true`.
+Without direnv: `nix-shell` / `nix-shell --arg gui true`. Works on any
+distro where Nix is installed.
+
+**Plain toolchain** — Rust 1.97+ (`rust-toolchain.toml` pins the version
+for rustup users), a C toolchain, and for GUI work the webkit2gtk
+development packages (see README for the list). No Nix required.
 
 The shell pins the verified toolchain (rustc 1.97.1); `rust-toolchain.toml`
 is inert inside it (no rustup) and only serves rustup-based contributors

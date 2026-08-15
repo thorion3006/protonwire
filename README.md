@@ -49,10 +49,13 @@ enforces this (PRD NFR-39).
 
 ## Building
 
-The repo-scoped devshell carries the entire toolchain (rustc 1.97.1,
-cargo, rustfmt, clippy, the gcc linker, cargo-audit, git); no
-system-wide Rust install is needed or used. With direnv it activates on
-entry:
+ProtonWire builds on any mainstream Linux distribution — CI proves every
+commit on stock Ubuntu runners. Two supported paths:
+
+**Nix devshell (recommended, any distro with Nix installed)** — the
+entire toolchain (rustc 1.97.1, cargo, rustfmt, clippy, gcc,
+cargo-audit, git) comes from the repo, nothing installed system-wide.
+With direnv it activates on entry:
 
 ```sh
 direnv allow                # once: toolchain active in every shell here
@@ -61,6 +64,20 @@ PROTONWIRE_GUI=1 direnv allow   # opt in to the webkit2gtk stack:
 ```
 
 Without direnv: `nix-shell` (or `nix-shell --arg gui true`).
+
+**Plain distro toolchain (no Nix)** — any Rust 1.97+ toolchain works;
+`rust-toolchain.toml` pins the version for rustup users:
+
+```sh
+rustup toolchain install 1.97.1   # or your distro's rustc >= 1.97
+# C toolchain required (gcc/clang; the engine chain builds C code)
+# GUI only: libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev \
+#           libayatana-appindicator3-dev pkg-config
+cargo build
+```
+
+The Proton sparse registry and the `cargo xtask` alias are configured in
+`.cargo/config.toml`.
 
 Toolchain floor: Rust ≥ 1.97 (edition 2024) — the Proton registry crates
 the engines depend on do not compile below ~1.94 (probe record in
