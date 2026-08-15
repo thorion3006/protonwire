@@ -15,7 +15,7 @@ use protonwire_frontend_api::{
 use tracing::{debug, info, warn};
 
 use crate::authz::{authorize, required_role};
-use crate::bus::{EventBus, MAX_SESSIONS};
+use crate::bus::EventBus;
 use crate::frame::{FrameError, FrameReader, write_msg};
 use crate::peer::PeerCredentials;
 
@@ -347,6 +347,7 @@ fn dispatch(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bus::MAX_SESSIONS;
     use crate::frame::{read_msg, write_msg};
     use protonwire_frontend_api::{ClientInfo, ClientSurface, Request};
 

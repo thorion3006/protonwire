@@ -65,25 +65,32 @@ fn main() {
         .unwrap_or_else(|| config.daemon.log_level.clone());
     init_tracing_filtered(&level);
 
+    // Codex PR review finding 4: capture daemon.socket_path before `config`
+    // moves into the core; binding applies it with --socket-dir > config >
+    // default precedence (see resolve_bind_location).
+    let config_socket_path = config.daemon.socket_path.clone();
     let bus = Arc::new(protonwire_ipc::EventBus::new());
     let core = Arc::new(protonwire_core::DaemonCore::new(
         env!("CARGO_PKG_VERSION"),
         config,
         Arc::new(BusSink(Arc::clone(&bus))),
     ));
-
-    let server =
-        match protonwire_ipc::server::IpcServer::bind(&paths.socket_dir, &paths.socket_name) {
-            Ok(server) => server,
-            Err(e) => {
-                eprintln!(
-                    "protonwire-daemon: cannot bind {}: {e}",
-                    paths.socket_path().display()
-                );
-                std::process::exit(1);
-            }
-        };
-
+    let (socket_dir, socket_name) = protonwire_daemon::resolve_bind_location(
+        args.socket_dir.as_deref(),
+        config_socket_path.as_deref(),
+        &paths.socket_dir,
+        &paths.socket_name,
+    );
+    let server = match protonwire_ipc::server::IpcServer::bind(&socket_dir, &socket_name) {
+        Ok(server) => server,
+        Err(e) => {
+            eprintln!(
+                "protonwire-daemon: cannot bind {}: {e}",
+                socket_dir.join(&socket_name).display()
+            );
+            std::process::exit(1);
+        }
+    };
     core.notice(
         protonwire_frontend_api::NoticeLevel::Info,
         "daemon started (milestone 1 foundation)",
