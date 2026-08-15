@@ -124,9 +124,7 @@ impl ProtonwireClient {
     /// [`IpcSecurityChecks::dev_unchecked()`] explicitly via
     /// [`ProtonwireClient::connect_to`].
     pub fn connect_default(surface: ClientSurface) -> Result<Self, ClientError> {
-        let path = std::env::var(SOCKET_ENV)
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from(DEFAULT_SOCKET_PATH));
+        let path = resolve_socket_path(None, std::env::var(SOCKET_ENV).ok().as_deref());
         Self::connect_to(&path, surface, security_checks_from_env())
     }
 
@@ -285,24 +283,35 @@ pub fn security_checks_from_env() -> IpcSecurityChecks {
     )
 }
 
+/// Resolves the daemon socket path (Codex PR review finding 6): an explicit
+/// `--socket` flag wins, then `PROTONWIRE_SOCKET`, then the documented
+/// default. Pure so the precedence is unit-testable — the env read stays in
+/// the callers because edition 2024 makes `set_var` unsafe and the workspace
+/// denies `unsafe_code` (same seam as [`checks_for`]).
+pub fn resolve_socket_path(socket: Option<&Path>, env_override: Option<&str>) -> PathBuf {
+    match socket {
+        Some(path) => path.to_owned(),
+        None => env_override
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(DEFAULT_SOCKET_PATH)),
+    }
+}
+
 /// Connects with an optional socket override and the SDK check policy.
 ///
 /// This is the connection entry point apps should use: it resolves the
-/// `PROTONWIRE_SOCKET` override and the (debug-only) bypass in one place,
-/// so clients never assemble the policy themselves.
+/// `--socket` flag and `PROTONWIRE_SOCKET` (flag wins — see
+/// [`resolve_socket_path`]) plus the (debug-only) bypass in one place, so
+/// clients never assemble the policy themselves.
 pub fn connect_with_socket_override(
     socket: Option<&Path>,
     surface: ClientSurface,
 ) -> Result<ProtonwireClient, ClientError> {
-    match socket {
-        Some(path) => {
-            let path = std::env::var(SOCKET_ENV)
-                .map(PathBuf::from)
-                .unwrap_or_else(|_| path.to_owned());
-            ProtonwireClient::connect_to(&path, surface, security_checks_from_env())
-        }
-        None => ProtonwireClient::connect_default(surface),
-    }
+    let path = resolve_socket_path(
+        socket,
+        std::env::var(SOCKET_ENV).ok().as_deref(),
+    );
+    ProtonwireClient::connect_to(&path, surface, security_checks_from_env())
 }
 
 #[cfg(test)]
@@ -630,5 +639,37 @@ mod tests {
                 "wrong exit code for {code:?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod socket_resolution_tests {
+    use super::*;
+
+    /// Codex PR review finding 6 (P2): an explicit --socket must WIN over
+    /// PROTONWIRE_SOCKET. The pre-fix branch resolved the environment first,
+    /// so `daemon stop --socket /run/protonwire-test.sock` with the env set
+    /// acted on a different daemon than the one named on the command line —
+    /// contradicting the CLI help, where the env is only part of the default.
+    /// Pure fn (env passed in) because edition 2024 makes set_var unsafe and
+    /// the workspace denies unsafe_code — same seam pattern as checks_for.
+    #[test]
+    fn explicit_socket_beats_environment_beats_default() {
+        assert_eq!(
+            resolve_socket_path(Some(Path::new("/run/explicit.sock")), Some("/run/env.sock")),
+            PathBuf::from("/run/explicit.sock")
+        );
+        assert_eq!(
+            resolve_socket_path(None, Some("/run/env.sock")),
+            PathBuf::from("/run/env.sock")
+        );
+        assert_eq!(
+            resolve_socket_path(Some(Path::new("/run/explicit.sock")), None),
+            PathBuf::from("/run/explicit.sock")
+        );
+        assert_eq!(
+            resolve_socket_path(None, None),
+            PathBuf::from(DEFAULT_SOCKET_PATH)
+        );
     }
 }
