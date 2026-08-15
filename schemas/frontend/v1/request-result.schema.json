@@ -69,7 +69,7 @@
   ],
   "$defs": {
     "DaemonState": {
-      "description": "Full daemon state snapshot — the authoritative view clients resynchronize\nagainst (PRD FR-127D). Connection details (server, tunnel statistics,\nrequested-vs-applied features) join this struct in Milestone 4+ as additive\noptional fields with a protocol minor version bump.",
+      "description": "Full daemon state snapshot — the authoritative view clients resynchronize\nagainst (PRD FR-127D). Connection details (server, tunnel statistics,\nrequested-vs-applied features) join this struct in Milestone 4+ as\nadditive-optional fields, which are wire-compatible WITHOUT a protocol\nversion bump (old and new documents round-trip — see\n`snapshot_sequence_is_optional_on_the_wire` for the same rule on\n`latest_event_seq`). A version bump is reserved for representation\nchanges that break older readers: renaming or repurposing fields,\nchanging a field's type or semantics, or making a previously-optional\nfield mandatory.",
       "type": "object",
       "properties": {
         "active_owner_uid": {
