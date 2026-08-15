@@ -276,7 +276,20 @@ fn serve_messages(
             }));
             return Ok(());
         }
-        let message = match reader.read_msg::<ClientMessage>() {
+        // Codex PR review round 2, finding 2: the deadline must hold DURING
+        // a frame too. A peer trickling one byte per sub-READ_POLL interval
+        // keeps every individual read succeeding, so the loop above is not
+        // revisited until the frame completes — a dribbled hello could hold
+        // its reserved session slot indefinitely. The codec-level deadline
+        // fails the read with TimedOut, which the arm below treats as
+        // pollable; the check at the top of the loop then issues the
+        // hello-timeout refusal. Post-hello reads are unbounded: a live
+        // session may take as long as its client needs between requests.
+        let message = match if hello_done {
+            reader.read_msg::<ClientMessage>()
+        } else {
+            reader.read_msg_within::<ClientMessage>(connected_at + HELLO_DEADLINE)
+        } {
             Ok(m) => m,
             Err(FrameError::Io(e))
                 if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut =>
@@ -722,6 +735,77 @@ mod tests {
             Ok(ServerMessage::Response(response)) => assert_eq!(response.id(), 7),
             other => panic!("expected a correlated response, got {other:?}"),
         }
+    }
+
+    /// Codex PR review round 2, finding 2 (P2): HELLO_DEADLINE was only
+    /// re-checked between COMPLETE frames. A peer that supplies one byte
+    /// before each 250 ms read timeout keeps `FrameReader`'s inner fill
+    /// loop satisfied — no error ever surfaces — so a maximum-sized hello
+    /// could dribble for hours while holding a reserved session slot.
+    /// The hello-phase read must fail once the deadline passes even while
+    /// bytes keep arriving.
+    #[test]
+    fn hello_deadline_holds_against_a_steady_byte_dribble() {
+        use std::io::Write;
+        use std::time::{Duration, Instant};
+
+        let dir = tempfile::tempdir().unwrap();
+        let handler = Arc::new(NullHandler {
+            version: "test".into(),
+            bus: EventBus::new(),
+        });
+        let server = spawn_server(&dir, handler);
+        let stream = std::os::unix::net::UnixStream::connect(server.socket_path()).unwrap();
+        let mut read_half = stream.try_clone().unwrap();
+        let mut write_half = stream;
+
+        let mut frame = Vec::new();
+        write_msg(
+            &mut frame,
+            &ClientMessage::Hello {
+                protocol_version: 1,
+                client: info(),
+            },
+        )
+        .unwrap();
+        // One byte every 100 ms completes this frame in well over double
+        // HELLO_DEADLINE, and no single read ever hits the 250 ms poll
+        // timeout — the exact shape of the claimed dribble.
+        assert!(
+            frame.len() as u64 * 100 > HELLO_DEADLINE.as_millis() as u64 * 2,
+            "fixture frame must out-dribble the deadline"
+        );
+
+        let dribbler = std::thread::spawn(move || {
+            for byte in frame {
+                if write_half.write_all(&[byte]).is_err() {
+                    break; // the server hung up mid-dribble
+                }
+                let _ = write_half.flush();
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        });
+
+        read_half
+            .set_read_timeout(Some(Duration::from_secs(7)))
+            .unwrap();
+        let started = Instant::now();
+        match read_msg::<_, ServerMessage>(&mut read_half) {
+            Ok(ServerMessage::HelloError(err)) => {
+                assert_eq!(err.reason, "hello-timeout");
+                assert!(
+                    started.elapsed() < HELLO_DEADLINE + Duration::from_secs(2),
+                    "refusal arrived well past the deadline"
+                );
+            }
+            other => panic!("expected a hello-timeout refusal, got {other:?}"),
+        }
+        // The session ends after the refusal.
+        assert!(matches!(
+            read_msg::<_, ServerMessage>(&mut read_half),
+            Err(crate::frame::FrameError::Truncated)
+        ));
+        dribbler.join().unwrap();
     }
     /// Codex PR review finding 11 (P2): only a definitive stale-socket
     /// signal (ECONNREFUSED) may authorize unlinking the socket file. Any

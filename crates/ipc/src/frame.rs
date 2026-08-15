@@ -10,8 +10,15 @@
 //! half a frame on a poll timeout desynchronizes the session, because the
 //! remaining bytes are then interpreted as a fresh length prefix (Codex PR
 //! review finding 5, tracked as rust-review #12).
+//!
+//! [`FrameReader`] reads can also carry a caller-supplied deadline
+//! ([`FrameReader::read_msg_within`]): a peer that trickles bytes faster
+//! than the socket read timeout keeps every individual `read` succeeding,
+//! so only a codec-level deadline bounds the total time one frame may take
+//! (Codex PR review round 2, finding 2 — the server's hello phase).
 
 use std::io::{Read, Write};
+use std::time::Instant;
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -124,10 +131,26 @@ impl<R: Read> FrameReader<R> {
     /// Reads one raw frame payload, resuming a partially read frame after
     /// a poll timeout.
     pub fn read_frame(&mut self) -> Result<Vec<u8>, FrameError> {
+        self.read_frame_deadline(None)
+    }
+
+    /// [`FrameReader::read_frame`] bounded by `deadline`.
+    ///
+    /// Fails with `TimedOut` once the deadline passes EVEN IF bytes keep
+    /// arriving: each successful `read` resets the socket-level timeout,
+    /// so a peer dribbling one byte per sub-timeout interval would
+    /// otherwise stretch a single frame out indefinitely. Partial
+    /// progress is retained, so a caller may still resume the frame with
+    /// [`FrameReader::read_frame`].
+    pub fn read_frame_within(&mut self, deadline: Instant) -> Result<Vec<u8>, FrameError> {
+        self.read_frame_deadline(Some(deadline))
+    }
+
+    fn read_frame_deadline(&mut self, deadline: Option<Instant>) -> Result<Vec<u8>, FrameError> {
         loop {
             match &mut self.stage {
                 Stage::Prefix { buf, filled } => {
-                    fill(&mut self.inner, buf, filled)?;
+                    fill(&mut self.inner, buf, filled, deadline)?;
                     let len = u32::from_be_bytes(*buf) as usize;
                     if len > MAX_FRAME_LEN {
                         // The stream is untrustworthy past this point;
@@ -145,7 +168,7 @@ impl<R: Read> FrameReader<R> {
                     };
                 }
                 Stage::Payload { buf, filled } => {
-                    fill(&mut self.inner, buf, filled)?;
+                    fill(&mut self.inner, buf, filled, deadline)?;
                     // Stage completed: hand over the payload and stand at
                     // the next frame boundary.
                     return match std::mem::replace(
@@ -169,6 +192,16 @@ impl<R: Read> FrameReader<R> {
         serde_json::from_slice(&payload).map_err(|e| FrameError::Payload(e.to_string()))
     }
 
+    /// [`FrameReader::read_msg`] bounded by `deadline` — see
+    /// [`FrameReader::read_frame_within`].
+    pub fn read_msg_within<T: DeserializeOwned>(
+        &mut self,
+        deadline: Instant,
+    ) -> Result<T, FrameError> {
+        let payload = self.read_frame_within(deadline)?;
+        serde_json::from_slice(&payload).map_err(|e| FrameError::Payload(e.to_string()))
+    }
+
     /// Unwraps into the underlying reader.
     pub fn into_inner(self) -> R {
         self.inner
@@ -177,8 +210,26 @@ impl<R: Read> FrameReader<R> {
 
 /// Advances `filled` toward `buf.len()` on `r`, leaving partial progress
 /// intact for the caller to resume after a poll timeout.
-fn fill<R: Read>(r: &mut R, buf: &mut [u8], filled: &mut usize) -> Result<(), FrameError> {
+///
+/// With `deadline` set, the loop also fails with `TimedOut` once the
+/// deadline passes — checked before every `read`, so a steady dribble of
+/// successfully arriving bytes cannot outlive it (Codex PR review round 2,
+/// finding 2).
+fn fill<R: Read>(
+    r: &mut R,
+    buf: &mut [u8],
+    filled: &mut usize,
+    deadline: Option<Instant>,
+) -> Result<(), FrameError> {
     while *filled < buf.len() {
+        if let Some(deadline) = deadline
+            && Instant::now() >= deadline
+        {
+            return Err(FrameError::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "frame deadline exceeded while bytes kept arriving",
+            )));
+        }
         match r.read(&mut buf[*filled..]) {
             Ok(0) => return Err(FrameError::Truncated),
             Ok(n) => *filled += n,
@@ -320,5 +371,54 @@ mod tests {
         };
         let value: serde_json::Value = serde_json::from_slice(&payload).unwrap();
         assert_eq!(value.as_array().map(Vec::len), Some(3));
+    }
+
+    /// Codex PR review round 2, finding 2: a STEADY dribble — one byte per
+    /// successful read, never a WouldBlock in between — must not outlive a
+    /// caller-supplied deadline. Each successful read resets the socket
+    /// timeout, so only the codec-level deadline bounds the frame's total
+    /// duration; partial progress is retained for resumption.
+    #[test]
+    fn deadline_bounds_a_steady_trickle_mid_frame() {
+        struct SteadyDribble {
+            data: Vec<u8>,
+            pos: usize,
+        }
+        impl Read for SteadyDribble {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if self.pos >= self.data.len() {
+                    return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
+                }
+                std::thread::sleep(std::time::Duration::from_micros(200));
+                buf[0] = self.data[self.pos];
+                self.pos += 1;
+                Ok(1)
+            }
+        }
+
+        let payload = "x".repeat(4096);
+        let mut frame = Vec::new();
+        write_msg(&mut frame, &serde_json::json!(&payload)).unwrap();
+
+        let deadline = Instant::now() + std::time::Duration::from_millis(50);
+        let mut reader = FrameReader::new(SteadyDribble {
+            data: frame.clone(),
+            pos: 0,
+        });
+        let err = reader
+            .read_frame_within(deadline)
+            .expect_err("the deadline must fire mid-dribble");
+        assert!(
+            matches!(&err, FrameError::Io(e) if e.kind() == std::io::ErrorKind::TimedOut),
+            "expected a TimedOut failure, got {err:?}"
+        );
+
+        // Partial progress survived: the same reader resumes and completes
+        // the SAME frame afterwards.
+        let resumed = reader
+            .read_frame()
+            .expect("frame resumes after the deadline");
+        let value: serde_json::Value = serde_json::from_slice(&resumed).unwrap();
+        assert_eq!(value.as_str(), Some(payload.as_str()));
     }
 }
