@@ -59,8 +59,14 @@ impl NetworkIntegration {
 
 /// Full daemon state snapshot — the authoritative view clients resynchronize
 /// against (PRD FR-127D). Connection details (server, tunnel statistics,
-/// requested-vs-applied features) join this struct in Milestone 4+ as additive
-/// optional fields with a protocol minor version bump.
+/// requested-vs-applied features) join this struct in Milestone 4+ as
+/// additive-optional fields, which are wire-compatible WITHOUT a protocol
+/// version bump (old and new documents round-trip — see
+/// `snapshot_sequence_is_optional_on_the_wire` for the same rule on
+/// `latest_event_seq`). A version bump is reserved for representation
+/// changes that break older readers: renaming or repurposing fields,
+/// changing a field's type or semantics, or making a previously-optional
+/// field mandatory.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct DaemonState {
     /// Protocol version the daemon speaks.
