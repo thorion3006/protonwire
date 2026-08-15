@@ -161,6 +161,15 @@ impl IpcClient {
                 path: path.to_owned(),
                 source,
             })?;
+        // The write ceiling matches: a daemon that stops reading mid-request
+        // cannot pin the client's writes either (Codex PR review round 2,
+        // finding 7).
+        stream
+            .set_write_timeout(Some(timeout))
+            .map_err(|source| ConnectError::Unreachable {
+                path: path.to_owned(),
+                source,
+            })?;
         let mut transport = Self {
             stream,
             next_id: 0,
@@ -185,10 +194,12 @@ impl IpcClient {
 
     /// Overrides the per-request timeout (tests use short values). Also
     /// bounds a whole request: a stream of events cannot keep one alive
-    /// past the deadline.
+    /// past the deadline, and a peer that stops reading cannot pin the
+    /// request's write either.
     pub fn set_timeout(&mut self, timeout: Duration) {
         self.timeout = timeout;
         let _ = self.stream.set_read_timeout(Some(timeout));
+        let _ = self.stream.set_write_timeout(Some(timeout));
     }
 
     fn handshake(&mut self, client: ClientInfo) -> Result<HelloAck, ConnectError> {
@@ -228,7 +239,28 @@ impl IpcClient {
         let deadline = std::time::Instant::now() + self.timeout;
         let id = self.next_id;
         self.next_id += 1;
-        write_msg(&mut self.stream, &ClientMessage::Request { id, request }).map_err(|e| {
+        // Codex PR review round 2, finding 7: the write side gets the same
+        // deadline treatment the reads got in round 1. A handshaken peer
+        // that stops reading pins write_all once the socket buffers fill
+        // (frames may be nearly MAX_FRAME_LEN), which would otherwise
+        // block past the whole-request guarantee set_timeout documents.
+        let write_budget = deadline.saturating_duration_since(std::time::Instant::now());
+        if write_budget.is_zero() {
+            self.poisoned = true;
+            return Err(RequestError::Transport(
+                "request timed out without a response".into(),
+            ));
+        }
+        if let Err(e) = self.stream.set_write_timeout(Some(write_budget)) {
+            self.poisoned = true;
+            return Err(RequestError::Transport(format!(
+                "cannot apply request deadline: {e}"
+            )));
+        }
+        let write_outcome = write_msg(&mut self.stream, &ClientMessage::Request { id, request });
+        // Restore the whole-request write ceiling between loops.
+        let _ = self.stream.set_write_timeout(Some(self.timeout));
+        write_outcome.map_err(|e| {
             self.poisoned = true;
             RequestError::Transport(format!("write failed: {e}"))
         })?;
@@ -604,6 +636,70 @@ mod tests {
     /// Codex PR review finding 10 (P2): next_event must fail fast once the
     /// transport is poisoned, exactly like request — otherwise a caller
     /// returning to its event loop after a failed request blocks for the
+
+    /// Codex PR review round 2, finding 7 (P2): round 1 bounded every READ
+    /// by the request deadline, but the write side had no timeout at all.
+    /// A handshaken peer that stops reading pins `write_all` once the
+    /// socket buffers fill — and frames may be nearly MAX_FRAME_LEN — so
+    /// `set_timeout`'s whole-request guarantee did not bound the request.
+    #[test]
+    fn request_write_is_bounded_by_the_deadline() {
+        use std::os::unix::net::UnixListener;
+        use std::time::{Duration, Instant};
+
+        // Completes the handshake, then never reads again.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("deaf.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        std::thread::spawn(move || {
+            let Ok((mut peer, _)) = listener.accept() else {
+                return;
+            };
+            let _ = crate::frame::read_msg::<_, ClientMessage>(&mut peer);
+            let _ = crate::frame::write_msg(
+                &mut peer,
+                &ServerMessage::HelloAck(protonwire_frontend_api::HelloAck {
+                    protocol_version: 1,
+                    daemon_version: "deaf".into(),
+                    latest_event_seq: 0,
+                }),
+            );
+            // Swallow nothing further: the client's send buffers fill and
+            // its write blocks.
+            std::thread::sleep(Duration::from_secs(30));
+        });
+
+        let mut client = IpcClient::connect_with_timeout(
+            &path,
+            &test_client_info(),
+            SecurityChecks::dev_unchecked(),
+            Duration::from_millis(300),
+        )
+        .unwrap();
+        let nonce = "x".repeat(900_000); // ~0.86 MiB frame, under MAX_FRAME_LEN
+        let started = Instant::now();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let worker = std::thread::spawn(move || {
+            let outcome = client.request(Request::Ping { nonce });
+            let _ = done_tx.send(());
+            outcome
+        });
+        assert!(
+            done_rx.recv_timeout(Duration::from_secs(2)).is_ok(),
+            "request() overran its deadline — the write is unbounded"
+        );
+        let outcome = worker.join().unwrap();
+        match outcome {
+            Err(RequestError::Transport(message)) => {
+                assert!(message.contains("write"), "got: {message}");
+            }
+            other => panic!("expected a transport failure, got {other:?}"),
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the failed write must return at the deadline, not hang"
+        );
+    }
     /// full socket timeout or consumes a stranded late response.
     #[test]
     fn next_event_fails_fast_after_poisoning() {
