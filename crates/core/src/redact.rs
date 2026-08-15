@@ -68,14 +68,17 @@ impl SecretHandle {
 
 /// Replaces every occurrence of a registered (still alive) secret with
 /// [`REDACTED`].
+///
+/// Secrets are replaced longest-first: when one secret is a substring of
+/// another (a token embedded in a longer value), replacing the shorter one
+/// first would leave the longer secret's residue in the output.
 pub fn scrub(input: &str) -> Cow<'_, str> {
     let mut registry = REGISTRY.lock().expect("secret registry lock");
     registry.retain(|weak| weak.strong_count() > 0);
+    let mut secrets: Vec<_> = registry.iter().filter_map(|weak| weak.upgrade()).collect();
+    secrets.sort_by_key(|secret| std::cmp::Reverse(secret.len()));
     let mut output: Option<String> = None;
-    for weak in registry.iter() {
-        let Some(secret) = weak.upgrade() else {
-            continue;
-        };
+    for secret in secrets {
         if input.contains(secret.as_str()) {
             let target = output.as_deref().unwrap_or(input);
             output = Some(target.replace(secret.as_str(), REDACTED));
@@ -269,6 +272,17 @@ mod tests {
     fn short_values_are_not_registered() {
         let _keep = register_secret("ab");
         assert_eq!(scrub("abc"), "abc");
+    }
+
+    /// Review finding: scrubbing in registration order lets a shorter
+    /// secret that is a substring of a longer one partially consume the
+    /// longer secret's text, disclosing its residue ("secret" leaking
+    /// from "secretvalue"). Replacement must go longest-first.
+    #[test]
+    fn overlapping_secrets_redact_longest_first() {
+        let _short = register_secret("value");
+        let _long = register_secret("secretvalue");
+        assert_eq!(scrub("x secretvalue y"), "x [redacted] y");
     }
 
     #[test]
