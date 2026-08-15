@@ -343,3 +343,27 @@ demonstrable correctness bug (1, 2, 4, 5, 6, 7, 9, 10, 11, 12, 13), a
 gate that protected nothing (3, 14, 15), or a broken terminal-lifecycle
 guarantee (8). Full per-finding rationale and test names live in the
 commit messages; the consolidated verdict comment is posted on PR #3.
+
+## 2026-08-15 — Codex PR review round 2 (PR #3)
+
+The Codex bot posted 8 further inline findings on `62a64d7` (after the
+round-1 set was fully fixed). Each was verified against the code before
+acceptance; 7 were genuine and fixed red-first, 1 was rejected with
+remote evidence. Red/green evidence lives in the commit messages.
+
+| # | Sev | Finding (anchor) | Verdict | Commit |
+|---|-----|------------------|---------|--------|
+| 1 | P2 | Pair the resync snapshot with its sequence (`crates/client/src/lib.rs:240`) | Fixed @ 3c2e37f | additive-optional `DaemonState.latest_event_seq` (stamped under the emitter lock in core); the SDK advances its cursor to the snapshot's sequence and drops covered buffered events; red: `resync_snapshot_advances_the_cursor_to_its_own_sequence` (cursor sat on the gap event's 2 while the snapshot covered 4) |
+| 2 | P2 | Enforce the hello deadline during frame reads (`crates/ipc/src/server.rs:272`) | Fixed @ 034f291 | `FrameReader::read_msg_within` checks a codec-level deadline before every read — a steady dribble (one byte per sub-250 ms interval) keeps socket reads succeeding forever; red: `hello_deadline_holds_against_a_steady_byte_dribble` (7 s read expired with WouldBlock, 2 s past the 5 s deadline, server never disconnected) |
+| 3 | P2 | Run push CI on the actual main branch (`.github/workflows/ci.yml:5`) | Rejected | the premise is false: the remote's only branch IS `master` (`git ls-remote --symref origin HEAD` → `ref: refs/heads/master`; `ls-remote --heads` lists no `main`; GitHub API `default_branch` = `master`), so the filter already targets the integration branch |
+| 4 | P2 | Flush the shutdown acknowledgement before stopping (`apps/daemon/src/lib.rs:76`) | Fixed @ 9bcdb57 | `serve()` joins every session worker before returning (session teardown already joins the writer after unsubscribe), so main's exit cannot beat the ack flush; red: `serve_returns_only_after_sessions_flushed_their_final_responses` (serve() returned at ~250 ms with `active_sessions() == 1` and the ack unqueued) |
+| 5 | P2 | Reject statuses outside the fixed manifest vocabulary (`xtask/src/manifest.rs:159`) | Fixed @ 54f20c3 | `status_definitions` must equal `REQUIRED_STATUSES` exactly — missing AND unknown keys are violations; red: `status_definitions_must_match_the_frozen_vocabulary_exactly` (a `waived` definition, with and without a capability using it, passed) |
+| 6 | P2 | Compare recorded package checksums to the pinned values (`xtask/src/manifest.rs:215`) | Fixed @ c454af6 | manifest-validate parses the committed Cargo.lock (toml) and requires the muon 2.6.1 / pvpnclient 3.0.3 digests to EQUAL the lockfile checksums; missing lock entries fail rather than pass vacuously; red: `upstream_checksums_must_match_the_lockfile` (a well-formed but wrong digest passed) |
+| 7 | P2 | Bound request writes by the request deadline (`crates/ipc/src/client.rs:231`) | Fixed @ 1670afe | connect/set_timeout set the write ceiling alongside the read ceiling; `request()` applies the remaining deadline to the write (zero-remainder guarded) and poisons on expiry; red: `request_write_is_bounded_by_the_deadline` (request() never returned within 2 s against a non-reading peer) |
+| 8 | P2 | Prevent frontends from depending directly on IPC (`xtask/src/deps.rs:24`) | Fixed @ 068ac3a | separate `FRONTEND_APPS` class forbids the cli/tui/gui → protonwire-ipc edge while `protonwire-client` keeps its exemption (why the edge could not live in `DEEP_DEPS`); red: `frontends_cannot_depend_on_ipc_directly` (the edge passed unseen) |
+
+One finding rejected with evidence (#3): every other item was a
+demonstrable defect — four wire/lifecycle correctness bugs (1, 2, 4, 7)
+and three gates that protected nothing (5, 6, 8). A follow-up style
+commit (`4a93fd2`) reattached two round-1 doc comments the new test
+insertions had split (caught by the clippy gate before push).
