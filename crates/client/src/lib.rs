@@ -307,10 +307,7 @@ pub fn connect_with_socket_override(
     socket: Option<&Path>,
     surface: ClientSurface,
 ) -> Result<ProtonwireClient, ClientError> {
-    let path = resolve_socket_path(
-        socket,
-        std::env::var(SOCKET_ENV).ok().as_deref(),
-    );
+    let path = resolve_socket_path(socket, std::env::var(SOCKET_ENV).ok().as_deref());
     ProtonwireClient::connect_to(&path, surface, security_checks_from_env())
 }
 

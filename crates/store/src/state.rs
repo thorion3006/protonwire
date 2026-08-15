@@ -101,10 +101,10 @@ impl StateStore {
             std::process::id(),
             TEMP_SEQ.fetch_add(1, Ordering::Relaxed)
         ));
-            use std::io::Write;
-            let mut file = std::fs::File::create(&tmp)?;
-            file.write_all(&bytes)?;
-            file.sync_all()?;
+        use std::io::Write;
+        let mut file = std::fs::File::create(&tmp)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
         std::fs::rename(&tmp, &self.path)?;
         Ok(())
     }
@@ -182,7 +182,9 @@ mod concurrent_save_tests {
                             since_unix: 1_770_000_000 + i as u64,
                         }),
                     };
-                    store.save(&state).expect("every concurrent save must succeed");
+                    store
+                        .save(&state)
+                        .expect("every concurrent save must succeed");
                 }
             }));
         }

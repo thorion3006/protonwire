@@ -73,8 +73,16 @@ mod parse_tests {
     #[test]
     fn connect_options_after_target_words_parse() {
         let cli = Cli::try_parse_from([
-            "protonwire", "connect", "country", "GB", "--by", "latency", "--protocol", "stealth",
-            "--dry-run", "--json",
+            "protonwire",
+            "connect",
+            "country",
+            "GB",
+            "--by",
+            "latency",
+            "--protocol",
+            "stealth",
+            "--dry-run",
+            "--json",
         ])
         .expect("options after target words must parse");
         match cli.command {
@@ -117,6 +125,9 @@ mod parse_tests {
         // one so the error is clap's "unexpected argument", not silent
         // capture into the target words.
         let err = Cli::try_parse_from(["protonwire", "select", "fastest", "--json"]);
-        assert!(err.is_err(), "unknown select options must not become target words");
+        assert!(
+            err.is_err(),
+            "unknown select options must not become target words"
+        );
     }
 }

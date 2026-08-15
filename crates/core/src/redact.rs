@@ -18,7 +18,6 @@ use std::borrow::Cow;
 use std::io::{self, Write};
 use std::sync::{Arc, Mutex};
 
-
 use zeroize::Zeroizing;
 
 /// Placeholder substituted for secret values.

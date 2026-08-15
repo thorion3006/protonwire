@@ -496,14 +496,16 @@ mod tests {
             let path = path.clone();
             let tx = tx.clone();
             let connect_error = Arc::clone(&connect_error);
-            std::thread::spawn(move || match std::os::unix::net::UnixStream::connect(&path) {
-                Ok(stream) => {
-                    let _ = tx.send(stream);
-                }
-                Err(_) => {
-                    connect_error.fetch_add(1, Ordering::SeqCst);
-                }
-            });
+            std::thread::spawn(
+                move || match std::os::unix::net::UnixStream::connect(&path) {
+                    Ok(stream) => {
+                        let _ = tx.send(stream);
+                    }
+                    Err(_) => {
+                        connect_error.fetch_add(1, Ordering::SeqCst);
+                    }
+                },
+            );
         }
         drop(tx);
         let mut streams = Vec::new();
@@ -737,7 +739,6 @@ mod tests {
         drop(listener);
         assert!(authorizes_unlink(&connect_error(&stale)));
 
-
         // An inconclusive failure (EACCES with the parent dir closed to us;
         // meaningful only for non-root test users) must NOT authorize it.
         if !nix::unistd::getuid().is_root() {
@@ -769,7 +770,9 @@ mod tests {
         let live_dir = dir.path().join("b");
         std::fs::create_dir(&live_dir).unwrap();
         let listener = std::os::unix::net::UnixListener::bind(live_dir.join("s.sock")).unwrap();
-        let err = IpcServer::bind(&live_dir, "s.sock").map(|_| ()).expect_err("live socket must abort bind");
+        let err = IpcServer::bind(&live_dir, "s.sock")
+            .map(|_| ())
+            .expect_err("live socket must abort bind");
         assert!(
             err.to_string().contains("another daemon"),
             "live socket must abort bind, got: {err}"

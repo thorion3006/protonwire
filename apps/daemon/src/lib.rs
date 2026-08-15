@@ -8,7 +8,6 @@ use protonwire_core::DaemonCore;
 use protonwire_frontend_api::{Request, RequestResult, RpcError};
 use protonwire_ipc::{EventBus, RequestHandler, SessionContext};
 
-
 use std::path::{Path, PathBuf};
 
 /// Resolves where the IPC server binds (Codex PR review finding 4):
@@ -191,7 +190,10 @@ mod bind_location_tests {
         // Nothing configured: the documented default.
         assert_eq!(
             resolve_bind_location(None, None, default_dir, default_name),
-            (PathBuf::from("/run/protonwire"), "protonwire.sock".to_owned())
+            (
+                PathBuf::from("/run/protonwire"),
+                "protonwire.sock".to_owned()
+            )
         );
     }
 }
