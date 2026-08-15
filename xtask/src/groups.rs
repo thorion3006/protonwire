@@ -56,6 +56,27 @@ const ALLOWED_OVERRIDE_KEYS: &[&str] = &[
 
 const EXPECTED_GROUP_COUNT: usize = 14;
 
+/// The v1 catalog's canonical id set (docs/connection-groups.yaml): 8
+/// `proton:*` official groups plus 6 `protonwire:*` regional fastest groups.
+/// The count check alone would let a renamed entry through, so the set
+/// itself is pinned against schema-version-1 documents.
+const EXPECTED_GROUP_IDS: [&str; EXPECTED_GROUP_COUNT] = [
+    "proton:anti-censorship",
+    "proton:fastest-country",
+    "proton:fastest-excluding-my-country",
+    "proton:gaming",
+    "proton:max-security",
+    "proton:random-country",
+    "proton:streaming-us",
+    "proton:work-school",
+    "protonwire:fastest-africa",
+    "protonwire:fastest-asia",
+    "protonwire:fastest-europe",
+    "protonwire:fastest-north-america",
+    "protonwire:fastest-oceania",
+    "protonwire:fastest-south-america",
+];
+
 #[derive(Deserialize)]
 pub(crate) struct GroupsFile {
     schema_version: Option<i64>,
@@ -388,6 +409,18 @@ fn check_groups(doc: &GroupsFile) -> Vec<String> {
         ));
     }
 
+    // Compare as sorted sets, mirroring the primary_regions pin: a renamed
+    // id (or an add-one-drop-one edit) must violate even at the right count.
+    let mut actual_ids: Vec<&str> = groups.iter().filter_map(|g| g.id.as_deref()).collect();
+    actual_ids.sort_unstable();
+    let mut expected_ids = EXPECTED_GROUP_IDS;
+    expected_ids.sort_unstable();
+    if actual_ids != expected_ids {
+        violations.push(format!(
+            "group ids must be exactly {EXPECTED_GROUP_IDS:?} (as a set), got {actual_ids:?}"
+        ));
+    }
+
     let policies: BTreeSet<&str> = doc
         .contract
         .as_ref()
@@ -708,6 +741,15 @@ groups:
         let path = temp_yaml("count", &yaml);
         assert!(!validate(&path).unwrap());
         fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn canonical_id_set_length_matches_expected_count() {
+        assert_eq!(
+            EXPECTED_GROUP_IDS.len(),
+            EXPECTED_GROUP_COUNT,
+            "the pinned id set and the count check must stay in sync"
+        );
     }
 
     #[test]
