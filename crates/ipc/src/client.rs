@@ -800,13 +800,17 @@ mod tests {
         );
     }
 
-    /// QA mutation gap (item G6): the zero-budget guard's failure mode is a
-    /// HANG, not a wrong result. With a deadline already expired at the
+    /// QA mutation gap (item G6): with a deadline already expired at the
     /// write (a sub-microsecond timeout makes `deadline - now` saturate to
-    /// zero), the request must refuse to write at all — a zero-duration
-    /// SO_SNDTIMEO means "block forever" on Linux, so without the guard
-    /// the 0.86 MiB frame into a never-reading 4 KiB peer pins the
-    /// caller indefinitely.
+    /// zero), the request must refuse to write at all. The observed red
+    /// on this kernel is a FAST WRONG RESULT: a sub-µs SO_SNDTIMEO
+    /// yields an immediate EAGAIN, so without the guard the 0.86 MiB
+    /// frame into the never-reading 4 KiB peer fails at ~0.02 s with a
+    /// "write failed" wording that flunks the deadline-refusal assert
+    /// below. A HANG is the kernel-dependent possibility — on kernels
+    /// that round the zero-duration timeout to blocking ("block forever"
+    /// on Linux) the same mutation pins the caller indefinitely — which
+    /// is the mode the watchdog assert exists to catch.
     #[test]
     fn request_refuses_to_write_when_the_budget_is_already_zero() {
         use std::os::unix::net::UnixListener;

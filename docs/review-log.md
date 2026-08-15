@@ -413,11 +413,54 @@ should keep honest about (per QA's evidence audit):
    pre-fix API): state "red with plumbing kept, \<behavior\> removed" —
    land the inert plumbing first, then observe the behavioral red. Used
    for items A/E.
-2. **Hang-mode reds** (the mutation's failure mode is a hang, not a
-   wrong result): the watchdog assert is the red — cite its failure
-   message and elapsed time (e.g. G6: 'a zero write budget hung the
-   request', FAILED in 0.02 s with the guard removed). A test that
-   merely times out in CI proves nothing without the message.
+2. **Kernel-dependent reds** (the mutation's failure mode varies by
+   kernel): record the mode actually observed, not the scariest one.
+   G6 with the guard removed failed FAST at 0.02 s on the
+   message-content assert — this kernel's sub-µs SO_SNDTIMEO yields an
+   immediate EAGAIN, so the unguarded write fails promptly with a
+   "write failed" wording (a fast wrong result, not a hang). A HANG is
+   the possibility on kernels that round the zero-duration timeout to
+   blocking ("block forever" on Linux), and G6's watchdog assert ('a
+   zero write budget hung the request') exists to catch that mode. A
+   test that merely times out in CI proves nothing without the message.
 3. **Pinning tests for existing behavior** (G-series): the pre-fix code
    is green by definition, so the red must be demonstrated against the
    named mutation and the commit must say which mutation was run.
+
+## 2026-08-15 — Round-3 closure (final fix pass)
+
+Both reviewers PASSed the round-3 batch; this closing hygiene pass
+landed their five remaining items:
+
+1. **request-path codec deadline** (Medium, both reviewers): the
+   request loop's read is now `read_msg_within(deadline)` — the last
+   per-syscall-only bound on the client side, closing the same dribble
+   gap round 3 fixed for handshake/next_event. Red-first: a daemon
+   dribbling the response frame pinned `request()` past its deadline
+   (watchdog fired at 2.00 s); green at 0.30 s after the fix.
+2. `server.rs`: the finished-session drain branch now joins the handle
+   (`session.join.join()`) instead of the no-op place expression.
+3. `server.rs`: `DRAIN_CEILING` is `WRITE_TIMEOUT.saturating_mul(3)` —
+   no truncation to a zero ceiling for a sub-second `WRITE_TIMEOUT`.
+4. G6 red-evidence narrative corrected (test comment + the
+   red-evidence nuances above): the observed red is a fast
+   wrong-result (immediate EAGAIN); the hang is the kernel-dependent
+   possibility.
+5. rustdoc: private-const intra-doc links converted to plain code
+   spans; `RUSTDOCFLAGS='-D warnings' cargo doc --no-deps
+   --document-private-items` is clean.
+
+Remaining Track items (informational):
+
+- **Abandoned-drain bus-slot release**: a session detached past
+  DRAIN_CEILING still releases its bus slot via its own drop-guard —
+  but if `serve()` were ever reused for a second run, an abandoned
+  straggler from the first run could outlive its slot accounting.
+  Today `serve()` runs once per process, so this is unreachable.
+- **JoinHandle retention**: detached stragglers' handles are dropped,
+  so a panic in an abandoned worker is silent (the catch_unwind log
+  line never runs for it).
+- **Lockfile strictness vs Cargo's keying**: our duplicate check keys
+  on (name, version) alone, which is stricter than Cargo's
+  (name, version, source) — a legitimate multi-source duplicate would
+  be rejected. No such package exists in the current tree.
