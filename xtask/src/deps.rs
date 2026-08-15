@@ -290,10 +290,10 @@ pub(crate) fn wildcard_versions(manifest: &str) -> Vec<String> {
             scan_dependency_entries(section, entries, &mut violations);
         }
     }
-    if let Some(workspace) = table.get("workspace").and_then(toml::Value::as_table) {
-        if let Some(entries) = workspace.get("dependencies") {
-            scan_dependency_entries("workspace.dependencies", entries, &mut violations);
-        }
+    if let Some(workspace) = table.get("workspace").and_then(toml::Value::as_table)
+        && let Some(entries) = workspace.get("dependencies")
+    {
+        scan_dependency_entries("workspace.dependencies", entries, &mut violations);
     }
     if let Some(targets) = table.get("target").and_then(toml::Value::as_table) {
         for (target, cfg_table) in targets {
