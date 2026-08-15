@@ -333,6 +333,7 @@ mod tests {
             vpn_state: protonwire_frontend_api::VpnState::Disconnected,
             network_integration: protonwire_frontend_api::NetworkIntegration::Auto,
             active_owner_uid: None,
+            latest_event_seq: None,
         };
         let document: serde_json::Value = serde_json::from_str(&status_json(&state)).unwrap();
         assert_eq!(document["state"], "disconnected");

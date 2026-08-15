@@ -86,12 +86,19 @@ impl DaemonCore {
     /// Full-state snapshot for `GetState`.
     pub fn state(&self) -> DaemonState {
         let inner = self.inner.lock().expect("core lock");
+        // Stamped under the same lock emitters hold across mutation,
+        // sequence allocation, and publication: the sequence reads back
+        // exactly the set of events whose effects this snapshot reflects,
+        // so a client can advance its resync cursor to it coherently
+        // (Codex PR review round 2, finding 1).
+        let latest_event_seq = self.seq.load(Ordering::SeqCst);
         DaemonState {
             protocol_version: PROTOCOL_VERSION,
             daemon_version: self.version.clone(),
             vpn_state: inner.vpn_state,
             network_integration: self.config.daemon.network_integration.into(),
             active_owner_uid: inner.active_owner_uid,
+            latest_event_seq: Some(latest_event_seq),
         }
     }
 
@@ -204,6 +211,20 @@ mod tests {
         assert_eq!(events[0].seq, 1);
         assert!(matches!(events[0].event, Event::StateChanged { .. }));
         assert_eq!(events[1].seq, 2);
+    }
+
+    /// Codex PR review round 2, finding 1: the snapshot carries the sequence
+    /// it reflects, so the SDK can pair `GetState` with its cursor instead
+    /// of guessing from the gap event that triggered the resync.
+    #[test]
+    fn snapshot_stamps_the_sequence_it_reflects() {
+        let (core, _) = core();
+        assert_eq!(core.state().latest_event_seq, Some(0));
+        core.notice(NoticeLevel::Info, "one");
+        core.notice(NoticeLevel::Info, "two");
+        assert_eq!(core.state().latest_event_seq, Some(2));
+        core.set_vpn_state(VpnState::Connecting);
+        assert_eq!(core.state().latest_event_seq, Some(3));
     }
 
     /// Regression (rust-review finding 2): with several threads emitting

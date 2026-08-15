@@ -76,6 +76,19 @@ pub struct DaemonState {
     /// if any.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub active_owner_uid: Option<u32>,
+    /// Sequence number of the newest event already reflected in this
+    /// snapshot. Daemons that predate the field omit it; clients treat
+    /// `None` as "sequence unknown" and fall back to their gap event.
+    ///
+    /// The resynchronization race this closes (Codex PR review round 2,
+    /// finding 1): `GetState` is a separate request, so events can be
+    /// published while it is in flight and the snapshot can reflect
+    /// sequences newer than the gap event that triggered the resync.
+    /// Pairing the snapshot with its own sequence lets the SDK advance
+    /// its cursor coherently instead of replaying older buffered events
+    /// after the newer snapshot.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest_event_seq: Option<u64>,
 }
 
 #[cfg(test)]
@@ -91,10 +104,37 @@ mod tests {
             vpn_state: VpnState::Disconnected,
             network_integration: NetworkIntegration::Auto,
             active_owner_uid: None,
+            latest_event_seq: None,
         };
         let json = serde_json::to_value(&state).unwrap();
         assert_eq!(json["vpn_state"], "disconnected");
         assert_eq!(json["network_integration"], "auto");
         assert!(json.get("active_owner_uid").is_none());
+        assert!(json.get("latest_event_seq").is_none());
+    }
+
+    /// Codex PR review round 2, finding 1: the field is additive-optional —
+    /// a document from a daemon that never stamps it (or an older daemon)
+    /// still deserializes, with the sequence reported as unknown.
+    #[test]
+    fn snapshot_sequence_is_optional_on_the_wire() {
+        let stamped = serde_json::json!({
+            "protocol_version": 1,
+            "daemon_version": "0.1.0",
+            "vpn_state": "disconnected",
+            "network_integration": "auto",
+            "latest_event_seq": 7,
+        });
+        let state: DaemonState = serde_json::from_value(stamped).unwrap();
+        assert_eq!(state.latest_event_seq, Some(7));
+
+        let legacy = serde_json::json!({
+            "protocol_version": 1,
+            "daemon_version": "0.1.0",
+            "vpn_state": "disconnected",
+            "network_integration": "auto",
+        });
+        let state: DaemonState = serde_json::from_value(legacy).unwrap();
+        assert_eq!(state.latest_event_seq, None);
     }
 }

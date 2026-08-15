@@ -70,6 +70,15 @@
           "description": "Daemon build version.",
           "type": "string"
         },
+        "latest_event_seq": {
+          "description": "Sequence number of the newest event already reflected in this\nsnapshot. Daemons that predate the field omit it; clients treat\n`None` as \"sequence unknown\" and fall back to their gap event.\n\nThe resynchronization race this closes (Codex PR review round 2,\nfinding 1): `GetState` is a separate request, so events can be\npublished while it is in flight and the snapshot can reflect\nsequences newer than the gap event that triggered the resync.\nPairing the snapshot with its own sequence lets the SDK advance\nits cursor coherently instead of replaying older buffered events\nafter the newer snapshot.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
         "network_integration": {
           "description": "Configured network integration mode (the configured value in Milestone\n1; the resolved adapter once Milestone 5 lands).",
           "$ref": "#/$defs/NetworkIntegration"

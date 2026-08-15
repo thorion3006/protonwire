@@ -228,16 +228,27 @@ impl ProtonwireClient {
     /// silently losing state (PRD FR-127D). Stale or duplicate sequence
     /// numbers (daemon restart, reordering) are skipped without rewinding
     /// the cursor (rust-review finding 9).
+    ///
+    /// The snapshot is paired with its own sequence (Codex PR review round
+    /// 2, finding 1): `GetState` is a separate request, so events published
+    /// while it was in flight are already reflected in the returned state.
+    /// The cursor advances to the snapshot's stamped sequence (falling back
+    /// to the gap event on daemons that do not stamp), and buffered events
+    /// the snapshot covers are dropped — replaying them after the newer
+    /// snapshot would regress the client's view.
     pub fn next_event(&mut self) -> Result<ClientEvent, ClientError> {
         loop {
             let envelope = self.ipc.next_event()?;
             let expected = self.last_seq.map_or(envelope.seq, |last| last + 1);
             if envelope.seq > expected {
                 let state = self.state()?;
-                self.last_seq = Some(envelope.seq);
+                let snapshot_seq = state.latest_event_seq.unwrap_or(envelope.seq);
+                let cursor = snapshot_seq.max(envelope.seq);
+                self.ipc.discard_events_through(cursor);
+                self.last_seq = Some(cursor);
                 return Ok(ClientEvent::Resynchronized {
                     state,
-                    resumed_at_seq: envelope.seq,
+                    resumed_at_seq: cursor,
                 });
             }
             if envelope.seq < expected {
@@ -375,6 +386,7 @@ mod tests {
                         vpn_state: VpnState::Disconnected,
                         network_integration: NetworkIntegration::Auto,
                         active_owner_uid: None,
+                        latest_event_seq: Some(self.seq.load(Ordering::SeqCst)),
                     },
                 }),
                 // Connect bumps the sequence twice but publishes only the
@@ -525,6 +537,130 @@ mod tests {
                 assert_eq!(notice, "fresh after stale");
             }
             ClientEvent::Resynchronized { .. } => panic!("stale event must not trigger resync"),
+        }
+    }
+
+    /// Codex PR review round 2, finding 1 (P2): the resync snapshot is a
+    /// SEPARATE `GetState` request, so events published while it is in
+    /// flight are already reflected in the snapshot the response carries.
+    /// Pre-fix, the SDK reset its cursor to the gap event's sequence and
+    /// replayed those buffered older events AFTER the newer snapshot —
+    /// regressing the client's displayed state. The daemon now stamps the
+    /// snapshot with its own sequence; the SDK must advance the cursor to
+    /// that stamp and drop buffered events the snapshot already covers.
+    #[test]
+    fn resync_snapshot_advances_the_cursor_to_its_own_sequence() {
+        /// Mirrors the production race deterministically: the GetState
+        /// handler publishes further events BEFORE answering, so the
+        /// snapshot is always newer than the gap event that triggered it.
+        struct RacyStateHandler {
+            bus: EventBus,
+            seq: AtomicU64,
+        }
+
+        impl protonwire_ipc::RequestHandler for RacyStateHandler {
+            fn daemon_version(&self) -> &str {
+                "test-daemon"
+            }
+            fn latest_event_seq(&self) -> u64 {
+                self.seq.load(Ordering::SeqCst)
+            }
+            fn handle(
+                &self,
+                _ctx: &protonwire_ipc::SessionContext,
+                request: Request,
+            ) -> Result<RequestResult, RpcError> {
+                match request {
+                    Request::Ping { nonce } => Ok(RequestResult::Pong { nonce }),
+                    Request::GetState => {
+                        // Events 3 and 4 land WHILE the snapshot request is
+                        // being served; the daemon state (stamped 4) already
+                        // includes them.
+                        for seq in [3u64, 4] {
+                            self.seq.store(seq, Ordering::SeqCst);
+                            self.bus.publish(ServerMessage::Event(EventEnvelope {
+                                seq,
+                                event: Event::Notice {
+                                    level: NoticeLevel::Info,
+                                    message: format!("event {seq}"),
+                                },
+                            }));
+                        }
+                        Ok(RequestResult::State {
+                            state: DaemonState {
+                                protocol_version: PROTOCOL_VERSION,
+                                daemon_version: "test-daemon".into(),
+                                vpn_state: VpnState::Disconnected,
+                                network_integration: NetworkIntegration::Auto,
+                                active_owner_uid: None,
+                                latest_event_seq: Some(self.seq.load(Ordering::SeqCst)),
+                            },
+                        })
+                    }
+                    other => Err(RpcError::new(
+                        RpcErrorCode::NotImplemented,
+                        format!("{other:?}"),
+                    )),
+                }
+            }
+            fn event_bus(&self) -> &EventBus {
+                &self.bus
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let handler = Arc::new(RacyStateHandler {
+            bus: EventBus::new(),
+            seq: AtomicU64::new(0),
+        });
+        let server = protonwire_ipc::test_util::TestServer::start(
+            dir.path(),
+            "racy.sock",
+            Arc::clone(&handler),
+        )
+        .expect("test server binds");
+        let path = server.socket_path().to_owned();
+        let mut client = dev_client(&path);
+        // Handshake reports seq 0, so the client expects event 1 next.
+
+        // Event 1 is lost; event 2 arrives first and triggers the resync.
+        handler.seq.store(2, Ordering::SeqCst);
+        handler.bus.publish(ServerMessage::Event(EventEnvelope {
+            seq: 2,
+            event: Event::Notice {
+                level: NoticeLevel::Info,
+                message: "gap event".into(),
+            },
+        }));
+
+        match client.next_event().unwrap() {
+            ClientEvent::Resynchronized { resumed_at_seq, .. } => assert_eq!(
+                resumed_at_seq, 4,
+                "the cursor must advance to the snapshot's stamped sequence, \
+                 not the gap event's 2"
+            ),
+            ClientEvent::Event(envelope) => {
+                panic!("expected resync, got event {:?}", envelope.event)
+            }
+        }
+
+        // Events 3 and 4 (already reflected in the snapshot) must never be
+        // delivered after it; the next delivery is the first event BEYOND
+        // the snapshot.
+        handler.seq.store(5, Ordering::SeqCst);
+        handler.bus.publish(ServerMessage::Event(EventEnvelope {
+            seq: 5,
+            event: Event::Notice {
+                level: NoticeLevel::Info,
+                message: "after snapshot".into(),
+            },
+        }));
+        match client.next_event().unwrap() {
+            ClientEvent::Event(envelope) => assert_eq!(
+                envelope.seq, 5,
+                "snapshot-covered events 3/4 must be suppressed, not replayed"
+            ),
+            ClientEvent::Resynchronized { .. } => panic!("unexpected second resync"),
         }
     }
 

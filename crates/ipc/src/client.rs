@@ -327,6 +327,15 @@ impl IpcClient {
             Err(e) => Err(map_frame_error(e)),
         }
     }
+
+    /// Drops buffered events at or below `seq`. Called after a resync whose
+    /// snapshot already reflects them (Codex PR review round 2, finding 1):
+    /// events that arrived while the `GetState` request was in flight would
+    /// otherwise be delivered AFTER the newer snapshot and regress the
+    /// client's state view.
+    pub fn discard_events_through(&mut self, seq: u64) {
+        self.pending_events.retain(|envelope| envelope.seq > seq);
+    }
 }
 
 fn map_frame_error(e: crate::frame::FrameError) -> io::Error {
@@ -424,6 +433,7 @@ mod tests {
                         vpn_state: VpnState::Disconnected,
                         network_integration: protonwire_frontend_api::NetworkIntegration::Auto,
                         active_owner_uid: None,
+                        latest_event_seq: Some(self.seq.load(Ordering::SeqCst)),
                     },
                 }),
                 other => Err(RpcError::new(
