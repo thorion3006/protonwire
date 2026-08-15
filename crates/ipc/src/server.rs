@@ -16,7 +16,7 @@ use tracing::{debug, info, warn};
 
 use crate::authz::{authorize, required_role};
 use crate::bus::{EventBus, MAX_SESSIONS};
-use crate::frame::{FrameError, read_msg, write_msg};
+use crate::frame::{FrameError, FrameReader, write_msg};
 use crate::peer::PeerCredentials;
 
 /// Interval at which session loops wake to check the stop flag while blocked
@@ -250,6 +250,7 @@ fn serve_messages(
     peer: &PeerCredentials,
     stop: &AtomicBool,
 ) -> Result<(), FrameError> {
+    let mut reader = FrameReader::new(read_half);
     let connected_at = std::time::Instant::now();
     let mut hello_done = false;
     let mut client_info = None;
@@ -261,7 +262,7 @@ fn serve_messages(
             }));
             return Ok(());
         }
-        let message = match read_msg::<_, ClientMessage>(read_half) {
+        let message = match reader.read_msg::<ClientMessage>() {
             Ok(m) => m,
             Err(FrameError::Io(e))
                 if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut =>
@@ -648,6 +649,61 @@ mod tests {
         match read_msg::<_, ServerMessage>(&mut stream).unwrap() {
             ServerMessage::HelloAck(ack) => assert_eq!(ack.protocol_version, 1),
             other => panic!("expected HelloAck, got {other:?}"),
+        }
+    }
+
+    /// Codex PR review finding 5 (P2; tracked as rust-review #12): a peer
+    /// that writes part of a frame, pauses longer than the 250 ms read
+    /// poll, then writes the rest must NOT desynchronize the session. The
+    /// pre-fix stateless read discarded the partial bytes on WouldBlock
+    /// and re-read the remainder as a fresh length prefix.
+    #[test]
+    fn partial_frame_across_read_timeouts_stays_synchronized() {
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().unwrap();
+        let handler = Arc::new(NullHandler {
+            version: "test".into(),
+            bus: EventBus::new(),
+        });
+        let server = spawn_server(&dir, handler);
+        let mut stream = std::os::unix::net::UnixStream::connect(server.socket_path()).unwrap();
+
+        // Serialize the hello frame, deliver 3 prefix bytes, stall past
+        // READ_POLL, then the rest.
+        let mut frame = Vec::new();
+        write_msg(
+            &mut frame,
+            &ClientMessage::Hello {
+                protocol_version: 1,
+                client: info(),
+            },
+        )
+        .unwrap();
+        assert!(frame.len() > 8);
+        stream.write_all(&frame[..3]).unwrap();
+        stream.flush().unwrap();
+        std::thread::sleep(READ_POLL * 3);
+        stream.write_all(&frame[3..]).unwrap();
+        stream.flush().unwrap();
+
+        // The session must still parse the hello and answer the ack.
+        match read_msg::<_, ServerMessage>(&mut stream) {
+            Ok(ServerMessage::HelloAck(_)) => {}
+            other => panic!("expected HelloAck after a split frame, got {other:?}"),
+        }
+        // ...and stay synchronized for a follow-up exchange.
+        write_msg(
+            &mut stream,
+            &ClientMessage::Request {
+                id: 7,
+                request: Request::GetState,
+            },
+        )
+        .unwrap();
+        match read_msg::<_, ServerMessage>(&mut stream) {
+            Ok(ServerMessage::Response(response)) => assert_eq!(response.id(), 7),
+            other => panic!("expected a correlated response, got {other:?}"),
         }
     }
 }

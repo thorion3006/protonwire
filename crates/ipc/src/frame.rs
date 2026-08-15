@@ -2,6 +2,14 @@
 //!
 //! Frame layout: 4-byte big-endian payload length, then the JSON payload.
 //! Frames above [`MAX_FRAME_LEN`] bytes are rejected to bound memory use.
+//!
+//! Two readers: the free functions ([`read_msg`]/[`read_frame`]) are
+//! stateless and block until a whole frame arrived — right for clients and
+//! writers. [`FrameReader`] additionally retains PARTIAL frame state across
+//! `WouldBlock`/timed-out reads, which a polling server needs: discarding
+//! half a frame on a poll timeout desynchronizes the session, because the
+//! remaining bytes are then interpreted as a fresh length prefix (Codex PR
+//! review finding 5, tracked as rust-review #12).
 
 use std::io::{Read, Write};
 
@@ -42,12 +50,18 @@ pub fn write_msg<W: Write, T: Serialize>(w: &mut W, msg: &T) -> Result<(), Frame
 }
 
 /// Reads one framed message, blocking until a whole frame arrived.
+///
+/// Stateless: a mid-frame timeout/error discards the bytes read so far.
+/// Polling readers must use [`FrameReader`] instead.
 pub fn read_msg<R: Read, T: DeserializeOwned>(r: &mut R) -> Result<T, FrameError> {
     let payload = read_frame(r)?;
     serde_json::from_slice(&payload).map_err(|e| FrameError::Payload(e.to_string()))
 }
 
 /// Reads one raw frame payload, blocking until a whole frame arrived.
+///
+/// Stateless: a mid-frame timeout/error discards the bytes read so far.
+/// Polling readers must use [`FrameReader`] instead.
 pub fn read_frame<R: Read>(r: &mut R) -> Result<Vec<u8>, FrameError> {
     let mut prefix = [0u8; 4];
     read_exact_or_truncated(r, &mut prefix)?;
@@ -68,6 +82,106 @@ fn read_exact_or_truncated<R: Read>(r: &mut R, buf: &mut [u8]) -> Result<(), Fra
         match r.read(&mut buf[filled..]) {
             Ok(0) => return Err(FrameError::Truncated),
             Ok(n) => filled += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(())
+}
+
+/// Where a [`FrameReader`] stands inside the current frame.
+enum Stage {
+    /// Reading the 4-byte length prefix; `filled` bytes of it arrived.
+    Prefix { buf: [u8; 4], filled: usize },
+    /// Reading the payload; `filled` bytes of it arrived.
+    Payload { buf: Vec<u8>, filled: usize },
+}
+
+/// Stateful frame reader that survives poll timeouts mid-frame.
+///
+/// A `WouldBlock`/timed-out read returns the I/O error like the free
+/// functions do, but every byte already consumed stays buffered: the next
+/// call resumes the SAME frame instead of misreading the remainder as a new
+/// length prefix. Build one per connection (e.g. over a `&mut UnixStream`)
+/// and reuse it for the connection's lifetime.
+pub struct FrameReader<R> {
+    inner: R,
+    stage: Stage,
+}
+
+impl<R: Read> FrameReader<R> {
+    /// Wraps a reader standing at a frame boundary.
+    pub fn new(inner: R) -> Self {
+        Self {
+            inner,
+            stage: Stage::Prefix {
+                buf: [0u8; 4],
+                filled: 0,
+            },
+        }
+    }
+
+    /// Reads one raw frame payload, resuming a partially read frame after
+    /// a poll timeout.
+    pub fn read_frame(&mut self) -> Result<Vec<u8>, FrameError> {
+        loop {
+            match &mut self.stage {
+                Stage::Prefix { buf, filled } => {
+                    fill(&mut self.inner, buf, filled)?;
+                    let len = u32::from_be_bytes(*buf) as usize;
+                    if len > MAX_FRAME_LEN {
+                        // The stream is untrustworthy past this point;
+                        // reset so a fresh connection state is at least
+                        // well-defined if a caller retries.
+                        self.stage = Stage::Prefix {
+                            buf: [0u8; 4],
+                            filled: 0,
+                        };
+                        return Err(FrameError::TooLarge(len));
+                    }
+                    self.stage = Stage::Payload {
+                        buf: vec![0u8; len],
+                        filled: 0,
+                    };
+                }
+                Stage::Payload { buf, filled } => {
+                    fill(&mut self.inner, buf, filled)?;
+                    // Stage completed: hand over the payload and stand at
+                    // the next frame boundary.
+                    return match std::mem::replace(
+                        &mut self.stage,
+                        Stage::Prefix {
+                            buf: [0u8; 4],
+                            filled: 0,
+                        },
+                    ) {
+                        Stage::Payload { buf, .. } => Ok(buf),
+                        _ => unreachable!("matched Payload above"),
+                    };
+                }
+            }
+        }
+    }
+
+    /// [`FrameReader::read_frame`] plus JSON deserialization.
+    pub fn read_msg<T: DeserializeOwned>(&mut self) -> Result<T, FrameError> {
+        let payload = self.read_frame()?;
+        serde_json::from_slice(&payload).map_err(|e| FrameError::Payload(e.to_string()))
+    }
+
+    /// Unwraps into the underlying reader.
+    pub fn into_inner(self) -> R {
+        self.inner
+    }
+}
+
+/// Advances `filled` toward `buf.len()` on `r`, leaving partial progress
+/// intact for the caller to resume after a poll timeout.
+fn fill<R: Read>(r: &mut R, buf: &mut [u8], filled: &mut usize) -> Result<(), FrameError> {
+    while *filled < buf.len() {
+        match r.read(&mut buf[*filled..]) {
+            Ok(0) => return Err(FrameError::Truncated),
+            Ok(n) => *filled += n,
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(e) => return Err(e.into()),
         }
@@ -120,5 +234,91 @@ mod tests {
         buf.extend_from_slice(payload);
         let err = read_msg::<_, serde_json::Value>(&mut buf.as_slice()).unwrap_err();
         assert!(matches!(err, FrameError::Payload(_)));
+    }
+
+    /// A reader that hands out one chunk at a time and fails with
+    /// `WouldBlock` between chunks — the wire equivalent of a slow peer
+    /// A reader that hands out one chunk at a time and fails with
+    /// `WouldBlock` between chunks — the wire equivalent of a slow peer
+    /// observed through a read-timeout poller.
+    struct Trickle {
+        chunks: Vec<Vec<u8>>,
+        fail_next: bool,
+    }
+
+    impl Read for Trickle {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.fail_next {
+                self.fail_next = false;
+                return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
+            }
+            let Some(chunk) = self.chunks.first() else {
+                // Idle connection: nothing more has arrived yet.
+                return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
+            };
+            let n = chunk.len().min(buf.len());
+            buf[..n].copy_from_slice(&chunk[..n]);
+            if n == chunk.len() {
+                self.chunks.remove(0);
+            } else {
+                self.chunks[0] = chunk[n..].to_vec();
+            }
+            self.fail_next = true;
+            Ok(n)
+        }
+    }
+
+    /// Codex PR review finding 5: partial-frame state must survive
+    /// WouldBlock between chunks — including a stall in the middle of the
+    /// 4-byte length prefix itself.
+    #[test]
+    fn frame_reader_resumes_partial_frames_across_wouldblock() {
+        let mut frame = Vec::new();
+        write_msg(&mut frame, &serde_json::json!({ "split": true })).unwrap();
+        assert!(frame.len() > 8, "payload must be split-able");
+
+        // Byte-by-byte prefix stall, then a payload split in half.
+        let payload_half = 4 + (frame.len() - 4) / 2;
+        let mut reader = FrameReader::new(Trickle {
+            chunks: vec![
+                frame[..1].to_vec(),
+                frame[1..3].to_vec(),
+                frame[3..4].to_vec(),
+                frame[4..payload_half].to_vec(),
+                frame[payload_half..].to_vec(),
+            ],
+            fail_next: false,
+        });
+        let mut would_blocks = 0;
+        let payload = loop {
+            match reader.read_frame() {
+                Ok(payload) => break payload,
+                Err(FrameError::Io(e)) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    would_blocks += 1;
+                    assert!(would_blocks < 32, "reader is spinning, not resuming");
+                }
+                other => panic!("unexpected result mid-frame: {other:?}"),
+            }
+        };
+        assert!(would_blocks >= 4, "the trickle must have stalled mid-frame");
+        let value: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(value["split"], true);
+
+        // And the very next frame still lines up.
+        let mut second = Vec::new();
+        write_msg(&mut second, &serde_json::json!([1u8, 2, 3])).unwrap();
+        let mut reader = FrameReader::new(Trickle {
+            chunks: vec![second[..2].to_vec(), second[2..].to_vec()],
+            fail_next: false,
+        });
+        let payload = loop {
+            match reader.read_frame() {
+                Ok(payload) => break payload,
+                Err(FrameError::Io(e)) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                other => panic!("unexpected result mid-frame: {other:?}"),
+            }
+        };
+        let value: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(value.as_array().map(Vec::len), Some(3));
     }
 }
