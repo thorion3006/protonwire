@@ -515,4 +515,27 @@ root-table-star = { version = "*" }
             assert!(deep.contains(crate_name));
         }
     }
+
+    /// Consolidated round 3, item E: FRONTEND_APPS is CLIENT_SIDE minus
+    /// the SDK by definition — the round-2 fix split the class but left
+    /// the two lists hand-maintained, so a future client-side crate added
+    /// to one and forgotten in the other would silently exempt (or
+    /// over-restrict) the direct-IPC rule. The test fails on any drift.
+    #[test]
+    fn frontend_apps_is_client_side_minus_the_sdk() {
+        let client_side: std::collections::BTreeSet<&str> = CLIENT_SIDE.iter().copied().collect();
+        let apps: std::collections::BTreeSet<&str> = FRONTEND_APPS.iter().copied().collect();
+        let expected: std::collections::BTreeSet<&str> = client_side
+            .iter()
+            .copied()
+            .filter(|c| *c != "protonwire-client")
+            .collect();
+        assert_eq!(
+            apps, expected,
+            "FRONTEND_APPS drifted from CLIENT_SIDE minus protonwire-client"
+        );
+        // And the split is non-trivial in both directions.
+        assert!(client_side.contains("protonwire-client"));
+        assert!(!apps.contains("protonwire-client"));
+    }
 }
