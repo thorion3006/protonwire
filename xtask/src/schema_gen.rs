@@ -1,8 +1,9 @@
 //! `cargo xtask schema-gen [--check]` — regenerates the versioned frontend
 //! JSON Schemas from `protonwire_frontend_api::schema::root_schemas()` into
 //! `schemas/frontend/v1/`. With `--check`, nothing is written and the command
-//! fails listing files that are missing or stale.
+//! fails listing files that are missing, stale, or obsolete.
 
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
 
@@ -51,8 +52,11 @@ fn write_all(dir: &Path, schemas: &[(&'static str, schemars::Schema)]) -> Result
 
 fn check_dir(dir: &Path, schemas: &[(&'static str, schemars::Schema)]) -> Vec<String> {
     let mut violations = Vec::new();
+    let mut expected: BTreeSet<String> = BTreeSet::new();
     for (name, schema) in schemas {
-        let path = dir.join(format!("{name}.schema.json"));
+        let file_name = format!("{name}.schema.json");
+        let path = dir.join(&file_name);
+        expected.insert(file_name);
         match fs::read(&path) {
             Ok(existing) if existing == render(schema) => {}
             Ok(_) => violations.push(format!(
@@ -63,6 +67,24 @@ fn check_dir(dir: &Path, schemas: &[(&'static str, schemars::Schema)]) -> Vec<St
                 "{} is missing; rerun `cargo xtask schema-gen`",
                 path.display()
             )),
+        }
+    }
+    // Codex PR review finding 14: a root schema that was renamed or removed
+    // leaves its old committed file behind, and inspecting only the schemas
+    // root_schemas() still returns let that obsolete file keep shipping as
+    // part of the versioned API. Anything in the directory outside the
+    // expected set fails the check.
+    if let Ok(entries) = fs::read_dir(dir) {
+        let present: BTreeSet<String> = entries
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".json"))
+            .collect();
+        for extra in present.difference(&expected) {
+            violations.push(format!(
+                "{} is not a generated schema; remove the obsolete file",
+                dir.join(extra).display()
+            ));
         }
     }
     violations
@@ -113,6 +135,37 @@ mod tests {
             violations
                 .iter()
                 .any(|v| v.contains(&format!("{stale_name}.schema.json")) && v.contains("stale"))
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Codex PR review finding 14 (P2): --check only inspected the schemas
+    /// root_schemas() still returns, so a renamed/removed root left its old
+    /// committed .schema.json invisible to the gate — an obsolete file
+    /// shipping as part of the versioned API forever. Extra files in the
+    /// directory must fail the check.
+    #[test]
+    fn check_mode_rejects_obsolete_files_left_in_the_directory() {
+        let dir = std::env::temp_dir().join(format!("xtask-schema-extra-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let all = schemas();
+        write_all(&dir, &all).unwrap();
+        assert!(
+            check_dir(&dir, &all).is_empty(),
+            "exact directory must be clean"
+        );
+
+        fs::write(dir.join("obsolete-root.schema.json"), b"{}\n").unwrap();
+        let violations = check_dir(&dir, &all);
+        assert_eq!(
+            violations.len(),
+            1,
+            "the obsolete file must be the only violation: {violations:?}"
+        );
+        assert!(
+            violations[0].contains("obsolete-root.schema.json"),
+            "violation must name the file: {violations:?}"
         );
 
         let _ = fs::remove_dir_all(&dir);
