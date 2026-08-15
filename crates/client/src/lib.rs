@@ -664,6 +664,223 @@ mod tests {
         }
     }
 
+    /// QA mutation gap (item G1): daemons that predate the snapshot stamp
+    /// (or any None-stamping daemon) must still resynchronize through the
+    /// gap-event fallback — `latest_event_seq.unwrap_or(envelope.seq)`.
+    /// The mutation `unwrap_or(u64::MAX)` passed the whole suite because
+    /// no test exercised the None branch end-to-end; the cursor would
+    /// have jumped to MAX and swallowed every subsequent event as stale.
+    #[test]
+    fn legacy_daemon_without_a_stamp_resyncs_via_the_gap_event() {
+        /// Mirrors a pre-stamp daemon: the snapshot carries no sequence.
+        struct LegacyStateHandler {
+            bus: EventBus,
+        }
+        impl protonwire_ipc::RequestHandler for LegacyStateHandler {
+            fn daemon_version(&self) -> &str {
+                "legacy-daemon"
+            }
+            fn latest_event_seq(&self) -> u64 {
+                0
+            }
+            fn handle(
+                &self,
+                _ctx: &protonwire_ipc::SessionContext,
+                request: Request,
+            ) -> Result<RequestResult, RpcError> {
+                match request {
+                    Request::Ping { nonce } => Ok(RequestResult::Pong { nonce }),
+                    Request::GetState => Ok(RequestResult::State {
+                        state: DaemonState {
+                            protocol_version: PROTOCOL_VERSION,
+                            daemon_version: "legacy-daemon".into(),
+                            vpn_state: VpnState::Disconnected,
+                            network_integration: NetworkIntegration::Auto,
+                            active_owner_uid: None,
+                            // The legacy wire shape: no stamp on the wire.
+                            latest_event_seq: None,
+                        },
+                    }),
+                    other => Err(RpcError::new(
+                        RpcErrorCode::NotImplemented,
+                        format!("{other:?}"),
+                    )),
+                }
+            }
+            fn event_bus(&self) -> &EventBus {
+                &self.bus
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let handler = Arc::new(LegacyStateHandler {
+            bus: EventBus::new(),
+        });
+        let server = protonwire_ipc::test_util::TestServer::start(
+            dir.path(),
+            "legacy.sock",
+            Arc::clone(&handler),
+        )
+        .expect("test server binds");
+        let path = server.socket_path().to_owned();
+        let mut client = dev_client(&path);
+        // Handshake reports seq 0, so the client expects event 1 next.
+
+        // Event 1 is lost; event 2 arrives first and triggers the resync
+        // against an unstamped snapshot.
+        handler.bus.publish(ServerMessage::Event(EventEnvelope {
+            seq: 2,
+            event: Event::Notice {
+                level: NoticeLevel::Info,
+                message: "gap on a legacy daemon".into(),
+            },
+        }));
+        match client.next_event().unwrap() {
+            ClientEvent::Resynchronized {
+                state,
+                resumed_at_seq,
+            } => {
+                // The fallback cursor is the gap event's own sequence —
+                // not u64::MAX, not the handshake's 0.
+                assert_eq!(
+                    resumed_at_seq, 2,
+                    "an unstamped snapshot must fall back to the gap event"
+                );
+                assert_eq!(state.latest_event_seq, None);
+                assert_eq!(state.daemon_version, "legacy-daemon");
+            }
+            ClientEvent::Event(envelope) => {
+                panic!("expected resync, got event {:?}", envelope.event)
+            }
+        }
+
+        // The cursor landed on 2, so event 3 flows normally afterwards —
+        // a MAX cursor would have swallowed it as stale forever.
+        handler.bus.publish(ServerMessage::Event(EventEnvelope {
+            seq: 3,
+            event: Event::Notice {
+                level: NoticeLevel::Info,
+                message: "after legacy resync".into(),
+            },
+        }));
+        match client.next_event().unwrap() {
+            ClientEvent::Event(envelope) => assert_eq!(envelope.seq, 3),
+            ClientEvent::Resynchronized { .. } => panic!("unexpected second resync"),
+        }
+    }
+
+    /// QA mutation gap (item G4): when the snapshot's stamp LAGS the gap
+    /// event (a daemon that stamped before later events were published),
+    /// the cursor must take the max of the two — dropping the `.max()`
+    /// passed the suite because every existing fixture stamped at or
+    /// above the gap event. Here the daemon stamps 2 while the gap event
+    /// is 4 and a covered event 3 lands mid-request: the cursor must be
+    /// 4, and event 3 must never replay after the snapshot.
+    #[test]
+    fn resync_cursor_takes_the_max_when_the_stamp_lags_the_gap() {
+        /// Publishes event 3 while serving GetState, then answers with a
+        /// stale stamp of 2 — a snapshot that lags what it was racing.
+        struct LaggingStampHandler {
+            bus: EventBus,
+        }
+        impl protonwire_ipc::RequestHandler for LaggingStampHandler {
+            fn daemon_version(&self) -> &str {
+                "lagging-daemon"
+            }
+            fn latest_event_seq(&self) -> u64 {
+                0
+            }
+            fn handle(
+                &self,
+                _ctx: &protonwire_ipc::SessionContext,
+                request: Request,
+            ) -> Result<RequestResult, RpcError> {
+                match request {
+                    Request::Ping { nonce } => Ok(RequestResult::Pong { nonce }),
+                    Request::GetState => {
+                        self.bus.publish(ServerMessage::Event(EventEnvelope {
+                            seq: 3,
+                            event: Event::Notice {
+                                level: NoticeLevel::Info,
+                                message: "buffered mid-request".into(),
+                            },
+                        }));
+                        Ok(RequestResult::State {
+                            state: DaemonState {
+                                protocol_version: PROTOCOL_VERSION,
+                                daemon_version: "lagging-daemon".into(),
+                                vpn_state: VpnState::Disconnected,
+                                network_integration: NetworkIntegration::Auto,
+                                active_owner_uid: None,
+                                latest_event_seq: Some(2),
+                            },
+                        })
+                    }
+                    other => Err(RpcError::new(
+                        RpcErrorCode::NotImplemented,
+                        format!("{other:?}"),
+                    )),
+                }
+            }
+            fn event_bus(&self) -> &EventBus {
+                &self.bus
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let handler = Arc::new(LaggingStampHandler {
+            bus: EventBus::new(),
+        });
+        let server = protonwire_ipc::test_util::TestServer::start(
+            dir.path(),
+            "lagging.sock",
+            Arc::clone(&handler),
+        )
+        .expect("test server binds");
+        let path = server.socket_path().to_owned();
+        let mut client = dev_client(&path);
+        // Handshake reports seq 0, so the client expects event 1 next.
+
+        // Events 1-3 are lost; event 4 arrives first and triggers the
+        // resync, during which event 3 is published and buffered while the
+        // snapshot comes back stamped 2.
+        handler.bus.publish(ServerMessage::Event(EventEnvelope {
+            seq: 4,
+            event: Event::Notice {
+                level: NoticeLevel::Info,
+                message: "gap event".into(),
+            },
+        }));
+        match client.next_event().unwrap() {
+            ClientEvent::Resynchronized { resumed_at_seq, .. } => assert_eq!(
+                resumed_at_seq, 4,
+                "the cursor must take max(stamp 2, gap 4) — a stamp-only \
+                 cursor would rewind below the gap event the client saw"
+            ),
+            ClientEvent::Event(envelope) => {
+                panic!("expected resync, got event {:?}", envelope.event)
+            }
+        }
+
+        // Buffered event 3 (below the cursor) must never replay; the next
+        // delivery is the first event BEYOND the cursor.
+        handler.bus.publish(ServerMessage::Event(EventEnvelope {
+            seq: 5,
+            event: Event::Notice {
+                level: NoticeLevel::Info,
+                message: "after the lagging stamp".into(),
+            },
+        }));
+        match client.next_event().unwrap() {
+            ClientEvent::Event(envelope) => assert_eq!(
+                envelope.seq, 5,
+                "a covered event replayed after the snapshot — the cursor \
+                 fell back to the lagging stamp"
+            ),
+            ClientEvent::Resynchronized { .. } => panic!("unexpected second resync"),
+        }
+    }
+
     #[test]
     fn missing_daemon_maps_to_exit_thirteen() {
         let err = ProtonwireClient::connect_to(

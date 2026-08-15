@@ -227,6 +227,83 @@ mod tests {
         assert_eq!(core.state().latest_event_seq, Some(3));
     }
 
+    /// QA mutation gap (item G2): the snapshot stamp is read under the
+    /// emitter lock, so a snapshot can never complete against a
+    /// half-finished publication — it either predates the event entirely
+    /// or reflects it (fields AND sequence) together. The EventSinkFn seam
+    /// makes the interleaving deterministic: the emitter parks mid-publish
+    /// while holding the state lock, and state() must queue behind it.
+    ///
+    /// Mutation-analysis note: a bare "read the atomic outside the lock"
+    /// mutation is NOT distinguishable through this seam — because
+    /// `emit_locked` allocates the sequence under the same lock that
+    /// guards the fields, the field reads force state() to wait for the
+    /// emitter regardless, and an unlocked read can only ever produce a
+    /// stamp that LAGS the fields (never one that leads them), in a
+    /// window no deterministic test can widen. What this test pins is the
+    /// serialization the locked read is part of: no snapshot observes a
+    /// sequence number whose event is still inside the sink.
+    #[test]
+    fn snapshot_stamp_waits_for_an_inflight_publication() {
+        use std::sync::mpsc;
+
+        let recorded = Arc::new(Mutex::new(Vec::new()));
+        let (publish_started_tx, publish_started_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        // Channel endpoints are Send but not Sync; the sink closure must be
+        // both, so each endpoint rides inside a Mutex.
+        let publish_started_tx = Mutex::new(publish_started_tx);
+        let release_rx = Mutex::new(release_rx);
+        let sink = {
+            let recorded = Arc::clone(&recorded);
+            EventSinkFn(move |env| {
+                recorded.lock().unwrap().push(env);
+                // Signal, then park: the emitter holds the state lock here.
+                let _ = publish_started_tx.lock().unwrap().send(());
+                let _ = release_rx.lock().unwrap().recv();
+            })
+        };
+        let core = Arc::new(DaemonCore::new(
+            "0.1.0-test",
+            Arc::new(SystemConfig::default()),
+            Arc::new(sink),
+        ));
+
+        let emitter = {
+            let core = Arc::clone(&core);
+            std::thread::spawn(move || core.notice(NoticeLevel::Info, "in flight"))
+        };
+        assert!(
+            publish_started_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .is_ok(),
+            "emitter must reach the sink"
+        );
+
+        // Sequence 1 is allocated but NOT yet published (the sink is
+        // parked). state() must block on the emitter's lock instead of
+        // handing out a snapshot stamped Some(1).
+        let snapshot = {
+            let core = Arc::clone(&core);
+            std::thread::spawn(move || core.state())
+        };
+        for _ in 0..8 {
+            assert!(
+                !snapshot.is_finished(),
+                "state() observed the sequence of an unpublished event — \
+                 the stamp is read outside the emitter lock"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(15));
+        }
+
+        // Let the publication finish; now the stamp legitimately reads 1.
+        release_tx.send(()).unwrap();
+        let state = snapshot.join().unwrap();
+        assert_eq!(state.latest_event_seq, Some(1));
+        assert_eq!(recorded.lock().unwrap().len(), 1);
+        emitter.join().unwrap();
+    }
+
     /// Regression (rust-review finding 2): with several threads emitting
     /// concurrently, publication order must always match sequence order —
     /// an inversion makes clients see a fake gap and rewind their cursor.

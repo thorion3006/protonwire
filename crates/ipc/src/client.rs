@@ -1155,4 +1155,85 @@ mod tests {
             "the expiry must arrive at the client deadline"
         );
     }
+
+    /// QA mutation gap (item G3): discard_events_through had only indirect
+    /// end-to-end coverage — the SDK's stale-skip also suppresses covered
+    /// events, so REMOVING the discard call passed the suite. Direct unit:
+    /// buffered events at or below the cursor must go, the queue must stay
+    /// bounded, and the socket must keep delivering past the cursor.
+    #[test]
+    fn discard_events_through_bounds_the_pending_queue() {
+        use std::os::unix::net::UnixListener;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("discard.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        std::thread::spawn(move || {
+            let Ok((mut peer, _)) = listener.accept() else {
+                return;
+            };
+            let _ = crate::frame::read_msg::<_, ClientMessage>(&mut peer);
+            let _ = crate::frame::write_msg(
+                &mut peer,
+                &ServerMessage::HelloAck(protonwire_frontend_api::HelloAck {
+                    protocol_version: 1,
+                    daemon_version: "discard".into(),
+                    latest_event_seq: 0,
+                }),
+            );
+            for seq in [5u64, 6] {
+                let _ = crate::frame::write_msg(
+                    &mut peer,
+                    &ServerMessage::Event(protonwire_frontend_api::EventEnvelope {
+                        seq,
+                        event: protonwire_frontend_api::Event::Notice {
+                            level: protonwire_frontend_api::NoticeLevel::Info,
+                            message: format!("event {seq}"),
+                        },
+                    }),
+                );
+            }
+            std::thread::sleep(Duration::from_secs(30));
+        });
+
+        let mut client = IpcClient::connect_with_timeout(
+            &path,
+            &test_client_info(),
+            SecurityChecks::dev_unchecked(),
+            Duration::from_secs(2),
+        )
+        .unwrap();
+
+        // Events 3 and 4 sit in the buffer (as if they arrived mid-request
+        // before a resync whose snapshot covered them); 5 and 6 are on the
+        // wire behind them.
+        for seq in [3u64, 4] {
+            client.pending_events.push_back(EventEnvelope {
+                seq,
+                event: protonwire_frontend_api::Event::Notice {
+                    level: protonwire_frontend_api::NoticeLevel::Info,
+                    message: format!("stale {seq}"),
+                },
+            });
+        }
+        client.discard_events_through(4);
+        assert!(
+            client
+                .pending_events
+                .iter()
+                .all(|envelope| envelope.seq > 4),
+            "the pending queue must be bounded to events past the cursor"
+        );
+        assert_eq!(client.pending_events.len(), 0);
+
+        // The next delivery is 5 — straight off the socket: the discard
+        // cleared the covered events without touching the stream.
+        let envelope = client.next_event().expect("socket event 5 arrives");
+        assert_eq!(
+            envelope.seq, 5,
+            "delivery must resume at 5, not a stale one"
+        );
+        let envelope = client.next_event().expect("socket event 6 arrives");
+        assert_eq!(envelope.seq, 6);
+    }
 }
