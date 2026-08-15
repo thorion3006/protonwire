@@ -377,9 +377,21 @@ fn handle_session<H: RequestHandler>(
         bus: handler.event_bus(),
         id: session_id,
     };
+    // pr-champion WO-5: the forwarder is gated so nothing it holds can
+    // reach the wire before the hello ack. Subscribe() happens before the
+    // handshake on purpose (events published mid-handshake must not be
+    // lost), but unguarded the forwarder raced them onto the socket ahead
+    // of HelloAck — and a client rejects any non-ack frame while
+    // handshaking. The gate opens only after the ack is queued; a session
+    // that ends pre-hello drops `gate_tx`, which unblocks (and ends) the
+    // forwarder instead of stranding it on the closed gate.
+    let (gate_tx, gate_rx) = mpsc::sync_channel::<()>(1);
     let event_forward = {
         let forward_tx = writer_tx.clone();
         std::thread::spawn(move || {
+            if gate_rx.recv().is_err() {
+                return; // session ended before hello; nothing to forward
+            }
             for message in event_rx {
                 if forward_tx.send(message).is_err() {
                     break;
@@ -391,6 +403,7 @@ fn handle_session<H: RequestHandler>(
     let result = serve_messages(
         &mut read_half,
         &writer_tx,
+        gate_tx,
         &handler,
         &peer,
         &stop,
@@ -400,7 +413,10 @@ fn handle_session<H: RequestHandler>(
     // enough — the forwarder holds a clone — so we must unsubscribe BEFORE
     // joining. Unsubscribe closes the bus sender, which ends the forwarder,
     // which drops the last writer-sender clone, which ends the writer.
-    // Joining first deadlocks and leaks the session slot plus both threads
+    // `gate_tx` is already gone by then: serve_messages took it by value,
+    // so every one of its exit paths (including pre-hello refusals and
+    // read errors) dropped it and unblocked the forwarder first. Joining
+    // first deadlocks and leaks the session slot plus both threads
     // (rust-review finding 1).
     drop(writer_tx);
     drop(_guard);
@@ -410,9 +426,16 @@ fn handle_session<H: RequestHandler>(
 }
 
 /// Handshake + request loop for one session.
+///
+/// `gate_tx` opens the event gate the forwarder blocks on: it is sent ONE
+/// `()` immediately after the hello ack is queued — the writer channel is
+/// FIFO, so the ack reaches the wire before any forwarded event — and it is
+/// dropped on every exit path, which ends a forwarder still waiting on the
+/// gate (a session that never handshook).
 fn serve_messages(
     read_half: &mut UnixStream,
     writer_tx: &mpsc::SyncSender<ServerMessage>,
+    gate_tx: mpsc::SyncSender<()>,
     handler: &Arc<impl RequestHandler>,
     peer: &PeerCredentials,
     stop: &AtomicBool,
@@ -487,6 +510,12 @@ fn serve_messages(
                     // finding 11).
                     return Ok(());
                 }
+                // The ack is queued ahead of anything the gated forwarder
+                // holds, and the writer drains its channel in FIFO order —
+                // so the ack is the first frame the client reads. Open the
+                // gate; buffered pre-hello events follow the ack onto the
+                // wire instead of beating it (pr-champion WO-5).
+                let _ = gate_tx.send(());
                 client_info = Some(client);
                 hello_done = true;
             }
@@ -1422,6 +1451,66 @@ mod tests {
             sessions.is_empty(),
             "the reap must join and remove every ended worker"
         );
+    }
+
+    /// pr-champion WO-5: `subscribe()` and the forwarder spawn preceded the
+    /// hello exchange, so an event published in that window reached the
+    /// wire before `HelloAck` — and a client rejects anything but the ack
+    /// while handshaking ("unexpected message during handshake",
+    /// client.rs). The ack must be the first frame on the wire; the
+    /// buffered event follows it.
+    #[test]
+    fn hello_ack_is_the_first_frame_even_under_pre_hello_events() {
+        use protonwire_frontend_api::{Event, EventEnvelope, NoticeLevel};
+
+        let dir = tempfile::tempdir().unwrap();
+        let handler = Arc::new(NullHandler {
+            version: "test".into(),
+            bus: EventBus::new(),
+        });
+        let server = spawn_server(&dir, Arc::clone(&handler));
+        let mut stream = std::os::unix::net::UnixStream::connect(server.socket_path()).unwrap();
+
+        // Wait until the session has actually subscribed: the accept loop
+        // polls at 250 ms, so a fixed sleep can race the subscribe and a
+        // too-early publish would miss the session entirely.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while handler.event_bus().session_count() != 1 {
+            assert!(Instant::now() < deadline, "session never subscribed");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        // Publish BEFORE the hello, then give the (pre-fix) forwarder a
+        // beat to race the event onto the wire ahead of the ack.
+        handler
+            .event_bus()
+            .publish(ServerMessage::Event(EventEnvelope {
+                seq: 1,
+                event: Event::Notice {
+                    level: NoticeLevel::Info,
+                    message: "pre-hello".into(),
+                },
+            }));
+        std::thread::sleep(Duration::from_millis(100));
+        write_msg(
+            &mut stream,
+            &ClientMessage::Hello {
+                protocol_version: 1,
+                client: info(),
+            },
+        )
+        .unwrap();
+
+        match read_msg::<_, ServerMessage>(&mut stream).unwrap() {
+            ServerMessage::HelloAck(_) => {}
+            other => panic!("hello ack must be the first frame, got {other:?}"),
+        }
+        // The buffered event is delivered right after the ack, not ahead
+        // of it.
+        match read_msg::<_, ServerMessage>(&mut stream).unwrap() {
+            ServerMessage::Event(envelope) => assert_eq!(envelope.seq, 1),
+            other => panic!("expected the buffered event after the ack, got {other:?}"),
+        }
     }
 
     fn connect_error(path: &Path) -> io::Error {
