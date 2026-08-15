@@ -128,6 +128,16 @@ pub fn run(root: &Path) -> Result<bool> {
             wildcard_violations.push(format!("{}: {violation}", package.manifest_path));
         }
     }
+    // The virtual workspace declares external versions in the ROOT
+    // manifest's [workspace.dependencies]; member manifests mostly carry
+    // only `workspace = true`, so the root must be scanned too (Codex PR
+    // review finding 15).
+    let root_manifest_path = root.join("Cargo.toml");
+    let root_manifest = fs::read_to_string(&root_manifest_path)
+        .with_context(|| format!("failed to read {}", root_manifest_path.display()))?;
+    for violation in wildcard_versions(&root_manifest) {
+        wildcard_violations.push(format!("{}: {violation}", root_manifest_path.display()));
+    }
     reporter.rule("no wildcard dependency versions", &wildcard_violations);
 
     let summary = format!(
@@ -266,7 +276,10 @@ fn walk_for_lock_files(dir: &Path, found: &mut Vec<PathBuf>) {
     }
 }
 
-/// Reject any dependency whose version is the wildcard `"*"`.
+/// Reject any dependency whose version is the wildcard `"*"`. Covers
+/// package manifests and the virtual workspace's root
+/// `[workspace.dependencies]`, where the external versions are actually
+/// declared (Codex PR review finding 15).
 pub(crate) fn wildcard_versions(manifest: &str) -> Vec<String> {
     let Ok(table) = toml::from_str::<toml::Table>(manifest) else {
         return vec!["manifest is not valid TOML".to_string()];
@@ -275,6 +288,11 @@ pub(crate) fn wildcard_versions(manifest: &str) -> Vec<String> {
     for section in ["dependencies", "dev-dependencies", "build-dependencies"] {
         if let Some(entries) = table.get(section) {
             scan_dependency_entries(section, entries, &mut violations);
+        }
+    }
+    if let Some(workspace) = table.get("workspace").and_then(toml::Value::as_table) {
+        if let Some(entries) = workspace.get("dependencies") {
+            scan_dependency_entries("workspace.dependencies", entries, &mut violations);
         }
     }
     if let Some(targets) = table.get("target").and_then(toml::Value::as_table) {
@@ -393,6 +411,28 @@ build-star = "*"
         assert!(!text.contains("`serde`"));
         assert!(!text.contains("`table-ok`"));
         assert!(!text.contains("`workspace-dep`"));
+    }
+
+    /// Codex PR review finding 15 (P2): this is a virtual workspace — the
+    /// external versions live in the ROOT `[workspace.dependencies]`, so a
+    /// wildcard there is exactly the case the gate exists to catch and it
+    /// previously passed unseen.
+    #[test]
+    fn wildcard_versions_are_rejected_in_the_root_workspace_table() {
+        let manifest = r#"
+[workspace]
+members = ["crates/core"]
+
+[workspace.dependencies]
+serde = "1"
+root-star = "*"
+root-table-star = { version = "*" }
+"#;
+        let violations = wildcard_versions(manifest);
+        let text = violations.join("\n");
+        assert!(text.contains("dependency `root-star`"), "got: {text}");
+        assert!(text.contains("dependency `root-table-star`"), "got: {text}");
+        assert!(!text.contains("`serde`"));
     }
 
     #[test]
