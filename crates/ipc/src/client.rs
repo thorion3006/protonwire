@@ -10,18 +10,26 @@ use std::io;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use protonwire_frontend_api::{
     ClientInfo, ClientMessage, EventEnvelope, HelloAck, PROTOCOL_VERSION, Request, RequestResult,
     Response, RpcError, ServerMessage,
 };
 
-use crate::frame::{read_msg, write_msg};
+use crate::frame::{FrameError, FrameReader, write_msg};
 use crate::peer::PeerCredentials;
 
 /// Default request timeout.
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Socket-level read poll while a whole frame is pending — deliberately
+/// shorter than the logical deadline (the client timeout), mirroring the
+/// server's READ_POLL: a mid-frame stall expires the SOCKET read but is
+/// retried (resuming the partial frame from the reader's state) until the
+/// deadline itself passes. Bounded waits therefore overshoot by at most
+/// one poll interval.
+const READ_POLL: Duration = Duration::from_millis(250);
 
 /// Failures while establishing a client connection.
 #[derive(Debug, thiserror::Error)]
@@ -108,6 +116,12 @@ pub enum RequestError {
 /// by [`IpcClient::next_event`].
 pub struct IpcClient {
     stream: UnixStream,
+    /// Stateful frame reader over a duplicate of the session socket, so
+    /// reads that expire mid-frame keep their partial progress (a retry
+    /// resumes the SAME frame instead of misparsing the remainder as a
+    /// fresh length prefix). Socket options are shared with `stream` —
+    /// `SO_RCVTIMEO`/`SO_SNDTIMEO` set on one fd govern the socket.
+    reader: FrameReader<UnixStream>,
     next_id: u64,
     pending_events: VecDeque<EventEnvelope>,
     timeout: Duration,
@@ -170,8 +184,16 @@ impl IpcClient {
                 path: path.to_owned(),
                 source,
             })?;
+        // The frame reader gets its own descriptor of the same socket.
+        let read_half = stream
+            .try_clone()
+            .map_err(|source| ConnectError::Unreachable {
+                path: path.to_owned(),
+                source,
+            })?;
         let mut transport = Self {
             stream,
+            reader: FrameReader::new(read_half),
             next_id: 0,
             pending_events: VecDeque::new(),
             timeout,
@@ -202,6 +224,12 @@ impl IpcClient {
         let _ = self.stream.set_write_timeout(Some(timeout));
     }
 
+    /// Reads the handshake reply bounded by the connect timeout as a WHOLE
+    /// (consolidated round 3, item B): a daemon dribbling the reply one
+    /// byte per sub-timeout interval keeps every socket read succeeding,
+    /// so only a codec-level deadline ends the wait. The socket polls at
+    /// [`READ_POLL`] inside that deadline so a mid-frame stall resumes
+    /// from the partial state instead of discarding it.
     fn handshake(&mut self, client: ClientInfo) -> Result<HelloAck, ConnectError> {
         write_msg(
             &mut self.stream,
@@ -211,16 +239,39 @@ impl IpcClient {
             },
         )
         .map_err(|e| ConnectError::Protocol(e.to_string()))?;
-        match read_msg::<_, ServerMessage>(&mut self.stream) {
-            Ok(ServerMessage::HelloAck(ack)) if ack.protocol_version <= PROTOCOL_VERSION => Ok(ack),
-            Ok(ServerMessage::HelloError(err)) => Err(ConnectError::HandshakeRefused {
+        let deadline = Instant::now() + self.timeout;
+        let _ = self
+            .stream
+            .set_read_timeout(Some(READ_POLL.min(self.timeout)));
+        let message = loop {
+            match self.reader.read_msg_within::<ServerMessage>(deadline) {
+                Ok(message) => break message,
+                Err(FrameError::Io(e))
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    if Instant::now() >= deadline {
+                        return Err(ConnectError::Protocol(
+                            "handshake timed out waiting for the daemon".into(),
+                        ));
+                    }
+                    continue; // partial frame retained; retry the poll
+                }
+                Err(e) => return Err(ConnectError::Protocol(e.to_string())),
+            }
+        };
+        let _ = self.stream.set_read_timeout(Some(self.timeout));
+        match message {
+            ServerMessage::HelloAck(ack) if ack.protocol_version <= PROTOCOL_VERSION => Ok(ack),
+            ServerMessage::HelloError(err) => Err(ConnectError::HandshakeRefused {
                 supported_version: err.supported_version,
                 reason: err.reason,
             }),
-            Ok(other) => Err(ConnectError::Protocol(format!(
+            other => Err(ConnectError::Protocol(format!(
                 "unexpected message during handshake: {other:?}"
             ))),
-            Err(e) => Err(ConnectError::Protocol(e.to_string())),
         }
     }
 
@@ -291,7 +342,7 @@ impl IpcClient {
                     "cannot apply request deadline: {e}"
                 )));
             }
-            let outcome = read_msg::<_, ServerMessage>(&mut self.stream);
+            let outcome = self.reader.read_msg::<ServerMessage>();
             // Restore the whole-request timeout for callers between loops
             // (next_event reads with it once request returns).
             let _ = self.stream.set_read_timeout(Some(self.timeout));
@@ -332,7 +383,17 @@ impl IpcClient {
         }
     }
 
-    /// Returns the next buffered or socket event, blocking until one arrives.
+    /// Returns the next buffered or socket event, blocking until one arrives
+    /// or the client timeout elapses — whichever comes first.
+    ///
+    /// Deadline policy (consolidated round 3, item B): the wait is bounded
+    /// by [`IpcClient::set_timeout`]'s value, because a daemon dribbling
+    /// bytes faster than the per-syscall socket timeout would otherwise pin
+    /// the caller forever. Expiry surfaces as [`io::ErrorKind::TimedOut`]
+    /// meaning "no event yet": callers re-poll rather than reconnect (an
+    /// idle-but-healthy daemon between events is the normal case). A frame
+    /// that stalls mid-read keeps its partial state, so the next call
+    /// resumes the SAME frame instead of desynchronizing.
     ///
     /// Fails fast on a poisoned transport (Codex PR review finding 10),
     /// exactly like [`IpcClient::request`]: after a timeout, I/O failure,
@@ -350,13 +411,38 @@ impl IpcClient {
         if let Some(envelope) = self.pending_events.pop_front() {
             return Ok(envelope);
         }
-        match read_msg::<_, ServerMessage>(&mut self.stream) {
+        let deadline = Instant::now() + self.timeout;
+        let _ = self
+            .stream
+            .set_read_timeout(Some(READ_POLL.min(self.timeout)));
+        let outcome = loop {
+            match self.reader.read_msg_within::<ServerMessage>(deadline) {
+                Ok(message) => break Ok(message),
+                Err(FrameError::Io(e))
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    if Instant::now() >= deadline {
+                        break Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            format!("no event within {:?}", self.timeout),
+                        ));
+                    }
+                    continue; // partial frame retained; retry the poll
+                }
+                Err(e) => break Err(map_frame_error(e)),
+            }
+        };
+        let _ = self.stream.set_read_timeout(Some(self.timeout));
+        match outcome {
             Ok(ServerMessage::Event(envelope)) => Ok(envelope),
             Ok(other) => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("unexpected message while awaiting event: {other:?}"),
             )),
-            Err(e) => Err(map_frame_error(e)),
+            Err(e) => Err(e),
         }
     }
 
@@ -737,5 +823,255 @@ mod tests {
             "error should instruct a reconnect, got: {err}"
         );
         assert_eq!(err.kind(), std::io::ErrorKind::ConnectionAborted);
+    }
+
+    /// A scripted daemon-side peer that trickles the HelloAck one byte per
+    /// interval and holds the socket open — the client-side mirror of the
+    /// server's hello dribble (consolidated round 3, item B).
+    struct DribblingAckPeer;
+
+    impl DribblingAckPeer {
+        fn spawn(dir: &tempfile::TempDir, ms_per_byte: u64) -> std::path::PathBuf {
+            use std::io::Write;
+            use std::os::unix::net::UnixListener;
+            let path = dir.path().join("dribble-ack.sock");
+            let listener = UnixListener::bind(&path).unwrap();
+            std::thread::spawn(move || {
+                let Ok((mut peer, _)) = listener.accept() else {
+                    return;
+                };
+                let _ = crate::frame::read_msg::<_, ClientMessage>(&mut peer);
+                let mut frame = Vec::new();
+                let _ = crate::frame::write_msg(
+                    &mut frame,
+                    &ServerMessage::HelloAck(protonwire_frontend_api::HelloAck {
+                        protocol_version: 1,
+                        daemon_version: "dribbler".into(),
+                        latest_event_seq: 0,
+                    }),
+                );
+                for byte in frame {
+                    if peer.write_all(&[byte]).is_err() {
+                        break;
+                    }
+                    let _ = peer.flush();
+                    std::thread::sleep(Duration::from_millis(ms_per_byte));
+                }
+                // Hold the socket: the dribble must fail on the CLIENT's
+                // deadline, not on the daemon hanging up.
+                std::thread::sleep(Duration::from_secs(30));
+            });
+            path
+        }
+    }
+
+    /// Consolidated round 3, item B (rust-reviewer): the handshake read was
+    /// stateless `read_msg` under a socket read timeout — per-syscall. A
+    /// daemon trickling the HelloAck faster than the timeout keeps every
+    /// read succeeding, so connect() pinned forever DESPITE the timeout.
+    /// The handshake must be bounded by the connect timeout as a whole.
+    #[test]
+    fn handshake_is_bounded_against_a_dribbling_daemon() {
+        use std::time::{Duration, Instant};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = DribblingAckPeer::spawn(&dir, 25);
+        let started = Instant::now();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let outcome = IpcClient::connect_with_timeout(
+                &path,
+                &test_client_info(),
+                SecurityChecks::dev_unchecked(),
+                Duration::from_millis(300),
+            );
+            let _ = done_tx.send(());
+            outcome
+        });
+        assert!(
+            done_rx.recv_timeout(Duration::from_secs(2)).is_ok(),
+            "connect() is pinned by a dribbling daemon despite its timeout"
+        );
+        match worker.join().unwrap() {
+            Err(ConnectError::Protocol(message)) => {
+                assert!(
+                    message.to_lowercase().contains("timed out"),
+                    "expected a timeout diagnosis, got: {message}"
+                );
+            }
+            Err(other) => panic!("expected a handshake protocol failure, got {other}"),
+            Ok(client) => panic!(
+                "a dribbling daemon must not complete connect: {:?}",
+                client.hello()
+            ),
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the refusal must arrive at the connect deadline"
+        );
+    }
+
+    /// Consolidated round 3, item B: next_event reads were stateless, so a
+    /// read that timed out mid-frame DISCARDED the partial bytes — the
+    /// next call then misparsed the frame remainder as a fresh length
+    /// prefix and desynchronized the stream. A call that expires must
+    /// leave the partial frame resumable: the follow-up call completes
+    /// the SAME event.
+    #[test]
+    fn next_event_resumes_a_partial_frame_after_a_timeout() {
+        use std::io::Write;
+        use std::os::unix::net::UnixListener;
+        use std::time::{Duration, Instant};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("split-event.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        std::thread::spawn(move || {
+            let Ok((mut peer, _)) = listener.accept() else {
+                return;
+            };
+            let _ = crate::frame::read_msg::<_, ClientMessage>(&mut peer);
+            let _ = crate::frame::write_msg(
+                &mut peer,
+                &ServerMessage::HelloAck(protonwire_frontend_api::HelloAck {
+                    protocol_version: 1,
+                    daemon_version: "splitter".into(),
+                    latest_event_seq: 0,
+                }),
+            );
+            let mut frame = Vec::new();
+            let _ = crate::frame::write_msg(
+                &mut frame,
+                &ServerMessage::Event(protonwire_frontend_api::EventEnvelope {
+                    seq: 5,
+                    event: protonwire_frontend_api::Event::Notice {
+                        level: protonwire_frontend_api::NoticeLevel::Info,
+                        message: "split across the deadline".into(),
+                    },
+                }),
+            );
+            assert!(frame.len() > 8, "fixture frame must be splittable");
+            // Deliver 3 bytes (mid length-prefix), stall well past the
+            // client timeout, then the rest.
+            let _ = peer.write_all(&frame[..3]);
+            let _ = peer.flush();
+            std::thread::sleep(Duration::from_millis(700));
+            let _ = peer.write_all(&frame[3..]);
+            let _ = peer.flush();
+            std::thread::sleep(Duration::from_secs(30));
+        });
+
+        let mut client = IpcClient::connect_with_timeout(
+            &path,
+            &test_client_info(),
+            SecurityChecks::dev_unchecked(),
+            Duration::from_millis(300),
+        )
+        .unwrap();
+
+        // The first call expires while the frame is stalled.
+        let started = Instant::now();
+        let err = client
+            .next_event()
+            .expect_err("a stalled frame must expire at the client timeout");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "next_event overran its deadline on a stalled frame"
+        );
+        assert!(
+            matches!(
+                err.kind(),
+                std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+            ),
+            "expiry must surface as a timeout, got: {err}"
+        );
+
+        // The second call resumes the SAME frame — pre-fix it misparsed the
+        // remainder as a fresh length prefix and desynchronized.
+        match client.next_event() {
+            Ok(envelope) => {
+                assert_eq!(envelope.seq, 5, "the resumed frame must be event 5");
+                match envelope.event {
+                    protonwire_frontend_api::Event::Notice { message, .. } => {
+                        assert_eq!(message, "split across the deadline")
+                    }
+                    other => panic!("expected the resumed notice, got {other:?}"),
+                }
+            }
+            Err(e) => panic!("the partial frame must resume, got {e}"),
+        }
+    }
+
+    /// Consolidated round 3, item B: next_event was unbounded against a
+    /// DRIBBLING daemon — each socket read succeeds, so the per-syscall
+    /// timeout never fires and the caller is pinned. The call is now
+    /// deadline-bounded by the client timeout (documented policy: the
+    /// expiry means "no event yet"; callers re-poll).
+    #[test]
+    fn next_event_is_bounded_against_an_ever_dribbling_daemon() {
+        use std::io::Write;
+        use std::os::unix::net::UnixListener;
+        use std::time::{Duration, Instant};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dribble-event.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        std::thread::spawn(move || {
+            let Ok((mut peer, _)) = listener.accept() else {
+                return;
+            };
+            let _ = crate::frame::read_msg::<_, ClientMessage>(&mut peer);
+            let _ = crate::frame::write_msg(
+                &mut peer,
+                &ServerMessage::HelloAck(protonwire_frontend_api::HelloAck {
+                    protocol_version: 1,
+                    daemon_version: "dribbler".into(),
+                    latest_event_seq: 0,
+                }),
+            );
+            // Announce a plausible frame length, then dribble payload
+            // bytes forever: no single read ever times out.
+            let announced = 60_000u32.to_be_bytes();
+            let _ = peer.write_all(&announced);
+            let _ = peer.flush();
+            let mut byte = b'x';
+            loop {
+                if peer.write_all(&[byte]).is_err() {
+                    break;
+                }
+                let _ = peer.flush();
+                byte = byte.wrapping_add(1);
+                std::thread::sleep(Duration::from_millis(25));
+            }
+        });
+
+        let mut client = IpcClient::connect_with_timeout(
+            &path,
+            &test_client_info(),
+            SecurityChecks::dev_unchecked(),
+            Duration::from_millis(300),
+        )
+        .unwrap();
+
+        let started = Instant::now();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let outcome = client.next_event();
+            let _ = done_tx.send(());
+            outcome
+        });
+        assert!(
+            done_rx.recv_timeout(Duration::from_secs(2)).is_ok(),
+            "next_event is pinned by an ever-dribbling daemon"
+        );
+        let err = worker.join().unwrap().expect_err("the dribble must expire");
+        assert!(
+            matches!(err.kind(), std::io::ErrorKind::TimedOut),
+            "expiry must surface as TimedOut, got: {err}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the expiry must arrive at the client deadline"
+        );
     }
 }
