@@ -353,7 +353,7 @@ remote evidence. Red/green evidence lives in the commit messages.
 
 | # | Sev | Finding (anchor) | Verdict | Commit |
 |---|-----|------------------|---------|--------|
-| 1 | P2 | Pair the resync snapshot with its sequence (`crates/client/src/lib.rs:240`) | Fixed @ 3c2e37f | additive-optional `DaemonState.latest_event_seq` (stamped under the emitter lock in core); the SDK advances its cursor to the snapshot's sequence and drops covered buffered events; red: `resync_snapshot_advances_the_cursor_to_its_own_sequence` (cursor sat on the gap event's 2 while the snapshot covered 4) |
+| 1 | P2 | Pair the resync snapshot with its sequence (`crates/client/src/lib.rs:240`) | Fixed @ 3c2e37f | additive-optional `DaemonState.latest_event_seq` (stamped under the emitter lock in core); the SDK advances its cursor to the snapshot's sequence. **Correction 2026-08-15 (round 3):** the original framing here — "and drops covered buffered events" — overstated what the test pins: `resync_snapshot_advances_the_cursor_to_its_own_sequence` proves events 3/4 are not *delivered* after the snapshot, but that suppression is equally delivered by the stale-skip path, so the test survived with `discard_events_through` removed entirely (QA mutation round). The discard call is now pinned directly (`discard_events_through_bounds_the_pending_queue`, commit 7748fc2) |
 | 2 | P2 | Enforce the hello deadline during frame reads (`crates/ipc/src/server.rs:272`) | Fixed @ 034f291 | `FrameReader::read_msg_within` checks a codec-level deadline before every read — a steady dribble (one byte per sub-250 ms interval) keeps socket reads succeeding forever; red: `hello_deadline_holds_against_a_steady_byte_dribble` (7 s read expired with WouldBlock, 2 s past the 5 s deadline, server never disconnected) |
 | 3 | P2 | Run push CI on the actual main branch (`.github/workflows/ci.yml:5`) | Rejected | the premise is false: the remote's only branch IS `master` (`git ls-remote --symref origin HEAD` → `ref: refs/heads/master`; `ls-remote --heads` lists no `main`; GitHub API `default_branch` = `master`), so the filter already targets the integration branch |
 | 4 | P2 | Flush the shutdown acknowledgement before stopping (`apps/daemon/src/lib.rs:76`) | Fixed @ 9bcdb57 | `serve()` joins every session worker before returning (session teardown already joins the writer after unsubscribe), so main's exit cannot beat the ack flush; red: `serve_returns_only_after_sessions_flushed_their_final_responses` (serve() returned at ~250 ms with `active_sessions() == 1` and the ack unqueued) |
@@ -367,3 +367,57 @@ demonstrable defect — four wire/lifecycle correctness bugs (1, 2, 4, 7)
 and three gates that protected nothing (5, 6, 8). A follow-up style
 commit (`4a93fd2`) reattached two round-1 doc comments the new test
 insertions had split (caught by the clippy gate before push).
+
+## 2026-08-15 — Consolidated round 3 (rust-reviewer + sec-auditor + qa-engineer)
+
+The three reports converged on one fix round; every item landed TDD-first
+with mutation-verified reds where the pin targets an existing behavior.
+Commit messages carry the full evidence.
+
+| Item | Verdict | Commit |
+| --- | --- | --- |
+| A — bound the serve() drain (SO_SNDTIMEO is per-syscall, not per-join) | Fixed | 16c9df2 (DRAIN_CEILING = 3x WRITE_TIMEOUT; stragglers force-disconnected via a weak socket handle and detached) |
+| B — client-side dribble defense + partial-frame resume in handshake/next_event | Fixed | 0469046 (`read_msg_within` deadlines; next_event now bounded by self.timeout — expiry means "no event yet", callers re-poll) |
+| C — dead request-local write re-arms dropped; zero-budget guard kept with rationale | Fixed | 6a54f01 |
+| D — host-independent deaf-peer write fixture (SO_RCVBUF pinned to 4 KiB) | Fixed | 6a54f01 |
+| E — FRONTEND_APPS/CLIENT_SIDE drift pinned by test | Fixed | 9a12827 |
+| F — DaemonState version-bump doc corrected (additive-optional needs no bump) | Fixed | 63efb11 |
+| G1-G7 — QA mutation gaps (legacy-None resync, stamp coherence, discard unit, max branch, pvpnclient tamper symmetry, zero-budget guard, multi-session drain) | Fixed | 7748fc2 (G1-G4), 6a54f01 (G6), cdbb74e (G5), 16c9df2 (G7) |
+| H — injectable HELLO_DEADLINE, 10x faster dribble fixture | Fixed | 1a7b14f (plumbing landed with A) |
+| I — lockfile map keyed (name, version) silently overwrote duplicates | Fixed | cdbb74e (duplicates rejected at parse) |
+
+### Accepted risks
+
+- **Post-hello dribble (server side) is deliberately unbounded** (carried
+  from round 2's design): once a session completes the handshake, its
+  reads may take as long as the client needs between requests — a live
+  session trickling bytes forever is indistinguishable from a slow one.
+  The exposure is bounded by the 64-session cap (`MAX_SESSIONS`): a
+  dribbler holds one reserved slot, not a thread per byte. The shutdown
+  path is no longer hostage to it: item A's DRAIN_CEILING force-closes
+  stragglers at stop time.
+- **G2's specific mutation is un-killable deterministically** (analysis in
+  `snapshot_stamp_waits_for_an_inflight_publication`): because
+  `emit_locked` allocates the sequence under the same lock that guards
+  the fields, a stamp read moved outside the lock can only ever lag the
+  fields — never lead them — and the field reads force `state()` to
+  serialize with the emitter regardless. The test pins the serialization
+  contract; both mutated read placements were run and stayed green.
+
+### Red-evidence nuances for future rounds
+
+Two shapes of "red" showed up this round that future commit messages
+should keep honest about (per QA's evidence audit):
+
+1. **Compile-failure reds** (the test cannot be built against the
+   pre-fix API): state "red with plumbing kept, \<behavior\> removed" —
+   land the inert plumbing first, then observe the behavioral red. Used
+   for items A/E.
+2. **Hang-mode reds** (the mutation's failure mode is a hang, not a
+   wrong result): the watchdog assert is the red — cite its failure
+   message and elapsed time (e.g. G6: 'a zero write budget hung the
+   request', FAILED in 0.02 s with the guard removed). A test that
+   merely times out in CI proves nothing without the message.
+3. **Pinning tests for existing behavior** (G-series): the pre-fix code
+   is green by definition, so the red must be demonstrated against the
+   named mutation and the commit must say which mutation was run.
