@@ -71,6 +71,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: taiki-e/install-action@v2
         with:
+          tool: cargo-audit
       # Flags known-vulnerable versions in the committed lockfile,
       # including the pinned Proton crates. Plain `cargo audit` audits
       # Cargo.lock from the repo root AND discovers .cargo/audit.toml as
