@@ -1,8 +1,8 @@
 //! Daemon runtime state (`/var/lib/protonwire/state.json`) with atomic
 //! persistence (PRD section 10).
-
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
@@ -31,6 +31,11 @@ pub struct OwnerRecord {
     /// When ownership was claimed (seconds since the Unix epoch).
     pub since_unix: u64,
 }
+
+/// Distinct temp-file counter: every save (in every thread) gets its own
+/// sibling temp file, so concurrent saves cannot truncate each other's
+/// inode or race the rename (Codex PR review finding 13).
+static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Failures of the state store.
 #[derive(Debug, thiserror::Error)]
@@ -88,19 +93,18 @@ impl StateStore {
         let parent = self.path.parent().unwrap_or(Path::new("."));
         std::fs::create_dir_all(parent)?;
         let tmp = parent.join(format!(
-            ".{}.tmp-{}",
+            ".{}.tmp-{}-{}",
             self.path
                 .file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or("state"),
-            std::process::id()
+            std::process::id(),
+            TEMP_SEQ.fetch_add(1, Ordering::Relaxed)
         ));
-        {
             use std::io::Write;
             let mut file = std::fs::File::create(&tmp)?;
             file.write_all(&bytes)?;
             file.sync_all()?;
-        }
         std::fs::rename(&tmp, &self.path)?;
         Ok(())
     }
@@ -145,5 +149,64 @@ mod tests {
         let path = dir.path().join("state.json");
         std::fs::write(&path, b"{ not json").unwrap();
         assert!(StateStore::new(&path).load().is_err());
+    }
+}
+
+#[cfg(test)]
+mod concurrent_save_tests {
+    use super::*;
+
+    /// Codex PR review finding 13 (P2): every clone derived the SAME
+    /// temp filename from the PID, so concurrent saves truncated and
+    /// rewrote one inode — interleaved bytes, a rename publishing the
+    /// other thread's write, and a NotFound failure for the loser.
+    /// Atomic-save must hold under concurrency: all saves succeed, the
+    /// final file parses, and no temp residue remains.
+    #[test]
+    fn concurrent_saves_are_atomic_and_leave_no_temp_residue() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let store = StateStore::new(path.clone());
+        const THREADS: usize = 8;
+        const SAVES_EACH: usize = 25;
+
+        let mut handles = Vec::new();
+        for t in 0..THREADS {
+            let store = store.clone();
+            handles.push(std::thread::spawn(move || {
+                for i in 0..SAVES_EACH {
+                    let state = StateFile {
+                        schema_version: 1,
+                        active_owner: Some(OwnerRecord {
+                            uid: 1000 + t as u32,
+                            since_unix: 1_770_000_000 + i as u64,
+                        }),
+                    };
+                    store.save(&state).expect("every concurrent save must succeed");
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().expect("no saver may panic");
+        }
+
+        // The published file is valid and complete...
+        let loaded = store.load().expect("final state must parse");
+        assert_eq!(loaded.schema_version, 1);
+        let uid = loaded.active_owner.expect("owner present").uid;
+        assert!(
+            (1000..1000 + THREADS as u32).contains(&uid),
+            "corrupted owner record: {uid}"
+        );
+        // ...and exactly one file remains: no temp residue.
+        let entries: Vec<std::ffi::OsString> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(
+            entries,
+            [std::ffi::OsString::from("state.json")],
+            "temp residue left behind: {entries:?}"
+        );
     }
 }
