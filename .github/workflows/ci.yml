@@ -71,11 +71,14 @@ jobs:
       - uses: actions/checkout@v4
       - uses: taiki-e/install-action@v2
         with:
-          tool: cargo-audit
       # Flags known-vulnerable versions in the committed lockfile,
-      # including the pinned Proton crates. --file makes policy application
-      # explicit rather than relying on discovery from the repo root.
-      - run: cargo audit --file .cargo/audit.toml
+      # including the pinned Proton crates. Plain `cargo audit` audits
+      # Cargo.lock from the repo root AND discovers .cargo/audit.toml as
+      # policy: --file takes a LOCKFILE path, not a policy path — passing
+      # the toml audited a 0-dependency "lockfile" and the gate passed
+      # vacuously (Codex PR review finding 3; verified locally:
+      # "Scanning .cargo/audit.toml for vulnerabilities (0 crate dependencies)").
+      - run: cargo audit
 
   doc:
     runs-on: ubuntu-24.04
