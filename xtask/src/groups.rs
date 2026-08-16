@@ -77,6 +77,38 @@ const EXPECTED_GROUP_IDS: [&str; EXPECTED_GROUP_COUNT] = [
     "protonwire:fastest-south-america",
 ];
 
+/// The v1 catalog's `target.kind` vocabulary: exactly the kinds the
+/// canonical document uses (docs/connection-groups.yaml) — `fastest` (5
+/// official groups), `random`, `fastest-in-country`, `secure-core`, and
+/// `fastest-in-region` (all 6 regional groups).
+const ALLOWED_TARGET_KINDS: &[&str] = &[
+    "fastest",
+    "fastest-in-country",
+    "fastest-in-region",
+    "random",
+    "secure-core",
+];
+
+/// Per-canonical-group `target.kind` map, pinning each id's selection
+/// semantics the way [`EXPECTED_GROUP_IDS`] pins the id set: a kind edit
+/// must be a deliberate contract change, not silent drift.
+const EXPECTED_GROUP_TARGET_KINDS: [(&str, &str); EXPECTED_GROUP_COUNT] = [
+    ("proton:anti-censorship", "fastest"),
+    ("proton:fastest-country", "fastest"),
+    ("proton:fastest-excluding-my-country", "fastest"),
+    ("proton:gaming", "fastest"),
+    ("proton:max-security", "secure-core"),
+    ("proton:random-country", "random"),
+    ("proton:streaming-us", "fastest-in-country"),
+    ("proton:work-school", "fastest"),
+    ("protonwire:fastest-africa", "fastest-in-region"),
+    ("protonwire:fastest-asia", "fastest-in-region"),
+    ("protonwire:fastest-europe", "fastest-in-region"),
+    ("protonwire:fastest-north-america", "fastest-in-region"),
+    ("protonwire:fastest-oceania", "fastest-in-region"),
+    ("protonwire:fastest-south-america", "fastest-in-region"),
+];
+
 #[derive(Deserialize)]
 pub(crate) struct GroupsFile {
     schema_version: Option<i64>,
@@ -544,19 +576,7 @@ fn check_group(
         }
     }
 
-    if let Some(target) = &group.target
-        && target.kind.as_deref() == Some("fastest-in-region")
-    {
-        match target.region.as_deref() {
-            Some(region) if regions.contains(region) => {}
-            Some(region) => violations.push(format!(
-                "{label}: target.region `{region}` is not a primary region"
-            )),
-            None => violations.push(format!(
-                "{label}: fastest-in-region targets must define target.region"
-            )),
-        }
-    }
+    violations.extend(check_target(&label, group, regions));
 
     if let Some(overrides) = &group.overrides {
         for key in overrides.keys() {
@@ -568,6 +588,43 @@ fn check_group(
         }
     }
 
+    violations
+}
+
+/// Target validation: every group MUST have a target, its `kind` must be in
+/// the vocabulary, `fastest-in-region` must name a primary region, and each
+/// canonical id's kind is pinned (a group that resolves nothing, or resolves
+/// it by unspecified means, is not a valid catalog entry).
+fn check_target(label: &str, group: &Group, regions: &BTreeSet<&str>) -> Vec<String> {
+    let Some(target) = &group.target else {
+        return vec![format!("{label}: `target` is missing")];
+    };
+    let mut violations = Vec::new();
+    match target.kind.as_deref() {
+        Some(kind) if ALLOWED_TARGET_KINDS.contains(&kind) => {}
+        Some(kind) => violations.push(format!(
+            "{label}: target.kind `{kind}` is not one of {ALLOWED_TARGET_KINDS:?}"
+        )),
+        None => violations.push(format!("{label}: `target.kind` is missing")),
+    }
+    if target.kind.as_deref() == Some("fastest-in-region") {
+        match target.region.as_deref() {
+            Some(region) if regions.contains(region) => {}
+            Some(region) => violations.push(format!(
+                "{label}: target.region `{region}` is not a primary region"
+            )),
+            None => violations.push(format!(
+                "{label}: fastest-in-region targets must define target.region"
+            )),
+        }
+    }
+    if let Some((_, expected)) = EXPECTED_GROUP_TARGET_KINDS
+        .iter()
+        .find(|(id, _)| Some(*id) == group.id.as_deref())
+        && target.kind.as_deref().is_some_and(|kind| kind != *expected)
+    {
+        violations.push(format!("{label}: target.kind must be `{expected}`"));
+    }
     violations
 }
 
@@ -633,18 +690,18 @@ regional_taxonomy:
 groups:
 "
         .to_string();
-        for id in [
-            "proton:fastest-country",
-            "proton:fastest-excluding-my-country",
-            "proton:random-country",
-            "proton:streaming-us",
-            "proton:gaming",
-            "proton:anti-censorship",
-            "proton:max-security",
-            "proton:work-school",
+        for (id, kind) in [
+            ("proton:fastest-country", "fastest"),
+            ("proton:fastest-excluding-my-country", "fastest"),
+            ("proton:random-country", "random"),
+            ("proton:streaming-us", "fastest-in-country"),
+            ("proton:gaming", "fastest"),
+            ("proton:anti-censorship", "fastest"),
+            ("proton:max-security", "secure-core"),
+            ("proton:work-school", "fastest"),
         ] {
             yaml.push_str(&format!(
-                "  - id: \"{id}\"\n    definition_source: official-client-compat\n    immutable: true\n    ranking_policy: proton-score\n    overrides: {{}}\n    sources: [docs]\n    target: {{kind: fastest}}\n"
+                "  - id: \"{id}\"\n    definition_source: official-client-compat\n    immutable: true\n    ranking_policy: proton-score\n    overrides: {{}}\n    sources: [docs]\n    target: {{kind: {kind}}}\n"
             ));
         }
         for region in [
@@ -743,6 +800,68 @@ groups:
         fs::remove_file(&path).ok();
     }
 
+    /// Review-fix V3: the target check only fired for kind ==
+    /// `fastest-in-region`, so a group with NO target (or a target whose
+    /// kind is not that one) got zero validation. Every group must have a
+    /// target; this deletes it from proton:fastest-country's entry (the
+    /// first proton group in the fixture).
+    #[test]
+    fn group_without_target_fails() {
+        let yaml = good_groups_yaml().replacen("\n    target: {kind: fastest}\n", "\n", 1);
+        let path = temp_yaml("no-target", &yaml);
+        assert!(
+            !validate(&path).unwrap(),
+            "a canonical group without a target must fail validation"
+        );
+        fs::remove_file(&path).ok();
+    }
+
+    /// A typo'd kind must violate the pinned target.kind vocabulary.
+    #[test]
+    fn typoed_target_kind_fails() {
+        let yaml =
+            good_groups_yaml().replacen("target: {kind: fastest}", "target: {kind: fatest}", 1);
+        let path = temp_yaml("typo-kind", &yaml);
+        assert!(
+            !validate(&path).unwrap(),
+            "a target.kind outside the vocabulary must fail validation"
+        );
+        fs::remove_file(&path).ok();
+    }
+
+    /// `fastest-in-region` is meaningless without its region.
+    #[test]
+    fn fastest_in_region_without_region_fails() {
+        let yaml = good_groups_yaml().replacen(
+            "target: {kind: fastest-in-region, region: africa}",
+            "target: {kind: fastest-in-region}",
+            1,
+        );
+        let path = temp_yaml("no-region", &yaml);
+        assert!(
+            !validate(&path).unwrap(),
+            "fastest-in-region without a region must fail validation"
+        );
+        fs::remove_file(&path).ok();
+    }
+
+    /// The region must be one of the taxonomy's primary regions
+    /// (EXPECTED_REGIONS), not an arbitrary string.
+    #[test]
+    fn fastest_in_region_with_unknown_region_fails() {
+        let yaml = good_groups_yaml().replacen(
+            "target: {kind: fastest-in-region, region: africa}",
+            "target: {kind: fastest-in-region, region: atlantis}",
+            1,
+        );
+        let path = temp_yaml("bad-region", &yaml);
+        assert!(
+            !validate(&path).unwrap(),
+            "fastest-in-region with a region outside EXPECTED_REGIONS must fail validation"
+        );
+        fs::remove_file(&path).ok();
+    }
+
     #[test]
     fn canonical_ids_have_valid_namespaces_and_are_unique() {
         // The `[&str; EXPECTED_GROUP_COUNT]` array type already pins the
@@ -762,6 +881,35 @@ groups:
             EXPECTED_GROUP_COUNT,
             "the pinned id set must contain exactly {EXPECTED_GROUP_COUNT} unique ids"
         );
+    }
+
+    /// The per-group kind map pins exactly the canonical ids (no strays,
+    /// no gaps) with the v1 catalog's kind distribution: 5x fastest, 1x
+    /// random, 1x fastest-in-country, 1x secure-core, 6x fastest-in-region.
+    #[test]
+    fn canonical_target_kind_map_is_pinned() {
+        let ids: BTreeSet<&str> = EXPECTED_GROUP_IDS.iter().copied().collect();
+        let pinned_ids: BTreeSet<&str> = EXPECTED_GROUP_TARGET_KINDS
+            .iter()
+            .map(|(id, _)| *id)
+            .collect();
+        assert_eq!(
+            pinned_ids, ids,
+            "the kind map must cover exactly the canonical ids"
+        );
+        let mut distribution: BTreeMap<&str, usize> = BTreeMap::new();
+        for (_, kind) in EXPECTED_GROUP_TARGET_KINDS {
+            assert!(
+                ALLOWED_TARGET_KINDS.contains(&kind),
+                "pinned kind `{kind}` must be in the vocabulary"
+            );
+            *distribution.entry(kind).or_default() += 1;
+        }
+        assert_eq!(distribution.get("fastest"), Some(&5));
+        assert_eq!(distribution.get("random"), Some(&1));
+        assert_eq!(distribution.get("fastest-in-country"), Some(&1));
+        assert_eq!(distribution.get("secure-core"), Some(&1));
+        assert_eq!(distribution.get("fastest-in-region"), Some(&6));
     }
 
     #[test]
