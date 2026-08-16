@@ -674,3 +674,40 @@ never-reading peer — session-level, bounded by MAX_SESSIONS, and it
 contradicts WRITE_TIMEOUT's doc comment on this kernel. Candidate
 fix if escalated in a later round: a writer-side deadline watchdog
 (a fan-out variant of `read_msg_within`). Not built now.
+
+### Round-5 reviewer verdicts and follow-up lane (close-out)
+
+- **rust-reviewer**: PASS on all four fixes — the shutdown ordering
+  provably preserves the flush guarantee, the clone-sharing primitive is
+  correct, no live-session false teardown, the CLI gate is the only
+  dispatch route, and the store taxonomy is clean. Its mutation-sanity
+  table drove five follow-ups, all landed:
+  - FU-1 @ fbd2c44 — kind-swap-for-another-valid-kind red test (the
+    per-id kind pin's only exposure).
+  - FU-2 @ 2ed831b — semantic target fields: all six catalog fields
+    deserialized, per-kind requirements (fastest-in-country ⇒ country,
+    secure-core ⇒ entry+exit) and per-id pins (exclude_physical_country
+    on two groups, connection_type on seven, selection_authority on
+    random-country) verified against docs/connection-groups.yaml; three
+    red tests pre-fix.
+  - FU-3 @ d8484ff — client-side EOF assertion, with an honest
+    correction: the literal `Shutdown::Read` mutation stays green
+    because the session's last strong fd dropping delivers EOF on
+    close(2) anyway; the red was demonstrated with the
+    weakened-shutdown+fd-outlive pair — the class that actually hangs
+    clients and the one the bounded EOF read pins.
+  - FU-4 @ 37da03c — hermetic nonexistent-socket fixture; the
+    environment-dependent Rpc arm removed.
+  - FU-5 @ 350b787 — ALLOWED_TARGET_KINDS contents pinned; the
+    arm-deletion mutation is honestly unobservable (shadowed by the
+    per-id pin plus the id set), so the constant pin is the enforceable
+    defense.
+- **qa-engineer**: teeth CONFIRMED — the V1 mutation is caught exactly,
+  the half-fix blindness is PROVEN benign (channel close implies the
+  dispatcher already returned, so the guards run; corroborated across
+  every channel-close-path test), and the TooLarge trigger is faithful
+  (the writer loop is error-variant-agnostic). The one narrow gap became
+  FU-5.
+- **Champion disposition**: `yaml::from_path` deleted @ aa4f9fd — zero
+  callers after V4, and the wrapper is the exact vector that would
+  re-wrap future read errors into the parse-error channel V4 closed.
