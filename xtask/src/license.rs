@@ -219,6 +219,36 @@ pub(crate) fn drift<'a>(unlicensed: &[String], known: &[&'a str]) -> (Vec<String
     (newly_blocked, resolved)
 }
 
+/// The NFR-35 scan proper: classifies every (package name, license) pair
+/// and returns one formatted violation per package whose declared license
+/// is either recognized as incompatible with the workspace's
+/// GPL-3.0-or-later terms or unrecognized (a human classifies it and, if
+/// warranted, extends the allowlist).
+///
+/// This is the scan-level gate, one step above `classify`: the classifier
+/// alone is unit-tested, but only this wiring makes an incompatible
+/// dependency actually fail `license-scan`. qa proved that replacing the
+/// `classify` call inside `run` with a constant `Compatible` verdict kept
+/// every classifier-level test green (the real tree is all-compatible),
+/// so the scan itself must be pinned by its own test.
+pub(crate) fn scan_licenses(entries: &[(String, String)]) -> Vec<String> {
+    let mut violations = Vec::new();
+    for (name, license) in entries {
+        match classify(license) {
+            Compatibility::Compatible => {}
+            Compatibility::Incompatible => violations.push(format!(
+                "`{name}` is `{license}` — incompatible with the workspace's \
+                 GPL-3.0-or-later terms (NFR-35)"
+            )),
+            Compatibility::Unrecognized => violations.push(format!(
+                "`{name}` is `{license}` — unrecognized license expression; \
+                 classify it and extend the allowlist (NFR-35)"
+            )),
+        }
+    }
+    violations
+}
+
 /// The release decision: distribution requires the clearance marker.
 pub(crate) fn release_allowed(clearance_exists: bool) -> Result<(), String> {
     if clearance_exists {
@@ -274,28 +304,20 @@ pub fn run(root: &Path) -> Result<bool> {
     // NFR-35: every declared license must be compatible with the
     // workspace's GPL-3.0-or-later terms. Unknown expressions fail loud —
     // a human classifies them and extends the allowlist if warranted.
-    let mut incompatible = Vec::new();
-    let mut classified = 0usize;
-    for package in &metadata.packages {
-        let license = package.license.as_deref().map(str::trim).unwrap_or("");
-        if license.is_empty() {
-            continue; // unlicensed: covered by the baseline drift rule above
-        }
-        classified += 1;
-        match classify(license) {
-            Compatibility::Compatible => {}
-            Compatibility::Incompatible => incompatible.push(format!(
-                "`{}` is `{license}` — incompatible with the workspace's \
-                 GPL-3.0-or-later terms (NFR-35)",
-                package.name
-            )),
-            Compatibility::Unrecognized => incompatible.push(format!(
-                "`{}` is `{license}` — unrecognized license expression; \
-                 classify it and extend the allowlist (NFR-35)",
-                package.name
-            )),
-        }
-    }
+    let entries: Vec<(String, String)> = metadata
+        .packages
+        .iter()
+        .filter_map(|package| {
+            let license = package.license.as_deref().map(str::trim).unwrap_or("");
+            if license.is_empty() {
+                None // unlicensed: covered by the baseline drift rule above
+            } else {
+                Some((package.name.to_string(), license.to_string()))
+            }
+        })
+        .collect();
+    let classified = entries.len();
+    let incompatible = scan_licenses(&entries);
     reporter.rule(
         "declared licenses are GPL-3.0-or-later compatible",
         &incompatible,
@@ -370,6 +392,53 @@ mod tests {
         // combined with the workspace's GPL-3.0-or-later terms.
         assert_eq!(classify("GPL-2.0-only"), Compatibility::Incompatible);
         assert_eq!(classify("GPL-2.0"), Compatibility::Incompatible);
+    }
+
+    #[test]
+    fn scan_licenses_flags_gpl2_only() {
+        // The scan-level NFR-35 gate: a GPL-2.0-only dependency must fail
+        // `license-scan`, not just the classifier. qa proved that a
+        // constant `Compatible` verdict at the scan's classify call site
+        // passed every classifier-level test (the real tree is
+        // all-compatible), so this test feeds the scan itself: exactly one
+        // violation, naming the package, its license, and the verdict.
+        let violations = scan_licenses(&[
+            ("evil-crate".to_string(), "GPL-2.0-only".to_string()),
+            ("fine".to_string(), "MIT".to_string()),
+        ]);
+        assert_eq!(
+            violations.len(),
+            1,
+            "only the GPL-2.0-only entry, got {violations:?}"
+        );
+        let violation = &violations[0];
+        assert!(violation.contains("`evil-crate`"), "in: {violation}");
+        assert!(violation.contains("GPL-2.0-only"), "in: {violation}");
+        assert!(violation.contains("incompatible"), "in: {violation}");
+    }
+
+    #[test]
+    fn mixed_and_or_binds_tighter() {
+        // AND binds tighter than OR: `MIT OR Apache-2.0 AND GPL-2.0-only`
+        // parses as MIT OR (Apache-2.0 AND GPL-2.0-only) and is therefore
+        // compatible even though the AND branch is not. Every other
+        // mixed-operator test parenthesizes, so swapping the
+        // parse_or/parse_and nesting passed them all; this pins the
+        // precedence itself.
+        assert_eq!(
+            classify("MIT OR Apache-2.0 AND GPL-2.0-only"),
+            Compatibility::Compatible
+        );
+    }
+
+    #[test]
+    fn allowlist_length_is_pinned() {
+        // 21 = the compliance-reviewer-verified set (PASS at e53fc40,
+        // docs/review-log.md: "every entry verified GPL-3.0-or-later
+        // compatible, zero allowlist corrections"). Growing or shrinking
+        // the allowlist must be a deliberate, compliance-reviewed decision;
+        // update this pin in the same commit as the reviewed change.
+        assert_eq!(GPL3_COMPATIBLE.len(), 21);
     }
 
     #[test]
@@ -474,9 +543,15 @@ mod tests {
 
     #[test]
     fn real_tree_expressions_classify() {
-        // A sample of the exact expressions `cargo metadata` reports for
-        // the current resolution, including the legacy slash forms and the
-        // parenthesized AND expressions.
+        // ROT GUARD: a sample of the exact expressions `cargo metadata`
+        // reports for the current resolution, including the legacy slash
+        // forms and the parenthesized AND expressions. This test is
+        // SUPPOSED to fail after a dependency change introduces a new
+        // expression shape — that is the drift signal working, not a flake.
+        // When it fails, classify the new expression deliberately (extend
+        // the allowlist only after a compliance review) and update these
+        // vectors in the same commit; never weaken the assertion to get
+        // back to green.
         for expr in [
             "MIT OR Apache-2.0",
             "Apache-2.0 OR MIT",
