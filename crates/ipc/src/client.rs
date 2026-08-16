@@ -16,12 +16,24 @@ use protonwire_frontend_api::{
     ClientInfo, ClientMessage, EventEnvelope, HelloAck, PROTOCOL_VERSION, Request, RequestResult,
     Response, RpcError, ServerMessage,
 };
+use tracing::warn;
 
 use crate::frame::{FrameError, FrameReader, write_msg};
 use crate::peer::PeerCredentials;
 
 /// Default request timeout.
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Cap on events buffered mid-request, when `request()` reads events it
+/// cannot yet deliver (pr-champion round 6, WO-W3). Mirrors the
+/// daemon-side rationale of `crate::bus::SESSION_QUEUE_LEN` (256): a
+/// lagging consumer resynchronizes from the sequence gap rather than
+/// buffering without bound (PRD FR-127D), so the client holds the same
+/// number for the same reason. Overflow drops the OLDEST buffered event
+/// and bumps a counter `next_event` surfaces; the induced seq gap is what
+/// the latest_event_seq resync machinery exists to recover from — the
+/// counter is observability, not correctness.
+const PENDING_EVENTS_CAP: usize = 256;
 
 /// Socket-level read poll while a whole frame is pending — deliberately
 /// shorter than the logical deadline (the client timeout), mirroring the
@@ -123,7 +135,16 @@ pub struct IpcClient {
     /// `SO_RCVTIMEO`/`SO_SNDTIMEO` set on one fd govern the socket.
     reader: FrameReader<UnixStream>,
     next_id: u64,
+    /// Events read mid-request, awaiting `next_event`. Bounded at
+    /// [`PENDING_EVENTS_CAP`]; overflow drops the oldest entry and bumps
+    /// `dropped_events`.
     pending_events: VecDeque<EventEnvelope>,
+    /// Events dropped after the pending queue hit [`PENDING_EVENTS_CAP`]
+    /// (cumulative). Observability only: the drop-induced seq gap is
+    /// recovered by the latest_event_seq resync path.
+    dropped_events: u64,
+    /// Portion of `dropped_events` not yet surfaced by `next_event`'s log.
+    unreported_drops: u64,
     timeout: Duration,
     poisoned: bool,
     ack: HelloAck,
@@ -196,6 +217,8 @@ impl IpcClient {
             reader: FrameReader::new(read_half),
             next_id: 0,
             pending_events: VecDeque::new(),
+            dropped_events: 0,
+            unreported_drops: 0,
             timeout,
             poisoned: false,
             ack: HelloAck {
@@ -365,6 +388,16 @@ impl IpcClient {
                     }
                 },
                 Ok(ServerMessage::Event(envelope)) => {
+                    // Bound the buffer like the daemon bounds its session
+                    // queues (bus::SESSION_QUEUE_LEN's rationale): drop the
+                    // OLDEST entry and account it — the seq gap it induces
+                    // is exactly what the latest_event_seq resync path
+                    // recovers from, while the counter keeps it observable.
+                    if self.pending_events.len() >= PENDING_EVENTS_CAP {
+                        self.pending_events.pop_front();
+                        self.dropped_events += 1;
+                        self.unreported_drops += 1;
+                    }
                     self.pending_events.push_back(envelope);
                 }
                 Ok(other) => {
@@ -414,6 +447,7 @@ impl IpcClient {
                 "connection unusable after a previous failure; reconnect",
             ));
         }
+        self.surface_pending_drops();
         if let Some(envelope) = self.pending_events.pop_front() {
             return Ok(envelope);
         }
@@ -459,6 +493,33 @@ impl IpcClient {
     /// client's state view.
     pub fn discard_events_through(&mut self, seq: u64) {
         self.pending_events.retain(|envelope| envelope.seq > seq);
+    }
+
+    /// Events dropped from the pending queue after it hit
+    /// [`PENDING_EVENTS_CAP`] (cumulative across the connection's life).
+    /// Observability only: after a drop-induced seq gap, correctness is
+    /// recovered by resynchronizing from `latest_event_seq`, not by this
+    /// count.
+    pub fn dropped_events(&self) -> u64 {
+        self.dropped_events
+    }
+
+    /// Surfaces queue-overflow drops on the first `next_event` after they
+    /// happened (one log per overflow episode, with the running total) —
+    /// the drop itself happens silently inside `request()`, where there is
+    /// no caller to report to.
+    fn surface_pending_drops(&mut self) {
+        if self.unreported_drops > 0 {
+            warn!(
+                dropped = self.unreported_drops,
+                total = self.dropped_events,
+                cap = PENDING_EVENTS_CAP,
+                "pending event queue overflowed while a request was in flight; \
+                 the oldest events were dropped — the seq gap is recovered by \
+                 the latest_event_seq resync"
+            );
+            self.unreported_drops = 0;
+        }
     }
 }
 
@@ -1326,5 +1387,125 @@ mod tests {
         );
         let envelope = client.next_event().expect("socket event 6 arrives");
         assert_eq!(envelope.seq, 6);
+    }
+
+    /// pr-champion round 6, WO-W3: events arriving while a request is in
+    /// flight were push_back'ed into `pending_events` without bound — a
+    /// daemon fanning out faster than the client re-enters `next_event`
+    /// grew the queue for the whole request wait. The queue is capped
+    /// (mirroring the daemon-side `bus::SESSION_QUEUE_LEN` = 256): overflow
+    /// drops the OLDEST entry and bumps a counter surfaced by `next_event`;
+    /// correctness after the induced seq gap is recovered by the existing
+    /// latest_event_seq resync machinery, the counter is observability.
+    #[test]
+    fn request_event_burst_bounds_the_pending_queue_with_drop_accounting() {
+        use std::os::unix::net::UnixListener;
+
+        // 256 + 44: enough overflow to prove both the cap and the count.
+        const EVENTS: u64 = PENDING_EVENTS_CAP as u64 + 44;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("burst.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        std::thread::spawn(move || {
+            let Ok((mut peer, _)) = listener.accept() else {
+                return;
+            };
+            let _ = crate::frame::read_msg::<_, ClientMessage>(&mut peer);
+            let _ = crate::frame::write_msg(
+                &mut peer,
+                &ServerMessage::HelloAck(protonwire_frontend_api::HelloAck {
+                    protocol_version: 1,
+                    daemon_version: "bursty".into(),
+                    latest_event_seq: 0,
+                }),
+            );
+            // Swallow the request, then a burst of events BEFORE the
+            // correlated response — the exact arrival pattern of a fan-out
+            // during a long request wait.
+            let request = crate::frame::read_msg::<_, ClientMessage>(&mut peer);
+            for seq in 1..=EVENTS {
+                let _ = crate::frame::write_msg(
+                    &mut peer,
+                    &ServerMessage::Event(EventEnvelope {
+                        seq,
+                        event: protonwire_frontend_api::Event::Notice {
+                            level: protonwire_frontend_api::NoticeLevel::Info,
+                            message: format!("burst {seq}"),
+                        },
+                    }),
+                );
+            }
+            if let Ok(ClientMessage::Request {
+                id,
+                request: Request::Ping { nonce },
+            }) = request
+            {
+                let _ = crate::frame::write_msg(
+                    &mut peer,
+                    &ServerMessage::Response(Response::Ok {
+                        id,
+                        result: RequestResult::Pong { nonce },
+                    }),
+                );
+            }
+            // Hold the socket: later reads must come from the buffer.
+            std::thread::sleep(Duration::from_secs(30));
+        });
+
+        let mut client = IpcClient::connect_with_timeout(
+            &path,
+            &test_client_info(),
+            SecurityChecks::dev_unchecked(),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+
+        match client
+            .request(Request::Ping { nonce: "p".into() })
+            .expect("the correlated pong arrives after the burst")
+        {
+            RequestResult::Pong { nonce } => assert_eq!(nonce, "p"),
+            other => panic!("unexpected result: {other:?}"),
+        }
+
+        // The queue is bounded at the cap...
+        assert_eq!(
+            client.pending_events.len(),
+            PENDING_EVENTS_CAP,
+            "the pending queue must stay bounded under a mid-request burst"
+        );
+        // ...the OLDEST events were the ones dropped (1..=44 are gone,
+        // 45..=300 remain in order)...
+        assert_eq!(
+            client.pending_events.front().expect("queue is full").seq,
+            EVENTS + 1 - PENDING_EVENTS_CAP as u64,
+            "overflow must drop the oldest buffered events"
+        );
+        assert_eq!(
+            client.pending_events.back().expect("queue is full").seq,
+            EVENTS,
+            "the newest event must be retained"
+        );
+        // ...and the drop counter accounts for exactly the overflow.
+        assert_eq!(
+            client.dropped_events(),
+            EVENTS - PENDING_EVENTS_CAP as u64,
+            "the drop counter must account for every dropped event"
+        );
+
+        // The resync path still works over the bounded queue: a snapshot
+        // through seq 299 covers all but the last event, and next_event
+        // delivers it from the buffer (also surfacing the drop log).
+        client.discard_events_through(EVENTS - 1);
+        let envelope = client
+            .next_event()
+            .expect("the newest event still delivers after the resync discard");
+        assert_eq!(envelope.seq, EVENTS);
+        assert_eq!(
+            client.dropped_events(),
+            EVENTS - PENDING_EVENTS_CAP as u64,
+            "the counter is cumulative and unaffected by delivery"
+        );
     }
 }
