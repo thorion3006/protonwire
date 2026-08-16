@@ -122,17 +122,25 @@ impl IpcServer {
         socket_name: &str,
         group: Option<&str>,
     ) -> io::Result<Self> {
-        Self::bind_with_resolved(socket_dir, socket_name, group, &resolve_group_gid)
+        Self::bind_with_resolved(
+            socket_dir,
+            socket_name,
+            group,
+            &resolve_group_gid,
+            &chown_socket_group,
+        )
     }
 
-    /// The bind path with an injectable group resolver (tests map the
-    /// resolution error surface without a group database; production goes
-    /// through [`IpcServer::bind_with_group`]).
+    /// The bind path with BOTH the group resolver and the chown injectable
+    /// (tests pin the hand-off between them — resolver output to chown
+    /// input, exactly once, with the bound path — without a group database
+    /// or root; production goes through [`IpcServer::bind_with_group`]).
     fn bind_with_resolved(
         socket_dir: &Path,
         socket_name: &str,
         group: Option<&str>,
         resolver: &dyn Fn(&str) -> io::Result<Option<nix::unistd::Gid>>,
+        chown: &dyn Fn(&Path, &str, nix::unistd::Gid) -> io::Result<()>,
     ) -> io::Result<Self> {
         std::fs::create_dir_all(socket_dir)?;
         let socket_path = socket_dir.join(socket_name);
@@ -145,7 +153,7 @@ impl IpcServer {
         if let Some(name) = group {
             let gid = resolver(name)?
                 .ok_or_else(|| io::Error::other(format!("socket group `{name}` does not exist")))?;
-            chown_socket_group(&socket_path, name, gid)?;
+            chown(&socket_path, name, gid)?;
         }
         info!(path = %socket_path.display(), "IPC server bound");
         Ok(Self {
@@ -1466,15 +1474,44 @@ mod tests {
     #[test]
     fn bind_with_group_maps_resolver_failures() {
         let dir = tempfile::tempdir().unwrap();
-        let err =
-            IpcServer::bind_with_resolved(dir.path(), "boom.sock", Some("clients"), &|_name| {
-                Err(io::Error::other("group database on fire"))
-            })
-            .map(|_| ())
-            .expect_err("a resolver failure must abort bind");
+        let err = IpcServer::bind_with_resolved(
+            dir.path(),
+            "boom.sock",
+            Some("clients"),
+            &|_name| Err(io::Error::other("group database on fire")),
+            &|_path, _name, _gid| panic!("resolution failed first: the chown must not run"),
+        )
+        .map(|_| ())
+        .expect_err("a resolver failure must abort bind");
         assert!(
             err.to_string().contains("group database on fire"),
             "got: {err}"
+        );
+    }
+
+    /// The second group-lookup error text (alongside the resolver-Err test
+    /// above): a name that resolves to nothing must fail loudly naming the
+    /// group — a daemon started with a typo'd group is a daemon nobody can
+    /// reach.
+    #[test]
+    fn unresolved_group_names_fail_loud_through_the_seam() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = IpcServer::bind_with_resolved(
+            dir.path(),
+            "missing.sock",
+            Some("wheel-clients"),
+            &|_name| Ok(None),
+            &|_path, _name, _gid| panic!("no gid was resolved: the chown must not run"),
+        )
+        .map(|_| ())
+        .expect_err("an unresolvable group must abort bind");
+        assert!(
+            err.to_string().contains("does not exist"),
+            "the lookup-failure text must say so, got: {err}"
+        );
+        assert!(
+            err.to_string().contains("wheel-clients"),
+            "the lookup-failure text must name the group, got: {err}"
         );
     }
 
@@ -1485,33 +1522,121 @@ mod tests {
         use std::os::unix::fs::MetadataExt;
 
         let dir = tempfile::tempdir().unwrap();
-        let server = IpcServer::bind_with_resolved(dir.path(), "plain.sock", None, &|_| {
-            panic!("no group configured: the resolver must not run")
-        })
+        let server = IpcServer::bind_with_resolved(
+            dir.path(),
+            "plain.sock",
+            None,
+            &|_| panic!("no group configured: the resolver must not run"),
+            &|_path, _name, _gid| panic!("no group configured: the chown must not run"),
+        )
         .unwrap();
         let meta = std::fs::metadata(server.socket_path()).unwrap();
         assert_eq!(meta.gid(), nix::unistd::getgid().as_raw());
         assert_eq!(meta.mode() & 0o777, 0o660);
     }
 
-    /// The resolved gid flows to a real chown (mode still 0o660). The
-    /// injected gid is the process's own primary group: POSIX lets any
-    /// user chgrp a file it owns to a group it belongs to, so this
-    /// exercises the chown path unprivileged. (Environments that run the
-    /// suite inside a restricted user namespace — where supplementary
-    /// gids are unmapped and chown to them answers EINVAL — still admit
-    /// the primary gid; a FOREIGN group is the root-gated test below.)
+    /// The effectiveness pin for the chown (qa mutation gap): the chown
+    /// seam must fire EXACTLY ONCE per configured group, with the bound
+    /// socket's path, the configured group name, and the gid the RESOLVER
+    /// returned — the hand-off `bind_with_group` exists to perform. The
+    /// old `bind_with_group_applies_the_resolved_gid` pin was tautological
+    /// (a fresh socket's gid already equals the process egid, so its
+    /// asserts held with the chown call deleted); recording the chown's
+    /// arguments makes the delete-chown mutation fail here.
+    #[test]
+    fn chown_seam_receives_the_resolved_gid() {
+        use std::sync::Mutex;
+
+        let dir = tempfile::tempdir().unwrap();
+        let calls: Mutex<Vec<(PathBuf, String, u32)>> = Mutex::new(Vec::new());
+        let server = IpcServer::bind_with_resolved(
+            dir.path(),
+            "seam.sock",
+            Some("wheel-clients"),
+            // A gid this process does NOT hold: the seam runs unprivileged
+            // precisely because the real chown never happens.
+            &|_name| Ok(Some(nix::unistd::Gid::from_raw(12345))),
+            &|path, name, gid| {
+                calls
+                    .lock()
+                    .unwrap()
+                    .push((path.to_owned(), name.to_owned(), gid.as_raw()));
+                Ok(())
+            },
+        )
+        .unwrap();
+        let recorded = calls.lock().unwrap();
+        assert_eq!(
+            recorded.len(),
+            1,
+            "the chown seam must be invoked exactly once for the configured group"
+        );
+        let (path, name, gid) = &recorded[0];
+        assert_eq!(
+            path,
+            server.socket_path(),
+            "the chown must target the bound socket"
+        );
+        assert_eq!(name, "wheel-clients");
+        assert_eq!(*gid, 12345, "the chown must receive the resolver's gid");
+    }
+
+    /// A chown failure (EPERM, say) passes through and aborts bind with
+    /// the group still named — never swallowed into a daemon nobody can
+    /// reach.
+    #[test]
+    fn chown_failures_pass_through_and_name_the_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = IpcServer::bind_with_resolved(
+            dir.path(),
+            "chown-boom.sock",
+            Some("wheel-clients"),
+            &|_name| Ok(Some(nix::unistd::Gid::from_raw(12345))),
+            &|_path, name, _gid| {
+                Err(io::Error::other(format!(
+                    "cannot chown socket to group `{name}`: permission denied"
+                )))
+            },
+        )
+        .map(|_| ())
+        .expect_err("a chown failure must abort bind");
+        assert!(
+            err.to_string().contains("wheel-clients"),
+            "the chown error must pass through naming the group, got: {err}"
+        );
+        assert!(
+            err.to_string().contains("permission denied"),
+            "the chown error must survive propagation un-mangled, got: {err}"
+        );
+    }
+
+    /// Real-syscall smoke test for the unprivileged chgrp path: POSIX lets
+    /// any user chgrp a file it owns to a group it belongs to, so
+    /// resolving to the process's own gid exercises the real chown(2)
+    /// alongside the 0o660 mode.
+    ///
+    /// Honest scope: this does NOT pin the chown call — a fresh socket's
+    /// gid already equals the process egid, so these asserts stay green
+    /// with the chown deleted (qa mutation evidence). The effectiveness
+    /// pin is [`chown_seam_receives_the_resolved_gid`]; this test still
+    /// proves the real syscall succeeds where POSIX allows it unprivileged
+    /// and leaves the mode intact. (Environments inside a restricted user
+    /// namespace where supplementary gids are unmapped still admit the
+    /// primary gid; a FOREIGN group is the root-gated test below.)
     #[test]
     fn bind_with_group_applies_the_resolved_gid() {
         use std::os::unix::fs::MetadataExt;
 
         let gid = nix::unistd::getgid();
         let dir = tempfile::tempdir().unwrap();
-        let server =
-            IpcServer::bind_with_resolved(dir.path(), "grouped.sock", Some("clients"), &|_| {
-                Ok(Some(gid))
-            })
-            .unwrap();
+        let server = IpcServer::bind_with_resolved(
+            dir.path(),
+            "grouped.sock",
+            Some("clients"),
+            &|_| Ok(Some(gid)),
+            &chown_socket_group,
+        )
+        .unwrap();
         let meta = std::fs::metadata(server.socket_path()).unwrap();
         assert_eq!(meta.gid(), gid.as_raw());
         assert_eq!(meta.mode() & 0o777, 0o660);
@@ -1521,14 +1646,29 @@ mod tests {
     /// `only_connection_refused_authorizes_unlinking_a_stale_socket`):
     /// only root may chown to a group it does not belong to, so the full
     /// production path — real resolver against the group database, real
-    /// chown — runs when the suite executes as root and skips otherwise.
+    /// chown — runs when the suite executes as root outside a user
+    /// namespace. Inside a user namespace (/proc/self/ns/user differing
+    /// from /proc/1/ns/user — or pid 1's file being unstatable, the form
+    /// this host exhibits) the process holds no mapping for foreign gids
+    /// and chown(2) to them answers EINVAL, so that environment skips
+    /// with a NOTICE rather than failing on the kernel's terms.
     #[test]
     fn bind_with_group_chowns_to_a_real_group_when_root() {
         use std::os::unix::fs::MetadataExt;
 
-        if !nix::unistd::getuid().is_root() {
+        if in_a_user_namespace() {
+            eprintln!(
+                "NOTICE: skipping bind_with_group_chowns_to_a_real_group_when_root: the \
+                 suite runs in a user namespace (/proc/self/ns/user differs from \
+                 /proc/1/ns/user) where chown to a foreign gid answers EINVAL"
+            );
             return;
         }
+        assert!(
+            nix::unistd::getuid().is_root(),
+            "outside a user namespace the real-chown arm requires root — the gate \
+             is broken, not the chown"
+        );
         let group = nix::unistd::Group::from_name("nogroup")
             .expect("nogroup resolves")
             .expect("nogroup exists");
@@ -1667,6 +1807,30 @@ mod tests {
 
     fn connect_error(path: &Path) -> io::Error {
         UnixStream::connect(path).expect_err("connect against a socket file must fail or succeed")
+    }
+
+    /// Whether the test process runs in a DIFFERENT user namespace than
+    /// init (pid 1). Namespace files live on nsfs, one stable inode per
+    /// namespace, so equal (dev, ino) means the same namespace. A process
+    /// in a user namespace typically cannot even stat pid 1's file (its
+    /// owner is unmapped there — exactly this host's quirk), which is
+    /// just as decisive: the real-chown arm may run only where the init
+    /// user namespace is positively confirmed. In such namespaces the
+    /// process holds no mapping for foreign gids and chown(2) to them
+    /// answers EINVAL — not a code fault, so that environment skips with
+    /// a NOTICE rather than failing on the kernel's terms.
+    fn in_a_user_namespace() -> bool {
+        use std::os::unix::fs::MetadataExt;
+
+        match (
+            std::fs::metadata("/proc/1/ns/user"),
+            std::fs::metadata("/proc/self/ns/user"),
+        ) {
+            (Ok(init), Ok(current)) => (init.dev(), init.ino()) != (current.dev(), current.ino()),
+            // Unstatable /proc (or absent pid 1) cannot confirm the init
+            // user namespace; assume the guarded case.
+            _ => true,
+        }
     }
 
     /// Shrinks a stream's `SO_RCVBUF` (std exposes no UnixStream helper) so
