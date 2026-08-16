@@ -504,3 +504,45 @@ Process notes:
   ever wanted; (2) the compile-time script hashes follow frontendDist
   output — any post-codegen HTML rewriting would invalidate them (we
   register none today).
+
+### Round-4 required-reviewer verdicts and track items
+
+**ZhFMP (socket group, 6b2ca35) — sec-auditor PASS, no must-fix.**
+Verified: mode-then-chown ordering safe (permissions widen
+monotonically to the steady state); unknown group fails loud with no
+silent root:root fallback; `chown(None, Some(gid))` preserves root
+ownership so both client gates hold; `daemon.socket_group` is
+system-authority-only (overlay cannot express it); NSS/name-confusion
+ruled out (root-managed config, exact-name match, NUL names fail at
+lookup); runtime dir root:root 0755 satisfies non-replaceability and
+traverse-needs. Four Low track items (M2 hardening, non-blocking):
+
+- (a) Pre-existing bind→chmod umask window: a umask guard at bind
+  closes it; folds into tracked item 11's M2 hardening.
+- (b) `create_dir_all` does not pin 0755 — set_permissions explicitly
+  or fail-loud verify the mode.
+- (c) The root-gated foreign-group test silently skips on non-root
+  hosts — add a skip notice and assert uid stays 0 in the same test.
+- (d) Untested enforcement interplay: member-can-connect /
+  non-member-EACCES, plus a strict-mode client accepting a root:<grp>
+  socket (root-gated arm).
+
+**ZhFMR (license gate, e53fc40) — compliance-reviewer PASS, zero
+allowlist corrections.** Every entry verified GPL-3.0-or-later
+compatible, including the load-bearing orderings: GPL-2.0-or-later is
+allowlisted before the incompatible-prefix branch; plain MPL-2.0
+passes while MPL-2.0-no-copyleft-exception correctly falls to
+Unrecognized. Four track items:
+
+1. When `docs/LICENSE-CLEARANCE.md` is created, embed the license-scan
+   output (743 classified packages, allowlist, commit) as clearance
+   evidence; carry per-package verdicts in the M8 SBOM.
+2. Compose `license::run` into `release_guard` so `v*` tags re-verify
+   compatibility, not just marker existence.
+3. Optional allowlist annotations: CC0 as waiver-fallback, CDLA as a
+   data license, MPL-2.0 variant scoping.
+4. Optional choose-the-compatible-branch semantics for
+   Compatible-OR-Unrecognized expressions.
+
+rust-reviewer and qa-engineer batch verdicts pending; any adverse
+finding reopens the affected thread and re-enters the fix loop.
