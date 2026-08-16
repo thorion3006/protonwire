@@ -480,10 +480,20 @@ mod tests {
     /// Bare `connect <target>`, and `--json` alone (presentation-only, so it
     /// stays ignored rather than refused), must keep dispatching: the
     /// modifier gate may not fire without a modifier, so the request still
-    /// reaches the daemon — whose answer for Request::Connect today is the
-    /// milestone-4 tunnel refusal.
+    /// reaches the daemon.
+    ///
+    /// FU-4 (rust-review round-5 follow-up, Low): the socket is a path
+    /// that cannot exist (an explicit `Some(path)` also wins over
+    /// PROTONWIRE_SOCKET and the /run/protonwire default), so only the
+    /// DaemonUnavailable branch is reachable — previously `None` fell
+    /// back to the default socket, and a live dev daemon from another
+    /// build made this assertion read whatever that build answered.
     #[test]
     fn bare_connect_and_json_only_still_dispatch() {
+        let socket = std::env::temp_dir().join(format!(
+            "protonwire-cli-nonexistent-{}.sock",
+            std::process::id()
+        ));
         for command in [
             Command::Connect {
                 target: vec!["fastest".into()],
@@ -500,16 +510,11 @@ mod tests {
                 json: true,
             },
         ] {
-            match run(&command, None, true) {
-                // No daemon on the default socket in unit tests: the request
-                // got past the gate and attempted the daemon.
+            match run(&command, Some(&socket), true) {
+                // The socket cannot exist: DaemonUnavailable IS the
+                // dispatch proof — the request got past the modifier gate
+                // and attempted the daemon.
                 Err(ClientError::DaemonUnavailable(_)) => {}
-                // With a live daemon, Request::Connect is answered by the
-                // milestone-4 tunnel refusal.
-                Err(ClientError::Rpc(rpc)) => {
-                    assert_eq!(rpc.code, RpcErrorCode::NotImplemented);
-                    assert!(rpc.message.contains("milestone 4"), "got: {}", rpc.message);
-                }
                 other => panic!("bare connect must still dispatch, got {other:?}"),
             }
         }
