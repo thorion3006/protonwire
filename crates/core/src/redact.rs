@@ -280,8 +280,20 @@ mod tests {
     /// from "secretvalue"). Replacement must go longest-first.
     #[test]
     fn overlapping_secrets_redact_longest_first() {
+        // Registration order short-then-long: replacement must go
+        // longest-first regardless of the registry's incidental order.
         let _short = register_secret("value");
         let _long = register_secret("secretvalue");
+        assert_eq!(scrub("x secretvalue y"), "x [redacted] y");
+
+        // Reverse registration order (long-then-short): the arm above is
+        // the one a plain `secrets.reverse()` in place of the
+        // longest-first sort survives, because reversing registration
+        // order happens to be long-first there. Registering the long
+        // secret AFTER the short one makes reverse() scrub 'value' first
+        // and leak the 'secret' residue — this arm pins the sort itself.
+        let _long_again = register_secret("secretvalue");
+        let _short_last = register_secret("value");
         assert_eq!(scrub("x secretvalue y"), "x [redacted] y");
     }
 
