@@ -1089,6 +1089,122 @@ capabilities:
         assert_eq!(count("T-"), 37, "PRD 17.1 defines 37 unit tests");
         assert_eq!(count("IT-"), 30, "PRD 17.2 defines 30 integration tests");
         assert_eq!(count("E2E-"), 25, "PRD 17.3 defines 25 end-to-end tests");
+        // FU-D (round-6 verdict residual): counts alone do not pin WHICH
+        // ids a prefix holds — swapping an unreferenced id for a phantom
+        // (T-37 → T-99) keeps every count intact. Pin the max id per
+        // prefix and require contiguity from 1, so both the phantom and
+        // the hole it leaves are named drift in one failure.
+        let mut drift = Vec::new();
+        for (prefix, expected_max) in [("T-", 37u32), ("IT-", 30), ("E2E-", 25)] {
+            let numbers: BTreeSet<u32> = CANONICAL_TEST_IDS
+                .iter()
+                .filter_map(|id| id.strip_prefix(prefix))
+                .filter_map(|suffix| suffix.parse().ok())
+                .collect();
+            match numbers.iter().max() {
+                Some(&max) if max == expected_max => {}
+                other => drift.push(format!(
+                    "{prefix} max id is {other:?}, expected {expected_max}"
+                )),
+            }
+            for n in 1..=expected_max {
+                if !numbers.contains(&n) {
+                    drift.push(format!(
+                        "`{prefix}{n}` is missing; {prefix} ids must be contiguous 1..={expected_max}"
+                    ));
+                }
+            }
+        }
+        assert!(drift.is_empty(), "canonical inventory drift: {drift:?}");
+    }
+
+    /// Slices the PRD text between the (unique) `## 17.` Test Plan and
+    /// `## 18.` Implementation Milestones headings — sections 17.1-17.3.
+    fn test_plan_section(prd: &str) -> &str {
+        let start = prd
+            .find("## 17. Test Plan")
+            .expect("the PRD must contain the `## 17. Test Plan` heading");
+        let end = prd[start..]
+            .find("## 18. Implementation Milestones")
+            .map(|offset| start + offset)
+            .expect("the PRD must contain the `## 18.` heading after the Test Plan");
+        &prd[start..end]
+    }
+
+    /// Extracts the bold test ids from the sliced Test Plan text. Every
+    /// PRD test entry opens its own line with exactly this shape
+    /// (`**T-37:** Validate ...`, `**IT-30:** ...`, `**E2E-25:** ...`), so
+    /// scanning line-initial `**` + id + `:**` prefixes matches the ids
+    /// and nothing else in the section.
+    fn bold_test_ids(section: &str) -> BTreeSet<String> {
+        let mut ids = BTreeSet::new();
+        for line in section.lines() {
+            let Some(rest) = line.trim_start().strip_prefix("**") else {
+                continue;
+            };
+            let (prefix, tail) = if let Some(tail) = rest.strip_prefix("E2E-") {
+                ("E2E-", tail)
+            } else if let Some(tail) = rest.strip_prefix("IT-") {
+                ("IT-", tail)
+            } else if let Some(tail) = rest.strip_prefix("T-") {
+                ("T-", tail)
+            } else {
+                continue;
+            };
+            let digits_end = tail
+                .char_indices()
+                .find(|(_, c)| !c.is_ascii_digit())
+                .map(|(i, _)| i)
+                .unwrap_or(tail.len());
+            if digits_end > 0 && tail[digits_end..].starts_with(":**") {
+                ids.insert(format!("{prefix}{}", &tail[..digits_end]));
+            }
+        }
+        ids
+    }
+
+    /// FU-D (round-6 verdict residual): nine inventory ids (E2E-9, E2E-11,
+    /// IT-1, IT-2, IT-13, IT-25, T-19, T-36, T-37) are referenced by no
+    /// capability, so swapping any of them for a shape-valid phantom passed
+    /// EVERYWHERE — the per-reference checks never fire on unreferenced
+    /// ids, and the count companions alone cannot see a within-prefix
+    /// swap. The constant cannot vouch for itself, so this test
+    /// cross-checks it against the authoritative source it records:
+    /// the PRD's own section 17.1-17.3 inventory.
+    ///
+    /// TEST-ONLY BY DESIGN — the GATE stays PRD-independent: `run`,
+    /// `validate`, and every `check_*` never read the PRD (a missing or
+    /// restructured PRD must never break `cargo xtask` itself), and the
+    /// inventory constant remains the gate's single authority. Only this
+    /// `#[cfg(test)]` code opens the PRD, so a PRD edit that forgets the
+    /// constant (or vice versa) fails `cargo test`, not CI's real-docs
+    /// run.
+    #[test]
+    fn canonical_test_inventory_matches_the_prd() {
+        let prd = crate::workspace_root()
+            .expect("cannot derive the workspace root")
+            .join("docs")
+            .join("PRD-proton-wire.md");
+        let text = fs::read_to_string(&prd)
+            .unwrap_or_else(|err| panic!("failed to read {}: {err}", prd.display()));
+        let prd_ids = bold_test_ids(test_plan_section(&text));
+        assert_eq!(
+            prd_ids.len(),
+            92,
+            "PRD 17.1-17.3 must define 92 bold test ids (37 + 30 + 25)"
+        );
+        let pinned: BTreeSet<String> = CANONICAL_TEST_IDS
+            .iter()
+            .map(|id| String::from(*id))
+            .collect();
+        let not_pinned: Vec<&String> = prd_ids.difference(&pinned).collect();
+        let not_in_prd: Vec<&String> = pinned.difference(&prd_ids).collect();
+        assert!(
+            not_pinned.is_empty() && not_in_prd.is_empty(),
+            "CANONICAL_TEST_IDS drifted from the PRD 17.1-17.3 inventory — \
+             in the PRD but not pinned: {not_pinned:?}; \
+             pinned but not in the PRD: {not_in_prd:?}"
+        );
     }
 
     #[test]
