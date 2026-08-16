@@ -14,7 +14,7 @@ use clap::Parser;
 use protonwire_core::redact::init_tracing_filtered;
 use protonwire_store::config::SystemConfig;
 use protonwire_store::paths::ConfigPaths;
-use tracing::info;
+use tracing::{info, warn};
 
 use protonwire_daemon::{BusSink, DaemonHandler};
 
@@ -52,8 +52,8 @@ fn main() {
     // `daemon.log_level` from the config applies (rust-review finding 7);
     // a `--log-level` flag wins over the config, and RUST_LOG wins over
     // both. Load failures predate the logger and go to stderr.
-    let config = match SystemConfig::load(&paths.system_config) {
-        Ok(config) => Arc::new(config),
+    let loaded = match SystemConfig::load(&paths.system_config) {
+        Ok(loaded) => loaded,
         Err(e) => {
             eprintln!("protonwire-daemon: {e}");
             std::process::exit(15); // PRD 9.8: config validation failed
@@ -62,8 +62,19 @@ fn main() {
     let level = args
         .log_level
         .clone()
-        .unwrap_or_else(|| config.daemon.log_level.clone());
+        .unwrap_or_else(|| loaded.config.daemon.log_level.clone());
     init_tracing_filtered(&level);
+    // pr-champion WO-9: SystemConfig::load warns about a missing file
+    // before any subscriber exists, so that record is discarded — re-emit
+    // it now that tracing is initialized, or operators would never learn
+    // the daemon is running on built-in defaults.
+    if loaded.used_defaults {
+        warn!(
+            path = %paths.system_config.display(),
+            "system configuration not found; using defaults"
+        );
+    }
+    let config = Arc::new(loaded.config);
 
     // Codex PR review finding 4: capture daemon.socket_path before `config`
     // moves into the core; binding applies it with --socket-dir > config >

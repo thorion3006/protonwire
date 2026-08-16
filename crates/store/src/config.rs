@@ -711,6 +711,22 @@ impl Default for SystemConfig {
     }
 }
 
+/// The outcome of [`SystemConfig::load`]: the validated document plus
+/// whether it came from disk or from the built-in defaults.
+///
+/// `used_defaults` exists because load's own `tracing::warn!` for a
+/// missing file can fire before the caller installs a subscriber (the
+/// daemon loads config before initializing logging so `daemon.log_level`
+/// applies) — a caller that needs the warning surfaced re-emits it from
+/// this flag after logging initializes (pr-champion WO-9).
+#[derive(Debug, Clone)]
+pub struct LoadedSystemConfig {
+    /// The validated configuration document.
+    pub config: SystemConfig,
+    /// True when the path was absent and built-in defaults were used.
+    pub used_defaults: bool,
+}
+
 impl SystemConfig {
     /// Expected schema version of this generation of the document.
     pub const EXPECTED_SCHEMA_VERSION: u32 = 2;
@@ -721,14 +737,22 @@ impl SystemConfig {
     /// a hard error — `exists()` would read that as "missing" and hand the
     /// daemon silent defaults for its socket, credential, and protection
     /// policy — and an invalid file is equally hard.
-    pub fn load(path: &std::path::Path) -> Result<Self, ConfigLoadError> {
+    ///
+    /// The result's [`LoadedSystemConfig::used_defaults`] flag says when
+    /// the defaults path was taken, so a caller whose subscriber is not up
+    /// yet can re-emit the missing-file warning after initializing
+    /// logging.
+    pub fn load(path: &std::path::Path) -> Result<LoadedSystemConfig, ConfigLoadError> {
         let bytes = match std::fs::read(path) {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 tracing::warn!(path = %path.display(), "system configuration not found; using defaults");
                 let defaults = Self::default();
                 defaults.validate()?;
-                return Ok(defaults);
+                return Ok(LoadedSystemConfig {
+                    config: defaults,
+                    used_defaults: true,
+                });
             }
             Err(error) => {
                 return Err(ConfigLoadError::Io {
@@ -739,7 +763,10 @@ impl SystemConfig {
         };
         let config: Self = yaml::from_slice(&bytes)?;
         config.validate()?;
-        Ok(config)
+        Ok(LoadedSystemConfig {
+            config,
+            used_defaults: false,
+        })
     }
 
     /// Validates cross-field rules and returns every violation.
@@ -954,9 +981,39 @@ mod tests {
     #[test]
     fn load_missing_file_yields_valid_defaults() {
         let dir = tempfile::tempdir().unwrap();
-        let config = SystemConfig::load(&dir.path().join("absent.yaml")).unwrap();
+        let config = SystemConfig::load(&dir.path().join("absent.yaml"))
+            .unwrap()
+            .config;
         assert_eq!(config.schema_version, SystemConfig::EXPECTED_SCHEMA_VERSION);
         config.validate().unwrap();
+    }
+
+    /// pr-champion WO-9: load's `tracing::warn!` for a missing file fires
+    /// before the daemon installs its subscriber, so the warning is
+    /// discarded. `load` must report whether defaults were substituted so
+    /// the daemon can re-emit the warning after logging initializes. Red
+    /// evidence pre-fix is the disclosed compile-red (`used_defaults` did
+    /// not exist on the load result).
+    #[test]
+    fn load_reports_whether_defaults_were_used() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = SystemConfig::load(&dir.path().join("absent.yaml")).unwrap();
+        assert!(
+            missing.used_defaults,
+            "a missing file must flag used_defaults"
+        );
+        assert_eq!(
+            missing.config.schema_version,
+            SystemConfig::EXPECTED_SCHEMA_VERSION
+        );
+
+        let path = dir.path().join("config.yaml");
+        std::fs::write(&path, example_config_yaml()).unwrap();
+        let present = SystemConfig::load(&path).unwrap();
+        assert!(
+            !present.used_defaults,
+            "a document loaded from disk must not flag used_defaults"
+        );
     }
 
     /// Review-fix V4: `load` used `!path.exists()`, so an EACCES ancestor
@@ -1018,7 +1075,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.yaml");
         std::fs::write(&path, example_config_yaml()).unwrap();
-        let config = SystemConfig::load(&path).unwrap();
+        let config = SystemConfig::load(&path).unwrap().config;
         assert_eq!(config.daemon.interface_name, "protonwire0");
     }
 
@@ -1035,7 +1092,7 @@ mod tests {
             "schema_version: 2\ndaemon:\n  socket_group: protonwire-clients\n",
         )
         .unwrap();
-        let config = SystemConfig::load(&path).unwrap();
+        let config = SystemConfig::load(&path).unwrap().config;
         config.validate().unwrap();
         assert_eq!(
             config.daemon.socket_group.as_deref(),
