@@ -356,7 +356,7 @@ fn planned_milestone(command: &Command) -> &'static str {
             "milestone 2 — server catalog and configuration overlays"
         }
         Command::Group | Command::Select { .. } => "milestone 3 — selection and groups",
-        Command::Protocols => "milestone 4 — ProTUN engine",
+        Command::Protocols | Command::Reconnect => "milestone 4 — ProTUN engine",
         Command::Integration | Command::Killswitch | Command::Lan | Command::Dns => {
             "milestone 5 — Linux network control"
         }
@@ -543,5 +543,111 @@ mod tests {
         let err = run(&Command::Servers { sub: None }, None, true)
             .expect_err("bare servers must refuse in milestone 1");
         assert!(err.to_string().contains("milestone 2"));
+    }
+
+    /// Round 7 (Zj_QN) — the class killer: EVERY `Command` variant must
+    /// survive `run()` without panicking. `protonwire reconnect` panicked
+    /// because `planned()` routed it into the typed-refusal path while
+    /// `planned_milestone` had no arm for it (`_ => unreachable!()`), and
+    /// `protonwire servers refresh` panicked the same shape before the
+    /// round-4 subcommand fix. Per-variant refusal tests only cover the
+    /// variants someone thought to test; this walks the whole enum. The
+    /// socket is a path that cannot exist, so each dispatch reaches only
+    /// its refusal or DaemonUnavailable branch — any `unreachable!()`,
+    /// missing match arm, or unwrap on the dispatch path fails here.
+    ///
+    /// `assert_every_variant_listed` is the exhaustiveness half: it has no
+    /// wildcard arm, so ADDING a `Command` variant without extending this
+    /// test's table breaks compilation rather than silently skipping it.
+    #[test]
+    fn every_command_survives_dispatch_without_panicking() {
+        use std::panic::AssertUnwindSafe;
+
+        fn assert_every_variant_listed(command: &Command) {
+            match command {
+                Command::Login
+                | Command::Logout
+                | Command::Account
+                | Command::Credentials { .. }
+                | Command::Protocols
+                | Command::Integration
+                | Command::Connect { .. }
+                | Command::ChangeServer
+                | Command::Disconnect
+                | Command::Reconnect
+                | Command::Status { .. }
+                | Command::Servers { .. }
+                | Command::Group
+                | Command::Select { .. }
+                | Command::Config
+                | Command::Profile
+                | Command::Split
+                | Command::Dns
+                | Command::Port
+                | Command::Killswitch
+                | Command::Lan
+                | Command::Daemon { .. }
+                | Command::Debug { .. } => {}
+            }
+        }
+
+        let socket = std::env::temp_dir().join(format!(
+            "protonwire-cli-dispatch-meta-{}.sock",
+            std::process::id()
+        ));
+        let cases: Vec<(&str, Command)> = vec![
+            ("login", Command::Login),
+            ("logout", Command::Logout),
+            ("account", Command::Account),
+            ("credentials", Command::Credentials { sub: None }),
+            ("protocols", Command::Protocols),
+            ("integration", Command::Integration),
+            (
+                "connect",
+                Command::Connect {
+                    target: vec!["fastest".to_string()],
+                    by: None,
+                    protocol: None,
+                    dry_run: false,
+                    json: false,
+                },
+            ),
+            ("change-server", Command::ChangeServer),
+            ("disconnect", Command::Disconnect),
+            ("reconnect", Command::Reconnect),
+            ("status", Command::Status { json: false }),
+            ("servers", Command::Servers { sub: None }),
+            ("group", Command::Group),
+            (
+                "select",
+                Command::Select {
+                    target: vec!["fastest".to_string()],
+                },
+            ),
+            ("config", Command::Config),
+            ("profile", Command::Profile),
+            ("split", Command::Split),
+            ("dns", Command::Dns),
+            ("port", Command::Port),
+            ("killswitch", Command::Killswitch),
+            ("lan", Command::Lan),
+            (
+                "daemon",
+                Command::Daemon {
+                    sub: DaemonSub::Start,
+                },
+            ),
+            ("debug", Command::Debug { sub: None }),
+        ];
+        assert_every_variant_listed(&cases[0].1);
+        for (name, command) in cases {
+            let outcome =
+                std::panic::catch_unwind(AssertUnwindSafe(|| run(&command, Some(&socket), true)));
+            assert!(
+                outcome.is_ok(),
+                "command `{name}` panicked during dispatch — a refusal or \
+                 DaemonUnavailable was required, never a panic"
+            );
+        }
     }
 }
