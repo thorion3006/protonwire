@@ -460,6 +460,16 @@ fn handle_session<H: RequestHandler>(
                 break;
             }
         }
+        // A dead writer takes the session with it (Codex round 5, P1):
+        // every clone shares ONE socket, so shutting it down here also
+        // fails the dispatcher's read half and drives `serve_messages`
+        // through the normal teardown (unsubscribe + slot release).
+        // Without this, a client that triggers the write ceiling with an
+        // oversized response and then merely holds its side open keeps
+        // its reserved session slot forever — 64 such connections wedge
+        // the daemon at MAX_SESSIONS. On normal teardown the socket is
+        // already closing, so the extra shutdown is a no-op there.
+        let _ = write_stream.shutdown(Shutdown::Both);
     });
 
     let (session_id, event_rx) = handler.event_bus().subscribe();
@@ -2022,6 +2032,116 @@ mod tests {
             // user namespace; assume the guarded case.
             _ => true,
         }
+    }
+
+    /// Codex round 5 (P1): the writer thread exiting on a write timeout
+    /// left the session alive — the dispatcher's read half (a try_clone of
+    /// the SAME socket) kept polling unbounded post-hello, so a client that
+    /// triggers the 10 s write ceiling with an oversized response and then
+    /// holds its side open kept its reserved session slot forever; 64 such
+    /// connections permanently wedged the daemon at MAX_SESSIONS. The
+    /// writer must take the session with it: shutting the shared socket
+    /// down fails the dispatcher's read and drives the normal teardown
+    /// (unsubscribe + slot release).
+    #[test]
+    fn writer_failure_tears_down_the_session() {
+        /// Answers pings with a 2 MiB pong — beyond MAX_FRAME_LEN, so the
+        /// writer's write_msg fails the moment it dequeues the response.
+        struct HugePong {
+            bus: Arc<EventBus>,
+        }
+        impl RequestHandler for HugePong {
+            fn daemon_version(&self) -> &str {
+                "test"
+            }
+            fn latest_event_seq(&self) -> u64 {
+                0
+            }
+            fn handle(
+                &self,
+                _ctx: &SessionContext,
+                request: Request,
+            ) -> Result<RequestResult, RpcError> {
+                match request {
+                    // Oversized ON PURPOSE: a response payload beyond
+                    // MAX_FRAME_LEN makes write_msg fail inside the writer
+                    // thread immediately — a writer failure with no
+                    // dependence on host SO_SNDTIMEO behavior (see the
+                    // comment at the trigger below).
+                    Request::Ping { .. } => Ok(RequestResult::Pong {
+                        nonce: "x".repeat(2 * crate::frame::MAX_FRAME_LEN),
+                    }),
+                    _ => Err(RpcError::new(
+                        protonwire_frontend_api::RpcErrorCode::NotImplemented,
+                        "test handler",
+                    )),
+                }
+            }
+            fn event_bus(&self) -> &EventBus {
+                &self.bus
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let handler = Arc::new(HugePong {
+            bus: Arc::new(EventBus::new()),
+        });
+        let server = IpcServer::bind(dir.path(), "writer-fail.sock").unwrap();
+        let path = server.socket_path().to_owned();
+        let stop = Arc::new(AtomicBool::new(false));
+        let served = {
+            let handler = Arc::clone(&handler);
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || server.serve(handler, stop))
+        };
+
+        let mut stream = connect_and_hello(&path);
+        // A tiny request (the oversized half is the RESPONSE): the server
+        // dispatches it, the writer dequeues the 2 MiB pong, and write_msg
+        // rejects it as TooLarge — a writer failure that fires on every
+        // host. (The review finding's literal trigger — a blocked write
+        // dying at the 10 s SO_SNDTIMEO ceiling — does NOT fire on this
+        // kernel: instrumented runs show a blocked AF_UNIX send to a
+        // 4 KiB peer buffer outlasting a 20 s window with a 10 s write
+        // timeout set. The teardown invariant is trigger-agnostic, so it
+        // is pinned with the deterministic failure; the kernel-dependent
+        // timeout flavor is flagged in docs/review-log.md.)
+        write_msg(
+            &mut stream,
+            &ClientMessage::Request {
+                id: 1,
+                request: Request::Ping {
+                    nonce: "ping".into(),
+                },
+            },
+        )
+        .unwrap();
+
+        // The client never reads and NEVER closes (`stream` stays alive):
+        // pre-fix the writer exited on the failed write and nothing else
+        // happened — the reserved slot stayed while the dispatcher polled
+        // its open read half forever. The session must instead tear down
+        // promptly after the writer's failure.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while handler.event_bus().active_sessions() != 0 {
+            assert!(
+                Instant::now() < deadline,
+                "the session outlived its failed writer — a held-open client \
+                 keeps its reserved slot after the writer died"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        // The subscription went away too (the teardown guards ran).
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while handler.event_bus().session_count() != 0 {
+            assert!(
+                Instant::now() < deadline,
+                "subscription leaked after the writer-failure teardown"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        stop.store(true, Ordering::SeqCst);
+        let _ = served.join();
     }
 
     /// Shrinks a stream's `SO_RCVBUF` (std exposes no UnixStream helper) so
