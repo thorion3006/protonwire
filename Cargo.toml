@@ -85,7 +85,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 # --- System ---------------------------------------------------------------
-nix = { version = "0.31", features = ["socket", "user", "fs", "signal"] }
+# `poll` backs the ipc tests' deterministic readability checks (WO-R4).
+nix = { version = "0.31", features = ["socket", "user", "fs", "signal", "poll"] }
 zeroize = "1"
 
 # Clients --------------------------------------------------------------

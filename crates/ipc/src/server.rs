@@ -1875,9 +1875,24 @@ mod tests {
     /// while handshaking ("unexpected message during handshake",
     /// client.rs). The ack must be the first frame on the wire; the
     /// buffered event follows it.
+    ///
+    /// WO-R4 hardening, both directions:
+    /// - GREEN-side regressions used to present as INFINITE HANGS (the
+    ///   test stream had no read timeout), so the stream now carries a
+    ///   5 s one and the ack's arrival is asserted punctual — a broken
+    ///   gate fails fast instead of hanging the suite.
+    /// - The red side used to rely on a 100 ms sleep heuristic. It is now
+    ///   a DETERMINISTIC readability poll (nix::poll POLLIN, 750 ms)
+    ///   between publishing the pre-hello event and sending Hello:
+    ///   readable means an event frame is ALREADY on the wire pre-hello —
+    ///   read it and fail reporting that frame; timeout means the gate
+    ///   held it — proceed to Hello and assert ack-first (no sleep on
+    ///   the green path).
     #[test]
     fn hello_ack_is_the_first_frame_even_under_pre_hello_events() {
+        use nix::poll::{PollFd, PollFlags, poll as poll_fd};
         use protonwire_frontend_api::{Event, EventEnvelope, NoticeLevel};
+        use std::os::fd::AsFd;
 
         let dir = tempfile::tempdir().unwrap();
         let handler = Arc::new(NullHandler {
@@ -1886,6 +1901,12 @@ mod tests {
         });
         let server = spawn_server(&dir, Arc::clone(&handler));
         let mut stream = std::os::unix::net::UnixStream::connect(server.socket_path()).unwrap();
+        // No-hang gate: every read below is bounded, so a regression that
+        // stops the ack (or the follow-up event) surfaces as a fast TimedOut
+        // failure rather than a suite-wide hang.
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
 
         // Wait until the session has actually subscribed: the accept loop
         // polls at 250 ms, so a fixed sleep can race the subscribe and a
@@ -1896,8 +1917,10 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
 
-        // Publish BEFORE the hello, then give the (pre-fix) forwarder a
-        // beat to race the event onto the wire ahead of the ack.
+        // Publish BEFORE the hello, then poll the wire — deterministically,
+        // not with a sleep. If the gate is broken the event is already on
+        // the socket and POLLIN fires within the poll window; if the gate
+        // held it, nothing is readable and the poll times out.
         handler
             .event_bus()
             .publish(ServerMessage::Event(EventEnvelope {
@@ -1907,7 +1930,26 @@ mod tests {
                     message: "pre-hello".into(),
                 },
             }));
-        std::thread::sleep(Duration::from_millis(100));
+        let mut fds = [PollFd::new(stream.as_fd(), PollFlags::POLLIN)];
+        let readable = poll_fd(&mut fds, 750u16).unwrap() > 0
+            && fds[0]
+                .revents()
+                .unwrap_or(PollFlags::empty())
+                .contains(PollFlags::POLLIN);
+        if readable {
+            // Deterministic red: an event frame beat the handshake onto
+            // the wire. Read and REPORT it instead of proceeding into a
+            // misleading downstream assertion.
+            let leaked: ServerMessage = read_msg(&mut stream).unwrap();
+            panic!(
+                "the event gate leaked: a frame reached the wire before Hello — \
+                 got {leaked:?}"
+            );
+        }
+
+        // The gate held the event: send Hello and demand the ack first,
+        // promptly.
+        let hello_sent_at = Instant::now();
         write_msg(
             &mut stream,
             &ClientMessage::Hello {
@@ -1916,11 +1958,16 @@ mod tests {
             },
         )
         .unwrap();
-
         match read_msg::<_, ServerMessage>(&mut stream).unwrap() {
             ServerMessage::HelloAck(_) => {}
             other => panic!("hello ack must be the first frame, got {other:?}"),
         }
+        assert!(
+            hello_sent_at.elapsed() < Duration::from_secs(5),
+            "the ack must arrive punctually, took {} ms — a regression is \
+             dragging the handshake",
+            hello_sent_at.elapsed().as_millis()
+        );
         // The buffered event is delivered right after the ack, not ahead
         // of it.
         match read_msg::<_, ServerMessage>(&mut stream).unwrap() {
