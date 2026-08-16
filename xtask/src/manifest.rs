@@ -164,6 +164,28 @@ const ALLOWED_OWNERS: &[&str] = &[
     "packaging",
 ];
 
+const CANONICAL_TEST_COUNT: usize = 92;
+
+/// The canonical test inventory (docs/PRD-proton-wire.md sections
+/// 17.1-17.3): 37 unit (T-*), 30 integration (IT-*), and 25 end-to-end
+/// (E2E-*) ids, extracted from the PRD once and recorded here — the same
+/// pin family as EXPECTED_CAPABILITY_IDS. Every `tests:` reference in the
+/// parity manifest must resolve against this inventory; parsing the PRD
+/// at runtime instead would hang the gate on the very document class it
+/// defends (round-6 triage note: fragile), while a recorded baseline
+/// turns a new test id into a deliberate PRD-plus-xtask change.
+const CANONICAL_TEST_IDS: [&str; CANONICAL_TEST_COUNT] = [
+    "T-1", "T-2", "T-3", "T-4", "T-5", "T-6", "T-7", "T-8", "T-9", "T-10", "T-11", "T-12", "T-13",
+    "T-14", "T-15", "T-16", "T-17", "T-18", "T-19", "T-20", "T-21", "T-22", "T-23", "T-24", "T-25",
+    "T-26", "T-27", "T-28", "T-29", "T-30", "T-31", "T-32", "T-33", "T-34", "T-35", "T-36", "T-37",
+    "IT-1", "IT-2", "IT-3", "IT-4", "IT-5", "IT-6", "IT-7", "IT-8", "IT-9", "IT-10", "IT-11",
+    "IT-12", "IT-13", "IT-14", "IT-15", "IT-16", "IT-17", "IT-18", "IT-19", "IT-20", "IT-21",
+    "IT-22", "IT-23", "IT-24", "IT-25", "IT-26", "IT-27", "IT-28", "IT-29", "IT-30", "E2E-1",
+    "E2E-2", "E2E-3", "E2E-4", "E2E-5", "E2E-6", "E2E-7", "E2E-8", "E2E-9", "E2E-10", "E2E-11",
+    "E2E-12", "E2E-13", "E2E-14", "E2E-15", "E2E-16", "E2E-17", "E2E-18", "E2E-19", "E2E-20",
+    "E2E-21", "E2E-22", "E2E-23", "E2E-24", "E2E-25",
+];
+
 #[derive(Deserialize)]
 struct Manifest {
     schema_version: Option<i64>,
@@ -541,6 +563,9 @@ fn check_capabilities(doc: &Manifest) -> Vec<String> {
         .as_ref()
         .map(|sources| sources.keys().map(String::as_str).collect())
         .unwrap_or_default();
+    // WO-W6: the recorded PRD section-17 inventory every tests reference
+    // must resolve against.
+    let test_ids: BTreeSet<&str> = CANONICAL_TEST_IDS.iter().copied().collect();
 
     let mut seen = BTreeSet::new();
     for (index, capability) in capabilities.iter().enumerate() {
@@ -549,7 +574,9 @@ fn check_capabilities(doc: &Manifest) -> Vec<String> {
         {
             violations.push(format!("duplicate capability id `{id}`"));
         }
-        violations.extend(check_capability(index, capability, &statuses, &sources));
+        violations.extend(check_capability(
+            index, capability, &statuses, &sources, &test_ids,
+        ));
     }
     violations
 }
@@ -559,6 +586,7 @@ fn check_capability(
     capability: &Capability,
     statuses: &BTreeSet<&str>,
     sources: &BTreeSet<&str>,
+    test_ids: &BTreeSet<&str>,
 ) -> Vec<String> {
     let mut violations = Vec::new();
     let label = capability
@@ -641,6 +669,12 @@ fn check_capability(
         if !is_test_id(test) {
             violations.push(format!(
                 "{label}: test `{test}` must match ^(T|IT|E2E)-[0-9]+$"
+            ));
+        } else if !test_ids.contains(test.as_str()) {
+            // WO-W6: a well-formed id that matches no PRD test is
+            // evidence pointing at nothing.
+            violations.push(format!(
+                "{label}: test `{test}` is not in the canonical PRD test inventory"
             ));
         }
     }
@@ -1005,6 +1039,58 @@ capabilities:
         fs::remove_file(&path).ok();
     }
 
+    /// pr-champion round-6 triage, WO-W6: `tests:` references were only
+    /// SHAPE-checked (^(T|IT|E2E)-[0-9]+$), so a well-formed id matching
+    /// no PRD test — T-999999 — passed the gate while pointing its
+    /// evidence at a test that does not exist. Every reference must
+    /// resolve against the canonical PRD section-17 inventory.
+    #[test]
+    fn test_references_must_resolve_against_the_canonical_inventory() {
+        let yaml = good_manifest_yaml().replacen("tests: [T-1]", "tests: [T-999999]", 1);
+        let path = temp_yaml("phantom-test", &yaml);
+        assert!(
+            !validate(&path, &good_lock()).unwrap(),
+            "a tests reference to T-999999 must fail the gate"
+        );
+        fs::remove_file(&path).ok();
+
+        // The violation must NAME the phantom id.
+        let (statuses, sources, test_ids) = contexts();
+        let mut capability = cap("account.login", "account", "required", "protonwire-api");
+        capability.tests = vec!["T-999999".to_string()];
+        assert!(
+            check_capability(0, &capability, &statuses, &sources, &test_ids)
+                .iter()
+                .any(|v| v.contains("T-999999") && v.contains("canonical PRD test inventory")),
+            "the violation must name T-999999 as outside the inventory"
+        );
+    }
+
+    /// The inventory itself is pinned (the canonical_capability meta-test
+    /// style): 92 unique shape-valid ids with the PRD's exact 37/30/25
+    /// split, so a stray edit to the constant fails loudly.
+    #[test]
+    fn canonical_test_inventory_is_pinned() {
+        for id in CANONICAL_TEST_IDS {
+            assert!(is_test_id(id), "`{id}` must match the test-id shape");
+        }
+        let unique: BTreeSet<&str> = CANONICAL_TEST_IDS.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            CANONICAL_TEST_COUNT,
+            "the inventory must contain exactly {CANONICAL_TEST_COUNT} unique ids"
+        );
+        let count = |prefix: &str| {
+            CANONICAL_TEST_IDS
+                .iter()
+                .filter(|id| id.starts_with(prefix))
+                .count()
+        };
+        assert_eq!(count("T-"), 37, "PRD 17.1 defines 37 unit tests");
+        assert_eq!(count("IT-"), 30, "PRD 17.2 defines 30 integration tests");
+        assert_eq!(count("E2E-"), 25, "PRD 17.3 defines 25 end-to-end tests");
+    }
+
     #[test]
     fn tampered_proton_pin_fails() {
         let yaml = good_manifest_yaml().replacen("revision: 12e7755a", "revision: not-th", 1);
@@ -1087,21 +1173,27 @@ capabilities:
         }
     }
 
-    fn contexts() -> (BTreeSet<&'static str>, BTreeSet<&'static str>) {
+    fn contexts() -> (
+        BTreeSet<&'static str>,
+        BTreeSet<&'static str>,
+        BTreeSet<&'static str>,
+    ) {
         (
             REQUIRED_STATUSES.iter().copied().collect(),
             ["docs"].into_iter().collect(),
+            CANONICAL_TEST_IDS.iter().copied().collect(),
         )
     }
 
     #[test]
     fn area_must_be_known_vocabulary() {
-        let (statuses, sources) = contexts();
+        let (statuses, sources, test_ids) = contexts();
         let violations = check_capability(
             0,
             &cap("account.login", "accounts", "required", "protonwire-api"),
             &statuses,
             &sources,
+            &test_ids,
         );
         assert!(
             violations
@@ -1120,6 +1212,7 @@ capabilities:
                 ),
                 &statuses,
                 &sources,
+                &test_ids,
             )
             .is_empty()
         );
@@ -1127,12 +1220,13 @@ capabilities:
 
     #[test]
     fn owner_must_be_allowed() {
-        let (statuses, sources) = contexts();
+        let (statuses, sources, test_ids) = contexts();
         let violations = check_capability(
             0,
             &cap("account.login", "account", "required", "someone"),
             &statuses,
             &sources,
+            &test_ids,
         );
         assert!(
             violations
@@ -1143,10 +1237,10 @@ capabilities:
 
     #[test]
     fn unknown_status_and_source_are_rejected() {
-        let (statuses, sources) = contexts();
+        let (statuses, sources, test_ids) = contexts();
         let mut capability = cap("account.login", "account", "dreaming", "protonwire-api");
         capability.sources = vec!["nowhere".to_string()];
-        let violations = check_capability(0, &capability, &statuses, &sources);
+        let violations = check_capability(0, &capability, &statuses, &sources, &test_ids);
         assert!(
             violations
                 .iter()
@@ -1161,10 +1255,10 @@ capabilities:
 
     #[test]
     fn malformed_tests_are_rejected() {
-        let (statuses, sources) = contexts();
+        let (statuses, sources, test_ids) = contexts();
         let mut capability = cap("account.login", "account", "required", "protonwire-api");
         capability.tests = vec!["T-1".to_string(), "unit-9".to_string()];
-        let violations = check_capability(0, &capability, &statuses, &sources);
+        let violations = check_capability(0, &capability, &statuses, &sources, &test_ids);
         assert!(violations.iter().any(|v| v.contains("unit-9")));
     }
 
