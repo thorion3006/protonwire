@@ -147,9 +147,19 @@ impl IpcServer {
     ) -> io::Result<Self> {
         std::fs::create_dir_all(socket_dir)?;
         let socket_path = socket_dir.join(socket_name);
-        if socket_path.exists() {
-            refuse_unless_stale_socket(&socket_path)?;
-            std::fs::remove_file(&socket_path)?;
+        // FU-B (round-6 residual): `Path::exists()` follows links, so a
+        // DANGLING symlink at the bind path read as "the name is free"
+        // and bind(2) then failed with an opaque EADDRINUSE. Existence is
+        // judged on the dirent itself — any entry reaches the guard below,
+        // which names it; a NotFound is the only "free" answer; every
+        // other stat error propagates.
+        match std::fs::symlink_metadata(&socket_path) {
+            Ok(_) => {
+                refuse_unless_stale_socket(&socket_path)?;
+                std::fs::remove_file(&socket_path)?;
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
         }
         let listener = UnixListener::bind(&socket_path)?;
         set_socket_mode(&socket_path)?;
@@ -398,7 +408,7 @@ fn ensure_not_live(socket_path: &Path) -> io::Result<()> {
 }
 
 /// Authorizes removing the entry at `socket_path` only if it is a SOCKET
-/// that no live daemon is serving (pr-champion round 6, WO-W1).
+/// that no live daemon is serving (pr-champion round 6, WO-W1; FU-B).
 ///
 /// The liveness probe alone cannot carry this: connect(2) to ANY non-socket
 /// path — a regular file above all — answers ECONNREFUSED, the exact signal
@@ -407,22 +417,51 @@ fn ensure_not_live(socket_path: &Path) -> io::Result<()> {
 /// is therefore checked first (and the probe never even runs against a
 /// non-socket), and any non-socket entry aborts bind loudly, naming the
 /// path and what it actually is.
+///
+/// The entry is judged through `symlink_metadata`, so a SYMLINK at the bind
+/// path is the link: refusals name the link (or, when it resolves to
+/// nothing, the dangling link), while the staleness probe follows it — a
+/// link to a stale socket authorizes removing the LINK, and the file it
+/// points at survives untouched.
 fn refuse_unless_stale_socket(socket_path: &Path) -> io::Result<()> {
     use std::os::unix::fs::FileTypeExt;
-    let meta = std::fs::metadata(socket_path)?;
-    if meta.file_type().is_socket() {
+    let meta = std::fs::symlink_metadata(socket_path)?;
+    let file_type = meta.file_type();
+    if file_type.is_socket() {
         return ensure_not_live(socket_path);
     }
-    Err(io::Error::other(format!(
-        "refusing to remove {}: not a socket ({})",
-        socket_path.display(),
-        entry_kind(&meta)
-    )))
+    if file_type.is_symlink() {
+        // Judge the LINK for the refusal, its TARGET for the probe: only a
+        // link resolving to a socket can authorize an unlink, and the
+        // probe then follows the link exactly as a connecting client
+        // would. Any other resolution (a regular file above all, or
+        // nothing at all) refuses naming the link; a target that cannot
+        // even be stat'ed (ELOOP, EACCES) propagates loudly.
+        return match std::fs::metadata(socket_path) {
+            Ok(target) if target.file_type().is_socket() => ensure_not_live(socket_path),
+            Ok(_) => Err(not_a_socket(socket_path, "symlink")),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                Err(not_a_socket(socket_path, "dangling symlink"))
+            }
+            Err(e) => Err(e),
+        };
+    }
+    Err(not_a_socket(socket_path, entry_kind(&meta)))
+}
+
+/// The bind refusal for a non-socket entry: loud, and naming both the path
+/// and what actually sits there.
+fn not_a_socket(socket_path: &Path, kind: &str) -> io::Error {
+    io::Error::other(format!(
+        "refusing to remove {}: not a socket ({kind})",
+        socket_path.display()
+    ))
 }
 
 /// Human name for an entry's file type, used to say WHAT bind refused to
-/// remove (metadata follows symlinks, so a link is reported as whatever it
-/// targets — the link itself is still never unlinked).
+/// remove. Callers feed it `symlink_metadata` output, so a link is
+/// reported as the LINK itself — the `is_symlink` arm is reachable only
+/// through lstat-style metadata.
 fn entry_kind(meta: &std::fs::Metadata) -> &'static str {
     use std::os::unix::fs::FileTypeExt;
     let file_type = meta.file_type();
@@ -1625,6 +1664,145 @@ mod tests {
         assert!(
             server.socket_path().exists(),
             "the replacement socket must be bound"
+        );
+    }
+
+    /// FU-B (round-6 residual): nothing pinned symlink behavior at the
+    /// bind path. `Path::exists()` FOLLOWS links, so a DANGLING symlink
+    /// answered "nothing there" and bind(2) then failed with an opaque
+    /// EADDRINUSE — while the guard's `metadata` judged whatever a link
+    /// RESOLVED to, never the link itself. The link cases below pin the
+    /// matrix alongside the direct ones above: a link to a stale socket is
+    /// replaced like a stale socket (the LINK goes, the target survives),
+    /// and a link to a live daemon is refused fail-closed.
+    #[test]
+    fn bind_replaces_a_symlink_to_a_stale_socket_leaving_the_target_untouched() {
+        use std::os::unix::fs::FileTypeExt;
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let case = dir.path().join("stale-link");
+        std::fs::create_dir(&case).unwrap();
+        // The stale socket lives at another name; s.sock is a symlink to it.
+        let target = case.join("real.sock");
+        drop(std::os::unix::net::UnixListener::bind(&target).unwrap());
+        symlink(&target, case.join("s.sock")).unwrap();
+
+        let server = IpcServer::bind(&case, "s.sock")
+            .expect("a link to a stale socket is replaced like a stale socket");
+        // The LINK was removed and a real socket bound in its place...
+        assert!(
+            std::fs::symlink_metadata(server.socket_path())
+                .expect("the bound entry exists")
+                .file_type()
+                .is_socket(),
+            "the bind path must now be the daemon's own socket, not a link"
+        );
+        // ...while the file it pointed at survived untouched.
+        assert!(
+            std::fs::symlink_metadata(&target)
+                .expect("the link's target survives")
+                .file_type()
+                .is_socket(),
+            "replacing the link must not remove the socket file it pointed at"
+        );
+
+        // The live arm of the matrix: a link to a LIVE daemon's socket is
+        // refused (the probe follows the link), and neither the link nor
+        // the listener is disturbed.
+        let live = dir.path().join("live-link");
+        std::fs::create_dir(&live).unwrap();
+        let live_target = live.join("real.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&live_target).unwrap();
+        symlink(&live_target, live.join("s.sock")).unwrap();
+        let err = IpcServer::bind(&live, "s.sock")
+            .map(|_| ())
+            .expect_err("a link to a live daemon's socket must abort bind");
+        assert!(
+            err.to_string().contains("another daemon"),
+            "the liveness probe must follow the link and refuse, got: {err}"
+        );
+        assert!(
+            std::fs::symlink_metadata(live.join("s.sock"))
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the refused link must survive"
+        );
+        drop(listener);
+    }
+
+    /// FU-B: a symlink to a REGULAR file is refused naming the LINK — the
+    /// entry at the bind path is the symlink, and saying "regular file"
+    /// (what the link resolves to) hides the surprising shape an
+    /// administrator actually needs to go look at. The link and its target
+    /// both survive.
+    #[test]
+    fn bind_refuses_a_symlink_to_a_regular_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let case = dir.path().join("regular-link");
+        std::fs::create_dir(&case).unwrap();
+        let target = case.join("precious.txt");
+        std::fs::write(&target, "precious data").unwrap();
+        std::os::unix::fs::symlink(&target, case.join("s.sock")).unwrap();
+
+        let err = IpcServer::bind(&case, "s.sock")
+            .map(|_| ())
+            .expect_err("a symlink at the bind path must abort bind");
+        assert!(
+            err.to_string().contains("refusing to remove"),
+            "the refusal must be explicit, got: {err}"
+        );
+        assert!(
+            err.to_string().contains("symlink"),
+            "the refusal must name the entry itself — the symlink — not what \
+             it resolves to, got: {err}"
+        );
+        assert!(
+            std::fs::symlink_metadata(case.join("s.sock"))
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the link must survive the refusal"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "precious data",
+            "bind must not touch the link's target"
+        );
+    }
+
+    /// FU-B: the dangling link — the case that sailed PAST the guard
+    /// pre-fix. `exists()` follows links, so a link resolving to nothing
+    /// read as "the path is free" and `UnixListener::bind` then failed
+    /// with bind(2)'s opaque EADDRINUSE (a dirent occupies the name), an
+    /// error that names neither the refusal nor the cause. The guard must
+    /// see the dirent itself and refuse loudly.
+    #[test]
+    fn bind_names_a_dangling_symlink_instead_of_an_opaque_addrinuse() {
+        let dir = tempfile::tempdir().unwrap();
+        let case = dir.path().join("dangling");
+        std::fs::create_dir(&case).unwrap();
+        // Points at a name that has never existed.
+        std::os::unix::fs::symlink(case.join("nothing.sock"), case.join("s.sock")).unwrap();
+
+        let err = IpcServer::bind(&case, "s.sock")
+            .map(|_| ())
+            .expect_err("a dangling symlink at the bind path must abort bind");
+        assert!(
+            err.to_string().contains("refusing to remove"),
+            "the refusal must be named — not bind(2)'s opaque EADDRINUSE, got: {err}"
+        );
+        assert!(
+            err.to_string().contains("dangling symlink"),
+            "the refusal must say the link resolves to nothing, got: {err}"
+        );
+        assert!(
+            std::fs::symlink_metadata(case.join("s.sock"))
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the dangling link must survive the refusal"
         );
     }
 
