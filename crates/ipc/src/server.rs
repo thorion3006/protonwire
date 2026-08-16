@@ -2140,6 +2140,32 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(50));
         }
+        // FU-3 (rust-review round-5 follow-up, Low): the assertions above
+        // observe only SERVER-side counters — the client-visible half of
+        // the 842c0c1 contract ("the writer takes the session down AND
+        // the client learns of it") was pinned by nothing. A bounded read
+        // must observe EOF: it fails whenever the teardown completes on
+        // the server side while the socket (or its write half) stays
+        // alive anywhere else — e.g. a weakened shutdown paired with a
+        // strong reference that outlives the session (the exact class
+        // the Weak SessionWorker handle exists to prevent). A client
+        // blocked reading its response would otherwise hang forever.
+        use std::io::Read;
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut byte = [0u8; 1];
+        // `== Ok(0)` in assert form: any Err (a read timeout above all —
+        // the Shutdown::Read mutation's signature) fails the expect; a
+        // successful read must be the 0-byte EOF.
+        assert_eq!(
+            stream
+                .read(&mut byte)
+                .expect("the client's read must answer within the timeout"),
+            0,
+            "the failed writer must deliver EOF to its client — a client \
+             blocked reading its response would hang forever"
+        );
         stop.store(true, Ordering::SeqCst);
         let _ = served.join();
     }
