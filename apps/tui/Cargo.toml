@@ -15,6 +15,10 @@ path = "src/main.rs"
 workspace = true
 
 [dependencies]
+# SIGTERM/SIGHUP flag handlers (R7-4). The workspace's pinned nix entry
+# already enables the "signal" feature, so no root Cargo.toml change and
+# no version change — same pattern as the ipc crate's nix usage.
+nix = { workspace = true }
 protonwire-client = { workspace = true }
 protonwire-frontend-api = { workspace = true }
 ratatui = { workspace = true }

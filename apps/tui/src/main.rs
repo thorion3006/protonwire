@@ -6,10 +6,12 @@
 //! exit, error, and handled quit keys. Daemon state refreshes on a
 //! background thread (pr-champion R7-3) so a stalled daemon can no longer
 //! freeze input and redraw: connect+GetState run off the render/poll
-//! thread and snapshots cross a bounded newest-wins channel. The remaining
-//! eight views, focus traversal, and confirmation dialogs land with
-//! Milestone 8 capability completion; exiting the TUI never touches the
-//! tunnel (FR-127I).
+//! thread and snapshots cross a bounded newest-wins channel. SIGTERM and
+//! SIGHUP restore the terminal too (pr-champion R7-4): the handler only
+//! sets an async-signal-safe flag that the main loop polls and turns into
+//! restore+exit on the main thread. The remaining eight views, focus
+//! traversal, and confirmation dialogs land with Milestone 8 capability
+//! completion; exiting the TUI never touches the tunnel (FR-127I).
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -18,6 +20,7 @@ use std::sync::mpsc::Receiver;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use nix::sys::signal::{SaFlags, SigAction, SigHandler, Signal, sigaction};
 use ratatui::crossterm::event::{Event as TermEvent, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::crossterm::{execute, terminal};
 use ratatui::style::{Color, Modifier, Style};
@@ -61,6 +64,12 @@ struct Options {
 
 fn main() {
     let options = parse_args();
+    // R7-4: catch SIGTERM/SIGHUP before the terminal is touched. Failure
+    // only costs the signal-driven restore (the default disposition
+    // returns), so it is reported, not fatal.
+    if let Err(e) = install_terminate_handler() {
+        eprintln!("protonwire-tui: cannot install SIGTERM/SIGHUP handlers: {e}");
+    }
     let mut terminal = match setup_terminal() {
         Ok(t) => t,
         Err(e) => {
@@ -172,6 +181,68 @@ fn connect(options: &Options) -> Result<ProtonwireClient, ClientError> {
     // Trust-check policy (including the debug-only bypass) lives in the
     // SDK (refactorer step 3).
     protonwire_client::connect_with_socket_override(options.socket.as_deref(), ClientSurface::Tui)
+}
+
+/// Set by the SIGTERM/SIGHUP handler (R7-4); polled by the main loop.
+static TERMINATE_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// SIGTERM/SIGHUP landing pad.
+///
+/// ASYNC-SIGNAL-SAFETY CONSTRAINT (R7-4): this runs on an arbitrary
+/// thread, interrupted from arbitrary code. The ENTIRE body is one store
+/// to a static atomic — no locks, no allocation, no I/O, and above all no
+/// terminal restoration, any of which could deadlock or corrupt state.
+/// The main loop polls the flag at its existing <=POLL (50ms) event-poll
+/// cadence and performs restore+exit on the main thread. Relaxed ordering
+/// suffices: the flag publishes no other data.
+extern "C" fn record_termination(_signal: nix::libc::c_int) {
+    TERMINATE_REQUESTED.store(true, Ordering::Relaxed);
+}
+
+/// Installs the SIGTERM/SIGHUP flag handlers (R7-4). Signals bypass
+/// unwind, so the panic hook never runs and raw mode plus the alternate
+/// screen used to leak on `kill`; with the handler in place the loop
+/// observes the flag and tears down through the same restore path as a
+/// quit key.
+///
+/// The workspace denies `unsafe_code`; this is the TUI's one audited
+/// unsafe block, sound because the installed handler writes only a
+/// static atomic (see [`record_termination`]). `SaFlags::empty()` —
+/// no SA_RESTART because it would not restart poll(2) anyway, and the
+/// loop must notice the flag, not have syscalls paper over the signal.
+#[allow(unsafe_code)]
+fn install_terminate_handler() -> nix::Result<()> {
+    let action = SigAction::new(
+        SigHandler::Handler(record_termination),
+        SaFlags::empty(),
+        nix::sys::signal::SigSet::empty(),
+    );
+    unsafe {
+        sigaction(Signal::SIGTERM, &action)?;
+        sigaction(Signal::SIGHUP, &action)?;
+    }
+    Ok(())
+}
+
+/// Whether the loop should keep running after a termination check.
+enum Flow {
+    Continue,
+    Exit,
+}
+
+/// The signal-observed path, extracted so it is unit-testable (R7-4):
+/// when the handler's flag is set, restore FIRST — on the main thread,
+/// never inside the handler — and report [`Flow::Exit`] so the loop
+/// unwinds promptly (a lingering worker shutdown cannot delay the
+/// restore). `main`'s own restore still runs afterwards and is
+/// idempotent.
+fn termination_check(flag: &AtomicBool, restore: impl FnOnce() -> std::io::Result<()>) -> Flow {
+    if flag.load(Ordering::Relaxed) {
+        let _ = restore();
+        Flow::Exit
+    } else {
+        Flow::Continue
+    }
 }
 
 /// One refresh cycle: connect + GetState, mapped exactly as the inline
@@ -365,7 +436,14 @@ fn run(terminal: &mut Term, options: Options) -> Result<(), ClientError> {
         }
         Ok(None)
     };
-    let result = drive(&mut drain, &mut state, &mut draw, &mut poll);
+    let result = drive(
+        &mut drain,
+        &mut state,
+        &TERMINATE_REQUESTED,
+        &restore,
+        &mut draw,
+        &mut poll,
+    );
     worker.shutdown();
     result.map_err(ClientError::Io)
 }
@@ -378,10 +456,13 @@ fn run(terminal: &mut Term, options: Options) -> Result<(), ClientError> {
 /// "keys and redraws keep flowing during a stall" pinnable at all.
 /// Processes at most one key per frame; at the frame cadence (one POLL
 /// window plus a draw) that is indistinguishable from draining the whole
-/// backlog per redraw.
+/// backlog per redraw. Each frame also polls the SIGTERM/SIGHUP flag
+/// (R7-4) and takes the restore+exit path on the main thread.
 fn drive(
     drain: &mut dyn FnMut() -> Option<Snapshot>,
     state: &mut LoopState,
+    terminate: &AtomicBool,
+    restore: &dyn Fn() -> std::io::Result<()>,
     draw: &mut dyn FnMut(&DashboardView<'_>) -> std::io::Result<()>,
     poll: &mut dyn FnMut() -> std::io::Result<Option<KeyInput>>,
 ) -> std::io::Result<()> {
@@ -389,8 +470,13 @@ fn drive(
         while let Some(snapshot) = drain() {
             state.on_snapshot(snapshot, Instant::now());
         }
+        if let Flow::Exit = termination_check(terminate, restore) {
+            return Ok(());
+        }
         draw(&state.view(Instant::now()))?;
-        if let Some(key) = poll()? && state.on_key(key) {
+        if let Some(key) = poll()?
+            && state.on_key(key)
+        {
             return Ok(()); // exiting the client never disconnects (FR-127I)
         }
     }
@@ -464,7 +550,10 @@ mod tests {
     use protonwire_frontend_api::{NetworkIntegration, PROTOCOL_VERSION, VpnState};
     use ratatui::crossterm::event::KeyCode;
 
-    use super::{DashboardView, KeyInput, LoopState, RefreshWorker, STALE_AFTER, Snapshot, drive};
+    use super::{
+        DashboardView, Flow, KeyInput, LoopState, RefreshWorker, STALE_AFTER, Snapshot,
+        TERMINATE_REQUESTED, drive, install_terminate_handler, termination_check,
+    };
 
     fn test_state() -> super::DaemonState {
         super::DaemonState {
@@ -583,7 +672,15 @@ mod tests {
         };
         let mut state = LoopState::new();
         let started = Instant::now();
-        let outcome = drive(&mut drain, &mut state, &mut draw, &mut poll);
+        let no_signal = AtomicBool::new(false);
+        let outcome = drive(
+            &mut drain,
+            &mut state,
+            &no_signal,
+            &|| Ok(()),
+            &mut draw,
+            &mut poll,
+        );
         let elapsed = started.elapsed();
         worker.shutdown();
         let _ = std::fs::remove_file(&socket_path);
@@ -722,5 +819,66 @@ mod tests {
             started.elapsed() < Duration::from_millis(1000),
             "shutdown waited out a stalled fetch"
         );
+    }
+
+    /// pr-champion R7-4: the signal-observed path — a set flag runs the
+    /// restore exactly once and takes the exit path; a clear flag leaves
+    /// the terminal alone and continues.
+    #[test]
+    fn a_set_termination_flag_restores_and_exits() {
+        let flag = AtomicBool::new(false);
+        assert!(matches!(
+            termination_check(&flag, || Ok(())),
+            Flow::Continue
+        ));
+        flag.store(true, Ordering::Relaxed);
+        let restored = Arc::new(AtomicBool::new(false));
+        let marker = Arc::clone(&restored);
+        assert!(matches!(
+            termination_check(&flag, move || {
+                marker.store(true, Ordering::SeqCst);
+                Ok(())
+            }),
+            Flow::Exit
+        ));
+        assert!(restored.load(Ordering::SeqCst));
+    }
+
+    /// pr-champion R7-4: real signal delivery. kill(getpid(), SIGTERM)
+    /// from a spawned thread must land in the handler (which only sets
+    /// the static flag — async-signal-safe, so this is benign for every
+    /// other test in the process) and be observable by polling, then take
+    /// the restore+exit path. Full signal-delivery tests are fragile in
+    /// CI; this one is deterministic because the handler's entire effect
+    /// is a flag store and the sender thread cannot race the install
+    /// (install runs first, on the test thread).
+    #[test]
+    fn delivered_sigterm_sets_the_flag_and_exits_through_restore() {
+        install_terminate_handler().unwrap();
+        TERMINATE_REQUESTED.store(false, Ordering::Relaxed);
+        std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_millis(25));
+            nix::sys::signal::kill(nix::unistd::Pid::this(), nix::sys::signal::Signal::SIGTERM)
+                .unwrap();
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !TERMINATE_REQUESTED.load(Ordering::Relaxed) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            TERMINATE_REQUESTED.load(Ordering::Relaxed),
+            "delivered SIGTERM was not observed"
+        );
+        let restored = Arc::new(AtomicBool::new(false));
+        let marker = Arc::clone(&restored);
+        assert!(matches!(
+            termination_check(&TERMINATE_REQUESTED, move || {
+                marker.store(true, Ordering::SeqCst);
+                Ok(())
+            }),
+            Flow::Exit
+        ));
+        assert!(restored.load(Ordering::SeqCst));
+        TERMINATE_REQUESTED.store(false, Ordering::Relaxed);
     }
 }
