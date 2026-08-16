@@ -594,3 +594,45 @@ gate-open, reverse-registration, dead-length assert — must FAIL the
 new tests. `Cargo.toml`: nix gained the `poll` feature for WO-R4's
 readability poll (existing dependency, no version change, lockfile
 untouched).
+
+### Reviewer verdicts and acceptance record (closing)
+
+- **compliance-reviewer**: PASS at both levels (classifier + scan seam);
+  zero allowlist corrections; mutations M2a (constant-Compatible) and
+  M2b (OR/AND swap) confirmed killed by `scan_licenses_flags_gpl2_only`
+  and `mixed_and_or_binds_tighter` respectively.
+- **sec-auditor**: PASS on the WO-R1 seam (re-verdict scoped to the
+  test surface; the production-code PASS stands).
+- **rust-reviewer**: FAIL→fixed @ a368775. The High: the root-gated
+  test's user-namespace heuristic false-negatives in keep-id-shaped
+  sandboxes (userns + pidns — the container init shares the user
+  namespace, so `/proc/self/ns/user` vs `/proc/1/ns/user` compares
+  equal), making the "gate is broken" canary panic for a plain
+  non-root run. Reproduced red with the reviewer's exact
+  `unshare --user --map-current-user --fork --pid --mount-proc` repro;
+  fixed skip-first (non-root NOTICE-skip before the userns gate, canary
+  removed); repro green (skip + NOTICE). qa independently recommended
+  the same shape while verifying at 13d82a2 in a worktree — converged.
+  Two Lows + one nit rode along in a368775 (distinct panic for a
+  leaked non-Event frame; shadowed Mutex import dropped).
+- **qa-engineer**: acceptance bar MET. All 7 named mutations killed by
+  their intended tests as sole/designated failures; deterministic reds
+  re-verified under 2-CPU pinning 3×; the hello gate red fires in
+  ~0.01 s with no hang, reporting the leaked frame verbatim; the
+  proactive probes M4b (non-cumulative counter) and M4c (never-called
+  observer) are also killed. qa's item 2 (root-gate assert would fail
+  stock non-root CI) was resolved by a368775 before its report landed.
+
+Track items (recorded, not built):
+
+1. Rootful-CI canary: enforce the real-chown arm's root precondition
+   via an explicit env var on a rootful runner (the in-test canary
+   assert died with the skip-first fix).
+2. `ReapStats` fields are `allow(dead_code)` outside tests — consume
+   the snapshot with `tracing::trace!` in `serve_observed` instead of
+   the attribute.
+3. The `serve` → `serve_with` → `serve_observed` delegation chain is
+   unpinned; a doc-comment note on the chain suffices.
+4. The userns/root skip NOTICEs are invisible under bare `cargo test`
+   (libtest captures per-test output); surface via `--nocapture` or a
+   test-runner notice mechanism.
