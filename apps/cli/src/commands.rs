@@ -176,7 +176,20 @@ pub fn run(command: &Command, socket: Option<&Path>, no_input: bool) -> RunResul
             dry_run,
             json,
         } => {
-            let _ = (by, protocol, dry_run, json);
+            // Presentation-only; honored wherever output is rendered.
+            let _ = json;
+            // Declared-but-unhonored modifiers must refuse rather than be
+            // discarded: sending the unmodified target would silently ignore
+            // `--by`/`--protocol`, and once Connect lands (M4) a `--dry-run`
+            // invocation would establish a REAL tunnel.
+            if let Some((flag, milestone)) = connect_modifier_refusal(by, protocol, *dry_run) {
+                return Err(ClientError::Rpc(RpcError::new(
+                    RpcErrorCode::NotImplemented,
+                    format!(
+                        "`connect {flag}` is not implemented in milestone 1 (planned: {milestone})"
+                    ),
+                )));
+            }
             let target = ConnectTargetArgs::parse(target)?;
             connect_command(socket, target)
         }
@@ -274,6 +287,25 @@ fn connect_command(
 ) -> RunResult {
     let mut client = connect(socket)?;
     client.connect_vpn(target)
+}
+
+/// The first unimplemented connect modifier, with its planned milestone in
+/// the module's refusal style (`--by`/`--dry-run` are selection modifiers
+/// (M3); `--protocol` constrains the tunnel's transports (M4)).
+fn connect_modifier_refusal(
+    by: &Option<String>,
+    protocol: &Option<String>,
+    dry_run: bool,
+) -> Option<(&'static str, &'static str)> {
+    if by.is_some() {
+        Some(("--by", "milestone 3 — selection and groups"))
+    } else if protocol.is_some() {
+        Some(("--protocol", "milestone 4 — ProTUN engine"))
+    } else if dry_run {
+        Some(("--dry-run", "milestone 3 — selection and groups"))
+    } else {
+        None
+    }
 }
 
 /// Commands with declared-but-unimplemented surfaces.
@@ -387,6 +419,100 @@ mod tests {
         let err = run(&Command::Login, None, true).expect_err("refusal");
         assert_eq!(err.exit_code(), 1);
         assert!(err.to_string().contains("milestone 2"));
+    }
+
+    /// Review-fix V2: the Connect arm used to discard `--by`/`--protocol`/
+    /// `--dry-run` (`let _ = ...`) and send the unmodified target, so once
+    /// the daemon implements Connect (M4) a `--dry-run` invocation would
+    /// establish a REAL tunnel. Until each modifier is honored it must be
+    /// refused with its planned milestone, in the module's refusal style.
+    #[test]
+    fn connect_modifier_flags_are_refused_with_their_milestones() {
+        let fastest = || vec!["fastest".to_string()];
+        let cases = [
+            (
+                Command::Connect {
+                    target: fastest(),
+                    by: Some("latency".into()),
+                    protocol: None,
+                    dry_run: false,
+                    json: false,
+                },
+                "--by",
+                "milestone 3",
+            ),
+            (
+                Command::Connect {
+                    target: fastest(),
+                    by: None,
+                    protocol: Some("stealth".into()),
+                    dry_run: false,
+                    json: false,
+                },
+                "--protocol",
+                "milestone 4",
+            ),
+            (
+                Command::Connect {
+                    target: fastest(),
+                    by: None,
+                    protocol: None,
+                    dry_run: true,
+                    json: false,
+                },
+                "--dry-run",
+                "milestone 3",
+            ),
+        ];
+        for (command, flag, milestone) in cases {
+            let err = run(&command, None, true)
+                .expect_err("an unimplemented connect modifier must refuse");
+            assert_eq!(err.exit_code(), 1, "NotImplemented exit code");
+            let message = err.to_string();
+            assert!(message.contains(flag), "must name the flag: {message}");
+            assert!(
+                message.contains(milestone),
+                "must name the planned milestone: {message}"
+            );
+        }
+    }
+
+    /// Bare `connect <target>`, and `--json` alone (presentation-only, so it
+    /// stays ignored rather than refused), must keep dispatching: the
+    /// modifier gate may not fire without a modifier, so the request still
+    /// reaches the daemon — whose answer for Request::Connect today is the
+    /// milestone-4 tunnel refusal.
+    #[test]
+    fn bare_connect_and_json_only_still_dispatch() {
+        for command in [
+            Command::Connect {
+                target: vec!["fastest".into()],
+                by: None,
+                protocol: None,
+                dry_run: false,
+                json: false,
+            },
+            Command::Connect {
+                target: vec!["fastest".into()],
+                by: None,
+                protocol: None,
+                dry_run: false,
+                json: true,
+            },
+        ] {
+            match run(&command, None, true) {
+                // No daemon on the default socket in unit tests: the request
+                // got past the gate and attempted the daemon.
+                Err(ClientError::DaemonUnavailable(_)) => {}
+                // With a live daemon, Request::Connect is answered by the
+                // milestone-4 tunnel refusal.
+                Err(ClientError::Rpc(rpc)) => {
+                    assert_eq!(rpc.code, RpcErrorCode::NotImplemented);
+                    assert!(rpc.message.contains("milestone 4"), "got: {}", rpc.message);
+                }
+                other => panic!("bare connect must still dispatch, got {other:?}"),
+            }
+        }
     }
 
     /// The documented `protonwire servers refresh [--yes]` (PRD ~789-790)
