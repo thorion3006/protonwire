@@ -1590,8 +1590,8 @@ mod tests {
     /// arguments makes the delete-chown mutation fail here.
     #[test]
     fn chown_seam_receives_the_resolved_gid() {
-        use std::sync::Mutex;
-
+        // (Mutex comes from the module-level `use std::sync::{Arc, Mutex};`
+        // — the local re-import shadowed it; rust-review nit.)
         let dir = tempfile::tempdir().unwrap();
         let calls: Mutex<Vec<(PathBuf, String, u32)>> = Mutex::new(Vec::new());
         let server = IpcServer::bind_with_resolved(
@@ -1701,6 +1701,22 @@ mod tests {
     fn bind_with_group_chowns_to_a_real_group_when_root() {
         use std::os::unix::fs::MetadataExt;
 
+        // Skip-FIRST: non-root before the user-namespace gate (rust-review
+        // keep-id repro). Under `unshare --user --map-current-user --fork
+        // --pid --mount-proc` the pid-namespace init shares our user
+        // namespace, so in_a_user_namespace() sees identical namespace
+        // links and answers false — gating on it first made a plain
+        // non-root run fall through to a "the gate is broken" panic. The
+        // foreign-group chown needs root regardless of namespaces, so a
+        // non-root run simply skips. (A rootful-CI canary assert needs an
+        // explicit env var — review-log track item, not built here.)
+        if !nix::unistd::getuid().is_root() {
+            eprintln!(
+                "NOTICE: skipping bind_with_group_chowns_to_a_real_group_when_root: \
+                 not running as root — the foreign-group chown arm needs root"
+            );
+            return;
+        }
         if in_a_user_namespace() {
             eprintln!(
                 "NOTICE: skipping bind_with_group_chowns_to_a_real_group_when_root: the \
@@ -1709,11 +1725,6 @@ mod tests {
             );
             return;
         }
-        assert!(
-            nix::unistd::getuid().is_root(),
-            "outside a user namespace the real-chown arm requires root — the gate \
-             is broken, not the chown"
-        );
         let group = nix::unistd::Group::from_name("nogroup")
             .expect("nogroup resolves")
             .expect("nogroup exists");
@@ -1941,10 +1952,19 @@ mod tests {
             // the wire. Read and REPORT it instead of proceeding into a
             // misleading downstream assertion.
             let leaked: ServerMessage = read_msg(&mut stream).unwrap();
-            panic!(
-                "the event gate leaked: a frame reached the wire before Hello — \
-                 got {leaked:?}"
-            );
+            match &leaked {
+                ServerMessage::Event(_) => panic!(
+                    "the event gate leaked: an event frame reached the wire \
+                     before Hello — got {leaked:?}"
+                ),
+                // Any other frame (a HelloError, say) is a different
+                // handshake defect, not an event-gate leak — say so
+                // instead of misattributing it (rust-review Low).
+                other => panic!(
+                    "a non-event frame reached the wire before Hello — not an \
+                     event-gate leak but a different handshake defect: got {other:?}"
+                ),
+            }
         }
 
         // The gate held the event: send Hello and demand the ack first,
