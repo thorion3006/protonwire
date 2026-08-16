@@ -1107,6 +1107,34 @@ groups:
         fs::remove_file(&path).ok();
     }
 
+    /// FU-5 (qa round-5 verdict): the kind vocabulary was checked only
+    /// one-way — pinned kinds ⊆ ALLOWED_TARGET_KINDS — so a stray kind
+    /// added to the constant passed the suite untouched. The CONTENTS of
+    /// the vocabulary are part of the v1 contract and are pinned like the
+    /// id set: exactly the five kinds the canonical document uses. This
+    /// is also typoed_target_kind_fails' independent defender — its
+    /// rejection power rests on the constant holding exactly these kinds.
+    #[test]
+    fn target_kind_vocabulary_contents_are_pinned() {
+        assert_eq!(
+            ALLOWED_TARGET_KINDS.len(),
+            5,
+            "the v1 catalog knows exactly five target kinds"
+        );
+        let vocabulary: BTreeSet<&str> = ALLOWED_TARGET_KINDS.iter().copied().collect();
+        let expected: BTreeSet<&str> = BTreeSet::from([
+            "fastest",
+            "fastest-in-country",
+            "fastest-in-region",
+            "random",
+            "secure-core",
+        ]);
+        assert_eq!(
+            vocabulary, expected,
+            "ALLOWED_TARGET_KINDS must stay exactly the v1 catalog's kinds"
+        );
+    }
+
     #[test]
     fn canonical_ids_have_valid_namespaces_and_are_unique() {
         // The `[&str; EXPECTED_GROUP_COUNT]` array type already pins the
