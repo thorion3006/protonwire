@@ -636,3 +636,41 @@ Track items (recorded, not built):
 4. The userns/root skip NOTICEs are invisible under bare `cargo test`
    (libtest captures per-test output); surface via `--nocapture` or a
    test-runner notice mechanism.
+
+## 2026-08-16 — Codex PR review round 5 (PR #3)
+
+Four findings on the round-4 close (00:20Z). All four verified genuine
+and fixed; one rejection-side kernel observation came out of V1's
+test work and is recorded below. Each fix landed red-first; V1 was
+champion-landed under explicit blessing with a documented test
+deviation.
+
+| Finding (anchor) | Verdict | Commit |
+|------------------|---------|--------|
+| Close the session when its writer fails (`server.rs`) — P1; a held-open client kept its slot forever after any writer exit; x64 wedged MAX_SESSIONS | Fixed @ 842c0c1 | writer-loop exit now `shutdown(Shutdown::Both)` — clones share one socket, so the dispatcher's read fails and the normal teardown runs (`writer_failure_tears_down_the_session`, toggle red 10.02 s / green 0.25 s) |
+| Refuse connect modifiers instead of discarding them (`commands.rs`) — P2; `--dry-run` would build a real tunnel once Connect lands | Fixed @ ee1ef8d | typed per-modifier refusal with planned milestone (`--by`/`--dry-run` M3, `--protocol` M4); `--json` stays presentation-only (`connect_modifier_flags_are_refused_with_their_milestones`) |
+| Validate every canonical group target (`groups.rs`) — P2; absent targets and every kind but fastest-in-region escaped validation | Fixed @ 65c56fc | every group must carry a target; `ALLOWED_TARGET_KINDS` vocabulary plus a per-canonical-group `EXPECTED_GROUP_TARGET_KINDS` map pins each id's selection semantics; fastest-in-region still requires a primary region (fixture-backed red tests) |
+| Propagate configuration metadata errors (`config.rs`) — P2; `exists()` read EACCES as absence and handed the daemon silent defaults | Fixed @ 66fb598 | direct `fs::read`: only `NotFound` yields defaults, every other I/O error is a hard `ConfigLoadError::Io` naming path and source (unreadable-parent red test; missing-file-yields-defaults unchanged) |
+
+### V1 test deviation (approved)
+
+The finding's literal trigger — a blocked write dying at the 10 s
+SO_SNDTIMEO ceiling — does not fire on this kernel. The pin therefore
+uses a deterministic writer failure (a 2 MiB pong beyond
+MAX_FRAME_LEN), which exercises the same invariant: writer-loop exit
+⇒ shared-socket shutdown ⇒ dispatcher read fails ⇒ teardown.
+
+### Track item: SO_SNDTIMEO does not interrupt steady-state blocked AF_UNIX sends here
+
+Instrumented evidence from V1's test work: a server-side send of a
+0.9 MiB frame to a client whose `SO_RCVBUF` is 4 KiB and which never
+reads **outlasted a 20 s window with a 10 s `set_write_timeout` set**
+— the blocked send was never interrupted; teardown only occurred when
+the test's unwind closed the client side (ECONNRESET). Scope: the
+shutdown drain is still bounded (DRAIN_CEILING force-closes
+stragglers), and 842c0c1 recovers the session whenever the writer
+does exit; the residual exposure is a writer blocked forever by a
+never-reading peer — session-level, bounded by MAX_SESSIONS, and it
+contradicts WRITE_TIMEOUT's doc comment on this kernel. Candidate
+fix if escalated in a later round: a writer-side deadline watchdog
+(a fan-out variant of `read_msg_within`). Not built now.
