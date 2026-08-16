@@ -16,14 +16,38 @@ use crate::{Reporter, expect_value, is_capability_id, is_git_revision, is_sha256
 
 const PROTON_REVISION: &str = "12e7755a112f59b7b843da79290b3de25febf653";
 
-/// The six pinned official-client baselines that must record a git revision.
-const OFFICIAL_UPSTREAMS: &[&str] = &[
-    "official_linux_cli",
-    "official_linux_gui",
-    "official_linux_api_core",
-    "official_android_app",
-    "official_windows_app",
-    "official_apple_app",
+/// The six pinned official-client baselines (upstream name → recorded git
+/// revision from docs/official-parity.yaml), in the EXPECTED_GROUP_IDS pin
+/// style: the revisions are pinned constants in the gate rather than values
+/// read back out of the validated document (self-consistency would let an
+/// edited docs file vouch for itself), so a swapped-but-valid revision is
+/// drift the gate catches and a real baseline bump is a deliberate
+/// docs-plus-xtask change.
+const OFFICIAL_REVISIONS: &[(&str, &str)] = &[
+    (
+        "official_linux_cli",
+        "a7c7abc8d3777f33b8d4c82279bd621258bd810d",
+    ),
+    (
+        "official_linux_gui",
+        "bd9c406befad847d613ba3fc634b0f0ea9f1a72e",
+    ),
+    (
+        "official_linux_api_core",
+        "fb35f610fc592ddc181230369dc59855c4f97a04",
+    ),
+    (
+        "official_android_app",
+        "cc1e29f8acd5f11f63701b48f97410e90fa6a71d",
+    ),
+    (
+        "official_windows_app",
+        "4d9ac60d1db5d3f2908498470a9d1646723afcfd",
+    ),
+    (
+        "official_apple_app",
+        "6973fc1f7703314d80cada3eba377766c55710e5",
+    ),
 ];
 
 const REQUIRED_STATUSES: &[&str] = &[
@@ -346,12 +370,19 @@ fn check_upstream(doc: &Manifest, lock: &Lockfile) -> Vec<String> {
         None => violations.push("upstream.pvpnclient is missing".to_string()),
     }
 
-    for name in OFFICIAL_UPSTREAMS {
+    for (name, pinned) in OFFICIAL_REVISIONS {
         match upstream.get(*name) {
             Some(entry) => {
                 violations.extend(expect_revision(
                     entry.revision.as_deref(),
                     &format!("upstream.{name}"),
+                ));
+                // WO-W4: the shape check alone lets any well-formed hash
+                // through; the recorded revision must EQUAL the pin.
+                violations.extend(expect_value(
+                    entry.revision.as_deref(),
+                    pinned,
+                    &format!("upstream.{name}.revision"),
                 ));
             }
             None => violations.push(format!("upstream.{name} is missing")),
@@ -361,7 +392,9 @@ fn check_upstream(doc: &Manifest, lock: &Lockfile) -> Vec<String> {
     // Any further upstream entry must also record a full git revision.
     for (name, entry) in upstream {
         if matches!(name.as_str(), "protun" | "muon" | "pvpnclient")
-            || OFFICIAL_UPSTREAMS.contains(&name.as_str())
+            || OFFICIAL_REVISIONS
+                .iter()
+                .any(|(official, _)| *official == name.as_str())
         {
             continue;
         }
@@ -694,6 +727,65 @@ capabilities:
         assert!(
             !validate(&path, &empty).unwrap(),
             "an unverifiable checksum must fail, not pass vacuously"
+        );
+        fs::remove_file(&path).ok();
+    }
+
+    /// pr-champion round-6 triage, WO-W4: the six official-client baselines
+    /// were only SHAPE-checked (40 hex characters), so replacing any
+    /// recorded revision with a different well-formed hash passed
+    /// manifest-validate — silent baseline drift the shape rule cannot
+    /// see, exactly like the checksum finding above. Each revision is
+    /// pinned instead (the EXPECTED_GROUP_IDS style): changing one must be
+    /// a deliberate docs-plus-xtask edit, never a one-file accident.
+    #[test]
+    fn official_revisions_must_match_the_pinned_baselines() {
+        // A swapped-but-valid revision (last hex digit flipped) on the
+        // first baseline.
+        let yaml = good_manifest_yaml().replacen(
+            "a7c7abc8d3777f33b8d4c82279bd621258bd810d",
+            "a7c7abc8d3777f33b8d4c82279bd621258bd810e",
+            1,
+        );
+        let path = temp_yaml("official-rev", &yaml);
+        assert!(
+            !validate(&path, &good_lock()).unwrap(),
+            "a swapped-but-valid official_linux_cli revision must fail the gate"
+        );
+        fs::remove_file(&path).ok();
+
+        // The same tamper on the LAST baseline proves the loop covers
+        // every official entry, not just the first.
+        let yaml = good_manifest_yaml().replacen(
+            "6973fc1f7703314d80cada3eba377766c55710e5",
+            "6973fc1f7703314d80cada3eba377766c55710f",
+            1,
+        );
+        let path = temp_yaml("official-rev-last", &yaml);
+        assert!(
+            !validate(&path, &good_lock()).unwrap(),
+            "a swapped-but-valid official_apple_app revision must fail the gate too"
+        );
+        fs::remove_file(&path).ok();
+
+        // Exchanging two official revisions (both well-formed, each in the
+        // wrong slot) must fail on both entries; the keyed search strings
+        // keep each `replacen` pinned to its own upstream block.
+        let yaml = good_manifest_yaml()
+            .replacen(
+                "official_linux_cli:\n    revision: a7c7abc8d3777f33b8d4c82279bd621258bd810d",
+                "official_linux_cli:\n    revision: bd9c406befad847d613ba3fc634b0f0ea9f1a72e",
+                1,
+            )
+            .replacen(
+                "official_linux_gui:\n    revision: bd9c406befad847d613ba3fc634b0f0ea9f1a72e",
+                "official_linux_gui:\n    revision: a7c7abc8d3777f33b8d4c82279bd621258bd810d",
+                1,
+            );
+        let path = temp_yaml("official-rev-swap", &yaml);
+        assert!(
+            !validate(&path, &good_lock()).unwrap(),
+            "two official revisions exchanged between their slots must fail the gate"
         );
         fs::remove_file(&path).ok();
     }
