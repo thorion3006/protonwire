@@ -120,9 +120,24 @@ fn setup_terminal() -> std::io::Result<Term> {
 }
 
 fn restore() -> std::io::Result<()> {
-    terminal::disable_raw_mode()?;
-    execute!(std::io::stdout(), terminal::LeaveAlternateScreen)?;
-    Ok(())
+    attempt_both(terminal::disable_raw_mode, || {
+        execute!(std::io::stdout(), terminal::LeaveAlternateScreen)
+    })
+}
+
+/// Attempts two independent teardown steps, running BOTH even when the
+/// first fails (pr-champion WO-8): `?` on disable_raw_mode used to return
+/// before LeaveAlternateScreen ran, potentially leaving the user on the
+/// alternate screen. The first error is reported.
+fn attempt_both(
+    first: impl FnOnce() -> std::io::Result<()>,
+    second: impl FnOnce() -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    match (first(), second()) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), _) => Err(error),
+        (Ok(()), Err(error)) => Err(error),
+    }
 }
 
 fn connect(options: &Options) -> Result<ProtonwireClient, ClientError> {
@@ -216,4 +231,51 @@ fn key_value(key: &str, value: &str) -> Line<'static> {
         ),
         Span::raw(value.to_owned()),
     ])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::attempt_both;
+    use std::io;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// pr-champion WO-8: restore() used `?` on disable_raw_mode, so a raw
+    /// mode teardown failure returned before LeaveAlternateScreen ran and
+    /// could leave the user stranded on the alternate screen. The teardown
+    /// steps must be attempted independently; the first error is reported.
+    /// No tty exists in CI, so this pins the structure (both closures are
+    /// attempted) rather than the real crossterm calls; restore() wiring
+    /// those calls through attempt_both is inspection-level.
+    #[test]
+    fn second_step_is_attempted_when_the_first_fails() {
+        let second_ran = Arc::new(AtomicBool::new(false));
+        let marker = Arc::clone(&second_ran);
+        let outcome = attempt_both(
+            || Err(io::Error::new(io::ErrorKind::Other, "raw mode")),
+            move || {
+                marker.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+        );
+        assert!(outcome.is_err());
+        assert!(
+            second_ran.load(Ordering::SeqCst),
+            "LeaveAlternateScreen must still be attempted when disable_raw_mode fails"
+        );
+    }
+
+    #[test]
+    fn first_error_wins_when_both_steps_fail() {
+        let outcome = attempt_both(
+            || Err(io::Error::new(io::ErrorKind::Other, "raw mode")),
+            || Err(io::Error::new(io::ErrorKind::Other, "alt screen")),
+        );
+        assert_eq!(outcome.unwrap_err().to_string(), "raw mode");
+    }
+
+    #[test]
+    fn both_steps_succeeding_yields_ok() {
+        attempt_both(|| Ok(()), || Ok(())).unwrap();
+    }
 }
