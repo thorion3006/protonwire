@@ -711,3 +711,59 @@ fix if escalated in a later round: a writer-side deadline watchdog
 - **Champion disposition**: `yaml::from_path` deleted @ aa4f9fd — zero
   callers after V4, and the wrapper is the exact vector that would
   re-wrap future read errors into the parse-error channel V4 closed.
+
+## 2026-08-16 — Codex PR review round 6 (PR #3)
+
+Ten findings on the accumulated close (01:03/01:16Z batches): nine
+accepted and fixed across eleven commits, one deferred to M2 with
+evidence. All verified against HEAD before acceptance; the three
+reviewer verdicts (rust PASS, sec PASS on the trust surfaces, qa teeth
+CONFIRMED) sanctioned thread resolution, with residuals triaged into a
+follow-up lane.
+
+| Finding (anchor) | Verdict | Commit |
+|------------------|---------|--------|
+| Never unlink a non-socket entry at the bind path (`server.rs`) — P2; a regular file also answers ECONNREFUSED, so the probe alone authorized destroying it | Fixed @ 88941b7 | type check BEFORE the probe (`refuse_unless_stale_socket`); non-socket entries abort bind naming what they are; sec-auditor verified the symlink matrix fail-closed in every case |
+| Bound events buffered while awaiting responses (`client.rs`) — P2; `pending_events` grew without limit | Fixed @ fc6310d | capped at 256 mirroring `SESSION_QUEUE_LEN`; overflow drops the oldest with cumulative accounting surfaced once per episode by `next_event`; the seq gap is recovered by the latest_event_seq resync path |
+| Move owned secrets directly into zeroizing storage (`redact.rs`) — P2; `register(&value.into())` stranded an unzeroized temporary | Fixed @ 0eef7cb | `register_owned` moves the allocation into `Arc<Zeroizing>` — no copy on the owned path (compile-red disclosed; the no-copy property itself is inspection-level, sec-verified at the move-semantics level) |
+| Attempt alternate-screen restoration after raw-mode errors (`tui/main.rs`) — P2; `?` returned before LeaveAlternateScreen | Fixed @ 5d38ba4 + 67afd3e | `attempt_both` runs BOTH teardown steps independently, first error reported |
+| Emit the missing-config warning after tracing initializes (`daemon/main.rs`) — P2; load warned before any subscriber existed | Fixed @ 0c64724 | `LoadedSystemConfig { config, used_defaults }`; the daemon re-emits after `init_tracing_filtered` (no double-emit: the pre-init record is discarded by design) |
+| Pin official-client revisions to recorded baselines (`manifest.rs`) — P2; 40-hex shape check only | Fixed @ 1e57e29 | `OFFICIAL_REVISIONS` pins all six; authority = recorded constants (a doc cannot vouch for itself); the any-further-entry rule derives from the pin map |
+| Preserve the canonical capability ID set (`manifest.rs`) — P2; deleting `account.login` passed | Fixed @ 6149259 | `EXPECTED_CAPABILITY_IDS` (72) set equality, full-catalog fixture + meta-test |
+| Require test references to resolve (`manifest.rs`) — P2; `T-999999` passed | Fixed @ 0403c6e | `CANONICAL_TEST_IDS` (92: T-1..37, IT-1..30, E2E-1..25 from PRD 17.1-17.3), subset check + split meta-test |
+| Require the complete canonical M49 country set (`m49.rs`) — P2; a 150-row floor let dozens of countries vanish | Fixed @ f9fbbbc | `EXPECTED_M49_ISO_CODES` (247) set equality both directions; the floor stays as defense-in-depth |
+| Preserve the negotiated protocol for outbound messages (`server.rs`) — P2 | Deferred to M2 | `PROTOCOL_VERSION` is 1 — version variance is unconstructible in M1 — and the handshake negotiation surface is M2's per the characterization tests' own docs (server.rs:870). **M2 track item:** when the constant grows, the negotiated version must flow into the event forwarder and response paths with per-version filtering; do not land a speculative filtering layer against a single-version protocol |
+
+Reviewer verdicts: rust-reviewer PASS (focus points sound; pins
+manually cross-diffed against ground truth — exact matches), with one
+Medium (daemon re-emit unpinned) and Lows triaged to the follow-up
+lane; sec-auditor PASS on W1+W2 (fail-closed symlink matrix; copy-free
+claim verified at move-semantics level; Lows are pre-existing tracked
+items including the round-4 dir-mode pin); qa-engineer teeth CONFIRMED
+(all four production reverts kill exactly their intended tests; gaps
+disclosed, none blocking).
+
+Evidence disclosures: W2's no-copy property is inspection-level
+(compile-red for the API, move-semantics verification by sec-auditor);
+W8's teardown red is behavioral against the short-circuit semantics
+(no tty in CI); W9's daemon-side re-emit is unpinned pending its FU
+(extract `run(args)` with an injectable tracing factory). qa's
+suite-health note: several `replacen`-based red tests can pass for
+the wrong reason if their anchor strings drift — new fixture tests
+should prefer unique anchors (the round-5 FU-1 test documents the
+pattern).
+
+Residual triage (follow-up lane): FU-A daemon run(args) extraction
+with injectable tracing (rust Medium); FU-B symlink existence via
+symlink_metadata + link→stale-socket (removed-not-target) and
+link→regular (refused) cases; FU-C one-shot warn pinned via a
+capturing subscriber (per-episode + two-episode reset); FU-D
+test-only PRD cross-check of CANONICAL_TEST_IDS (the GATE stays
+PRD-independent; only the `#[cfg(test)]` reads the PRD) plus
+max-id-per-prefix + contiguity meta-tests — closes qa's one true
+blind spot (nine unreferenced ids were swappable); FU-E W2 alloc
+probe (approved with a scoped `#![allow(unsafe_code)]` in the test
+crate, GUI-boundary precedent); FU-F any-further-entry rule test
+(revision-less extra upstream). Review-log notes, no code:
+duplicate-violation cosmetic, `dropped_events` consumer (M2 GUI/TUI
+surfaces), W6-2 mapping-scope gap.
