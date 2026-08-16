@@ -101,8 +101,11 @@ impl IpcServer {
     /// Binds `socket_dir/socket_name`.
     ///
     /// Creates the directory if missing, refuses to displace a live daemon's
-    /// socket, and removes a stale socket file left by an unclean shutdown.
-    /// The socket is created with mode `0o660`. See
+    /// socket, removes a stale socket file left by an unclean shutdown, and
+    /// refuses loudly to remove any NON-socket entry at the path (a regular
+    /// file there also answers ECONNREFUSED on the liveness probe — the
+    /// probe alone must never authorize the unlink). The socket is created
+    /// with mode `0o660`. See
     /// [`IpcServer::bind_with_group`] for the client-group chown a root
     /// daemon needs on top of that mode.
     pub fn bind(socket_dir: &Path, socket_name: &str) -> io::Result<Self> {
@@ -145,7 +148,7 @@ impl IpcServer {
         std::fs::create_dir_all(socket_dir)?;
         let socket_path = socket_dir.join(socket_name);
         if socket_path.exists() {
-            ensure_not_live(&socket_path)?;
+            refuse_unless_stale_socket(&socket_path)?;
             std::fs::remove_file(&socket_path)?;
         }
         let listener = UnixListener::bind(&socket_path)?;
@@ -391,6 +394,52 @@ fn ensure_not_live(socket_path: &Path) -> io::Result<()> {
         ))),
         Err(e) if authorizes_unlink(&e) => Ok(()),
         Err(e) => Err(e),
+    }
+}
+
+/// Authorizes removing the entry at `socket_path` only if it is a SOCKET
+/// that no live daemon is serving (pr-champion round 6, WO-W1).
+///
+/// The liveness probe alone cannot carry this: connect(2) to ANY non-socket
+/// path — a regular file above all — answers ECONNREFUSED, the exact signal
+/// [`authorizes_unlink`] treats as proof of staleness. Ungated, that let
+/// bind remove the user's file and bind over the crater. The entry's TYPE
+/// is therefore checked first (and the probe never even runs against a
+/// non-socket), and any non-socket entry aborts bind loudly, naming the
+/// path and what it actually is.
+fn refuse_unless_stale_socket(socket_path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::FileTypeExt;
+    let meta = std::fs::metadata(socket_path)?;
+    if meta.file_type().is_socket() {
+        return ensure_not_live(socket_path);
+    }
+    Err(io::Error::other(format!(
+        "refusing to remove {}: not a socket ({})",
+        socket_path.display(),
+        entry_kind(&meta)
+    )))
+}
+
+/// Human name for an entry's file type, used to say WHAT bind refused to
+/// remove (metadata follows symlinks, so a link is reported as whatever it
+/// targets — the link itself is still never unlinked).
+fn entry_kind(meta: &std::fs::Metadata) -> &'static str {
+    use std::os::unix::fs::FileTypeExt;
+    let file_type = meta.file_type();
+    if file_type.is_file() {
+        "regular file"
+    } else if file_type.is_dir() {
+        "directory"
+    } else if file_type.is_symlink() {
+        "symlink"
+    } else if file_type.is_fifo() {
+        "FIFO"
+    } else if file_type.is_char_device() {
+        "character device"
+    } else if file_type.is_block_device() {
+        "block device"
+    } else {
+        "unknown entry type"
     }
 }
 
@@ -1501,6 +1550,82 @@ mod tests {
             "live socket must abort bind, got: {err}"
         );
         drop(listener);
+    }
+
+    /// pr-champion round 6, WO-W1: a REGULAR file at the socket path also
+    /// answers ECONNREFUSED on the liveness probe (connect(2) to any
+    /// non-socket refuses), so `authorizes_unlink` alone passed and
+    /// `remove_file` destroyed the user's file before binding over it. The
+    /// entry's TYPE must authorize the unlink: anything but a socket aborts
+    /// bind loudly, naming the path and the actual entry type, and the
+    /// file's contents survive untouched. A stale SOCKET keeps the existing
+    /// replace-and-bind behavior.
+    #[test]
+    fn bind_refuses_to_unlink_non_socket_entries() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // A regular file at the bind path: refuse loudly, name the type,
+        // leave the contents intact.
+        let file_dir = dir.path().join("regular");
+        std::fs::create_dir(&file_dir).unwrap();
+        let hoarded = file_dir.join("s.sock");
+        std::fs::write(&hoarded, "precious data").unwrap();
+        let err = IpcServer::bind(&file_dir, "s.sock")
+            .map(|_| ())
+            .expect_err("a regular file at the bind path must abort bind");
+        assert!(
+            err.to_string().contains("refusing to remove"),
+            "the refusal must be explicit, got: {err}"
+        );
+        assert!(
+            err.to_string().contains("regular file"),
+            "the refusal must name the entry type, got: {err}"
+        );
+        assert!(
+            err.to_string().contains("s.sock"),
+            "the refusal must name the path, got: {err}"
+        );
+        assert!(
+            hoarded.is_file(),
+            "the entry itself must survive the refusal"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&hoarded).unwrap(),
+            "precious data",
+            "bind must not destroy the file's contents"
+        );
+
+        // A directory at the bind path: refused too (remove_file on a
+        // directory only fails with EISDIR — an opaque error that names
+        // neither the refusal nor the type).
+        let dir_case = dir.path().join("dircase");
+        std::fs::create_dir(&dir_case).unwrap();
+        let as_socket = dir_case.join("s.sock");
+        std::fs::create_dir(&as_socket).unwrap();
+        let err = IpcServer::bind(&dir_case, "s.sock")
+            .map(|_| ())
+            .expect_err("a directory at the bind path must abort bind");
+        assert!(
+            err.to_string().contains("refusing to remove"),
+            "directories are refused like any non-socket, got: {err}"
+        );
+        assert!(
+            err.to_string().contains("directory"),
+            "the refusal must name the entry type, got: {err}"
+        );
+        assert!(as_socket.is_dir(), "the directory must survive");
+
+        // A stale socket (listener dropped, file left behind) is still
+        // replaced and bound — existing behavior pinned.
+        let stale_dir = dir.path().join("stale");
+        std::fs::create_dir(&stale_dir).unwrap();
+        drop(std::os::unix::net::UnixListener::bind(stale_dir.join("s.sock")).unwrap());
+        let server = IpcServer::bind(&stale_dir, "s.sock")
+            .expect("a stale socket at the bind path is still replaced");
+        assert!(
+            server.socket_path().exists(),
+            "the replacement socket must be bound"
+        );
     }
 
     /// pr-champion WO-7 (PRD 6.3): bind() chmods the socket 0o660 but
