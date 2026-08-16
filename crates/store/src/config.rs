@@ -715,16 +715,29 @@ impl SystemConfig {
     /// Expected schema version of this generation of the document.
     pub const EXPECTED_SCHEMA_VERSION: u32 = 2;
 
-    /// Loads and validates the system configuration; a missing file yields
-    /// defaults (with a log record), an invalid file is a hard error.
+    /// Loads and validates the system configuration. Only *absence* is
+    /// soft: a missing file yields defaults (with a log record). A file
+    /// that cannot be read (an EACCES ancestor directory, for example) is
+    /// a hard error — `exists()` would read that as "missing" and hand the
+    /// daemon silent defaults for its socket, credential, and protection
+    /// policy — and an invalid file is equally hard.
     pub fn load(path: &std::path::Path) -> Result<Self, ConfigLoadError> {
-        if !path.exists() {
-            tracing::warn!(path = %path.display(), "system configuration not found; using defaults");
-            let defaults = Self::default();
-            defaults.validate()?;
-            return Ok(defaults);
-        }
-        let config: Self = yaml::from_path(path)?;
+        let bytes = match std::fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                tracing::warn!(path = %path.display(), "system configuration not found; using defaults");
+                let defaults = Self::default();
+                defaults.validate()?;
+                return Ok(defaults);
+            }
+            Err(error) => {
+                return Err(ConfigLoadError::Io {
+                    path: path.to_path_buf(),
+                    source: error,
+                });
+            }
+        };
+        let config: Self = yaml::from_slice(&bytes)?;
         config.validate()?;
         Ok(config)
     }
@@ -838,6 +851,15 @@ pub enum ConfigLoadError {
     /// The document could not be parsed.
     #[error(transparent)]
     Yaml(#[from] yaml::YamlError),
+    /// The document could not be read (absence is NOT this variant — only
+    /// a missing file yields defaults).
+    #[error("failed to read system configuration from {path}: {source}")]
+    Io {
+        /// The path that could not be read.
+        path: std::path::PathBuf,
+        /// The underlying I/O failure.
+        source: std::io::Error,
+    },
     /// Cross-field validation failed.
     #[error("configuration validation failed:\n  - {}",
         violations.join("\n  - "))]
@@ -935,6 +957,40 @@ mod tests {
         let config = SystemConfig::load(&dir.path().join("absent.yaml")).unwrap();
         assert_eq!(config.schema_version, SystemConfig::EXPECTED_SCHEMA_VERSION);
         config.validate().unwrap();
+    }
+
+    /// Review-fix V4: `load` used `!path.exists()`, so an EACCES ancestor
+    /// read as "missing" and the daemon got silent defaults for its socket,
+    /// credential, and protection policy. A config under a mode-0000 parent
+    /// must be a hard error naming the path and the underlying failure —
+    /// never defaults. Mirrors the suite's non-root-only permission pattern.
+    #[test]
+    fn load_unreadable_config_is_hard_error_not_defaults() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let closed = dir.path().join("closed");
+        std::fs::create_dir(&closed).unwrap();
+        let path = closed.join("config.yaml");
+        std::fs::write(&path, example_config_yaml()).unwrap();
+        std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let outcome = SystemConfig::load(&path);
+        // Root ignores DAC, so the denial is only provable for non-root
+        // test users (the pattern used by the ipc suite).
+        let provable = std::fs::read(&path).is_err();
+        std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(0o700)).unwrap();
+        if !provable {
+            return; // running as root: the mode bits deny nothing
+        }
+        let err = outcome.expect_err("an unreadable config must be a hard error");
+        let message = err.to_string();
+        assert!(
+            message.contains("config.yaml"),
+            "must name the path: {message}"
+        );
+        assert!(
+            message.contains("Permission denied"),
+            "must name the underlying error: {message}"
+        );
     }
 
     #[test]
