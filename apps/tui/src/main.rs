@@ -252,7 +252,7 @@ mod tests {
         let second_ran = Arc::new(AtomicBool::new(false));
         let marker = Arc::clone(&second_ran);
         let outcome = attempt_both(
-            || Err(io::Error::new(io::ErrorKind::Other, "raw mode")),
+            || Err(io::Error::other("raw mode")),
             move || {
                 marker.store(true, Ordering::SeqCst);
                 Ok(())
@@ -268,8 +268,8 @@ mod tests {
     #[test]
     fn first_error_wins_when_both_steps_fail() {
         let outcome = attempt_both(
-            || Err(io::Error::new(io::ErrorKind::Other, "raw mode")),
-            || Err(io::Error::new(io::ErrorKind::Other, "alt screen")),
+            || Err(io::Error::other("raw mode")),
+            || Err(io::Error::other("alt screen")),
         );
         assert_eq!(outcome.unwrap_err().to_string(), "raw mode");
     }
