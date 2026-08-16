@@ -581,6 +581,7 @@ pub fn verify_socket_trusted(path: &Path) -> Result<(), ConnectError> {
 mod tests {
     use super::*;
     use std::sync::Arc;
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use protonwire_frontend_api::{RpcErrorCode, VpnState};
@@ -1397,12 +1398,23 @@ mod tests {
     /// drops the OLDEST entry and bumps a counter surfaced by `next_event`;
     /// correctness after the induced seq gap is recovered by the existing
     /// latest_event_seq resync machinery, the counter is observability.
+    ///
+    /// FU-C (round-6 residual): none of that was pinned against the LOG —
+    /// deleting `surface_pending_drops`' body passed the whole suite. The
+    /// episodes below run under a capturing subscriber (hand-rolled: the
+    /// crate has no tracing-subscriber dependency and only needs the WARN
+    /// event's fields, not formatted output) and pin the one-shot warning:
+    /// EXACTLY ONE overflow line per episode, the second episode warning
+    /// carrying the cumulative total, and no line once the episode has been
+    /// reported (the `unreported_drops` reset).
     #[test]
     fn request_event_burst_bounds_the_pending_queue_with_drop_accounting() {
         use std::os::unix::net::UnixListener;
 
         // 256 + 44: enough overflow to prove both the cap and the count.
         const EVENTS: u64 = PENDING_EVENTS_CAP as u64 + 44;
+        // Two episodes: the burst fixture below repeats for each request.
+        const EPISODES: u64 = 2;
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("burst.sock");
@@ -1420,34 +1432,37 @@ mod tests {
                     latest_event_seq: 0,
                 }),
             );
-            // Swallow the request, then a burst of events BEFORE the
-            // correlated response — the exact arrival pattern of a fan-out
-            // during a long request wait.
-            let request = crate::frame::read_msg::<_, ClientMessage>(&mut peer);
-            for seq in 1..=EVENTS {
-                let _ = crate::frame::write_msg(
-                    &mut peer,
-                    &ServerMessage::Event(EventEnvelope {
-                        seq,
-                        event: protonwire_frontend_api::Event::Notice {
-                            level: protonwire_frontend_api::NoticeLevel::Info,
-                            message: format!("burst {seq}"),
-                        },
-                    }),
-                );
-            }
-            if let Ok(ClientMessage::Request {
-                id,
-                request: Request::Ping { nonce },
-            }) = request
-            {
-                let _ = crate::frame::write_msg(
-                    &mut peer,
-                    &ServerMessage::Response(Response::Ok {
-                        id,
-                        result: RequestResult::Pong { nonce },
-                    }),
-                );
+            // One request/burst round per episode: swallow the request,
+            // then a burst of events BEFORE the correlated response — the
+            // exact arrival pattern of a fan-out during a long request
+            // wait.
+            for episode in 0..EPISODES {
+                let request = crate::frame::read_msg::<_, ClientMessage>(&mut peer);
+                for seq in episode * EVENTS + 1..=(episode + 1) * EVENTS {
+                    let _ = crate::frame::write_msg(
+                        &mut peer,
+                        &ServerMessage::Event(EventEnvelope {
+                            seq,
+                            event: protonwire_frontend_api::Event::Notice {
+                                level: protonwire_frontend_api::NoticeLevel::Info,
+                                message: format!("burst {seq}"),
+                            },
+                        }),
+                    );
+                }
+                if let Ok(ClientMessage::Request {
+                    id,
+                    request: Request::Ping { nonce },
+                }) = request
+                {
+                    let _ = crate::frame::write_msg(
+                        &mut peer,
+                        &ServerMessage::Response(Response::Ok {
+                            id,
+                            result: RequestResult::Pong { nonce },
+                        }),
+                    );
+                }
             }
             // Hold the socket: later reads must come from the buffer.
             std::thread::sleep(Duration::from_secs(30));
@@ -1461,51 +1476,191 @@ mod tests {
         )
         .unwrap();
 
-        match client
-            .request(Request::Ping { nonce: "p".into() })
-            .expect("the correlated pong arrives after the burst")
-        {
-            RequestResult::Pong { nonce } => assert_eq!(nonce, "p"),
-            other => panic!("unexpected result: {other:?}"),
+        let capture = CaptureWarns::default();
+        tracing::subscriber::with_default(capture.subscriber(), || {
+            // Episode 1: the first burst overflows the cap by exactly the
+            // first episode's surplus.
+            match client
+                .request(Request::Ping { nonce: "p1".into() })
+                .expect("the correlated pong arrives after the burst")
+            {
+                RequestResult::Pong { nonce } => assert_eq!(nonce, "p1"),
+                other => panic!("unexpected result: {other:?}"),
+            }
+
+            // The queue is bounded at the cap...
+            assert_eq!(
+                client.pending_events.len(),
+                PENDING_EVENTS_CAP,
+                "the pending queue must stay bounded under a mid-request burst"
+            );
+            // ...the OLDEST events were the ones dropped (1..=44 are gone,
+            // 45..=300 remain in order)...
+            assert_eq!(
+                client.pending_events.front().expect("queue is full").seq,
+                EVENTS + 1 - PENDING_EVENTS_CAP as u64,
+                "overflow must drop the oldest buffered events"
+            );
+            assert_eq!(
+                client.pending_events.back().expect("queue is full").seq,
+                EVENTS,
+                "the newest event must be retained"
+            );
+            // ...and the drop counter accounts for exactly the overflow.
+            assert_eq!(
+                client.dropped_events(),
+                EVENTS - PENDING_EVENTS_CAP as u64,
+                "the drop counter must account for every dropped event"
+            );
+
+            // The resync path still works over the bounded queue: a snapshot
+            // through seq 299 covers all but the last event, and next_event
+            // delivers it from the buffer — surfacing episode 1's drops as
+            // exactly ONE warning.
+            client.discard_events_through(EVENTS - 1);
+            let envelope = client
+                .next_event()
+                .expect("the newest event still delivers after the resync discard");
+            assert_eq!(envelope.seq, EVENTS);
+
+            // Episode 2: a second burst against a queue drained by the
+            // resync discard overflows it by the same surplus again; the
+            // cumulative counter therefore doubles.
+            match client
+                .request(Request::Ping { nonce: "p2".into() })
+                .expect("the second correlated pong arrives after the second burst")
+            {
+                RequestResult::Pong { nonce } => assert_eq!(nonce, "p2"),
+                other => panic!("unexpected result: {other:?}"),
+            }
+            let per_episode = EVENTS - PENDING_EVENTS_CAP as u64;
+            let expected_total = EPISODES * per_episode;
+            assert_eq!(
+                client.dropped_events(),
+                expected_total,
+                "the drop counter is cumulative across episodes"
+            );
+            // The second episode's first next_event surfaces the second
+            // warning (with the cumulative total); one more delivery after
+            // it must stay SILENT — the episode was already reported. The
+            // queue's front is the oldest survivor of the second burst.
+            let oldest_survivor = EPISODES * EVENTS - PENDING_EVENTS_CAP as u64 + 1;
+            let envelope = client
+                .next_event()
+                .expect("the second episode still delivers buffered events");
+            assert_eq!(envelope.seq, oldest_survivor);
+            let envelope = client
+                .next_event()
+                .expect("buffered events keep delivering");
+            assert_eq!(envelope.seq, oldest_survivor + 1);
+        });
+
+        // The one-shot pin: exactly one overflow warning per episode, the
+        // second carrying the episode's own drops AND the cumulative
+        // total — deleting the warn (zero lines) or the unreported_drops
+        // reset (a third line, or a wrong second one) both fail here.
+        let per_episode = EVENTS - PENDING_EVENTS_CAP as u64;
+        let overflows = capture.overflow_warnings();
+        assert_eq!(
+            overflows,
+            vec![
+                (per_episode, per_episode),
+                (per_episode, EPISODES * per_episode),
+            ],
+            "expected exactly one overflow warning per episode with the \
+             cumulative totals, got: {overflows:?}"
+        );
+    }
+
+    /// FU-C: a hand-rolled WARN-event capture. The crate deliberately has
+    /// no tracing-subscriber dependency, so this implements the three
+    /// required [`tracing::Subscriber`] methods directly and records only
+    /// the fields the overflow warning carries — no formatted output, no
+    /// filtering infrastructure, no new dependency.
+    #[derive(Debug, Default)]
+    struct CaptureWarns {
+        overflows: Arc<Mutex<Vec<(u64, u64)>>>,
+    }
+
+    impl CaptureWarns {
+        /// The subscriber to install via
+        /// [`tracing::subscriber::with_default`]; it is consumed there,
+        /// while `overflow_warnings` keeps reading through the shared
+        /// handle.
+        fn subscriber(&self) -> CaptureSubscriber {
+            CaptureSubscriber {
+                overflows: Arc::clone(&self.overflows),
+            }
         }
 
-        // The queue is bounded at the cap...
-        assert_eq!(
-            client.pending_events.len(),
-            PENDING_EVENTS_CAP,
-            "the pending queue must stay bounded under a mid-request burst"
-        );
-        // ...the OLDEST events were the ones dropped (1..=44 are gone,
-        // 45..=300 remain in order)...
-        assert_eq!(
-            client.pending_events.front().expect("queue is full").seq,
-            EVENTS + 1 - PENDING_EVENTS_CAP as u64,
-            "overflow must drop the oldest buffered events"
-        );
-        assert_eq!(
-            client.pending_events.back().expect("queue is full").seq,
-            EVENTS,
-            "the newest event must be retained"
-        );
-        // ...and the drop counter accounts for exactly the overflow.
-        assert_eq!(
-            client.dropped_events(),
-            EVENTS - PENDING_EVENTS_CAP as u64,
-            "the drop counter must account for every dropped event"
-        );
+        /// `(dropped, total)` pairs of every captured overflow warning, in
+        /// emission order.
+        fn overflow_warnings(&self) -> Vec<(u64, u64)> {
+            self.overflows.lock().unwrap().clone()
+        }
+    }
 
-        // The resync path still works over the bounded queue: a snapshot
-        // through seq 299 covers all but the last event, and next_event
-        // delivers it from the buffer (also surfacing the drop log).
-        client.discard_events_through(EVENTS - 1);
-        let envelope = client
-            .next_event()
-            .expect("the newest event still delivers after the resync discard");
-        assert_eq!(envelope.seq, EVENTS);
-        assert_eq!(
-            client.dropped_events(),
-            EVENTS - PENDING_EVENTS_CAP as u64,
-            "the counter is cumulative and unaffected by delivery"
-        );
+    /// The subscriber half of [`CaptureWarns`].
+    #[derive(Debug)]
+    struct CaptureSubscriber {
+        overflows: Arc<Mutex<Vec<(u64, u64)>>>,
+    }
+
+    impl tracing::Subscriber for CaptureSubscriber {
+        fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            // The synchronous transport never creates spans; the trait
+            // requires the method regardless.
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+        fn enter(&self, _span: &tracing::span::Id) {}
+
+        fn exit(&self, _span: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut fields = OverflowFields::default();
+            event.record(&mut fields);
+            if fields.is_overflow {
+                self.overflows
+                    .lock()
+                    .unwrap()
+                    .push((fields.dropped, fields.total));
+            }
+        }
+    }
+
+    /// Field recorder for one event: flags the overflow warning by its
+    /// message text and pulls its `dropped`/`total` counters.
+    #[derive(Debug, Default)]
+    struct OverflowFields {
+        is_overflow: bool,
+        dropped: u64,
+        total: u64,
+    }
+
+    impl tracing::field::Visit for OverflowFields {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message"
+                && format!("{value:?}").contains("pending event queue overflowed")
+            {
+                self.is_overflow = true;
+            }
+        }
+
+        fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+            match field.name() {
+                "dropped" => self.dropped = value,
+                "total" => self.total = value,
+                _ => {}
+            }
+        }
     }
 }
