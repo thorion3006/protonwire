@@ -18,6 +18,31 @@ const DEFAULT_SNAPSHOT_PATH: &str = "resources/geo/un-m49.csv";
 const CSV_HEADER: &str = "m49_region_code,m49_code,iso_3166_1_alpha_2,name,region";
 const MINIMUM_DATA_ROWS: usize = 150;
 
+/// The complete canonical country/territory set the vendored UN M49
+/// snapshot must carry (resources/geo/un-m49.csv): 247 ISO 3166-1
+/// alpha-2 codes, recorded once in the EXPECTED_GROUP_IDS pin style. A
+/// row-count floor alone lets a truncated snapshot slip through; set
+/// equality turns every missing country - and every code outside the
+/// set - into a named violation.
+const EXPECTED_M49_ISO_CODES: [&str; 247] = [
+    "AD", "AE", "AF", "AG", "AI", "AL", "AM", "AO", "AR", "AS", "AT", "AU", "AW", "AX", "AZ", "BA",
+    "BB", "BD", "BE", "BF", "BG", "BH", "BI", "BJ", "BL", "BM", "BN", "BO", "BQ", "BR", "BS", "BT",
+    "BV", "BW", "BY", "BZ", "CA", "CC", "CD", "CF", "CG", "CH", "CI", "CK", "CL", "CM", "CN", "CO",
+    "CR", "CU", "CV", "CW", "CX", "CY", "CZ", "DE", "DJ", "DK", "DM", "DO", "DZ", "EC", "EE", "EG",
+    "EH", "ER", "ES", "ET", "FI", "FJ", "FK", "FM", "FO", "FR", "GA", "GB", "GD", "GE", "GF", "GG",
+    "GH", "GI", "GL", "GM", "GN", "GP", "GQ", "GR", "GS", "GT", "GU", "GW", "GY", "HK", "HM", "HN",
+    "HR", "HT", "HU", "ID", "IE", "IL", "IM", "IN", "IO", "IQ", "IR", "IS", "IT", "JE", "JM", "JO",
+    "JP", "KE", "KG", "KH", "KI", "KM", "KN", "KP", "KR", "KW", "KY", "KZ", "LA", "LB", "LC", "LI",
+    "LK", "LR", "LS", "LT", "LU", "LV", "LY", "MA", "MC", "MD", "ME", "MF", "MG", "MH", "MK", "ML",
+    "MM", "MN", "MO", "MP", "MQ", "MR", "MS", "MT", "MU", "MV", "MW", "MX", "MY", "MZ", "NA", "NC",
+    "NE", "NF", "NG", "NI", "NL", "NO", "NP", "NR", "NU", "NZ", "OM", "PA", "PE", "PF", "PG", "PH",
+    "PK", "PL", "PM", "PN", "PR", "PS", "PT", "PW", "PY", "QA", "RE", "RO", "RS", "RU", "RW", "SA",
+    "SB", "SC", "SD", "SE", "SG", "SH", "SI", "SJ", "SK", "SL", "SM", "SN", "SO", "SR", "SS", "ST",
+    "SV", "SX", "SY", "SZ", "TC", "TD", "TF", "TG", "TH", "TJ", "TK", "TL", "TM", "TN", "TO", "TR",
+    "TT", "TV", "TZ", "UA", "UG", "UM", "US", "UY", "UZ", "VA", "VC", "VE", "VG", "VI", "VN", "VU",
+    "WF", "WS", "YE", "YT", "ZA", "ZM", "ZW",
+];
+
 pub fn run(root: &Path) -> Result<bool> {
     let doc = groups::load(&root.join("docs").join("connection-groups.yaml"))?;
     let taxonomy = doc.regional_taxonomy.as_ref();
@@ -83,7 +108,10 @@ pub fn run(root: &Path) -> Result<bool> {
         reporter.note(&format!("rows per region: {per_region}"));
     }
 
-    let summary = format!("vendored snapshot `{relative}` ({MINIMUM_DATA_ROWS}+ rows required)");
+    let summary = format!(
+        "vendored snapshot `{relative}` (complete {}-code country set required; {MINIMUM_DATA_ROWS}+ row floor)",
+        EXPECTED_M49_ISO_CODES.len()
+    );
     Ok(reporter.finish(&summary))
 }
 
@@ -246,6 +274,23 @@ pub(crate) fn verify_csv(bytes: &[u8], mapping: &BTreeMap<String, String>) -> Cs
         }
     }
 
+    // WO-W7: set equality against the canonical country set. The row
+    // floor above passes a truncated snapshot (200 of 247 rows); every
+    // missing country — and every code outside the set — is a named
+    // violation.
+    let expected: BTreeSet<&str> = EXPECTED_M49_ISO_CODES.iter().copied().collect();
+    let actual: BTreeSet<&str> = seen.iter().map(String::as_str).collect();
+    for code in expected.difference(&actual) {
+        outcome
+            .violations
+            .push(format!("canonical ISO code `{code}` is missing"));
+    }
+    for code in actual.difference(&expected) {
+        outcome.violations.push(format!(
+            "ISO code `{code}` is not part of the canonical 247-code country set"
+        ));
+    }
+
     outcome
 }
 
@@ -405,6 +450,73 @@ regional_taxonomy:
         assert_eq!(outcome.rows_per_region.get("asia"), Some(&1));
         assert_eq!(outcome.rows_per_region.get("oceania"), Some(&1));
         assert_eq!(outcome.rows_per_region.get("europe"), Some(&0));
+    }
+
+    /// pr-champion round-6 triage, WO-W7: completeness was a 150-row
+    /// FLOOR against a 247-row canonical file, so a snapshot that dropped
+    /// 47 countries still passed m49-verify. The exact ISO-alpha-2 set is
+    /// pinned: any missing country is a named violation, and a code
+    /// outside the set is one too.
+    #[test]
+    fn incomplete_country_set_fails() {
+        // 200 of the 247 canonical codes, every row individually valid:
+        // the pre-existing 150-row floor passes 200 rows, so only the set
+        // pin can notice the 47 missing countries.
+        let mut rows = String::new();
+        for code in EXPECTED_M49_ISO_CODES.iter().take(200) {
+            rows.push_str(&format!("002,004,{code},X,africa\n"));
+        }
+        let csv = format!("{CSV_HEADER}\n{rows}");
+        let outcome = verify_csv(csv.as_bytes(), &mapping());
+        assert!(
+            outcome
+                .violations
+                .iter()
+                .any(|v| { v.contains("is missing") && v.contains(EXPECTED_M49_ISO_CODES[200]) }),
+            "the violation must name `{}` (the first missing code)",
+            EXPECTED_M49_ISO_CODES[200]
+        );
+    }
+
+    /// The symmetric drift: a 248th row whose code the canonical set
+    /// never contained. `ZZ` sorts after the last canonical code (`ZW`),
+    /// so every other row-level rule stays satisfied.
+    #[test]
+    fn code_outside_the_canonical_set_fails() {
+        let mut rows = String::new();
+        for code in EXPECTED_M49_ISO_CODES {
+            rows.push_str(&format!("002,004,{code},X,africa\n"));
+        }
+        rows.push_str("002,004,ZZ,Atlantis,africa\n");
+        let csv = format!("{CSV_HEADER}\n{rows}");
+        let outcome = verify_csv(csv.as_bytes(), &mapping());
+        assert!(
+            outcome
+                .violations
+                .iter()
+                .any(|v| v.contains("`ZZ` is not part of the canonical")),
+            "a code outside the 247-code set must be a named violation"
+        );
+    }
+
+    /// The pin itself is pinned (the canonical_ids meta-test style): 247
+    /// unique two-letter codes — the country/territory count the vendored
+    /// snapshot carries.
+    #[test]
+    fn canonical_iso_set_is_pinned() {
+        for code in EXPECTED_M49_ISO_CODES {
+            assert_eq!(code.len(), 2, "`{code}` must be two letters");
+            assert!(
+                code.bytes().all(|b| b.is_ascii_uppercase()),
+                "`{code}` must be uppercase"
+            );
+        }
+        let unique: BTreeSet<&str> = EXPECTED_M49_ISO_CODES.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            247,
+            "the pinned set must contain exactly 247 unique codes"
+        );
     }
 
     #[test]
