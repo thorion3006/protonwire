@@ -1467,5 +1467,28 @@ capabilities:
                 .iter()
                 .any(|v| v.contains("official_linux_cli"))
         );
+
+        // FU-F (round-6 verdict residual): the second loop in
+        // check_upstream — the any-further-entry rule — had NO test, so
+        // deleting it passed the whole suite and its preservation was
+        // inspection-level only. An upstream entry OUTSIDE the pinned
+        // names (here a revision-less official_bb10_app) must still be
+        // named as a violation by that loop.
+        if let Some(upstream) = doc.upstream.as_mut() {
+            upstream.insert(
+                "official_bb10_app".to_string(),
+                UpstreamEntry {
+                    version: None,
+                    revision: None,
+                    checksum_sha256: None,
+                },
+            );
+        }
+        assert!(
+            check_upstream(&doc, &good_lock())
+                .iter()
+                .any(|v| v.contains("official_bb10_app")),
+            "a revision-less extra upstream entry must be named as a violation"
+        );
     }
 }
