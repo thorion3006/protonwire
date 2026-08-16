@@ -59,6 +59,91 @@ const REQUIRED_STATUSES: &[&str] = &[
     "legacy-excluded",
 ];
 
+const EXPECTED_CAPABILITY_COUNT: usize = 72;
+
+/// The canonical capability id set (docs/official-parity.yaml), pinned the
+/// EXPECTED_GROUP_IDS way: set equality, not per-entry membership. The
+/// per-entry checks alone let a DELETED capability pass — every surviving
+/// entry stays individually valid while the parity contract silently
+/// shrinks — and an invented id is equally invisible. Recording the set in
+/// the gate (rather than reading it back out of the validated document)
+/// makes adding or removing a capability a deliberate docs-plus-xtask
+/// change.
+const EXPECTED_CAPABILITY_IDS: [&str; EXPECTED_CAPABILITY_COUNT] = [
+    "account.login",
+    "account.session",
+    "account.credential-lifecycle",
+    "account.two-factor",
+    "account.human-verification",
+    "account.sso",
+    "account.guest-mode",
+    "account.entitlements-and-jails",
+    "security.upstream-secret-logging",
+    "protocol.smart",
+    "protocol.wireguard-udp",
+    "protocol.wireguard-tcp",
+    "protocol.stealth",
+    "protocol.network-change",
+    "protocol.circumvention-routing",
+    "servers.catalog-and-search",
+    "servers.metadata-refresh-budget",
+    "servers.fastest-and-random",
+    "groups.official-built-ins",
+    "groups.fastest-excluding-my-country",
+    "groups.anti-censorship",
+    "groups.regional-fastest",
+    "groups.cross-client-parity",
+    "servers.location",
+    "servers.exact",
+    "servers.free-change",
+    "servers.secure-core",
+    "servers.p2p",
+    "servers.tor",
+    "servers.streaming",
+    "servers.gateway",
+    "profiles.crud-and-types",
+    "profiles.overrides",
+    "profiles.recents-pins-default",
+    "profiles.connect-and-go",
+    "profiles.import-export",
+    "protection.kill-switch-standard",
+    "protection.kill-switch-permanent",
+    "protection.dns-and-ipv6-leaks",
+    "protection.lan",
+    "protection.lan-name-resolution",
+    "protection.auto-connect-reconnect",
+    "dns.proton-and-custom",
+    "dns.netshield-levels",
+    "dns.netshield-statistics",
+    "options.vpn-accelerator",
+    "options.nat",
+    "options.port-forwarding",
+    "options.ipv6-and-mtu",
+    "split.apps-and-ip",
+    "split.advanced-linux-policy",
+    "split.domains",
+    "split.kill-switch-coexistence",
+    "diagnostics.connection-details",
+    "diagnostics.packet-capture",
+    "diagnostics.debug-and-crash",
+    "diagnostics.network-conflict-detection",
+    "diagnostics.connection-feedback",
+    "clients.single-core-monorepo",
+    "clients.shared-sdk",
+    "clients.cli",
+    "clients.ratatui-tui",
+    "clients.tauri-gui",
+    "clients.cross-client-parity",
+    "integration.native",
+    "integration.network-manager",
+    "integration.systemd-networkd",
+    "integration.headless-frontend-api",
+    "integration.nixos",
+    "legacy.openvpn",
+    "legacy.ikev2",
+    "presentation.mobile-tv-browser-ui",
+];
+
 const ALLOWED_OWNERS: &[&str] = &[
     "protonwire-core",
     "protonwire-frontend-api",
@@ -138,6 +223,7 @@ fn validate(path: &Path, lock: &Lockfile) -> Result<bool> {
         &check_status_definitions(&doc),
     );
     reporter.rule("upstream pins", &check_upstream(&doc, lock));
+    reporter.rule("canonical capability id set", &check_capability_ids(&doc));
     reporter.rule("capabilities", &check_capabilities(&doc));
 
     let total = doc.capabilities.as_ref().map_or(0, Vec::len);
@@ -407,6 +493,35 @@ fn check_upstream(doc: &Manifest, lock: &Lockfile) -> Vec<String> {
     violations
 }
 
+/// WO-W5 (pr-champion round-6): set equality against the canonical
+/// capability id set. The per-entry checks alone let a DELETED capability
+/// pass — every surviving entry stays individually valid while the parity
+/// contract silently shrinks — and an invented id is equally invisible to
+/// them. Each violation names the drifted id so the gate output points at
+/// the exact contract change.
+fn check_capability_ids(doc: &Manifest) -> Vec<String> {
+    let Some(capabilities) = &doc.capabilities else {
+        // The `capabilities` rule already reports the missing list; 72
+        // "missing id" lines on top would only bury that signal.
+        return Vec::new();
+    };
+    let actual: BTreeSet<&str> = capabilities
+        .iter()
+        .filter_map(|c| c.id.as_deref())
+        .collect();
+    let expected: BTreeSet<&str> = EXPECTED_CAPABILITY_IDS.iter().copied().collect();
+    let mut violations = Vec::new();
+    for id in expected.difference(&actual) {
+        violations.push(format!("canonical capability `{id}` is missing"));
+    }
+    for id in actual.difference(&expected) {
+        violations.push(format!(
+            "capability `{id}` is not part of the canonical id set"
+        ));
+    }
+    violations
+}
+
 fn check_capabilities(doc: &Manifest) -> Vec<String> {
     let mut violations = Vec::new();
     let Some(capabilities) = &doc.capabilities else {
@@ -603,8 +718,13 @@ checksum = \"3c14ef052727e0204ec5e80cf8df50786db38a83b6a6557a188b78a4c264f380\"
         Lockfile::parse(&good_lockfile_text()).unwrap()
     }
 
-    fn good_manifest_yaml() -> String {
-        "\
+    /// A manifest fixture whose capability list is exactly `ids` (each a
+    /// uniform per-entry-valid record): the good fixture must enumerate
+    /// the full canonical set because the id SET is what the gate pins,
+    /// and the drift tests derive their fixtures by dropping or adding
+    /// ids here.
+    fn manifest_yaml_with_ids(ids: &[&str]) -> String {
+        let mut yaml = "\
 schema_version: 3
 baseline:
   as_of: \"2026-01-01\"
@@ -642,22 +762,18 @@ status_definitions:
 sources:
   docs: https://example.com
 capabilities:
-  - id: account.login
-    area: account
-    status: required
-    behavior: Log in.
-    owner: protonwire-api
-    sources: [docs]
-    tests: [T-1]
-  - id: legacy.openvpn
-    area: legacy
-    status: legacy-excluded
-    behavior: Excluded.
-    owner: none
-    sources: [docs]
-    tests: [T-2]
 "
-        .to_string()
+        .to_string();
+        for id in ids {
+            yaml.push_str(&format!(
+                "  - id: {id}\n    area: account\n    status: required\n    behavior: Does something.\n    owner: protonwire-api\n    sources: [docs]\n    tests: [T-1]\n"
+            ));
+        }
+        yaml
+    }
+
+    fn good_manifest_yaml() -> String {
+        manifest_yaml_with_ids(&EXPECTED_CAPABILITY_IDS)
     }
 
     fn temp_yaml(tag: &str, content: &str) -> std::path::PathBuf {
@@ -676,6 +792,73 @@ capabilities:
         );
         fs::remove_file(&path).ok();
     }
+
+    /// pr-champion round-6 triage, WO-W5: capabilities were checked only
+    /// per-entry, so DELETING one (e.g. account.login) left every
+    /// surviving entry valid and the gate green — the parity contract
+    /// silently shrinking. The canonical id set is pinned and enforced as
+    /// set equality: a missing id and an invented id are both violations.
+    #[test]
+    fn deleted_or_invented_capability_ids_fail() {
+        // Dropping account.login: every surviving entry is individually
+        // valid; only the set pin can notice the contract shrank.
+        let without: Vec<&str> = EXPECTED_CAPABILITY_IDS
+            .iter()
+            .copied()
+            .filter(|id| *id != "account.login")
+            .collect();
+        let path = temp_yaml("missing-cap", &manifest_yaml_with_ids(&without));
+        assert!(
+            !validate(&path, &good_lock()).unwrap(),
+            "a manifest missing account.login must fail the gate"
+        );
+        fs::remove_file(&path).ok();
+
+        // The violation must NAME the missing id, not just count it.
+        let doc: Manifest = serde_norway::from_str(&manifest_yaml_with_ids(&without)).unwrap();
+        assert!(
+            check_capability_ids(&doc)
+                .iter()
+                .any(|v| v == "canonical capability `account.login` is missing"),
+            "the id-set violation must name `account.login`"
+        );
+
+        // Adding a well-formed id the canonical set never contained.
+        let mut with_extra = EXPECTED_CAPABILITY_IDS.to_vec();
+        with_extra.push("account.magic");
+        let path = temp_yaml("extra-cap", &manifest_yaml_with_ids(&with_extra));
+        assert!(
+            !validate(&path, &good_lock()).unwrap(),
+            "an invented capability id must fail the gate"
+        );
+        fs::remove_file(&path).ok();
+
+        // The extra id is named too.
+        let doc: Manifest = serde_norway::from_str(&manifest_yaml_with_ids(&with_extra)).unwrap();
+        assert!(
+            check_capability_ids(&doc)
+                .iter()
+                .any(|v| v == "capability `account.magic` is not part of the canonical id set"),
+            "the id-set violation must name `account.magic`"
+        );
+    }
+
+    /// The pin itself is pinned (the canonical_ids meta-test style): a
+    /// stray edit to the constant — typo, duplicate, count change — must
+    /// fail loudly instead of quietly redefining the contract.
+    #[test]
+    fn canonical_capability_id_set_is_pinned() {
+        for id in EXPECTED_CAPABILITY_IDS {
+            assert!(is_capability_id(id), "`{id}` must match the id shape");
+        }
+        let unique: BTreeSet<&str> = EXPECTED_CAPABILITY_IDS.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            EXPECTED_CAPABILITY_COUNT,
+            "the pinned id set must contain exactly {EXPECTED_CAPABILITY_COUNT} unique ids"
+        );
+    }
+
     /// Codex PR review round 2, finding 6 (P2): the muon/pvpnclient
     /// checksums were only SHAPE-checked (64 lowercase hex characters), so
     /// replacing either recorded digest with any other well-formed value
