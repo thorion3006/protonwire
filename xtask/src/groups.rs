@@ -744,11 +744,23 @@ groups:
     }
 
     #[test]
-    fn canonical_id_set_length_matches_expected_count() {
+    fn canonical_ids_have_valid_namespaces_and_are_unique() {
+        // The `[&str; EXPECTED_GROUP_COUNT]` array type already pins the
+        // length at compile time, so a runtime len() assert was provably
+        // always-true. What the type does NOT pin: every id living in a
+        // valid namespace, and uniqueness (a duplicated id at the right
+        // length would still compile and silently weaken the set check).
+        for id in EXPECTED_GROUP_IDS {
+            assert!(
+                id.starts_with("proton:") || id.starts_with("protonwire:"),
+                "`{id}` must live in the `proton:` or `protonwire:` namespace"
+            );
+        }
+        let unique: BTreeSet<&str> = EXPECTED_GROUP_IDS.iter().copied().collect();
         assert_eq!(
-            EXPECTED_GROUP_IDS.len(),
+            unique.len(),
             EXPECTED_GROUP_COUNT,
-            "the pinned id set and the count check must stay in sync"
+            "the pinned id set must contain exactly {EXPECTED_GROUP_COUNT} unique ids"
         );
     }
 
