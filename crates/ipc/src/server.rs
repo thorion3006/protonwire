@@ -197,19 +197,40 @@ impl IpcServer {
         stop: Arc<AtomicBool>,
         budgets: ServeBudgets,
     ) {
+        self.serve_observed(handler, stop, budgets, &|_| {});
+    }
+
+    /// [`IpcServer::serve_with`] with an observer fired after EVERY
+    /// accept-loop reap (tests watch ended workers leave the list without
+    /// waiting for shutdown; production passes a no-op).
+    pub(crate) fn serve_observed<H: RequestHandler + 'static>(
+        &self,
+        handler: Arc<H>,
+        stop: Arc<AtomicBool>,
+        budgets: ServeBudgets,
+        observe: &dyn Fn(ReapStats),
+    ) {
         // Poll-accept so shutdown is responsive without signal plumbing here.
         if let Err(e) = self.listener.set_nonblocking(true) {
             warn!("cannot switch accept loop to nonblocking mode: {e}");
             return;
         }
         let mut sessions: Vec<SessionWorker> = Vec::new();
+        // Cumulative reaped count across the whole accept loop: the load-
+        // bearing half of [`ReapStats`] — `remaining` alone cannot pin the
+        // reap because it is trivially 0 before any client connects.
+        let mut reaped = 0usize;
         while !stop.load(Ordering::SeqCst) {
             // Reap before (potentially) accepting again: the list only
             // grows otherwise, and a client that reconnects on a cadence
             // (the TUI retries every 750 ms) leaves one dead worker per
             // attempt — ~115k handles a day held until shutdown
             // (pr-champion WO-4).
-            reap_finished(&mut sessions);
+            reaped += reap_finished(&mut sessions);
+            observe(ReapStats {
+                reaped,
+                remaining: sessions.len(),
+            });
             match self.listener.accept() {
                 Ok((stream, _)) => {
                     // Reserve the session slot ATOMICALLY, before the worker
@@ -301,25 +322,49 @@ struct SessionWorker {
     stream: std::sync::Weak<UnixStream>,
 }
 
-/// Joins and removes session workers whose threads have finished.
+/// Snapshot of the accept loop's reap bookkeeping, reported through the
+/// [`IpcServer::serve_observed`] seam after every reap pass.
 ///
-/// `serve_with` pushes one [`SessionWorker`] per accepted connection and
-/// calls this from the top of every accept-loop iteration, so the list
+/// `reaped` is CUMULATIVE across the whole `serve()` call — the load-
+/// bearing field: `remaining == 0` is trivially true before any client has
+/// ever connected, so only a monotonically growing reaped count can pin
+/// that ended workers actually leave the list (pr-champion WO-R3).
+///
+/// The fields are read by the recording observers tests install through
+/// the seam; production's observer is a no-op, so only the lib build sees
+/// them constructed-but-unread.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ReapStats {
+    /// Workers reaped since the accept loop started (cumulative).
+    pub(crate) reaped: usize,
+    /// Workers still in the list after this reap pass.
+    pub(crate) remaining: usize,
+}
+
+/// Joins and removes session workers whose threads have finished, and
+/// returns how many left.
+///
+/// `serve_observed` pushes one [`SessionWorker`] per accepted connection
+/// and calls this from the top of every accept-loop iteration, so the list
 /// holds only the sessions still being served. Joining a handle whose
 /// thread already reported [`std::thread::JoinHandle::is_finished`]
 /// returns immediately, so this never blocks on a live session — and the
 /// shutdown drain below is unaffected: a worker joined here is gone from
 /// the list before the drain phase ever looks at it.
-fn reap_finished(sessions: &mut Vec<SessionWorker>) {
+fn reap_finished(sessions: &mut Vec<SessionWorker>) -> usize {
     let mut index = 0;
+    let mut reaped = 0;
     while index < sessions.len() {
         if sessions[index].join.is_finished() {
             let finished = sessions.remove(index);
             let _ = finished.join.join();
+            reaped += 1;
         } else {
             index += 1;
         }
     }
+    reaped
 }
 
 /// Whether a connect failure definitively identifies a stale socket file
@@ -617,7 +662,7 @@ mod tests {
     use crate::frame::{read_msg, write_msg};
     use protonwire_frontend_api::{ClientInfo, ClientSurface, Request};
 
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
     struct NullHandler {
@@ -1724,7 +1769,11 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(5));
         }
-        reap_finished(&mut sessions);
+        assert_eq!(
+            reap_finished(&mut sessions),
+            8,
+            "the reap must report every ended worker it removed"
+        );
         assert_eq!(
             sessions.len(),
             1,
@@ -1738,11 +1787,86 @@ mod tests {
             assert!(Instant::now() < deadline, "live worker never finished");
             std::thread::sleep(Duration::from_millis(5));
         }
-        reap_finished(&mut sessions);
+        assert_eq!(
+            reap_finished(&mut sessions),
+            1,
+            "the reap must report the last worker too"
+        );
         assert!(
             sessions.is_empty(),
             "the reap must join and remove every ended worker"
         );
+    }
+
+    /// pr-champion WO-R3 mutation gap: deleting the accept loop's
+    /// `reap_finished` call passed the ENTIRE suite (only -D warnings
+    /// caught the full removal; partial wiring mutations slipped
+    /// silently). The observer seam makes the reap directly observable:
+    /// `serve_observed` reports a cumulative [`ReapStats`] after every
+    /// accept-loop reap, and three ended clients must drive `reaped` to
+    /// three — a deleted (or mis-wired) reap call leaves it stuck at 0
+    /// forever, which the watchdog below turns into a fast failure.
+    #[test]
+    fn accept_loop_reaps_ended_workers() {
+        let dir = tempfile::tempdir().unwrap();
+        let handler = Arc::new(NullHandler {
+            version: "test".into(),
+            bus: EventBus::new(),
+        });
+        let server = IpcServer::bind(dir.path(), "reap.sock").unwrap();
+        let path = server.socket_path().to_owned();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stats: Arc<Mutex<Vec<ReapStats>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&stats);
+        let observe = move |snapshot: ReapStats| {
+            recorder.lock().unwrap().push(snapshot);
+        };
+        let stop_flag = Arc::clone(&stop);
+        let served = std::thread::spawn(move || {
+            server.serve_observed(handler, stop_flag, ServeBudgets::default(), &observe)
+        });
+
+        for _ in 0..3 {
+            drop(connect_and_hello(&path));
+        }
+
+        // Watchdog: every dropped client's worker must be reaped by the
+        // accept loop WHILE THE SERVER KEEPS RUNNING — not parked in the
+        // list until shutdown. Cumulative `reaped` reaching 3 is the pin;
+        // `remaining` alone could not carry it (it is 0 before any client
+        // ever connects).
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let reaped = stats
+                .lock()
+                .unwrap()
+                .last()
+                .map(|snapshot| snapshot.reaped)
+                .unwrap_or(0);
+            if reaped >= 3 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the accept loop never reaped the ended workers: cumulative \
+                 reaped is stuck at {reaped} after 3 clients connected and \
+                 disconnected — the reap call is gone or mis-wired"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        // Each snapshot reported a consistent list: cumulative reaped
+        // never exceeds the number of sessions the loop ever pushed
+        // (3), and remaining never exceeds it either.
+        for snapshot in stats.lock().unwrap().iter() {
+            assert!(snapshot.reaped <= 3, "impossible reap count: {snapshot:?}");
+            assert!(
+                snapshot.remaining <= 3,
+                "impossible remainder: {snapshot:?}"
+            );
+        }
+
+        stop.store(true, Ordering::SeqCst);
+        let _ = served.join();
     }
 
     /// pr-champion WO-5: `subscribe()` and the forwarder spawn preceded the
