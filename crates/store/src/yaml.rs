@@ -49,12 +49,6 @@ pub fn from_slice<T: DeserializeOwned>(input: &[u8]) -> Result<T, YamlError> {
     serde_norway::from_slice(input).map_err(|e| YamlError::Parse(e.to_string()))
 }
 
-/// Loads a YAML file from disk.
-pub fn from_path<T: DeserializeOwned>(path: &std::path::Path) -> Result<T, YamlError> {
-    let bytes = std::fs::read(path)?;
-    from_slice(&bytes)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
