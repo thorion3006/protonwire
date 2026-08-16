@@ -18,7 +18,7 @@ use protonwire_frontend_api::{
 };
 use tracing::warn;
 
-use crate::frame::{FrameError, FrameReader, write_msg};
+use crate::frame::{FrameError, FrameReader, write_msg, write_msg_within};
 use crate::peer::PeerCredentials;
 
 /// Default request timeout.
@@ -318,14 +318,16 @@ impl IpcClient {
         // that stops reading pins write_all once the socket buffers fill
         // (frames may be nearly MAX_FRAME_LEN), which would otherwise
         // block past the whole-request guarantee set_timeout documents.
-        // The ceiling itself is the socket-wide SO_SNDTIMEO that
-        // connect/set_timeout already applied (consolidated round 3, item
-        // C: the two request-local re-arms were mutation-verified inert —
-        // the write happens once at request start, where the remaining
-        // budget differs from self.timeout only by microseconds). What
-        // stays load-bearing is the zero-budget guard: a zero remainder
-        // must not reach the write path, because a zero SO_SNDTIMEO means
-        // "block forever" on Linux, not "fail immediately".
+        // R7-1 closes the residual write gap the same way the server's
+        // writer threads got: the request write is codec-bounded by the
+        // whole-request deadline (write_msg_within — poll-for-writability
+        // inside the remaining budget), because SO_SNDTIMEO is
+        // kernel-flavored (measured answering after ~2x the configured
+        // timeout here) and dribbling partial writes stretch past any
+        // per-syscall ceiling. The socket-wide SO_SNDTIMEO that
+        // connect/set_timeout applied stays as a syscall-level backstop,
+        // and the zero-budget guard remains load-bearing: a spent deadline
+        // must not enter the write path at all.
         let write_budget = deadline.saturating_duration_since(std::time::Instant::now());
         if write_budget.is_zero() {
             self.poisoned = true;
@@ -333,7 +335,12 @@ impl IpcClient {
                 "request timed out without a response".into(),
             ));
         }
-        write_msg(&mut self.stream, &ClientMessage::Request { id, request }).map_err(|e| {
+        write_msg_within(
+            &mut self.stream,
+            &ClientMessage::Request { id, request },
+            deadline,
+        )
+        .map_err(|e| {
             self.poisoned = true;
             RequestError::Transport(format!("write failed: {e}"))
         })?;

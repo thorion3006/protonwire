@@ -17,7 +17,7 @@ use tracing::{debug, info, warn};
 
 use crate::authz::{authorize, required_role};
 use crate::bus::EventBus;
-use crate::frame::{FrameError, FrameReader, write_msg};
+use crate::frame::{FrameError, FrameReader, write_msg_within};
 use crate::peer::PeerCredentials;
 
 /// Interval at which session loops wake to check the stop flag while blocked
@@ -27,8 +27,14 @@ const READ_POLL: Duration = Duration::from_millis(250);
 /// A connection must complete the hello handshake within this window.
 const HELLO_DEADLINE: Duration = Duration::from_secs(5);
 
-/// Ceiling on blocked writes to one client; a peer that stops reading loses
-/// its session instead of pinning a writer thread forever.
+/// Ceiling on any ONE message's write to one client (R7-1): enforced by a
+/// userspace deadline watchdog in the writer thread (poll-for-writability
+/// inside the remaining budget), with `SO_SNDTIMEO` kept only as a
+/// syscall-level backstop — on this kernel the syscall timeout answered
+/// after ~2x the configured value, and a slow-draining peer stretches
+/// partial writes past any per-syscall ceiling. A peer that stops reading
+/// (or dribbles) loses its session instead of pinning a writer thread —
+/// and a reserved slot — forever.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Overall ceiling on post-stop draining. `SO_SNDTIMEO` bounds each WRITE
@@ -39,14 +45,20 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 const DRAIN_CEILING: Duration = WRITE_TIMEOUT.saturating_mul(3);
 
 /// Timing budgets for one `serve()` invocation. Production uses the
-/// defaults; tests inject shrunk values so drain and dribble scenarios run
-/// in milliseconds instead of wall-clock seconds (QA robustness round 3).
+/// defaults; tests inject shrunk values so drain, dribble, and
+/// stalled-writer scenarios run in milliseconds instead of wall-clock
+/// seconds (QA robustness round 3; R7-1 adds the write ceiling).
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ServeBudgets {
     /// Window in which a connection must complete the hello handshake.
     pub(crate) hello_deadline: Duration,
     /// Overall ceiling on draining sessions after the stop flag is set.
     pub(crate) drain_ceiling: Duration,
+    /// Ceiling on any ONE message's write to a client that has stopped
+    /// reading (R7-1): each writer-thread write is deadline-bounded in
+    /// userspace, because `SO_SNDTIMEO` does not reliably interrupt a
+    /// blocked AF_UNIX send on this kernel.
+    pub(crate) write_timeout: Duration,
 }
 
 impl Default for ServeBudgets {
@@ -54,6 +66,7 @@ impl Default for ServeBudgets {
         Self {
             hello_deadline: HELLO_DEADLINE,
             drain_ceiling: DRAIN_CEILING,
+            write_timeout: WRITE_TIMEOUT,
         }
     }
 }
@@ -185,7 +198,8 @@ impl IpcServer {
     /// Each session runs on two threads (reader/dispatcher and writer) and is
     /// fully isolated: a misbehaving client only drops its own session.
     /// Sessions are bounded (64), must complete the handshake within 5 s,
-    /// and cannot pin a writer past 10 s.
+    /// and cannot pin a writer past 10 s per message (a userspace write
+    /// deadline, R7-1 — not just `SO_SNDTIMEO`).
     ///
     /// Returning implies every session has DRAINED: responses queued before
     /// the stop flag — an administrator Shutdown acknowledgement, for
@@ -264,7 +278,13 @@ impl IpcServer {
                     let stop = Arc::clone(&stop);
                     let join = std::thread::spawn(move || {
                         if let Err(e) = std::panic::catch_unwind(AssertUnwindSafe(|| {
-                            handle_session(stream, handler, stop, budgets.hello_deadline)
+                            handle_session(
+                                stream,
+                                handler,
+                                stop,
+                                budgets.hello_deadline,
+                                budgets.write_timeout,
+                            )
                         })) {
                             warn!("IPC session panicked and was dropped: {e:?}");
                         }
@@ -506,6 +526,7 @@ fn handle_session<H: RequestHandler>(
     handler: Arc<H>,
     stop: Arc<AtomicBool>,
     hello_deadline: Duration,
+    write_timeout: Duration,
 ) {
     // The session slot the accept loop reserved is released on EVERY exit
     // path — early rejects below, dispatcher panics (the serve loop's
@@ -531,11 +552,13 @@ fn handle_session<H: RequestHandler>(
         return;
     };
 
-    // Writer thread owns a socket handle exclusively; a write timeout bounds
-    // how long a non-reading peer can pin it. Socket options are shared with
-    // every clone of the socket, so the timeouts set here govern the reader
-    // and the drain handle alike.
-    if let Err(e) = stream.set_write_timeout(Some(WRITE_TIMEOUT)) {
+    // Writer thread owns a socket handle exclusively; the write ceiling is
+    // enforced per-message by the userspace watchdog in the writer loop
+    // below, with this syscall-level timeout as a backstop for any send
+    // that slips past the poll. Socket options are shared with every clone
+    // of the socket, so the timeouts set here govern the reader and the
+    // drain handle alike.
+    if let Err(e) = stream.set_write_timeout(Some(write_timeout)) {
         warn!("set_write_timeout failed: {e}");
         return;
     }
@@ -544,7 +567,14 @@ fn handle_session<H: RequestHandler>(
     let writer = std::thread::spawn(move || {
         let mut write_half = &*write_stream;
         for message in writer_rx {
-            if write_msg(&mut write_half, &message).is_err() {
+            // R7-1 (round-5 track item, P1): every message gets the full
+            // write ceiling as a USERSPACE deadline — `SO_SNDTIMEO` alone
+            // answered only after ~2x the timeout on this kernel's
+            // instrumented runs, and a slow-draining peer can stretch
+            // partial writes past any syscall ceiling. Expiry fails the
+            // write, the loop breaks, and the teardown below fires.
+            let deadline = Instant::now() + write_timeout;
+            if write_msg_within(&mut write_half, &message, deadline).is_err() {
                 break;
             }
         }
@@ -2469,6 +2499,258 @@ mod tests {
             "the failed writer must deliver EOF to its client — a client \
              blocked reading its response would hang forever"
         );
+        stop.store(true, Ordering::SeqCst);
+        let _ = served.join();
+    }
+
+    /// Answers pings with a ~0.86 MiB pong — a VALID frame (under
+    /// MAX_FRAME_LEN, so it actually goes on the wire, unlike the TooLarge
+    /// fixture in `writer_failure_tears_down_the_session`) sized to
+    /// overwhelm any peer that is not reading fast enough. Shared by the
+    /// R7-1 watchdog scenarios.
+    struct HugeValidPong {
+        bus: Arc<EventBus>,
+    }
+    impl RequestHandler for HugeValidPong {
+        fn daemon_version(&self) -> &str {
+            "test"
+        }
+        fn latest_event_seq(&self) -> u64 {
+            0
+        }
+        fn handle(
+            &self,
+            _ctx: &SessionContext,
+            request: Request,
+        ) -> Result<RequestResult, RpcError> {
+            match request {
+                Request::Ping { .. } => Ok(RequestResult::Pong {
+                    nonce: "x".repeat(900_000),
+                }),
+                _ => Err(RpcError::new(
+                    protonwire_frontend_api::RpcErrorCode::NotImplemented,
+                    "test handler",
+                )),
+            }
+        }
+        fn event_bus(&self) -> &EventBus {
+            &self.bus
+        }
+    }
+
+    /// R7-1 (round-5 track item, escalated P1): the writer thread's writes
+    /// must be deadline-bounded in USERSPACE, because `SO_SNDTIMEO` is a
+    /// kernel-flavored bound: round-5's instrumented run watched a ~0.9
+    /// MiB send to a 4 KiB-rcvbuf peer that never reads "outlast 20 s
+    /// under a 10 s timeout", and a standalone probe on this host now
+    /// measures the blocked send answering EAGAIN after ~2x the
+    /// configured timeout (2.06 s for 1 s, with or without a draining
+    /// peer) — i.e. the slot was held for roughly TWICE the deadline the
+    /// operator configured, and on the round-5 kernel the interrupt did
+    /// not come at all inside the window. A writer that never exits means
+    /// the round-5 V1 teardown (writer exit ⇒ shared-socket shutdown ⇒
+    /// slot release) never fires: a client that merely holds its side
+    /// open keeps its reserved session slot far past the ceiling — 64
+    /// such connections wedge the daemon at MAX_SESSIONS.
+    ///
+    /// The trigger is the literal finding: a VALID ~0.86 MiB pong (under
+    /// MAX_FRAME_LEN, unlike the TooLarge fixture above, which never
+    /// reaches the wire), a 4 KiB `SO_RCVBUF`, and a client that never
+    /// reads and never closes. The write ceiling is shrunk through
+    /// [`ServeBudgets`] (the ServeBudgets pattern: `WRITE_TIMEOUT` becomes
+    /// injectable so the watchdog scenario runs in seconds instead of a
+    /// 20 s wall-clock red; production keeps the 10 s default). The red
+    /// is the WALL-CLOCK separation: pre-fix the slot is held ~2x the
+    /// ceiling (this kernel's flavor — the red run below fails the
+    /// ceiling+1 s watchdog), post-fix the userspace deadline tears the
+    /// session down at ~1x.
+    #[test]
+    fn blocked_writer_releases_its_session_at_the_write_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let handler = Arc::new(HugeValidPong {
+            bus: Arc::new(EventBus::new()),
+        });
+        let server = IpcServer::bind(dir.path(), "writer-watchdog.sock").unwrap();
+        let path = server.socket_path().to_owned();
+        let stop = Arc::new(AtomicBool::new(false));
+        let write_ceiling = Duration::from_secs(2);
+        let served = {
+            let handler = Arc::clone(&handler);
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                server.serve_with(
+                    handler,
+                    stop,
+                    ServeBudgets {
+                        write_timeout: write_ceiling,
+                        ..ServeBudgets::default()
+                    },
+                )
+            })
+        };
+
+        // Handshake, shrink the receive buffer, request the huge pong, and
+        // NEVER read (and never close): the writer's frame cannot fit and
+        // the write stalls mid-payload.
+        let mut stream = connect_and_hello(&path);
+        set_rcvbuf(&stream, 4096);
+        write_msg(
+            &mut stream,
+            &ClientMessage::Request {
+                id: 1,
+                request: Request::Ping {
+                    nonce: "ping".into(),
+                },
+            },
+        )
+        .unwrap();
+
+        // Wall-clock watchdog: the reserved slot must be back inside the
+        // ceiling plus scheduling slack. Pre-fix — the writer blocked
+        // inside write_all, with this kernel's SO_SNDTIMEO answering only
+        // after ~2x the configured timeout — the slot was still held at
+        // 3007 ms of a 2000 ms ceiling when the assert fired (the red
+        // run's evidence).
+        let started = Instant::now();
+        while handler.event_bus().active_sessions() != 0 {
+            assert!(
+                Instant::now() < started + write_ceiling + Duration::from_secs(1),
+                "the session outlived its write deadline — the slot is still \
+                 held {} ms into a {} ms ceiling: a blocked writer pins the \
+                 daemon one MAX_SESSIONS wedge at a time",
+                started.elapsed().as_millis(),
+                write_ceiling.as_millis()
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        // The subscription tore down with the slot.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while handler.event_bus().session_count() != 0 {
+            assert!(
+                Instant::now() < deadline,
+                "subscription leaked after the write-deadline teardown"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            started.elapsed() < write_ceiling + Duration::from_secs(1),
+            "the write-deadline teardown overran: {} ms for a {} ms ceiling",
+            started.elapsed().as_millis(),
+            write_ceiling.as_millis()
+        );
+        stop.store(true, Ordering::SeqCst);
+        let _ = served.join();
+    }
+
+    /// R7-1's partial-progress companion — the write-side mirror of the
+    /// round-2 dribbled-READ finding. A peer that keeps freeing a LITTLE
+    /// space should, on textbook semantics, keep every write succeeding
+    /// with partial progress, stretching one ~0.86 MiB frame across the
+    /// peer's whole drain rate (4 KiB per 150 ms ≈ 34 s here) while the
+    /// reserved slot sits held — no per-syscall ceiling can bound that.
+    /// (On this kernel the observed flavor is stranger still: the blocked
+    /// send never accepts the freed space and answers EAGAIN only after
+    /// ~2x the timeout.) Only a WHOLE-MESSAGE deadline bounds the frame:
+    /// pre-fix the red run below shows the slot still held 3022 ms into a
+    /// 2000 ms ceiling; post-fix the watchdog tears the session down at
+    /// the ceiling. This variant is also the one with teeth against a
+    /// reset-the-deadline-per-chunk mutation — a resetting deadline
+    /// stretches to the drainer's ~34 s pace and fails the watchdog.
+    #[test]
+    fn slow_draining_peer_releases_the_session_at_the_write_deadline() {
+        use std::io::Read;
+
+        let dir = tempfile::tempdir().unwrap();
+        let handler = Arc::new(HugeValidPong {
+            bus: Arc::new(EventBus::new()),
+        });
+        let server = IpcServer::bind(dir.path(), "writer-dribble.sock").unwrap();
+        let path = server.socket_path().to_owned();
+        let stop = Arc::new(AtomicBool::new(false));
+        let write_ceiling = Duration::from_secs(2);
+        let served = {
+            let handler = Arc::clone(&handler);
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                server.serve_with(
+                    handler,
+                    stop,
+                    ServeBudgets {
+                        write_timeout: write_ceiling,
+                        ..ServeBudgets::default()
+                    },
+                )
+            })
+        };
+
+        // Handshake, shrink the receive buffer, and park a reader that
+        // drains 4 KiB every 150 ms — a pace at which one ~0.86 MiB pong
+        // takes ~34 s, far past any per-message ceiling, while the socket
+        // keeps tripping "slightly writable".
+        let mut stream = connect_and_hello(&path);
+        set_rcvbuf(&stream, 4096);
+        let hurry = Arc::new(AtomicBool::new(false));
+        let hurry_flag = Arc::clone(&hurry);
+        let mut drain_half = stream.try_clone().unwrap();
+        let drainer = std::thread::spawn(move || {
+            let mut chunk = [0u8; 4096];
+            loop {
+                match drain_half.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {
+                        if !hurry_flag.load(Ordering::SeqCst) {
+                            std::thread::sleep(Duration::from_millis(150));
+                        }
+                    }
+                }
+            }
+        });
+        write_msg(
+            &mut stream,
+            &ClientMessage::Request {
+                id: 1,
+                request: Request::Ping {
+                    nonce: "ping".into(),
+                },
+            },
+        )
+        .unwrap();
+
+        // Wall-clock watchdog (the red): the slot must be back inside the
+        // ceiling plus slack. Pre-fix the slot was still held at 3022 ms
+        // of a 2000 ms ceiling when this assert fired — the kernel's ~2x
+        // SO_SNDTIMEO flavor at best, an unbounded send at worst.
+        let started = Instant::now();
+        while handler.event_bus().active_sessions() != 0 {
+            assert!(
+                Instant::now() < started + write_ceiling + Duration::from_secs(1),
+                "the session outlived its write deadline — partial-progress \
+                 writes pinned the writer: the slot is still held {} ms into \
+                 a {} ms ceiling",
+                started.elapsed().as_millis(),
+                write_ceiling.as_millis()
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while handler.event_bus().session_count() != 0 {
+            assert!(
+                Instant::now() < deadline,
+                "subscription leaked after the write-deadline teardown"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            started.elapsed() < write_ceiling + Duration::from_secs(1),
+            "the write-deadline teardown overran: {} ms for a {} ms ceiling",
+            started.elapsed().as_millis(),
+            write_ceiling.as_millis()
+        );
+        // Let the drainer finish quickly (drain the buffered remainder at
+        // full speed until the teardown's EOF) and keep the socket alive
+        // for exactly as long as the test needs it.
+        hurry.store(true, Ordering::SeqCst);
+        let _ = drainer.join();
         stop.store(true, Ordering::SeqCst);
         let _ = served.join();
     }

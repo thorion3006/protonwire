@@ -16,8 +16,17 @@
 //! than the socket read timeout keeps every individual `read` succeeding,
 //! so only a codec-level deadline bounds the total time one frame may take
 //! (Codex PR review round 2, finding 2 — the server's hello phase).
+//!
+//! The write side has the mirror-image exposure ([`write_msg_within`],
+//! R7-1): `SO_SNDTIMEO` bounds one write SYSCALL — on this kernel it does
+//! not even do that at face value, a blocked AF_UNIX send answering
+//! EAGAIN only after roughly TWICE the configured timeout — and a peer
+//! that keeps freeing a little space can keep partial writes succeeding
+//! indefinitely. A whole-message userspace deadline bounds the frame
+//! regardless of kernel flavor or dribble pace.
 
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
+use std::os::fd::{AsFd, AsRawFd};
 use std::time::Instant;
 
 use serde::Serialize;
@@ -54,6 +63,102 @@ pub fn write_msg<W: Write, T: Serialize>(w: &mut W, msg: &T) -> Result<(), Frame
     w.write_all(&payload)?;
     w.flush()?;
     Ok(())
+}
+
+/// [`write_msg`] bounded by `deadline` — the write-side mirror of
+/// [`FrameReader::read_msg_within`] (R7-1, round-5 track item).
+///
+/// `SO_SNDTIMEO` bounds one write SYSCALL, and neither half of that is
+/// enough: on this kernel a blocked AF_UNIX send answers `EAGAIN` only
+/// after roughly TWICE the configured timeout (a standalone probe
+/// measured 2.06 s under a 1 s timeout, with and without a draining
+/// peer), and — worse — a send entered on a merely-partially-writable
+/// socket can block inside the kernel regardless of the space poll(2)
+/// reported. Each chunk is therefore sent with `MSG_DONTWAIT`, so the
+/// syscall itself can never block; poll(2) paces the retries and waits
+/// no longer than the deadline's remaining budget. Expiry fails with
+/// [`std::io::ErrorKind::TimedOut`]; partial progress does NOT reset the
+/// deadline (one message, one budget).
+pub fn write_msg_within<W: Write + AsFd, T: Serialize>(
+    w: &mut W,
+    msg: &T,
+    deadline: Instant,
+) -> Result<(), FrameError> {
+    let payload = serde_json::to_vec(msg).map_err(|e| FrameError::Payload(e.to_string()))?;
+    if payload.len() > MAX_FRAME_LEN {
+        return Err(FrameError::TooLarge(payload.len()));
+    }
+    let len = u32::try_from(payload.len()).expect("checked against MAX_FRAME_LEN");
+    write_all_within(w, &len.to_be_bytes(), deadline)?;
+    write_all_within(w, &payload, deadline)?;
+    w.flush()?;
+    Ok(())
+}
+
+/// `Write::write_all` that never enters a send it cannot leave: every
+/// chunk goes out with `MSG_DONTWAIT` (nonblocking for this one syscall,
+/// whatever the fd's flags — so clones of the socket keep their blocking
+/// semantics), retries are paced by poll(2) inside the remaining budget,
+/// and expiry fails with `TimedOut`.
+fn write_all_within<W: Write + AsFd>(
+    w: &mut W,
+    buf: &[u8],
+    deadline: Instant,
+) -> Result<(), FrameError> {
+    use nix::poll::{PollFd, PollFlags, poll};
+    use nix::sys::socket::{MsgFlags, send};
+
+    let mut written = 0;
+    while written < buf.len() {
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(write_deadline_exceeded());
+        }
+        // poll(2) rounds to whole milliseconds and nix's PollTimeout tops
+        // out at u16; a sub-millisecond budget still gets one poll so a
+        // just-writable socket is not failed spuriously, and a budget past
+        // the u16 range is clamped — expiry is re-checked at the loop top
+        // regardless, so a clamped poll merely waits in 65 s slices.
+        let budget_ms = ((deadline - now).as_millis().min(u16::MAX as u128) as u16).max(1);
+        let mut writable = [PollFd::new(w.as_fd(), PollFlags::POLLOUT)];
+        match poll(&mut writable, budget_ms) {
+            // Budget spent with no writability: the deadline's answer.
+            Ok(0) => return Err(write_deadline_exceeded()),
+            // Writable, or POLLERR/POLLHUP — the send attempt below
+            // surfaces the peer's error instead of guessing at revents.
+            Ok(_) => {}
+            Err(nix::errno::Errno::EINTR) => continue,
+            Err(e) => return Err(FrameError::Io(std::io::Error::other(e.to_string()))),
+        }
+        match send(
+            w.as_fd().as_raw_fd(),
+            &buf[written..],
+            MsgFlags::MSG_DONTWAIT,
+        ) {
+            Ok(0) => {
+                return Err(FrameError::Io(std::io::Error::new(
+                    ErrorKind::WriteZero,
+                    "writer wrote zero bytes",
+                )));
+            }
+            Ok(n) => written += n,
+            // The writable race lost (or the moment passed): re-poll
+            // within the remaining budget rather than spinning.
+            Err(nix::errno::Errno::EAGAIN) => continue,
+            Err(nix::errno::Errno::EINTR) => continue,
+            Err(e) => return Err(FrameError::Io(std::io::Error::other(e.to_string()))),
+        }
+    }
+    Ok(())
+}
+
+/// The R7-1 expiry error: named so callers can distinguish "the peer
+/// stalled past the deadline" from a generic socket failure.
+fn write_deadline_exceeded() -> FrameError {
+    FrameError::Io(std::io::Error::new(
+        ErrorKind::TimedOut,
+        "frame write deadline exceeded while the peer stalled",
+    ))
 }
 
 /// Reads one framed message, blocking until a whole frame arrived.
@@ -420,5 +525,80 @@ mod tests {
             .expect("frame resumes after the deadline");
         let value: serde_json::Value = serde_json::from_slice(&resumed).unwrap();
         assert_eq!(value.as_str(), Some(payload.as_str()));
+    }
+
+    /// R7-1: a write to a never-reading peer must fail at the WHOLE-MESSAGE
+    /// deadline, in userspace — not lean on `SO_SNDTIMEO`, which on this
+    /// kernel answers EAGAIN only after roughly twice the configured
+    /// timeout, and elsewhere may not interrupt a blocked send at all
+    /// (round-5 instrumented evidence).
+    #[test]
+    fn write_msg_within_fails_at_the_deadline_against_a_stalled_peer() {
+        let (mut a, b) = std::os::unix::net::UnixStream::pair().unwrap();
+        nix::sys::socket::setsockopt(&b, nix::sys::socket::sockopt::RcvBuf, &4096usize)
+            .expect("SO_RCVBUF applies");
+        let deadline = Instant::now() + std::time::Duration::from_millis(300);
+        let payload = "x".repeat(900_000);
+        let started = Instant::now();
+        let err = write_msg_within(&mut a, &serde_json::json!(payload), deadline)
+            .expect_err("a never-reading 4 KiB peer must expire the write");
+        assert!(
+            matches!(&err, FrameError::Io(e) if e.kind() == ErrorKind::TimedOut),
+            "expected a TimedOut failure, got {err:?}"
+        );
+        // The budget is honored from both sides: never before the
+        // deadline (the loop only fails once it is spent)...
+        assert!(
+            started.elapsed() + std::time::Duration::from_millis(10)
+                >= std::time::Duration::from_millis(300),
+            "the write failed before its own deadline: {:?}",
+            started.elapsed()
+        );
+        // ...and not much after it (no kernel-flavored doubling).
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "the deadline must bound the write, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// R7-1: a draining peer keeps the writes SUCCEEDING — the frame
+    /// completes when, and only when, the whole transfer fits inside the
+    /// one deadline budget; partial progress never resets it.
+    #[test]
+    fn write_msg_within_completes_when_the_peer_drains() {
+        use std::io::Read;
+
+        let (mut a, mut b) = std::os::unix::net::UnixStream::pair().unwrap();
+        nix::sys::socket::setsockopt(&b, nix::sys::socket::sockopt::RcvBuf, &4096usize)
+            .expect("SO_RCVBUF applies");
+
+        // The big frame forces many partial writes through the 4 KiB
+        // receive window; a follow-up small frame proves the stream stays
+        // synchronized afterwards.
+        let big = "x".repeat(300_000);
+        let mut expected = Vec::new();
+        write_msg(&mut expected, &serde_json::json!(&big)).unwrap();
+        let expected = expected.len();
+
+        let reader = std::thread::spawn(move || {
+            let mut got = 0;
+            let mut chunk = [0u8; 16_384];
+            while got < expected {
+                got += b.read(&mut chunk).expect("peer keeps draining");
+            }
+            let follow_up: serde_json::Value =
+                read_msg(&mut b).expect("the follow-up frame arrives");
+            follow_up
+        });
+
+        let generous = Instant::now() + std::time::Duration::from_secs(5);
+        write_msg_within(&mut a, &serde_json::json!(&big), generous)
+            .expect("a draining peer accepts the frame inside the budget");
+        write_msg_within(&mut a, &serde_json::json!({ "done": true }), generous)
+            .expect("the follow-up frame writes");
+
+        let follow_up = reader.join().unwrap();
+        assert_eq!(follow_up["done"], true);
     }
 }
