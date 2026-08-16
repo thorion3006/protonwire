@@ -464,3 +464,43 @@ Remaining Track items (informational):
   on (name, version) alone, which is stricter than Cargo's
   (name, version, source) — a legitimate multi-source duplicate would
   be rejected. No such package exists in the current tree.
+
+## 2026-08-15 — Codex PR review round 4 (PR #3)
+
+Two further Codex passes on `1912fca` (5 findings at 15:14Z, 3 at
+17:14Z — the raw-API "re-posts" of round-1/2 anchors were the REST
+listing's original comments at their original commit ids; GraphQL
+ground truth showed no duplicate threads). 7 accepted as genuine and
+fixed red-first; 1 rejected on pinned-framework evidence. All 8 were
+answered in-thread and resolved.
+
+| Finding (anchor) | Verdict | Commit |
+|------------------|---------|--------|
+| Reap completed session workers (`server.rs`) — P1; the TUI reconnects every 750 ms, ~115k retained handles/day | Fixed @ 5ada8ea | `reap_finished` at the top of the accept loop; drain semantics unchanged (`reap_finished_joins_and_removes_ended_workers`) |
+| Queue the hello ack before forwarding events (`server.rs`) — P2; a pre-hello publish reached the wire before `HelloAck` and clients rejected the session | Fixed @ cf0b81d | event forwarder gated on a channel opened only after the ack is queued (writer FIFO ⇒ ack first); pre-hello exits drop the gate and end the forwarder (`hello_ack_is_the_first_frame_even_under_pre_hello_events`) |
+| Chown the production socket to the client group (`server.rs`) — P1; root daemon left the socket root:root 0o660, EACCES for every unprivileged client (PRD 6.3) | Fixed @ 6b2ca35 | `daemon.socket_group` (system authority, unset = no chown) + `bind_with_group` fail-loud on an unknown group; root-gated foreign-group test (`bind_with_group_chowns_to_a_real_group_when_root`) |
+| CSP blocks the dashboard inline script (`tauri.conf.json`) — P1 | Rejected | premise false for Tauri-served assets: tauri-codegen 2.6.3 (`context.rs:47-66`) hashes every inline `script:not(:empty)` of frontendDist HTML, and tauri 2.11.5 (`manager/mod.rs:86-94, 126-153`) creates `script-src` with `'self'` + those hashes because `dangerousDisableAssetCspModification` defaults to enabled (we do not disable it). frontend-reviewer concurred |
+| Enforce GPL-3 dependency compatibility in license-scan (`license.rs`) — P2; any nonempty license string passed, NFR-35 unenforced | Fixed @ e53fc40 | recursive-descent SPDX classifier: `/` ⇒ OR, OR=any branch, AND=all, `WITH` limited to LLVM-exception, unknown tokens fail loud (`gpl2_only_is_incompatible` and the classifier suite) |
+| Redact longer overlapping secrets before substrings (`redact.rs`) — P2; registration-order replacement disclosed the longer secret's residue | Fixed @ a28a800 | live secrets sorted longest-first before replacement (`overlapping_secrets_redact_longest_first`) |
+| Model `servers refresh` as the documented subcommand (`commands.rs`) — P2; PRD 9.4 grammar died in clap debug asserts before reaching the milestone-2 refusal | Fixed @ 5a733f7 | `ServersSub::Refresh { --yes }`; parse + refusal tests (`servers_refresh_parses_as_documented_subcommand`) |
+| Pin the canonical group ID set (`groups.rs`) — P2; count-only check let renames through | Fixed @ f267beb | `EXPECTED_GROUP_IDS: [&str; EXPECTED_GROUP_COUNT]` set-equality check, mirroring the regions pin (`renamed_group_id_violates`) |
+
+Process notes:
+
+- **Batch integrity disclosure**: 5a733f7 folded a test-fixture hunk in
+  `xtask/src/groups.rs` (canonical IDs replacing synthetic
+  `proton:g{i}` in `good_groups_yaml()` — a dependency of f267beb's
+  set check) alongside its CLI work. Test-fixture-only, benign; kept
+  as history rather than rewritten.
+- **Host quirk (WO-7 test)**: this machine's user namespace rejects
+  chown to supplementary gids (EINVAL), so the unprivileged test
+  injects the process's primary gid (a legal owner chgrp) to exercise
+  the real chown path; the foreign-group stat assertion lives in the
+  root-gated test and skips as non-root.
+- **M8 advisories from the CSP rejection** (frontend-reviewer): (1)
+  Tauri's runtime style-src nonce injection means a nonce-source makes
+  engines ignore `'unsafe-inline'` — keep styling in the stylesheet,
+  or disable style-src modification, if inline style attributes are
+  ever wanted; (2) the compile-time script hashes follow frontendDist
+  output — any post-codegen HTML rewriting would invalidate them (we
+  register none today).
