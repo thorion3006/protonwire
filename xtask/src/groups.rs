@@ -845,6 +845,34 @@ groups:
         fs::remove_file(&path).ok();
     }
 
+    /// FU-1 (rust-review round-5 follow-up, Medium — the repo's own
+    /// red-test rule): swapping a canonical id's kind for ANOTHER VALID
+    /// kind stays inside the vocabulary and still resolves something, so
+    /// every other check passes — only the EXPECTED_GROUP_TARGET_KINDS
+    /// pin in `check_target` catches the drift. Deleting that enforcement
+    /// block used to leave every test AND the CI gate green (the real
+    /// document satisfies the pin, so only a mutated fixture can expose
+    /// the gap). Both lines are unique in the fixture, so each `replacen`
+    /// targets exactly one group: `random` → `fastest` on
+    /// proton:random-country and `secure-core` → `fastest` on
+    /// proton:max-security (the non-ambiguous secure-core line).
+    #[test]
+    fn kind_swapped_for_another_valid_kind_fails() {
+        for (original, swapped) in [
+            ("target: {kind: random}", "target: {kind: fastest}"),
+            ("target: {kind: secure-core}", "target: {kind: fastest}"),
+        ] {
+            let yaml = good_groups_yaml().replacen(original, swapped, 1);
+            let path = temp_yaml("kind-swap", &yaml);
+            assert!(
+                !validate(&path).unwrap(),
+                "swapping `{original}` for `{swapped}` must fail validation: a \
+                 canonical id's pinned target kind must not drift"
+            );
+            fs::remove_file(&path).ok();
+        }
+    }
+
     /// The region must be one of the taxonomy's primary regions
     /// (EXPECTED_REGIONS), not an arbitrary string.
     #[test]
