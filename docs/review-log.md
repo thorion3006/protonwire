@@ -546,3 +546,51 @@ Unrecognized. Four track items:
 
 rust-reviewer and qa-engineer batch verdicts pending; any adverse
 finding reopens the affected thread and re-enters the fix loop.
+
+## 2026-08-15 — QA test-effectiveness round on the round-4 batch
+
+qa-engineer's mutation audit of the round-4 tests: 3 High, 2 Medium,
+2 Low — all test-effectiveness/process; the production code itself had
+passed rust-reviewer, sec-auditor, and compliance-reviewer. Every
+finding was accepted; six test commits landed (9f488c8..13d82a2).
+
+| # | Finding | Disposition | Commit |
+|---|---------|-------------|--------|
+| F1 | `bind_with_group_applies_the_resolved_gid` was tautological (fresh-socket gid == process egid, so the assert held with the chown deleted — qa proved it); the only real gid-change assert never runs in CI | Fixed @ e8ac83b | chown injectable beside the resolver; `chown_seam_receives_the_resolved_gid` records the hand-off (path, name, RESOLVED gid, exactly once); resolver-Err/None arms now panic if chown runs; root-gated test skips under a user namespace with a notice and asserts uid stays 0 |
+| F2 | The classifier could be disconnected from `run()` with everything green (constant-Compatible passed all 14 tests and CI) — the NFR-35 red was unproducible | Fixed @ 338bdcc | `scan_licenses` extracted; `scan_licenses_flags_gpl2_only` fails under the constant-Compatible mutation; `mixed_and_or_binds_tighter` kills the OR/AND swap (all prior mixed tests used parens); allowlist length pinned to 21; rot-guard comment on the real-tree vectors |
+| F3 | `renamed_group_id_violates` was planted in 5a733f7 while its pin landed two commits later (f267beb), leaving **5a733f7, 5ada8ea, cf0b81d individually red** at their own trees (qa verified); 5a733f7's message claimed only the cli suite passed; 5ada8ea half-disclosed the cross-stream contamination | Process note (below) | history is pushed and stays; no code change |
+| F4 | Deleting the `reap_finished` call passed the whole suite (only `-D warnings` caught full removal; partial wiring slipped silently) | Fixed @ 606d2b6 | `serve_observed` reports cumulative `ReapStats` after every reap; `accept_loop_reaps_ended_workers` drives real connect/disconnect cycles — the call-deletion mutation now fails it alone (watchdog red) |
+| F5 | Hello-gate test: green-side regressions hung the suite (no read timeout); red side relied on a 100 ms sleep heuristic | Fixed @ 13d82a2 | 5 s read timeout + punctual-arrival assert; deterministic POLLIN readability poll replaces the sleep — a gate-open mutation fails in ~10 ms reporting the leaked frame verbatim; the green path has no sleep |
+| F6 | `canonical_id_set_length_matches_expected_count` was provably always-true (the array type pins the length) | Fixed @ 86f7d9a | replaced with namespace + uniqueness validation of the canonical IDs (what the type does not pin) |
+| F7 | The overlap-scrub test pinned the instance, not the property (reverse-registration mutation survived) | Fixed @ 9e0e5e7 | reverse-registration arm (long-then-short) added — a plain `reverse()` in place of the sort now leaks and fails |
+| F8 | (1) both group-lookup error texts unmapped; (2) daemon 3-line `socket_group` pass-through untested | (1) folded into e8ac83b; (2) accepted residual (below) | — |
+
+### F3 — bisect hazard disclosure
+
+Three pushed commits in the round-4 batch are individually red:
+**5a733f7** and **5ada8ea** and **cf0b81d**. Cause: the
+`renamed_group_id_violates` red test and the canonical-ID fixture edit
+for WO-2 were staged inside the WO-3 (cli) commit while WO-2's
+EXPECTED_GROUP_IDS check landed two commits later (f267beb) —
+cross-stream fixture staging in a concurrently-implemented batch.
+`git bisect` across 5a733f7..cf0b81d will stop on these. Rules for
+future rounds: **a red test ships in the SAME commit as the fix that
+turns it green, never an unrelated stream's commit**; concurrent
+implementers stage by explicit paths and gate in isolation (the
+xtask implementer's temp-worktree gate during this QA round is the
+pattern to keep).
+
+### Accepted residual
+
+The daemon's three-line `config_socket_group` pass-through
+(main.rs: config → `bind_with_group`) is untested end-to-end: both
+ends (the config field, the bind seam) are tested and the wiring is
+type-checked, but no test drives `main` itself. Covered when the M2
+daemon/systemd-unit integration test lands.
+
+Mutation acceptance bar (qa re-verification): each named mutation —
+chown deletion, constant-Compatible, OR/AND swap, reap-call deletion,
+gate-open, reverse-registration, dead-length assert — must FAIL the
+new tests. `Cargo.toml`: nix gained the `poll` feature for WO-R4's
+readability poll (existing dependency, no version change, lockfile
+untouched).
