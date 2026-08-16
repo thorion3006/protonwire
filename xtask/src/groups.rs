@@ -109,6 +109,35 @@ const EXPECTED_GROUP_TARGET_KINDS: [(&str, &str); EXPECTED_GROUP_COUNT] = [
     ("protonwire:fastest-south-america", "fastest-in-region"),
 ];
 
+/// Per-canonical-group `target.exclude_physical_country` pin: the v1
+/// catalog sets the flag on exactly two groups
+/// (docs/connection-groups.yaml) — deleting it there (or adding it
+/// elsewhere) must be a deliberate contract change, not silent drift.
+const EXPECTED_EXCLUDE_PHYSICAL_COUNTRY: [(&str, bool); 2] = [
+    ("proton:anti-censorship", true),
+    ("proton:fastest-excluding-my-country", true),
+];
+
+/// Per-canonical-group `target.connection_type` pin: `standard` on every
+/// official group except proton:max-security, whose secure-core target
+/// defines none.
+const EXPECTED_CONNECTION_TYPES: [(&str, &str); 7] = [
+    ("proton:anti-censorship", "standard"),
+    ("proton:fastest-country", "standard"),
+    ("proton:fastest-excluding-my-country", "standard"),
+    ("proton:gaming", "standard"),
+    ("proton:random-country", "standard"),
+    ("proton:streaming-us", "standard"),
+    ("proton:work-school", "standard"),
+];
+
+/// Per-canonical-group `target.selection_authority` pin: only
+/// proton:random-country delegates the choice to the backend
+/// ("unless backend policy controls the choice", contract.
+/// ranking_policies.random-country-then-server).
+const EXPECTED_SELECTION_AUTHORITIES: [(&str, &str); 1] =
+    [("proton:random-country", "proton-backend-when-required")];
+
 #[derive(Deserialize)]
 pub(crate) struct GroupsFile {
     schema_version: Option<i64>,
@@ -172,10 +201,21 @@ struct Group {
     target: Option<Target>,
 }
 
+/// A group's selection target. Every field of the v1 catalog's target
+/// vocabulary is deserialized (FU-2): kind+region alone let `country`,
+/// `exclude_physical_country`, the secure-core entry/exit pair,
+/// `connection_type`, and `selection_authority` be silently dropped from
+/// the document without failing the gate.
 #[derive(Deserialize)]
 struct Target {
     kind: Option<String>,
     region: Option<String>,
+    country: Option<String>,
+    exclude_physical_country: Option<bool>,
+    entry_country: Option<String>,
+    exit_country: Option<String>,
+    connection_type: Option<String>,
+    selection_authority: Option<String>,
 }
 
 pub fn run(root: &Path) -> Result<bool> {
@@ -591,17 +631,48 @@ fn check_group(
     violations
 }
 
-/// Target validation: every group MUST have a target, its `kind` must be in
-/// the vocabulary, `fastest-in-region` must name a primary region, and each
-/// canonical id's kind is pinned (a group that resolves nothing, or resolves
-/// it by unspecified means, is not a valid catalog entry).
+/// Target validation: every group MUST have a target, its `kind` must be
+/// in the vocabulary, the semantic fields each kind requires must be
+/// present (`fastest-in-country` names a country; `secure-core` names
+/// its entry and exit), `fastest-in-region` must name a primary region,
+/// and each canonical id's kind is pinned (a group that resolves
+/// nothing, or resolves it by unspecified means, is not a valid catalog
+/// entry). The remaining semantic fields (`exclude_physical_country`,
+/// `connection_type`, `selection_authority`) are pinned per canonical id
+/// where the catalog defines them.
 fn check_target(label: &str, group: &Group, regions: &BTreeSet<&str>) -> Vec<String> {
     let Some(target) = &group.target else {
         return vec![format!("{label}: `target` is missing")];
     };
     let mut violations = Vec::new();
     match target.kind.as_deref() {
-        Some(kind) if ALLOWED_TARGET_KINDS.contains(&kind) => {}
+        Some(kind) if ALLOWED_TARGET_KINDS.contains(&kind) => {
+            // FU-2: per-kind semantic requirements — the fields that give
+            // a kind its meaning must be present, or the target silently
+            // resolves something other than its kind claims.
+            match kind {
+                "fastest-in-country" => {
+                    if target.country.is_none() {
+                        violations.push(format!(
+                            "{label}: fastest-in-country targets must define target.country"
+                        ));
+                    }
+                }
+                "secure-core" => {
+                    if target.entry_country.is_none() {
+                        violations.push(format!(
+                            "{label}: secure-core targets must define target.entry_country"
+                        ));
+                    }
+                    if target.exit_country.is_none() {
+                        violations.push(format!(
+                            "{label}: secure-core targets must define target.exit_country"
+                        ));
+                    }
+                }
+                _ => {}
+            }
+        }
         Some(kind) => violations.push(format!(
             "{label}: target.kind `{kind}` is not one of {ALLOWED_TARGET_KINDS:?}"
         )),
@@ -625,7 +696,50 @@ fn check_target(label: &str, group: &Group, regions: &BTreeSet<&str>) -> Vec<Str
     {
         violations.push(format!("{label}: target.kind must be `{expected}`"));
     }
+    violations.extend(expect_pinned(
+        label,
+        group.id.as_deref(),
+        &EXPECTED_EXCLUDE_PHYSICAL_COUNTRY,
+        target.exclude_physical_country,
+        "exclude_physical_country",
+    ));
+    violations.extend(expect_pinned(
+        label,
+        group.id.as_deref(),
+        &EXPECTED_CONNECTION_TYPES,
+        target.connection_type.as_deref(),
+        "connection_type",
+    ));
+    violations.extend(expect_pinned(
+        label,
+        group.id.as_deref(),
+        &EXPECTED_SELECTION_AUTHORITIES,
+        target.selection_authority.as_deref(),
+        "selection_authority",
+    ));
     violations
+}
+
+/// Enforces one per-canonical-id target-field pin (the
+/// [`EXPECTED_GROUP_TARGET_KINDS`] style, applied to the remaining
+/// semantic fields): where the v1 catalog defines the field on an id, a
+/// document whose value differs — or which drops it — is silent semantic
+/// drift, not a valid catalog. Ids without a pin are unconstrained.
+fn expect_pinned<T: PartialEq + std::fmt::Display>(
+    label: &str,
+    id: Option<&str>,
+    pins: &[(&str, T)],
+    actual: Option<T>,
+    field: &str,
+) -> Vec<String> {
+    let Some((_, expected)) = pins.iter().find(|(pinned, _)| Some(*pinned) == id) else {
+        return Vec::new();
+    };
+    if actual.as_ref() == Some(expected) {
+        Vec::new()
+    } else {
+        vec![format!("{label}: target.{field} must be `{expected}`")]
+    }
 }
 
 fn namespace_counts(doc: &GroupsFile) -> BTreeMap<String, usize> {
@@ -690,18 +804,46 @@ regional_taxonomy:
 groups:
 "
         .to_string();
-        for (id, kind) in [
-            ("proton:fastest-country", "fastest"),
-            ("proton:fastest-excluding-my-country", "fastest"),
-            ("proton:random-country", "random"),
-            ("proton:streaming-us", "fastest-in-country"),
-            ("proton:gaming", "fastest"),
-            ("proton:anti-censorship", "fastest"),
-            ("proton:max-security", "secure-core"),
-            ("proton:work-school", "fastest"),
+        // The proton targets mirror docs/connection-groups.yaml exactly:
+        // connection_type, selection_authority, exclude_physical_country,
+        // country, and the secure-core entry/exit pair are each entry's
+        // pinned selection semantics, not decoration.
+        for (id, target) in [
+            (
+                "proton:fastest-country",
+                "{kind: fastest, connection_type: standard}",
+            ),
+            (
+                "proton:fastest-excluding-my-country",
+                "{kind: fastest, connection_type: standard, exclude_physical_country: true}",
+            ),
+            (
+                "proton:random-country",
+                "{kind: random, connection_type: standard, selection_authority: proton-backend-when-required}",
+            ),
+            (
+                "proton:streaming-us",
+                "{kind: fastest-in-country, connection_type: standard, country: US}",
+            ),
+            (
+                "proton:gaming",
+                "{kind: fastest, connection_type: standard}",
+            ),
+            (
+                "proton:anti-censorship",
+                "{kind: fastest, connection_type: standard, exclude_physical_country: true}",
+            ),
+            (
+                "proton:max-security",
+                "{kind: secure-core, entry_country: fastest, exit_country: fastest}",
+            ),
+            (
+                "proton:work-school",
+                "{kind: fastest, connection_type: standard}",
+            ),
         ] {
             yaml.push_str(&format!(
-                "  - id: \"{id}\"\n    definition_source: official-client-compat\n    immutable: true\n    ranking_policy: proton-score\n    overrides: {{}}\n    sources: [docs]\n    target: {{kind: {kind}}}\n"
+                "  - id: \"{id}\"\n    definition_source: official-client-compat\n    immutable: true\n    ranking_policy: proton-score\n    overrides: {{}}\n    sources: [docs]\n    target: {target}\n"
             ));
         }
         for region in [
@@ -807,7 +949,11 @@ groups:
     /// first proton group in the fixture).
     #[test]
     fn group_without_target_fails() {
-        let yaml = good_groups_yaml().replacen("\n    target: {kind: fastest}\n", "\n", 1);
+        let yaml = good_groups_yaml().replacen(
+            "\n    target: {kind: fastest, connection_type: standard}\n",
+            "\n",
+            1,
+        );
         let path = temp_yaml("no-target", &yaml);
         assert!(
             !validate(&path).unwrap(),
@@ -819,8 +965,11 @@ groups:
     /// A typo'd kind must violate the pinned target.kind vocabulary.
     #[test]
     fn typoed_target_kind_fails() {
-        let yaml =
-            good_groups_yaml().replacen("target: {kind: fastest}", "target: {kind: fatest}", 1);
+        let yaml = good_groups_yaml().replacen(
+            "target: {kind: fastest, connection_type: standard}",
+            "target: {kind: fatest, connection_type: standard}",
+            1,
+        );
         let path = temp_yaml("typo-kind", &yaml);
         assert!(
             !validate(&path).unwrap(),
@@ -852,15 +1001,24 @@ groups:
     /// pin in `check_target` catches the drift. Deleting that enforcement
     /// block used to leave every test AND the CI gate green (the real
     /// document satisfies the pin, so only a mutated fixture can expose
-    /// the gap). Both lines are unique in the fixture, so each `replacen`
-    /// targets exactly one group: `random` → `fastest` on
+    /// the gap). Both target lines are unique in the fixture, so each
+    /// `replacen` targets exactly one group: `random` → `fastest` on
     /// proton:random-country and `secure-core` → `fastest` on
-    /// proton:max-security (the non-ambiguous secure-core line).
+    /// proton:max-security (the non-ambiguous secure-core line); the
+    /// swapped targets keep every other pinned field (connection_type,
+    /// selection_authority, entry/exit) intact, so the kind pin is the
+    /// only rule that fires.
     #[test]
     fn kind_swapped_for_another_valid_kind_fails() {
         for (original, swapped) in [
-            ("target: {kind: random}", "target: {kind: fastest}"),
-            ("target: {kind: secure-core}", "target: {kind: fastest}"),
+            (
+                "target: {kind: random, connection_type: standard, selection_authority: proton-backend-when-required}",
+                "target: {kind: fastest, connection_type: standard, selection_authority: proton-backend-when-required}",
+            ),
+            (
+                "target: {kind: secure-core, entry_country: fastest, exit_country: fastest}",
+                "target: {kind: fastest}",
+            ),
         ] {
             let yaml = good_groups_yaml().replacen(original, swapped, 1);
             let path = temp_yaml("kind-swap", &yaml);
@@ -871,6 +1029,65 @@ groups:
             );
             fs::remove_file(&path).ok();
         }
+    }
+
+    /// FU-2 (rust-review round-5 follow-up, Medium): `Target` used to
+    /// deserialize only kind+region, so `country` was silently dropped —
+    /// deleting it from proton:streaming-us left a `fastest-in-country`
+    /// target with nothing to be fastest IN, and the gate stayed green.
+    #[test]
+    fn fastest_in_country_without_country_fails() {
+        let yaml = good_groups_yaml().replacen(
+            "target: {kind: fastest-in-country, connection_type: standard, country: US}",
+            "target: {kind: fastest-in-country, connection_type: standard}",
+            1,
+        );
+        let path = temp_yaml("no-country", &yaml);
+        assert!(
+            !validate(&path).unwrap(),
+            "fastest-in-country without target.country must fail validation"
+        );
+        fs::remove_file(&path).ok();
+    }
+
+    /// FU-2: same silent-drop gap for `exclude_physical_country` — the
+    /// flag IS the group's meaning on the two ids the catalog sets it on.
+    /// The first (and only, until anti-censorship's) occurrence of this
+    /// target line is proton:fastest-excluding-my-country, the fixture's
+    /// proton order.
+    #[test]
+    fn exclude_physical_country_deletion_fails() {
+        let yaml = good_groups_yaml().replacen(
+            "target: {kind: fastest, connection_type: standard, exclude_physical_country: true}",
+            "target: {kind: fastest, connection_type: standard}",
+            1,
+        );
+        let path = temp_yaml("no-exclude", &yaml);
+        assert!(
+            !validate(&path).unwrap(),
+            "deleting target.exclude_physical_country from a pinned canonical \
+             group must fail validation"
+        );
+        fs::remove_file(&path).ok();
+    }
+
+    /// FU-2: a secure-core target without its exit country silently
+    /// selects nothing the kind names. The catalog pins both
+    /// entry_country and exit_country on proton:max-security
+    /// (`fastest`/`fastest`); the entry half alone must not pass.
+    #[test]
+    fn secure_core_without_exit_country_fails() {
+        let yaml = good_groups_yaml().replacen(
+            "target: {kind: secure-core, entry_country: fastest, exit_country: fastest}",
+            "target: {kind: secure-core, entry_country: fastest}",
+            1,
+        );
+        let path = temp_yaml("no-exit", &yaml);
+        assert!(
+            !validate(&path).unwrap(),
+            "secure-core without target.exit_country must fail validation"
+        );
+        fs::remove_file(&path).ok();
     }
 
     /// The region must be one of the taxonomy's primary regions
