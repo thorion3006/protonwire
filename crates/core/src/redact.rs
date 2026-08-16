@@ -34,9 +34,21 @@ static REGISTRY: Mutex<Vec<std::sync::Weak<Zeroizing<String>>>> = Mutex::new(Vec
 
 /// Prunes dead weak entries, then registers `value` and returns the strong
 /// handle that keeps it scrubbable.
+///
+/// The one `to_owned` here is the unavoidable cost of the borrowed API; the
+/// resulting allocation goes straight into zeroizing storage via
+/// [`register_owned`].
 fn register(value: &str) -> Arc<Zeroizing<String>> {
-    let secret = Arc::new(Zeroizing::new(value.to_owned()));
-    if value.len() >= MIN_SECRET_LEN {
+    register_owned(value.to_owned())
+}
+
+/// Registers an already-owned secret value, MOVING the caller's allocation
+/// into zeroizing storage with no intermediate copy (pr-champion WO-2:
+/// `register(&value.into())` used to strand an unzeroized temporary clone
+/// of the secret next to the zeroizing copy).
+fn register_owned(value: String) -> Arc<Zeroizing<String>> {
+    let secret = Arc::new(Zeroizing::new(value));
+    if secret.len() >= MIN_SECRET_LEN {
         let mut registry = REGISTRY.lock().expect("secret registry lock");
         registry.retain(|weak| weak.strong_count() > 0);
         registry.push(Arc::downgrade(&secret));
@@ -95,9 +107,11 @@ pub fn scrub(input: &str) -> Cow<'_, str> {
 pub struct SecretString(Arc<Zeroizing<String>>);
 
 impl SecretString {
-    /// Creates a secret and registers its value for log scrubbing.
+    /// Creates a secret and registers its value for log scrubbing. The
+    /// caller's allocation moves into zeroizing storage directly — no
+    /// unzeroized copy is made along the way.
     pub fn new(value: impl Into<String>) -> Self {
-        Self(register(&value.into()))
+        Self(register_owned(value.into()))
     }
 
     /// Read access for the deliberate consumer.
@@ -352,6 +366,31 @@ mod registry_lifetime_tests {
             scrub(&leaked),
             "header Authorization=[redacted]",
             "a live secret must never age out of the registry"
+        );
+    }
+
+    /// pr-champion WO-2: `SecretString::new` used to route its owned value
+    /// through the borrowed `register(&value.into())`, whose `to_owned`
+    /// stranded an unzeroized temporary copy of the secret on the heap. The
+    /// owned path must take the caller's allocation by move. Red evidence
+    /// pre-fix is the disclosed compile-red (`register_owned` did not
+    /// exist); that the path makes no intermediate copy is inspection-level:
+    /// `String` -> `Zeroizing::new` with no `clone`/`to_owned` in between.
+    #[test]
+    fn register_owned_moves_the_allocation_and_tracks_its_lifetime() {
+        let value = String::from("tok-owned-move-0007");
+        let handle = register_owned(value);
+        // Alive: the moved allocation is registered and scrubbable.
+        assert_eq!(
+            scrub("Authorization: tok-owned-move-0007"),
+            "Authorization: [redacted]"
+        );
+        // Dead: once the last handle drops, the value falls out of
+        // scrubbing (the registry prunes it on the next pass).
+        drop(handle);
+        assert_eq!(
+            scrub("Authorization: tok-owned-move-0007"),
+            "Authorization: tok-owned-move-0007"
         );
     }
 
