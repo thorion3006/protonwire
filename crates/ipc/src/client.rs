@@ -496,7 +496,7 @@ impl IpcClient {
     }
 
     /// Events dropped from the pending queue after it hit
-    /// [`PENDING_EVENTS_CAP`] (cumulative across the connection's life).
+    /// PENDING_EVENTS_CAP (cumulative across the connection's life).
     /// Observability only: after a drop-induced seq gap, correctness is
     /// recovered by resynchronizing from `latest_event_seq`, not by this
     /// count.
