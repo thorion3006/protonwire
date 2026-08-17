@@ -248,6 +248,21 @@ impl IpcServer {
         budgets: ServeBudgets,
         observe: &dyn Fn(ReapStats),
     ) {
+        // Rust-review round 7 (drain/write ordering): DRAIN_CEILING derives
+        // from the const while the writer threads use the INJECTED
+        // write_timeout — nothing tied the two together for test budgets.
+        // Pin the documented ordering (three write ceilings, per
+        // DRAIN_CEILING's rationale) at every injection point so a
+        // mis-shrunk budget fails loudly here instead of silently
+        // violating the drain contract.
+        debug_assert!(
+            budgets.drain_ceiling >= budgets.write_timeout.saturating_mul(3),
+            "drain_ceiling must cover >= 3x write_timeout (one blocked final \
+             write, one slow poll loop, one in-flight dispatch); got \
+             drain_ceiling={:?}, write_timeout={:?}",
+            budgets.drain_ceiling,
+            budgets.write_timeout
+        );
         // Poll-accept so shutdown is responsive without signal plumbing here.
         if let Err(e) = self.listener.set_nonblocking(true) {
             warn!("cannot switch accept loop to nonblocking mode: {e}");
@@ -1361,17 +1376,29 @@ mod tests {
     /// future blocking handler would pin it forever. Draining needs an
     /// overall ceiling: past it, the straggler's socket is forced down
     /// and the join abandoned.
+    ///
+    /// Round 7 re-shape (honest straggler class): R7-1's watchdog bounds a
+    /// pinned WRITER inside write_timeout, and the round-7 invariant
+    /// (drain_ceiling >= 3x write_timeout, asserted in serve_observed)
+    /// keeps that strictly below the ceiling — so a pinned writer can no
+    /// longer outlive the drain, and the straggler that exercises the
+    /// force-down path is a BLOCKING DISPATCH: the handler below sets the
+    /// stop flag, then sleeps past the whole drain window before answering
+    /// a huge pong. (The pre-R7-1 shape — a pinned writer outlasting the
+    /// join — is covered by the two watchdog tests above, which pin the
+    /// writer's own deadline instead.)
     #[test]
-    fn serve_returns_within_the_drain_ceiling_when_a_writer_is_pinned() {
+    fn serve_returns_within_the_drain_ceiling_when_a_dispatch_blocks_past_it() {
         use std::time::{Duration, Instant};
 
-        /// Stop-then-pong, but the pong is far larger than the socket
+        /// Sets the stop flag, then stays inside handle() past the drain
+        /// window before answering with a pong far larger than the socket
         /// buffers of a client that never reads.
-        struct StopThenHugePong {
+        struct StopThenBlockedHugePong {
             bus: Arc<EventBus>,
             stop: Arc<AtomicBool>,
         }
-        impl RequestHandler for StopThenHugePong {
+        impl RequestHandler for StopThenBlockedHugePong {
             fn daemon_version(&self) -> &str {
                 "test"
             }
@@ -1386,7 +1413,12 @@ mod tests {
                 match request {
                     Request::Ping { nonce } => {
                         self.stop.store(true, Ordering::SeqCst);
-                        std::thread::sleep(Duration::from_millis(200));
+                        // Past the drain deadline even in the worst case:
+                        // the accept loop observes the flag within one
+                        // READ_POLL (250 ms) and the ceiling adds 600 ms,
+                        // so the straggler must still be mid-handle at
+                        // ~850 ms.
+                        std::thread::sleep(Duration::from_millis(1200));
                         Ok(RequestResult::Pong { nonce })
                     }
                     _ => Err(RpcError::new(
@@ -1403,7 +1435,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let bus = Arc::new(EventBus::new());
         let stop = Arc::new(AtomicBool::new(false));
-        let handler = Arc::new(StopThenHugePong {
+        let handler = Arc::new(StopThenBlockedHugePong {
             bus: Arc::clone(&bus),
             stop: Arc::clone(&stop),
         });
@@ -1416,13 +1448,15 @@ mod tests {
                 stop,
                 ServeBudgets {
                     drain_ceiling: ceiling,
+                    // Satisfies the round-7 invariant: 3 x 150 ms <= 600 ms.
+                    write_timeout: Duration::from_millis(150),
                     ..ServeBudgets::default()
                 },
             )
         });
 
         // Handshake normally, then shrink our receive buffer and never read
-        // again: the ~0.86 MiB pong cannot fit and pins the session writer.
+        // again: the eventual ~0.86 MiB pong cannot fit the socket buffers.
         let mut stream = connect_and_hello(&path);
         set_rcvbuf(&stream, 4096);
         write_msg(
@@ -1436,14 +1470,14 @@ mod tests {
         )
         .unwrap();
 
-        // Pre-fix, serve() waited out the writer's full 10 s write ceiling
-        // (or forever for a blocked handler); the bound must be the
-        // injected drain ceiling plus polling slack.
+        // Pre-fix, serve() waited out every session to completion (forever
+        // for a blocked handler); the bound must be the injected drain
+        // ceiling plus polling slack.
         let started = Instant::now();
         while !served.is_finished() {
             assert!(
                 Instant::now() < started + ceiling + Duration::from_secs(2),
-                "serve() is pinned past the drain ceiling by a blocked writer"
+                "serve() is pinned past the drain ceiling by a blocked dispatch"
             );
             std::thread::sleep(Duration::from_millis(25));
         }
