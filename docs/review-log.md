@@ -981,3 +981,26 @@ sorted order (one honest correction to the reviewer's sketch: for
 the {z,c} fixture the extra list is ["c","z"], not ["z"] — the
 prescribed ordering pin is what landed, and the assert demonstrably
 has teeth: a wrong expectation fails it).
+
+### Refactor-round close and queue termination
+
+c54e117 landed the verdict-Low bundle (set_drift ordering pin — with
+one honest correction to the reviewer's sketch: for the {z,c}
+fixture the extra list is ["c","z"]; the assert's teeth were
+demonstrated by failing on the wrong expectation during landing).
+bea8f4d is a mechanical fmt followup: c54e117 pushed past a failing
+fmt gate because the shell chain bound the push to the doc job's
+exit — the same pipe-masking class recorded at round 8, this time
+costing one red CI run before the fix.
+
+Final severity-bar disposals (13:23Z, both P2, both verified
+genuine, tracked to M2): partial wildcard requirements ("1.*") pass
+the "*" equality check (deps gate, with its transitive-graph
+sibling); source strings accept any nonempty value rather than a
+usable evidence location (manifest, incremental past X3).
+
+QUEUE TERMINATED EXTERNALLY: at 13:50Z the Codex review bot posted
+that it has reached its usage limit — no further automated review
+rounds will arrive. At termination: 71/71 threads resolved, zero
+unresolved, CI green on bea8f4d. The PR stands at the owner's merge
+call.
