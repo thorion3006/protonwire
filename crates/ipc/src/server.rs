@@ -30,11 +30,14 @@ const HELLO_DEADLINE: Duration = Duration::from_secs(5);
 /// Ceiling on any ONE message's write to one client (R7-1): enforced by a
 /// userspace deadline watchdog in the writer thread (poll-for-writability
 /// inside the remaining budget), with `SO_SNDTIMEO` kept only as a
-/// syscall-level backstop — on this kernel the syscall timeout answered
-/// after ~2x the configured value, and a slow-draining peer stretches
-/// partial writes past any per-syscall ceiling. A peer that stops reading
-/// (or dribbles) loses its session instead of pinning a writer thread —
-/// and a reserved slot — forever.
+/// syscall-level backstop. The measured record (sec round-7 probe; the
+/// round-5 instrumented run in docs/review-log.md's SO_SNDTIMEO track
+/// item): `SO_SNDTIMEO` bounds each WAIT, not the message — progress
+/// resets it, and a multi-syscall write multiplies it (a 0.9 MiB frame
+/// is ~4 syscalls) — and under steady drain it never expires (80+ s
+/// watched under a 1 s timeout). A peer that stops reading (or dribbles)
+/// loses its session instead of pinning a writer thread — and a reserved
+/// slot — forever.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Overall ceiling on post-stop draining. `SO_SNDTIMEO` bounds each WRITE
@@ -56,8 +59,10 @@ pub(crate) struct ServeBudgets {
     pub(crate) drain_ceiling: Duration,
     /// Ceiling on any ONE message's write to a client that has stopped
     /// reading (R7-1): each writer-thread write is deadline-bounded in
-    /// userspace, because `SO_SNDTIMEO` does not reliably interrupt a
-    /// blocked AF_UNIX send on this kernel.
+    /// userspace, because `SO_SNDTIMEO` bounds each WAIT, not the
+    /// message — progress resets it, a multi-syscall write multiplies
+    /// it, and under steady drain it never expires at all (sec round-7
+    /// probe).
     pub(crate) write_timeout: Duration,
 }
 
@@ -568,11 +573,12 @@ fn handle_session<H: RequestHandler>(
         let mut write_half = &*write_stream;
         for message in writer_rx {
             // R7-1 (round-5 track item, P1): every message gets the full
-            // write ceiling as a USERSPACE deadline — `SO_SNDTIMEO` alone
-            // answered only after ~2x the timeout on this kernel's
-            // instrumented runs, and a slow-draining peer can stretch
-            // partial writes past any syscall ceiling. Expiry fails the
-            // write, the loop breaks, and the teardown below fires.
+            // write ceiling as a USERSPACE deadline — `SO_SNDTIMEO`
+            // bounds each WAIT, not the message (progress resets it; a
+            // 0.9 MiB frame is ~4 syscalls, so the waits multiply), and
+            // under steady drain it never expires at all (sec round-7
+            // probe). Expiry fails the write, the loop breaks, and the
+            // teardown below fires.
             let deadline = Instant::now() + write_timeout;
             if write_msg_within(&mut write_half, &message, deadline).is_err() {
                 break;
@@ -2540,14 +2546,14 @@ mod tests {
 
     /// R7-1 (round-5 track item, escalated P1): the writer thread's writes
     /// must be deadline-bounded in USERSPACE, because `SO_SNDTIMEO` is a
-    /// kernel-flavored bound: round-5's instrumented run watched a ~0.9
-    /// MiB send to a 4 KiB-rcvbuf peer that never reads "outlast 20 s
-    /// under a 10 s timeout", and a standalone probe on this host now
-    /// measures the blocked send answering EAGAIN after ~2x the
-    /// configured timeout (2.06 s for 1 s, with or without a draining
-    /// peer) — i.e. the slot was held for roughly TWICE the deadline the
-    /// operator configured, and on the round-5 kernel the interrupt did
-    /// not come at all inside the window. A writer that never exits means
+    /// per-WAIT bound, not a message bound: round-5's instrumented run
+    /// watched a ~0.9 MiB send to a 4 KiB-rcvbuf peer that never reads
+    /// "outlast 20 s under a 10 s timeout", and the round-7 sec probe
+    /// measured the two defects directly — progress resets the wait, and
+    /// a multi-syscall write multiplies it (a 0.9 MiB frame is ~4
+    /// syscalls), while a steadily draining peer keeps it resetting
+    /// indefinitely (80+ s under a 1 s timeout). A writer that never
+    /// exits means
     /// the round-5 V1 teardown (writer exit ⇒ shared-socket shutdown ⇒
     /// slot release) never fires: a client that merely holds its side
     /// open keeps its reserved session slot far past the ceiling — 64
@@ -2560,10 +2566,10 @@ mod tests {
     /// [`ServeBudgets`] (the ServeBudgets pattern: `WRITE_TIMEOUT` becomes
     /// injectable so the watchdog scenario runs in seconds instead of a
     /// 20 s wall-clock red; production keeps the 10 s default). The red
-    /// is the WALL-CLOCK separation: pre-fix the slot is held ~2x the
-    /// ceiling (this kernel's flavor — the red run below fails the
-    /// ceiling+1 s watchdog), post-fix the userspace deadline tears the
-    /// session down at ~1x.
+    /// is the WALL-CLOCK separation: the red run below shows the slot
+    /// still held 3007 ms into a 2000 ms ceiling when the watchdog
+    /// assert fired (per-syscall waits stretching past the ceiling);
+    /// post-fix the userspace deadline tears the session down at ~1x.
     #[test]
     fn blocked_writer_releases_its_session_at_the_write_deadline() {
         let dir = tempfile::tempdir().unwrap();
@@ -2607,10 +2613,9 @@ mod tests {
 
         // Wall-clock watchdog: the reserved slot must be back inside the
         // ceiling plus scheduling slack. Pre-fix — the writer blocked
-        // inside write_all, with this kernel's SO_SNDTIMEO answering only
-        // after ~2x the configured timeout — the slot was still held at
-        // 3007 ms of a 2000 ms ceiling when the assert fired (the red
-        // run's evidence).
+        // inside write_all, with no whole-message bound to end it — the
+        // slot was still held at 3007 ms of a 2000 ms ceiling when the
+        // assert fired (the red run's evidence).
         let started = Instant::now();
         while handler.event_bus().active_sessions() != 0 {
             assert!(
@@ -2648,9 +2653,10 @@ mod tests {
     /// with partial progress, stretching one ~0.86 MiB frame across the
     /// peer's whole drain rate (4 KiB per 150 ms ≈ 34 s here) while the
     /// reserved slot sits held — no per-syscall ceiling can bound that.
-    /// (On this kernel the observed flavor is stranger still: the blocked
-    /// send never accepts the freed space and answers EAGAIN only after
-    /// ~2x the timeout.) Only a WHOLE-MESSAGE deadline bounds the frame:
+    /// (The sec round-7 probe measured this directly: 80+ s of dribble
+    /// progress under a 1 s timeout — every freed byte resets the wait,
+    /// so the syscall ceiling never fires at all.) Only a WHOLE-MESSAGE
+    /// deadline bounds the frame:
     /// pre-fix the red run below shows the slot still held 3022 ms into a
     /// 2000 ms ceiling; post-fix the watchdog tears the session down at
     /// the ceiling. This variant is also the one with teeth against a
@@ -2718,8 +2724,8 @@ mod tests {
 
         // Wall-clock watchdog (the red): the slot must be back inside the
         // ceiling plus slack. Pre-fix the slot was still held at 3022 ms
-        // of a 2000 ms ceiling when this assert fired — the kernel's ~2x
-        // SO_SNDTIMEO flavor at best, an unbounded send at worst.
+        // of a 2000 ms ceiling when this assert fired — per-syscall waits
+        // stretching at best, an unbounded dribble at worst.
         let started = Instant::now();
         while handler.event_bus().active_sessions() != 0 {
             assert!(

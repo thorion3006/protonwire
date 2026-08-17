@@ -18,12 +18,16 @@
 //! (Codex PR review round 2, finding 2 — the server's hello phase).
 //!
 //! The write side has the mirror-image exposure ([`write_msg_within`],
-//! R7-1): `SO_SNDTIMEO` bounds one write SYSCALL — on this kernel it does
-//! not even do that at face value, a blocked AF_UNIX send answering
-//! EAGAIN only after roughly TWICE the configured timeout — and a peer
-//! that keeps freeing a little space can keep partial writes succeeding
-//! indefinitely. A whole-message userspace deadline bounds the frame
-//! regardless of kernel flavor or dribble pace.
+//! R7-1): `SO_SNDTIMEO` cannot bound a MESSAGE, for two measured reasons
+//! (sec round-7 probe; the round-5 instrumented run is recorded in
+//! docs/review-log.md's SO_SNDTIMEO track item). First, it bounds each
+//! WAIT, not the message: progress resets it, and a multi-syscall write
+//! multiplies it — a 0.9 MiB frame is ~4 syscalls, i.e. up to ~4x the
+//! configured timeout for one message. Second, under steady drain it
+//! NEVER expires: every dribbled byte that frees space starts a fresh
+//! wait (the probe watched a draining peer stretch past 80 s under a
+//! 1 s timeout). Only a whole-message userspace deadline bounds the
+//! frame.
 
 use std::io::{ErrorKind, Read, Write};
 use std::os::fd::{AsFd, AsRawFd};
@@ -68,15 +72,17 @@ pub fn write_msg<W: Write, T: Serialize>(w: &mut W, msg: &T) -> Result<(), Frame
 /// [`write_msg`] bounded by `deadline` — the write-side mirror of
 /// [`FrameReader::read_msg_within`] (R7-1, round-5 track item).
 ///
-/// `SO_SNDTIMEO` bounds one write SYSCALL, and neither half of that is
-/// enough: on this kernel a blocked AF_UNIX send answers `EAGAIN` only
-/// after roughly TWICE the configured timeout (a standalone probe
-/// measured 2.06 s under a 1 s timeout, with and without a draining
-/// peer), and — worse — a send entered on a merely-partially-writable
-/// socket can block inside the kernel regardless of the space poll(2)
-/// reported. Each chunk is therefore sent with `MSG_DONTWAIT`, so the
-/// syscall itself can never block; poll(2) paces the retries and waits
-/// no longer than the deadline's remaining budget. Expiry fails with
+/// `SO_SNDTIMEO` cannot carry this bound, for the two measured reasons
+/// of the module-level record (sec round-7 probe; round-5 instrumented
+/// evidence in docs/review-log.md's SO_SNDTIMEO track item): it bounds
+/// each WAIT, not the message — progress resets it, and a multi-syscall
+/// write multiplies it (a 0.9 MiB frame is ~4 syscalls, so up to ~4x the
+/// configured timeout for one message) — and under steady drain it never
+/// expires at all, because each dribbled byte that frees space starts a
+/// fresh wait (80+ s watched under a 1 s timeout). Each chunk is
+/// therefore sent with `MSG_DONTWAIT`, so the syscall itself can never
+/// block; poll(2) paces the retries and waits no longer than the
+/// deadline's remaining budget. Expiry fails with
 /// [`std::io::ErrorKind::TimedOut`]; partial progress does NOT reset the
 /// deadline (one message, one budget).
 pub fn write_msg_within<W: Write + AsFd, T: Serialize>(
@@ -534,10 +540,12 @@ mod tests {
     }
 
     /// R7-1: a write to a never-reading peer must fail at the WHOLE-MESSAGE
-    /// deadline, in userspace — not lean on `SO_SNDTIMEO`, which on this
-    /// kernel answers EAGAIN only after roughly twice the configured
-    /// timeout, and elsewhere may not interrupt a blocked send at all
-    /// (round-5 instrumented evidence).
+    /// deadline, in userspace — not lean on `SO_SNDTIMEO`, which bounds
+    /// each WAIT, not the message: progress resets it, a multi-syscall
+    /// write multiplies it (a 0.9 MiB frame is ~4 syscalls), and under
+    /// steady drain it never expires at all (sec round-7 probe; the
+    /// round-5 instrumented run is recorded in docs/review-log.md's
+    /// SO_SNDTIMEO track item).
     #[test]
     fn write_msg_within_fails_at_the_deadline_against_a_stalled_peer() {
         let (mut a, b) = std::os::unix::net::UnixStream::pair().unwrap();
@@ -560,7 +568,8 @@ mod tests {
             "the write failed before its own deadline: {:?}",
             started.elapsed()
         );
-        // ...and not much after it (no kernel-flavored doubling).
+        // ...and not much after it (one deadline for one message, not a
+        // multiple of per-syscall waits).
         assert!(
             started.elapsed() < std::time::Duration::from_secs(2),
             "the deadline must bound the write, took {:?}",
