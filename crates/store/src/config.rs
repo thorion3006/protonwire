@@ -34,7 +34,13 @@ pub struct DaemonSection {
     /// IPC socket path override (system authority).
     pub socket_path: Option<String>,
     /// Group the IPC socket is chowned to so unprivileged clients can
-    /// reach it (system authority; unset means no chown).
+    /// reach it (system authority). Defaults to `Some("protonwire")` — the
+    /// group the shipped package provisions (R9-1): with the old `None`
+    /// default a standard root launch left the socket root:root 0660 and
+    /// every unprivileged client ate EACCES while PRD 433 requires clients
+    /// to run unprivileged. An explicit `null` opts out (no chown); the
+    /// daemon's bind path applies the chown only when running as root, so
+    /// non-root dev launches are unaffected (see `IpcServer::bind_with_group`).
     pub socket_group: Option<String>,
     /// TUN interface name.
     pub interface_name: String,
@@ -48,7 +54,7 @@ impl Default for DaemonSection {
     fn default() -> Self {
         Self {
             socket_path: None,
-            socket_group: None,
+            socket_group: Some("protonwire".into()),
             interface_name: "protonwire0".into(),
             log_level: "info".into(),
             network_integration: NetworkIntegrationMode::Auto,
@@ -1014,6 +1020,15 @@ mod tests {
         config.validate().unwrap();
         assert_eq!(config.schema_version, 2);
         assert_eq!(config.daemon.interface_name, "protonwire0");
+        // R9-1: the example must carry the client-admission group — the
+        // default the shipped package provisions (it creates the
+        // `protonwire` group; an absent group on a dev box is the
+        // non-root-gated bind path, see server.rs).
+        assert_eq!(
+            config.daemon.socket_group.as_deref(),
+            Some("protonwire"),
+            "the PRD section 10 example must pin the default socket group"
+        );
         assert_eq!(
             config.daemon.network_integration,
             NetworkIntegrationMode::Auto
@@ -1417,10 +1432,13 @@ mod tests {
 
     /// pr-champion WO-7 (PRD 6.3): `daemon.socket_group` names the group
     /// the daemon chowns its socket to so unprivileged clients can reach
-    /// it. It sits beside `socket_path`, defaults to unset (no chown), and
-    /// is system authority like its neighbor.
+    /// it. It sits beside `socket_path` and is system authority like its
+    /// neighbor. R9-1: the DEFAULT is `Some("protonwire")` — with `None`
+    /// a standard root launch left the socket root:root 0660 and every
+    /// unprivileged client ate EACCES (PRD 433 requires unprivileged
+    /// clients). An explicit `null` remains the documented opt-out.
     #[test]
-    fn daemon_socket_group_parses_and_defaults_to_unset() {
+    fn daemon_socket_group_parses_and_defaults_to_protonwire() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.yaml");
         std::fs::write(
@@ -1434,7 +1452,47 @@ mod tests {
             config.daemon.socket_group.as_deref(),
             Some("protonwire-clients")
         );
-        assert!(SystemConfig::default().daemon.socket_group.is_none());
+        assert_eq!(
+            DaemonSection::default().socket_group.as_deref(),
+            Some("protonwire"),
+            "the built-in default must name the packaged protonwire group"
+        );
+        assert_eq!(
+            SystemConfig::default().daemon.socket_group.as_deref(),
+            Some("protonwire"),
+            "the whole-document default must carry the section default"
+        );
+    }
+
+    /// R9-1: the missing-file soft path hands the built-in defaults to the
+    /// daemon, so the defaulted document must carry the group through a
+    /// serialize/parse round trip exactly like one read from disk.
+    #[test]
+    fn config_defaults_round_trip_the_socket_group() {
+        let rendered = serde_norway::to_string(&SystemConfig::default()).unwrap();
+        let reloaded: SystemConfig = crate::yaml::from_str(&rendered).unwrap();
+        reloaded.validate().unwrap();
+        assert_eq!(
+            reloaded.daemon.socket_group.as_deref(),
+            Some("protonwire"),
+            "the default group must survive a YAML round trip"
+        );
+    }
+
+    /// R9-1: an explicit `socket_group: null` is the documented opt-out —
+    /// a deployment that manages socket permissions itself (or admits only
+    /// root clients) must be able to say "no chown" and get exactly `None`.
+    #[test]
+    fn explicit_null_socket_group_opts_out_of_the_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        std::fs::write(&path, "schema_version: 2\ndaemon:\n  socket_group: null\n").unwrap();
+        let config = SystemConfig::load(&path).unwrap().config;
+        config.validate().unwrap();
+        assert_eq!(
+            config.daemon.socket_group, None,
+            "an explicit null must override the Some(protonwire) default"
+        );
     }
 
     #[test]

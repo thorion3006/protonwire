@@ -138,6 +138,17 @@ impl IpcServer {
     /// untouched) right after the mode is applied, so members of the group
     /// can connect. An unresolvable group name fails loudly — a daemon
     /// started with a typo'd group is a daemon nobody can reach.
+    ///
+    /// R9-1: the whole group hand-off (resolution AND chown) is gated on
+    /// the daemon running as root. The configuration default is now
+    /// `Some("protonwire")` — the group the shipped package provisions —
+    /// and an unprivileged dev launch on a box without that group would
+    /// otherwise fail the lookup loudly (or the chown with EPERM): a
+    /// default must not brick non-root dev, so non-root keeps today's
+    /// no-chown behavior. The missing-group fail-loud contract is
+    /// therefore a ROOT-daemon contract, and the group's existence is the
+    /// M8 packaging dependency (the package creates the `protonwire`
+    /// group).
     pub fn bind_with_group(
         socket_dir: &Path,
         socket_name: &str,
@@ -147,19 +158,22 @@ impl IpcServer {
             socket_dir,
             socket_name,
             group,
+            &process_is_root,
             &resolve_group_gid,
             &chown_socket_group,
         )
     }
 
-    /// The bind path with BOTH the group resolver and the chown injectable
-    /// (tests pin the hand-off between them — resolver output to chown
-    /// input, exactly once, with the bound path — without a group database
-    /// or root; production goes through [`IpcServer::bind_with_group`]).
+    /// The bind path with the root gate, group resolver, and chown ALL
+    /// injectable (tests pin the hand-off between them — root gate open:
+    /// resolver output to chown input, exactly once, with the bound path;
+    /// root gate closed: neither half runs — without a group database or
+    /// root; production goes through [`IpcServer::bind_with_group`]).
     fn bind_with_resolved(
         socket_dir: &Path,
         socket_name: &str,
         group: Option<&str>,
+        is_root: &dyn Fn() -> bool,
         resolver: &dyn Fn(&str) -> io::Result<Option<nix::unistd::Gid>>,
         chown: &dyn Fn(&Path, &str, nix::unistd::Gid) -> io::Result<()>,
     ) -> io::Result<Self> {
@@ -182,9 +196,22 @@ impl IpcServer {
         let listener = UnixListener::bind(&socket_path)?;
         set_socket_mode(&socket_path)?;
         if let Some(name) = group {
-            let gid = resolver(name)?
-                .ok_or_else(|| io::Error::other(format!("socket group `{name}` does not exist")))?;
-            chown(&socket_path, name, gid)?;
+            // R9-1: the hand-off is a root-daemon contract. Non-root keeps
+            // today's no-chown behavior so the `Some("protonwire")` default
+            // cannot brick a dev launch (unprovisioned group → fail-loud
+            // lookup; foreign gid → EPERM). Skipped loudly enough to debug:
+            // a debug record, not a refusal.
+            if !is_root() {
+                debug!(
+                    group = name,
+                    "not running as root; skipping the socket group chown"
+                );
+            } else {
+                let gid = resolver(name)?.ok_or_else(|| {
+                    io::Error::other(format!("socket group `{name}` does not exist"))
+                })?;
+                chown(&socket_path, name, gid)?;
+            }
         }
         info!(path = %socket_path.display(), "IPC server bound");
         Ok(Self {
@@ -531,6 +558,14 @@ fn entry_kind(meta: &std::fs::Metadata) -> &'static str {
 fn set_socket_mode(socket_path: &Path) -> io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o660))
+}
+
+/// Whether this daemon runs as root — the gate for the socket-group
+/// hand-off (R9-1; see [`IpcServer::bind_with_group`]). Injected through
+/// [`IpcServer::bind_with_resolved`] so the gate itself is testable
+/// without a privileged runner.
+fn process_is_root() -> bool {
+    nix::unistd::getuid().is_root()
 }
 
 /// Resolves a group name to its gid through the system group database.
@@ -1924,25 +1959,34 @@ mod tests {
         );
     }
 
-    /// pr-champion WO-7 (PRD 6.3): bind() chmods the socket 0o660 but
-    /// never chgrps it, so a root daemon leaves the socket root:root and
-    /// every unprivileged client eats EACCES. `bind_with_group` must
-    /// chown to the configured group's gid — and an unresolvable name
-    /// must fail loudly rather than start a daemon nobody can reach.
+    /// pr-champion WO-7 (PRD 6.3) + R9-1's root gate, through the
+    /// production path: a ROOT daemon asked for an unresolvable group must
+    /// fail loudly (a typo'd group is a daemon nobody can reach), while a
+    /// NON-root daemon (dev) skips the whole hand-off — the
+    /// `Some("protonwire")` default would otherwise brick every dev launch
+    /// on a box without the packaged group. The group the package
+    /// provisions IS the M8 packaging dependency: the unit that ships the
+    /// daemon creates the `protonwire` group.
     #[test]
-    fn bind_with_group_fails_loud_on_an_unknown_group() {
+    fn bind_with_group_fails_loud_on_an_unknown_group_only_when_root() {
         let dir = tempfile::tempdir().unwrap();
-        let err = IpcServer::bind_with_group(
-            dir.path(),
-            "nope.sock",
-            Some("protonwire-no-such-group-3f9a"),
-        )
-        .map(|_| ())
-        .expect_err("an unresolvable group must abort bind");
-        assert!(
-            err.to_string().contains("does not exist"),
-            "fail-loud error must name the problem, got: {err}"
-        );
+        let group = Some("protonwire-no-such-group-3f9a");
+        if nix::unistd::getuid().is_root() {
+            let err = IpcServer::bind_with_group(dir.path(), "nope.sock", group)
+                .map(|_| ())
+                .expect_err("a root daemon with an unresolvable group must abort bind");
+            assert!(
+                err.to_string().contains("does not exist"),
+                "fail-loud error must name the problem, got: {err}"
+            );
+        } else {
+            let server = IpcServer::bind_with_group(dir.path(), "nope.sock", group)
+                .expect("a non-root daemon must skip the group hand-off, not fail");
+            assert!(
+                server.socket_path().exists(),
+                "the non-root bind must produce a usable socket"
+            );
+        }
     }
 
     /// A resolver failure (group database unreadable, say) maps to an
@@ -1954,6 +1998,7 @@ mod tests {
             dir.path(),
             "boom.sock",
             Some("clients"),
+            &|| true, // root gate open: the resolver failure must surface
             &|_name| Err(io::Error::other("group database on fire")),
             &|_path, _name, _gid| panic!("resolution failed first: the chown must not run"),
         )
@@ -1976,6 +2021,7 @@ mod tests {
             dir.path(),
             "missing.sock",
             Some("wheel-clients"),
+            &|| true, // root gate open: the unresolved name must fail loudly
             &|_name| Ok(None),
             &|_path, _name, _gid| panic!("no gid was resolved: the chown must not run"),
         )
@@ -2002,6 +2048,9 @@ mod tests {
             dir.path(),
             "plain.sock",
             None,
+            // Root gate OPEN: with no group configured nothing may run even
+            // for root — the group check gates before the root check.
+            &|| true,
             &|_| panic!("no group configured: the resolver must not run"),
             &|_path, _name, _gid| panic!("no group configured: the chown must not run"),
         )
@@ -2011,24 +2060,71 @@ mod tests {
         assert_eq!(meta.mode() & 0o777, 0o660);
     }
 
-    /// The effectiveness pin for the chown (qa mutation gap): the chown
-    /// seam must fire EXACTLY ONCE per configured group, with the bound
-    /// socket's path, the configured group name, and the gid the RESOLVER
-    /// returned — the hand-off `bind_with_group` exists to perform. The
-    /// old `bind_with_group_applies_the_resolved_gid` pin was tautological
-    /// (a fresh socket's gid already equals the process egid, so its
-    /// asserts held with the chown call deleted); recording the chown's
-    /// arguments makes the delete-chown mutation fail here.
+    /// The effectiveness pin for the chown (qa mutation gap), extended by
+    /// R9-1 with the root gate: the whole group hand-off — resolution AND
+    /// chown — must run ONLY for a root daemon. A non-root daemon (dev
+    /// runs, this suite) keeps today's no-chown behavior, because the new
+    /// `Some("protonwire")` default would otherwise brick every non-root
+    /// launch: the packaged group does not exist on a dev box (fail-loud
+    /// resolution) and a foreign-gid chown answers EPERM. The root arm
+    /// still pins the hand-off itself: the chown seam fires EXACTLY ONCE
+    /// per configured group, with the bound socket's path, the configured
+    /// group name, and the gid the RESOLVER returned. The old
+    /// `bind_with_group_applies_the_resolved_gid` pin was tautological (a
+    /// fresh socket's gid already equals the process egid); recording the
+    /// calls makes the delete-chown mutation fail here.
     #[test]
-    fn chown_seam_receives_the_resolved_gid() {
+    fn chown_seam_gates_on_root_and_hands_off_the_resolved_gid() {
         // (Mutex comes from the module-level `use std::sync::{Arc, Mutex};`
         // — the local re-import shadowed it; rust-review nit.)
         let dir = tempfile::tempdir().unwrap();
+
+        // NON-root arm: neither half of the hand-off may run. A default
+        // group must not brick non-root dev, so the gate sits BEFORE the
+        // resolver (an unprovisioned dev box would otherwise fail the
+        // lookup loudly) as well as before the chown (EPERM).
+        let resolved: Mutex<Vec<String>> = Mutex::new(Vec::new());
+        let chowned: Mutex<Vec<(PathBuf, String, u32)>> = Mutex::new(Vec::new());
+        let server = IpcServer::bind_with_resolved(
+            dir.path(),
+            "seam-nonroot.sock",
+            Some("protonwire"),
+            &|| false,
+            &|name| {
+                resolved.lock().unwrap().push(name.to_owned());
+                Ok(Some(nix::unistd::Gid::from_raw(12345)))
+            },
+            &|path, name, gid| {
+                chowned
+                    .lock()
+                    .unwrap()
+                    .push((path.to_owned(), name.to_owned(), gid.as_raw()));
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(
+            server.socket_path().exists(),
+            "non-root bind succeeds without the group hand-off"
+        );
+        assert!(
+            resolved.lock().unwrap().is_empty(),
+            "a non-root daemon must not even resolve the group — an \
+             unprovisioned dev box would fail the lookup and brick the launch"
+        );
+        assert!(
+            chowned.lock().unwrap().is_empty(),
+            "a non-root daemon must not attempt the chown (EPERM)"
+        );
+
+        // ROOT arm: the full hand-off runs, exactly once, with the
+        // resolver's gid — the delete-chown mutation fails here.
         let calls: Mutex<Vec<(PathBuf, String, u32)>> = Mutex::new(Vec::new());
         let server = IpcServer::bind_with_resolved(
             dir.path(),
             "seam.sock",
             Some("wheel-clients"),
+            &|| true,
             // A gid this process does NOT hold: the seam runs unprivileged
             // precisely because the real chown never happens.
             &|_name| Ok(Some(nix::unistd::Gid::from_raw(12345))),
@@ -2067,6 +2163,7 @@ mod tests {
             dir.path(),
             "chown-boom.sock",
             Some("wheel-clients"),
+            &|| true, // root gate open: the chown failure must pass through
             &|_name| Ok(Some(nix::unistd::Gid::from_raw(12345))),
             &|_path, name, _gid| {
                 Err(io::Error::other(format!(
@@ -2109,6 +2206,7 @@ mod tests {
             dir.path(),
             "grouped.sock",
             Some("clients"),
+            &|| true, // root gate open: the real chgrp path runs
             &|_| Ok(Some(gid)),
             &chown_socket_group,
         )

@@ -118,6 +118,9 @@ fn run(args: Args, init_tracing: &dyn Fn(&str), trust_root: Option<&Path>) -> i3
     // default precedence (see resolve_bind_location). daemon.socket_group
     // rides along (pr-champion WO-7): the socket is chowned to that group
     // so unprivileged clients can reach a root-owned socket (PRD 6.3).
+    // R9-1: the config default is now Some("protonwire") — the packaged
+    // group — and bind_with_group applies the hand-off only when running
+    // as root, so dev launches without the group are unaffected.
     let config_socket_path = config.daemon.socket_path.clone();
     let config_socket_group = config.daemon.socket_group.clone();
     let bus = Arc::new(protonwire_ipc::EventBus::new());
