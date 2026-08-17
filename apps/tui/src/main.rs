@@ -6,7 +6,7 @@
 //! exit, error, and handled quit keys. Daemon state refreshes on a
 //! background thread (pr-champion R7-3) so a stalled daemon can no longer
 //! freeze input and redraw: connect+GetState run off the render/poll
-//! thread and snapshots cross a bounded newest-wins channel. SIGTERM,
+//! thread and snapshots cross a single-slot newest-wins cell (R9-4). SIGTERM,
 //! SIGHUP, SIGINT, and SIGQUIT restore the terminal too (pr-champion
 //! R7-4; round 7 added SIGINT/SIGQUIT): the handler only
 //! sets an async-signal-safe flag that the main loop polls and turns into
@@ -60,9 +60,53 @@ type Snapshot = Result<DaemonState, String>;
 
 /// A snapshot paired with the instant its fetch COMPLETED in the refresh
 /// worker (round 7): staleness measures from fetch time, so a snapshot
-/// that sat in the bounded channel — or was drained late by a slow render
+/// that sat in the delivery slot — or was taken late by a slow render
 /// loop — still renders with its true age instead of passing as fresh.
 type StampedSnapshot = (Instant, Snapshot);
+
+/// Single-slot, newest-wins delivery cell (R9-4): the refresh worker
+/// [`SnapshotSlot::publish`]es by OVERWRITING and the render loop
+/// [`SnapshotSlot::take`]s, so whatever the loop drains after a gap is
+/// always the freshest COMPLETED fetch. The depth-1 channel this replaces
+/// used `try_send`, which DISCARDED the newest snapshot on Full and left
+/// the stale one queued (oldest-wins) — exactly the wrong snapshot lost
+/// when an SSH stall pauses the render loop across several refreshes.
+/// The mutex is held only for one store and one take, never across a
+/// fetch, draw, or poll, so neither side can block on the other's daemon
+/// or tty work.
+#[derive(Debug, Default)]
+struct SnapshotSlot {
+    slot: std::sync::Mutex<Option<StampedSnapshot>>,
+}
+
+impl SnapshotSlot {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// Worker side: replace whatever the slot holds with this (freshest)
+    /// snapshot. Occupied-slot publishing overwrites rather than drops,
+    /// so the freshest completed fetch always occupies the slot.
+    fn publish(&self, snapshot: StampedSnapshot) {
+        *self.locked() = Some(snapshot);
+    }
+
+    /// Render side: take the newest snapshot, emptying the slot for the
+    /// next publish. Never blocks waiting for a snapshot.
+    fn take(&self) -> Option<StampedSnapshot> {
+        self.locked().take()
+    }
+
+    /// The lock is held only for a store or a take, so poisoning would
+    /// require a panic inside those trivial critical sections; recovering
+    /// the guard anyway keeps a panicking consumer from wedging the
+    /// worker thread (or vice versa).
+    fn locked(&self) -> std::sync::MutexGuard<'_, Option<StampedSnapshot>> {
+        self.slot
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
 
 #[derive(Debug)]
 struct Options {
@@ -271,13 +315,15 @@ fn fetch_snapshot(options: &Options) -> Snapshot {
 
 /// Background refresh worker (pr-champion R7-3): connect+GetState run on
 /// their own thread on the [`REFRESH`] tick, and snapshots cross to the
-/// render/poll thread through a depth-1 bounded channel with `try_send`.
-/// Newest-wins with a bounded channel means the worker NEVER blocks on a
-/// slow consumer, and a dropped snapshot is stale by construction (a
-/// newer fetch is already scheduled) — the frame's staleness marker is
-/// what tells the user. A stalled daemon stalls only this thread; the
-/// render/poll thread keeps drawing the last snapshot, marking it stale,
-/// and polling keys.
+/// render/poll thread through the single-slot [`SnapshotSlot`] (R9-4):
+/// the worker OVERWRITES, so newest-wins actually holds under
+/// backpressure — a render loop stalled across several refreshes (the
+/// SSH-stall shape) loses only snapshots it was going to supersede
+/// anyway, and the frame after the gap renders the freshest completed
+/// fetch. The worker never blocks on a slow consumer, and a fetch that
+/// completes not at all is what the frame's staleness marker reports. A
+/// stalled daemon stalls only this thread; the render/poll thread keeps
+/// drawing the last snapshot, marking it stale, and polling keys.
 struct RefreshWorker {
     stop: Arc<AtomicBool>,
     done: Receiver<()>,
@@ -287,17 +333,18 @@ struct RefreshWorker {
 impl RefreshWorker {
     /// Production wiring: the SDK connect+GetState fetch on the
     /// [`REFRESH`] tick.
-    fn start_refresh(options: Options) -> (Self, Receiver<StampedSnapshot>) {
+    fn start_refresh(options: Options) -> (Self, Arc<SnapshotSlot>) {
         Self::start(move || fetch_snapshot(&options), REFRESH)
     }
 
     /// Core spawn with an injectable fetch, so the stall test can point
     /// the worker at an accepting-but-never-responding stub daemon.
-    fn start<F>(mut fetch: F, period: Duration) -> (Self, Receiver<StampedSnapshot>)
+    fn start<F>(mut fetch: F, period: Duration) -> (Self, Arc<SnapshotSlot>)
     where
         F: FnMut() -> Snapshot + Send + 'static,
     {
-        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let slot = Arc::new(SnapshotSlot::new());
+        let latest = Arc::clone(&slot);
         let stop = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&stop);
         let (done_tx, done_rx) = std::sync::mpsc::channel();
@@ -305,15 +352,17 @@ impl RefreshWorker {
             .name("protonwire-refresh".into())
             .spawn(move || {
                 while !flag.load(Ordering::SeqCst) {
-                    // Depth-1 newest-wins: a full channel means the render
-                    // loop still holds a newer snapshot, so dropping this
-                    // one is correct (and never blocks this thread).
+                    // R9-4 single-slot newest-wins: publishing REPLACES
+                    // any snapshot the render loop has not taken yet, so
+                    // a slow consumer can only ever delay a snapshot, not
+                    // make the loop render a superseded one (and this
+                    // thread never waits on the consumer).
                     // Round 7: the timestamp is captured HERE, at fetch
                     // completion — never at drain time — so the render
                     // loop cannot launder an old snapshot as fresh.
                     let snapshot = fetch();
                     let fetched_at = Instant::now();
-                    let _ = tx.try_send((fetched_at, snapshot));
+                    latest.publish((fetched_at, snapshot));
                     let next_tick = Instant::now() + period;
                     while !flag.load(Ordering::SeqCst) {
                         let remaining = next_tick.saturating_duration_since(Instant::now());
@@ -332,7 +381,7 @@ impl RefreshWorker {
                 done: done_rx,
                 handle: Some(handle),
             },
-            rx,
+            slot,
         )
     }
 
@@ -443,7 +492,7 @@ fn run(terminal: &mut Term, options: Options) -> Result<(), ClientError> {
     // R7-3: connect+GetState live on the refresh thread; the render/poll
     // thread only drains snapshots (never blocking) and renders.
     let (mut worker, snapshots) = RefreshWorker::start_refresh(options);
-    let mut drain = move || snapshots.try_recv().ok();
+    let mut drain = move || snapshots.take();
     let mut state = LoopState::new();
     let mut draw = |view: &DashboardView<'_>| -> std::io::Result<()> {
         terminal.draw(|frame| render(frame, view)).map(|_| ())
@@ -572,7 +621,6 @@ mod tests {
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::sync::mpsc::TrySendError;
     use std::time::{Duration, Instant};
 
     use protonwire_frontend_api::{NetworkIntegration, PROTOCOL_VERSION, VpnState};
@@ -580,7 +628,7 @@ mod tests {
 
     use super::{
         DashboardView, Flow, KeyInput, LoopState, RefreshWorker, STALE_AFTER, Snapshot,
-        StampedSnapshot, TERMINATE_REQUESTED, drive, install_terminate_handler, termination_check,
+        SnapshotSlot, TERMINATE_REQUESTED, drive, install_terminate_handler, termination_check,
     };
 
     fn test_state() -> super::DaemonState {
@@ -683,7 +731,7 @@ mod tests {
         let starved_at = Instant::now() + Duration::from_millis(2000);
         let draws = Arc::new(AtomicUsize::new(0));
         let draw_counter = Arc::clone(&draws);
-        let mut drain = move || snapshots.try_recv().ok();
+        let mut drain = move || snapshots.take();
         let mut draw = move |_view: &DashboardView<'_>| -> io::Result<()> {
             draw_counter.fetch_add(1, Ordering::SeqCst);
             Ok(())
@@ -794,21 +842,117 @@ mod tests {
         assert_eq!(state.notice, "view lands in milestone 8 (PRD 9.9)");
     }
 
-    /// pr-champion R7-3: the bounded channel's load-bearing property — a
-    /// full channel makes the worker DROP the snapshot, never block on
-    /// the render loop.
+    /// pr-champion R7-3, re-pinned for R9-4: the delivery mechanism's
+    /// load-bearing property. The depth-1 channel this test used to pin
+    /// (`try_send` drops on Full) lost the NEWEST snapshot and kept the
+    /// stale one queued — oldest-wins. The single-slot cell's property is
+    /// the inverse: publishing over an occupied slot REPLACES the occupant
+    /// (newest-wins), promptly, and the slot holds exactly one snapshot.
     #[test]
-    fn a_full_snapshot_channel_drops_instead_of_blocking() {
-        let (tx, rx) = std::sync::mpsc::sync_channel::<StampedSnapshot>(1);
-        let t0 = Instant::now();
-        tx.try_send((t0, Err("first".into()))).unwrap();
+    fn publishing_over_an_occupied_slot_replaces_it_with_the_newest() {
+        let slot = SnapshotSlot::new();
+        let stale_fetch_at = Instant::now() - STALE_AFTER;
+        slot.publish((stale_fetch_at, Err("stale".into())));
         let started = Instant::now();
-        let dropped = tx.try_send((t0, Err("second".into())));
-        assert!(started.elapsed() < Duration::from_millis(50));
-        assert!(matches!(dropped, Err(TrySendError::Full(_))));
+        let fresh_fetch_at = Instant::now();
+        slot.publish((fresh_fetch_at, Err("fresh".into())));
         assert!(
-            matches!(rx.try_recv(), Ok((at, Err(e))) if e == "first" && at == t0),
-            "the surviving snapshot must keep its own fetch stamp"
+            started.elapsed() < Duration::from_millis(50),
+            "publishing over an occupied slot must not block the worker"
+        );
+        match slot.take() {
+            Some((at, Err(e))) => assert!(
+                e == "fresh" && at == fresh_fetch_at && at > stale_fetch_at,
+                "the slot must hold the newest snapshot with its own fetch \
+                 stamp, got ({at:?}, {e:?})"
+            ),
+            other => panic!("the slot must hold a snapshot, got {other:?}"),
+        }
+        assert!(
+            slot.take().is_none(),
+            "the slot is single-shot: one take empties it until republished"
+        );
+    }
+
+    /// R9-4: the SSH-stall shape — the render loop is descheduled long
+    /// enough (one frozen poll window) for the refresh worker to complete
+    /// SEVERAL fetches before the loop drains again. Delivery must be
+    /// newest-wins: the frame rendered after the gap shows the FRESH
+    /// fetch's state, not the stale one that happened to complete first.
+    /// Red evidence (pre-fix): the depth-1 channel's `try_send` dropped
+    /// every snapshot after the first on Full, so the loop drained and
+    /// rendered the STALE first fetch — oldest-wins.
+    #[test]
+    fn after_a_drain_gap_the_loop_renders_the_freshest_snapshot() {
+        // The gate orders the actors deterministically: fetch-1 must not
+        // complete until the loop has finished its FIRST drain (which
+        // therefore sees an empty channel) and entered its poll window.
+        let gate = Arc::new(AtomicBool::new(false));
+        let fetch_gate = Arc::clone(&gate);
+        let mut fetches = 0u32;
+        let (mut worker, snapshots) = RefreshWorker::start(
+            move || {
+                while !fetch_gate.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                fetches += 1;
+                let mut state = test_state();
+                state.daemon_version = if fetches == 1 {
+                    "stale-fetch".into()
+                } else {
+                    "fresh-fetch".into()
+                };
+                Ok(state)
+            },
+            Duration::from_millis(20),
+        );
+
+        let mut drain = move || snapshots.take();
+        let rendered = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen = Arc::clone(&rendered);
+        let mut draw = move |view: &DashboardView<'_>| -> io::Result<()> {
+            if let Some(version) = view
+                .snapshot
+                .and_then(|s| s.as_ref().ok().map(|d| d.daemon_version.clone()))
+            {
+                seen.lock().unwrap().push(version);
+            }
+            Ok(())
+        };
+        let mut poll_calls = 0;
+        let mut poll = move || -> io::Result<Option<KeyInput>> {
+            poll_calls += 1;
+            if poll_calls == 1 {
+                // The stall: keys keep being polled, snapshots are NOT
+                // drained, while the worker completes more fetches.
+                gate.store(true, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(400));
+                Ok(None)
+            } else {
+                Ok(Some(KeyInput {
+                    code: KeyCode::Char('q'),
+                    ctrl: false,
+                }))
+            }
+        };
+        let mut state = LoopState::new();
+        let no_signal = AtomicBool::new(false);
+        let outcome = drive(
+            &mut drain,
+            &mut state,
+            &no_signal,
+            &|| Ok(()),
+            &mut draw,
+            &mut poll,
+        );
+        worker.shutdown();
+        outcome.unwrap();
+        let rendered = rendered.lock().unwrap().clone();
+        assert_eq!(
+            rendered.last(),
+            Some(&"fresh-fetch".to_string()),
+            "after a drain gap the loop must render the FRESHEST completed \
+             fetch, but rendered {rendered:?}"
         );
     }
 
