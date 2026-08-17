@@ -894,3 +894,52 @@ innocent (no close action preceded the fixes) and the correction is
 recorded here as it happened. A pipe-masked clippy run hid the
 duplicated-attribute error once; gate exit codes are now checked raw.
 3c9936f (CONTRIBUTING conventions) rode this round's push.
+
+## 2026-08-17 — Codex round 9 + the severity bar (PR #3)
+
+Five findings (11:11Z) — TWO of them Codex escalating track items our
+own reviews had recorded and deliberately deferred (the round-7
+queued-response amplification figure and compliance-reviewer's
+round-4 release-guard composition), both premises pre-verified by our
+own evidence. All five fixed; closed LEAN under the new severity bar:
+sec-auditor verdicts only where required (both PASS, no must-fix),
+the three P2s' verdict record = lane evidence + the champion's batch
+review.
+
+| Finding | Verdict | Commit |
+|---------|---------|--------|
+| Set a usable default socket group (P1, `config.rs`) — defaults left the socket root:root against PRD 433 | Fixed @ ab8f464 (+3c4b951) | default Some("protonwire") in defaults AND the PRD example; hand-off gated on is_root (non-root dev keeps no-chown); root+unresolvable stays fail-loud; M8 packaging owns the group. sec PASS: gate un-invertible, no privilege path, PRD pairing executed |
+| Bound the response queue by bytes (P1, `server.rs`) — ~230 MiB/session parked before backpressure | Fixed @ d22ef82 | request-credit window (16 unwritten → stop READING): flow control, not termination; ~18 MiB worst case; events count-but-never-wait; no wedge from ack or X4 marker. sec PASS: arithmetic verified, watchdog interplay traced |
+| Re-run the license scan in the release guard (P2) | Fixed @ 3670bfe | release-guard composes the live license-scan before the marker check |
+| Replace the queued snapshot with the newest one (P2, TUI) | Fixed @ c96029d | single-slot newest-wins cell replaces the depth-1 try_send channel |
+| Run daemon_state off the Tauri main thread (P2, GUI) | Fixed @ c98704e | async command + worker task; webview boundary disclosed |
+
+Verdict-Low dispositions from sec (3c4b951): the resolved gid is
+logged at bind (operator audit — AnyUser covers Connect/Disconnect);
+the hello-error refusals' counter underflow documented as a DELIBERATE
+exception (terminal sends must not wait on the window). New track
+items: M8 deployment note for the pre-existing-group collision hazard.
+
+### Severity-bar dispositions (the 12:07Z batch, four P2s — replies ARE the dispositions)
+
+- Client cursor seeds from the ack stamp, so a buffered pre-hello
+  event classifies stale and is dropped — TRACK ITEM, M2 SDK
+  event-cursor semantics (FR-127D): initialize from an initial
+  snapshot or deliver-then-advance.
+- IpcServer::drop unlinks a replaced socket — TRACK ITEM, M8 daemon
+  lifecycle/handover: record the bound inode; remove only while it
+  still identifies this server's socket.
+- umask-0077 makes create_dir_all produce 0700, defeating traversal
+  even with the default group — the RECORDED round-6 sec item
+  ("create_dir_all does not pin 0755"), sharpened by R9-1's default;
+  moves WITH the runtime-dir pinning hardening (M2).
+- The dep gate checks direct names only; a neutral-helper transitive
+  route would bypass — TRACK ITEM, M2 boundary-gate hardening: walk
+  metadata.resolve from every client-side package (prophylactic; no
+  such crate exists in-tree today).
+
+Process note: the re-review queue is not a debt to drain —
+triage-and-dispose (P1 lean / P2 track / reject with evidence) IS the
+termination discipline. Two of five round-9 findings were our own
+deferred track items, escalated on schedule: the deferral discipline
+worked as designed.
