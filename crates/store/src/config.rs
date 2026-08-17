@@ -1139,7 +1139,6 @@ mod tests {
     /// defect. Fully provable unprivileged — chmod needs no privileges,
     /// and the walk's mode pass runs before its ownership pass, so a
     /// user-owned file never shadows the mode defect.
-    #[test]
     /// rust-review round 8 (live-reproduced against the daemon): an ABSENT
     /// ancestor directory under the trust root used to hard-fail the
     /// strict walk — "untrusted ... could not inspect" (the misnomer; the
