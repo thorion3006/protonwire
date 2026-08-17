@@ -309,7 +309,10 @@ mod tests {
         // outputs arrive in canonical (sorted) order per the doc contract —
         // insertion order would answer vec!["b","a"] and fail here.
         let actual: BTreeSet<&str> = ["z", "c"].into_iter().collect();
-        assert_eq!(set_drift(&["b", "a"], &actual), (vec!["a", "b"], vec!["c", "z"]));
+        assert_eq!(
+            set_drift(&["b", "a"], &actual),
+            (vec!["a", "b"], vec!["c", "z"])
+        );
 
         // An exact match reports no drift in either direction.
         let pinned: BTreeSet<&str> = ["a", "c"].into_iter().collect();
