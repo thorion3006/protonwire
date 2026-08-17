@@ -824,3 +824,73 @@ hang construction for stall tests.
 Process note: the IPC lane's `cargo fmt --all` reformatted the TUI
 lane's in-flight file mid-run (harmless, nothing staged of theirs) —
 concurrent lanes should use `-p`-scoped fmt.
+
+## 2026-08-16 — Codex round 8 + verdicts + FAIL-fix lane (PR #3)
+
+Eight findings (02:25Z) — the pin-family completion plus one trust
+surface and one protocol corner. All eight fixed; verdicts: compliance
+PASS, sec PASS (X4 hard trigger recorded), qa teeth CONFIRMED (20
+mutations, all caught, deterministic under 2-CPU pinning), rust-review
+FAIL → three prescribed fixes landed by the champion under explicit
+blessing, each with its red recorded.
+
+| Finding | Verdict | Commit |
+|---------|---------|--------|
+| Pin each country's canonical M49 mapping (`m49.rs`) | Fixed @ 715f4ef | 247 per-country (code, m49, region) tuples; distribution cross-checked |
+| Reject unknown GPL-3.0-prefixed license IDs (`license.rs`) | Fixed @ 050a5f3 | exact-suffix acceptance in both GPL families; phantoms → Unrecognized |
+| Validate source entries (`manifest.rs`) | Fixed @ 92f22ef | typed non-empty entries with kind describers |
+| End-of-burst queue overflow signal (`bus.rs`/`server.rs`/SDK) | Fixed @ a0812ec + 4152cf8 | sentinel seq u64::MAX resync marker — see design record |
+| Reject untrusted system configuration (`config.rs`) | Fixed @ 0af6234 | sshd StrictModes-style fs_trust walk — see design record |
+| Compare the ProTUN pin with the resolved dependency (`manifest.rs`) | Fixed @ db1eb2a | pin vs the lockfile's `#<rev>` fragment; missing fragment fails |
+| Pin canonical override maps (`groups.rs`) | Fixed @ 4d284ac | 14 per-id override maps pinned |
+| Preserve every forbidden physical-country source (`groups.rs`) | Fixed @ 3d962d6 | the exact five-source set required |
+
+**X4 design record.** A drop marks the session (atomic flag); the
+forwarder claims it after forwarding one of the necessarily-queued
+events (drop ⇒ full queue ⇒ events behind it — the reachability
+argument) and sends the reserved-marker envelope straight down the
+writer channel, bypassing the possibly-still-full bus queue while
+riding the writer's FIFO and backpressure. Rejected alternatives (in
+the commit): a new wire variant would poison old clients via serde
+unknown-tag; a real-dropped-seq marker is indistinguishable at the
+boundary. Compat, corrected per review: RELEASE builds of a pre-signal
+SDK self-recover; DEBUG builds panicked on cursor+1 — fixed by
+checked_add @ 55d7346 (red: "attempt to add with overflow" at
+client.rs:267, reproduced by toggle). Fully gating the marker behind
+the hello handshake is sec's HARD TRIGGER: must-fix before any
+separately-shipped client artifact.
+
+**X5 design record.** fs_trust walks every component from leaf to
+trust root (`/` in production) with lstat: no symlinks, leaf regular,
+ancestors directories, no group/world write, root uid+gid ownership;
+two-pass leaf-first defect naming keeps the arms unprivileged-testable;
+`MissingLeaf::Allow` keeps absence soft — and after rust's FAIL-fix,
+absent ANCESTORS stay soft too (c3f7b49; live repro: the daemon called
+a nonexistent dir "untrusted ... could not inspect" and exited 15) —
+while existing ancestors are still verified (no laundering).
+Relative components are rejected before inspection (dee01a9: `.`/`..`
+resolve against the live tree, escaping the lexical walk). Track item:
+consolidate ipc's verify_socket_trusted onto this walker when the
+runtime-dir pinning lands.
+
+**rust-review FAIL-fix lane** (champion-landed, reds recorded in the
+commits): c3f7b49 absent-ancestor soft-NotFound; 55d7346 cursor
+checked_add + release-only marker doc; dee01a9 RelativeComponent
+rejection; plus 282466b (two more private doc links the doc gate
+caught pre-push) and the #[test]-dedup followup.
+
+**qa's three observations** (log-only): X1's unit-level gap is by
+design — non-GB m49 drift is caught only by m49-verify against the
+real snapshot (CI-side); the gate dependency is explicit. X7's
+canonical_override_map_is_pinned meta-test is structure-only — value
+drift is caught by the fixtures and the real gate, not the meta-test;
+its name slightly oversells. X5's daemon production-call test cannot
+distinguish mode from ownership regressions on unprivileged runners
+(exit 15 either way) — the store suite carries both arms.
+
+**Process records.** The coordinator's FAIL-blocking checkpoint fired
+between fix-verification and the three-commit split — the window was
+innocent (no close action preceded the fixes) and the correction is
+recorded here as it happened. A pipe-masked clippy run hid the
+duplicated-attribute error once; gate exit codes are now checked raw.
+3c9936f (CONTRIBUTING conventions) rode this round's push.
