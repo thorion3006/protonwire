@@ -49,6 +49,41 @@ and CI, which installs its own pinned toolchains. A flake-based devshell
 is blocked until Nix's libgit2 supports this repository's reftable ref
 storage (tracked with the M8 packaging work).
 
+## Concurrent lanes & environment-gated tests
+
+Concurrent lanes share one working tree; these rules keep them out of
+each other's commits and test runs.
+
+1. **Stage by explicit paths, never `git add -A`** — the shared tree
+   carries siblings' in-flight edits, and `-A` absorbs them into your
+   commit (the round-4 staging incident).
+2. **A red test ships in the SAME commit as its fix**, never in an
+   unrelated lane's commit — split staging leaves commits that are
+   individually red and breaks `git bisect` (three such commits in
+   round 4).
+3. **Gate in a temp `git worktree` at your own commit** when the
+   shared tree carries siblings' uncommitted edits, and remove the
+   worktree afterwards. `direnv exec <dir> <cmd>` does NOT chdir —
+   cd into the worktree first.
+4. **Format scoped**: `cargo fmt -p <pkg>` from a concurrent lane;
+   bare `cargo fmt --all` rewrites siblings' in-flight files.
+5. **Root/userns-gated tests skip FIRST on `!getuid().is_root()`**
+   (NOTICE skip), then on the user-namespace check (NOTICE skip) —
+   the keep-id-sandbox false negative came from gating in the wrong
+   order. The NOTICEs are invisible under bare `cargo test` (libtest
+   captures per-test output); see them with `-- --nocapture` or
+   `-- --show-output`, and prefer observable skip patterns where the
+   skip itself matters.
+6. **Label red evidence honestly in the commit message**: behavioral
+   red (preferred); compile-red (disclosed as such — say what was
+   removed to build it); inspection-level (disclosed, naming what was
+   inspected). Wall-clock reds state their bounds and where they
+   depend on kernel behavior.
+7. **Reuse the seam-injection idiom** for testability — inject
+   collaborators as `&dyn Fn` parameters (`bind_with_resolved`,
+   `serve_observed`, the daemon's `run`) or extract a pure function
+   (`checks_for`) rather than inventing per-site variants.
+
 ## Local gates (must be green before push; run inside the devshell)
 
 ```sh
