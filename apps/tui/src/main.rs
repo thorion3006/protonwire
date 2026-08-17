@@ -6,8 +6,9 @@
 //! exit, error, and handled quit keys. Daemon state refreshes on a
 //! background thread (pr-champion R7-3) so a stalled daemon can no longer
 //! freeze input and redraw: connect+GetState run off the render/poll
-//! thread and snapshots cross a bounded newest-wins channel. SIGTERM and
-//! SIGHUP restore the terminal too (pr-champion R7-4): the handler only
+//! thread and snapshots cross a bounded newest-wins channel. SIGTERM,
+//! SIGHUP, SIGINT, and SIGQUIT restore the terminal too (pr-champion
+//! R7-4; round 7 added SIGINT/SIGQUIT): the handler only
 //! sets an async-signal-safe flag that the main loop polls and turns into
 //! restore+exit on the main thread. The remaining eight views, focus
 //! traversal, and confirmation dialogs land with Milestone 8 capability
@@ -64,11 +65,11 @@ struct Options {
 
 fn main() {
     let options = parse_args();
-    // R7-4: catch SIGTERM/SIGHUP before the terminal is touched. Failure
-    // only costs the signal-driven restore (the default disposition
-    // returns), so it is reported, not fatal.
+    // R7-4: catch SIGTERM/SIGHUP/SIGINT/SIGQUIT before the terminal is
+    // touched. Failure only costs the signal-driven restore (the default
+    // disposition returns), so it is reported, not fatal.
     if let Err(e) = install_terminate_handler() {
-        eprintln!("protonwire-tui: cannot install SIGTERM/SIGHUP handlers: {e}");
+        eprintln!("protonwire-tui: cannot install SIGTERM/SIGHUP/SIGINT/SIGQUIT handlers: {e}");
     }
     let mut terminal = match setup_terminal() {
         Ok(t) => t,
@@ -183,10 +184,11 @@ fn connect(options: &Options) -> Result<ProtonwireClient, ClientError> {
     protonwire_client::connect_with_socket_override(options.socket.as_deref(), ClientSurface::Tui)
 }
 
-/// Set by the SIGTERM/SIGHUP handler (R7-4); polled by the main loop.
+/// Set by the SIGTERM/SIGHUP/SIGINT/SIGQUIT handler (R7-4); polled by the
+/// main loop.
 static TERMINATE_REQUESTED: AtomicBool = AtomicBool::new(false);
 
-/// SIGTERM/SIGHUP landing pad.
+/// Terminating-signal landing pad (SIGTERM, SIGHUP, SIGINT, SIGQUIT).
 ///
 /// ASYNC-SIGNAL-SAFETY CONSTRAINT (R7-4): this runs on an arbitrary
 /// thread, interrupted from arbitrary code. The ENTIRE body is one store
@@ -199,17 +201,23 @@ extern "C" fn record_termination(_signal: nix::libc::c_int) {
     TERMINATE_REQUESTED.store(true, Ordering::Relaxed);
 }
 
-/// Installs the SIGTERM/SIGHUP flag handlers (R7-4). Signals bypass
-/// unwind, so the panic hook never runs and raw mode plus the alternate
-/// screen used to leak on `kill`; with the handler in place the loop
-/// observes the flag and tears down through the same restore path as a
-/// quit key.
+/// Installs the flag handler for SIGTERM, SIGHUP, SIGINT, and SIGQUIT
+/// (R7-4; round 7 added SIGINT/SIGQUIT — Ctrl-C and Ctrl-\ bypass the
+/// quit-key path, and the handler body is signal-agnostic, so the same
+/// flag store serves them). Signals bypass unwind, so the panic hook
+/// never runs and raw mode plus the alternate screen used to leak on
+/// `kill`; with the handler in place the loop observes the flag and
+/// tears down through the same restore path as a quit key.
 ///
 /// The workspace denies `unsafe_code`; this is the TUI's one audited
 /// unsafe block, sound because the installed handler writes only a
 /// static atomic (see [`record_termination`]). `SaFlags::empty()` —
 /// no SA_RESTART because it would not restart poll(2) anyway, and the
 /// loop must notice the flag, not have syscalls paper over the signal.
+/// EINTR note (sec round 7): crossterm 0.29 retries `Interrupted` event
+/// reads internally (mio.rs:80), so a signal landing mid-poll surfaces
+/// as a fresh poll window rather than a propagated error — the flag is
+/// observed within one POLL (50 ms) cadence either way.
 #[allow(unsafe_code)]
 fn install_terminate_handler() -> nix::Result<()> {
     let action = SigAction::new(
@@ -220,6 +228,8 @@ fn install_terminate_handler() -> nix::Result<()> {
     unsafe {
         sigaction(Signal::SIGTERM, &action)?;
         sigaction(Signal::SIGHUP, &action)?;
+        sigaction(Signal::SIGINT, &action)?;
+        sigaction(Signal::SIGQUIT, &action)?;
     }
     Ok(())
 }
@@ -456,8 +466,9 @@ fn run(terminal: &mut Term, options: Options) -> Result<(), ClientError> {
 /// "keys and redraws keep flowing during a stall" pinnable at all.
 /// Processes at most one key per frame; at the frame cadence (one POLL
 /// window plus a draw) that is indistinguishable from draining the whole
-/// backlog per redraw. Each frame also polls the SIGTERM/SIGHUP flag
-/// (R7-4) and takes the restore+exit path on the main thread.
+/// backlog per redraw. Each frame also polls the SIGTERM/SIGHUP/SIGINT/
+/// SIGQUIT flag (R7-4) and takes the restore+exit path on the main
+/// thread.
 fn drive(
     drain: &mut dyn FnMut() -> Option<Snapshot>,
     state: &mut LoopState,
@@ -844,31 +855,39 @@ mod tests {
         assert!(restored.load(Ordering::SeqCst));
     }
 
-    /// pr-champion R7-4: real signal delivery. kill(getpid(), SIGTERM)
-    /// from a spawned thread must land in the handler (which only sets
-    /// the static flag — async-signal-safe, so this is benign for every
-    /// other test in the process) and be observable by polling, then take
-    /// the restore+exit path. Full signal-delivery tests are fragile in
-    /// CI; this one is deterministic because the handler's entire effect
-    /// is a flag store and the sender thread cannot race the install
-    /// (install runs first, on the test thread).
+    /// pr-champion R7-4: real signal delivery. kill(getpid(), ...) from a
+    /// spawned thread must land in the handler (which only sets the
+    /// static flag — async-signal-safe, so this is benign for every other
+    /// test in the process) and be observable by polling, then take the
+    /// restore+exit path. Round 7 extended the loop to SIGINT and SIGQUIT
+    /// — both new registrations delivered for real, one signal at a time
+    /// (a second concurrent signal test could reset the shared flag
+    /// mid-observation and fail spuriously). Full signal-delivery tests
+    /// are fragile in CI; this one is deterministic because the handler's
+    /// entire effect is a flag store and the sender thread cannot race
+    /// the install (install runs first, on the test thread).
     #[test]
-    fn delivered_sigterm_sets_the_flag_and_exits_through_restore() {
+    fn delivered_terminate_signals_set_the_flag_and_exit_through_restore() {
         install_terminate_handler().unwrap();
-        TERMINATE_REQUESTED.store(false, Ordering::Relaxed);
-        std::thread::spawn(|| {
-            std::thread::sleep(Duration::from_millis(25));
-            nix::sys::signal::kill(nix::unistd::Pid::this(), nix::sys::signal::Signal::SIGTERM)
-                .unwrap();
-        });
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while !TERMINATE_REQUESTED.load(Ordering::Relaxed) && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(5));
+        for signal in [
+            nix::sys::signal::Signal::SIGTERM,
+            nix::sys::signal::Signal::SIGINT,
+            nix::sys::signal::Signal::SIGQUIT,
+        ] {
+            TERMINATE_REQUESTED.store(false, Ordering::Relaxed);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(25));
+                nix::sys::signal::kill(nix::unistd::Pid::this(), signal).unwrap();
+            });
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !TERMINATE_REQUESTED.load(Ordering::Relaxed) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(
+                TERMINATE_REQUESTED.load(Ordering::Relaxed),
+                "delivered {signal:?} was not observed"
+            );
         }
-        assert!(
-            TERMINATE_REQUESTED.load(Ordering::Relaxed),
-            "delivered SIGTERM was not observed"
-        );
         let restored = Arc::new(AtomicBool::new(false));
         let marker = Arc::clone(&restored);
         assert!(matches!(
