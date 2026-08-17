@@ -85,7 +85,12 @@ pub fn write_msg<W: Write, T: Serialize>(w: &mut W, msg: &T) -> Result<(), Frame
 /// deadline's remaining budget. Expiry fails with
 /// [`std::io::ErrorKind::TimedOut`]; partial progress does NOT reset the
 /// deadline (one message, one budget).
-pub fn write_msg_within<W: Write + AsFd, T: Serialize>(
+///
+/// Takes [`AsFd`] only: every byte goes out through `send(fd, MSG_DONTWAIT)`
+/// in [`write_all_within`], so `std::io::Write` is never used (a `flush`
+/// would be a no-op on a socket anyway) and advertising the bound would
+/// imply a stdio-style writer is acceptable here.
+pub fn write_msg_within<W: AsFd, T: Serialize>(
     w: &mut W,
     msg: &T,
     deadline: Instant,
@@ -97,7 +102,6 @@ pub fn write_msg_within<W: Write + AsFd, T: Serialize>(
     let len = u32::try_from(payload.len()).expect("checked against MAX_FRAME_LEN");
     write_all_within(w, &len.to_be_bytes(), deadline)?;
     write_all_within(w, &payload, deadline)?;
-    w.flush()?;
     Ok(())
 }
 
@@ -106,7 +110,7 @@ pub fn write_msg_within<W: Write + AsFd, T: Serialize>(
 /// whatever the fd's flags — so clones of the socket keep their blocking
 /// semantics), retries are paced by poll(2) inside the remaining budget,
 /// and expiry fails with `TimedOut`.
-fn write_all_within<W: Write + AsFd>(
+fn write_all_within<W: AsFd>(
     w: &mut W,
     buf: &[u8],
     deadline: Instant,
