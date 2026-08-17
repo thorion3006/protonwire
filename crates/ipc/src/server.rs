@@ -206,17 +206,23 @@ impl IpcServer {
     /// and cannot pin a writer past 10 s per message (a userspace write
     /// deadline, R7-1 — not just `SO_SNDTIMEO`).
     ///
-    /// Returning implies every session has DRAINED: responses queued before
-    /// the stop flag — an administrator Shutdown acknowledgement, for
-    /// example — are flushed to their sockets first (Codex PR review round
-    /// 2, finding 4). A caller that exits when this returns therefore
-    /// cannot lose a final response to process teardown. Draining is
-    /// bounded overall by DRAIN_CEILING (3× the 10 s write ceiling):
-    /// a session still owing data past it has its socket forced down and
-    /// its worker detached, because `SO_SNDTIMEO` bounds each write
-    /// syscall — not the shutdown join — and a slow-dribbling peer (or a
-    /// blocking handler, see [`RequestHandler::handle`]) would otherwise
-    /// pin `serve()` indefinitely.
+    /// Returning implies every session has drained or been given up on —
+    /// the flush of stop-time responses is an ATTEMPT, not a delivery
+    /// guarantee (Codex PR review round 2, finding 4). Each message
+    /// queued before the stop flag — an administrator Shutdown
+    /// acknowledgement, for example — gets one write_timeout of
+    /// deadline-bounded writing (R7-1): a peer draining at
+    /// frame-size / write_timeout pace receives it in full, while a peer
+    /// that is momentarily not reading — a TUI mid-refresh, the named
+    /// casualty — receives a truncated frame followed by a clean
+    /// mid-frame EOF (the writer's deadline expiry breaks the loop and
+    /// shuts the shared socket down). DRAIN_CEILING (3× the 10 s write
+    /// ceiling) bounds only the shutdown JOIN/DETACH, not per-message
+    /// delivery: a session still owing work past it has its socket forced
+    /// down and its worker detached, because `SO_SNDTIMEO` bounds each
+    /// write syscall — not the shutdown join — and a blocking handler
+    /// (see [`RequestHandler::handle`]) would otherwise pin `serve()`
+    /// indefinitely.
     pub fn serve<H: RequestHandler + 'static>(&self, handler: Arc<H>, stop: Arc<AtomicBool>) {
         self.serve_with(handler, stop, ServeBudgets::default());
     }
