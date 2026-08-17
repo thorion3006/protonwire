@@ -367,6 +367,25 @@ fn expect_lock_checksum(recorded: Option<&str>, locked: Option<&str>, what: &str
     }
 }
 
+/// Round-8 X6: like the checksum rule above, the recorded ProTUN revision
+/// is compared against the resolution authority — the git revision
+/// Cargo.lock actually locked for the package (the `git+…#<rev>` source
+/// fragment) — and not only against the validator constant, so the pin
+/// cannot drift from the resolved dependency silently. A lockfile entry
+/// without a git revision fails rather than passing vacuously.
+fn expect_lock_revision(recorded: Option<&str>, locked: Option<&str>, what: &str) -> Vec<String> {
+    match (recorded, locked) {
+        (Some(recorded), Some(locked)) if recorded == locked => Vec::new(),
+        (Some(recorded), Some(locked)) => vec![format!(
+            "{what} `{recorded}` disagrees with the Cargo.lock git revision `{locked}`"
+        )],
+        (Some(_), None) => vec![format!(
+            "{what} cannot be verified: Cargo.lock records no git revision for the pinned version"
+        )],
+        (None, _) => vec![format!("{what} is missing")],
+    }
+}
+
 fn expect_checksum(actual: Option<&str>, what: &str) -> Option<String> {
     match actual {
         Some(value) if is_sha256_hex(value) => None,
@@ -394,12 +413,17 @@ struct Lockfile {
     /// `(name, version)` → checksum, for packages that carry one (path
     /// and git dependencies record none).
     checksums: BTreeMap<(String, String), String>,
+    /// `(name, version)` → resolved git revision, for packages whose
+    /// source is a git dependency (`git+…#<rev>`; round-8 X6).
+    git_revs: BTreeMap<(String, String), String>,
 }
 
 #[derive(Deserialize)]
 struct LockPackage {
     name: String,
     version: String,
+    #[serde(default)]
+    source: Option<String>,
     #[serde(default)]
     checksum: Option<String>,
 }
@@ -423,10 +447,11 @@ impl Lockfile {
         let doc: LockDocument =
             toml::from_str(text).with_context(|| "failed to parse Cargo.lock")?;
         let mut checksums = BTreeMap::new();
+        let mut git_revs = BTreeMap::new();
         let mut seen = BTreeSet::new();
         for package in doc.packages {
             let key = (package.name.clone(), package.version.clone());
-            if !seen.insert(key) {
+            if !seen.insert(key.clone()) {
                 return Err(anyhow!(
                     "Cargo.lock lists {} {} more than once — duplicate \
                      (name, version) entries make the checksum ambiguous",
@@ -435,10 +460,19 @@ impl Lockfile {
                 ));
             }
             if let Some(checksum) = package.checksum {
-                checksums.insert((package.name, package.version), checksum);
+                checksums.insert(key.clone(), checksum);
+            }
+            // Round-8 X6: git dependencies record the commit Cargo
+            // actually resolved as the `#<rev>` fragment of their
+            // `git+…` source URL.
+            if let Some(rev) = package.source.as_deref().and_then(git_rev_from_source) {
+                git_revs.insert(key, rev.to_owned());
             }
         }
-        Ok(Self { checksums })
+        Ok(Self {
+            checksums,
+            git_revs,
+        })
     }
 
     /// Reads and parses the lockfile at `path`.
@@ -455,6 +489,25 @@ impl Lockfile {
             .get(&(name.to_owned(), version.to_owned()))
             .map(String::as_str)
     }
+
+    /// The git revision Cargo resolved for `name` at `version`, if the
+    /// lockfile entry is a git dependency carrying one (round-8 X6).
+    fn git_rev(&self, name: &str, version: &str) -> Option<&str> {
+        self.git_revs
+            .get(&(name.to_owned(), version.to_owned()))
+            .map(String::as_str)
+    }
+}
+
+/// The commit a git dependency locked to. Cargo records git sources as
+/// `git+<url>?rev=<rev>#<rev>` (and branch/tag pins as
+/// `git+<url>?branch=…#<rev>`): the `#` fragment is always the commit
+/// actually checked out — the query parameters only record what was
+/// requested — so the fragment is the resolved revision.
+fn git_rev_from_source(source: &str) -> Option<&str> {
+    let url = source.strip_prefix("git+")?;
+    let (_, rev) = url.rsplit_once('#')?;
+    (!rev.is_empty()).then_some(rev)
 }
 
 fn check_upstream(doc: &Manifest, lock: &Lockfile) -> Vec<String> {
@@ -473,6 +526,13 @@ fn check_upstream(doc: &Manifest, lock: &Lockfile) -> Vec<String> {
             violations.extend(expect_value(
                 entry.revision.as_deref(),
                 PROTON_REVISION,
+                "upstream.protun.revision",
+            ));
+            // Round-8 X6: the constant pin alone cannot see the manifest
+            // drifting from what Cargo actually resolved.
+            violations.extend(expect_lock_revision(
+                entry.revision.as_deref(),
+                lock.git_rev("protun", "2.2.1"),
                 "upstream.protun.revision",
             ));
         }
@@ -769,7 +829,9 @@ mod tests {
     use super::*;
     /// A minimal lockfile fixture matching the good manifest's pins — the
     /// real Cargo.lock carries the same two checksums for muon 2.6.1 and
-    /// pvpnclient 3.0.3 (Proton sparse-registry entries).
+    /// pvpnclient 3.0.3 (Proton sparse-registry entries) and the same git
+    /// source for protun 2.2.1 (`git+…?rev=…#…`, the fragment being the
+    /// commit Cargo actually resolved).
     fn good_lockfile_text() -> String {
         "\
 version = 4
@@ -785,6 +847,11 @@ name = \"pvpnclient\"
 version = \"3.0.3\"
 source = \"sparse+https://rust-registry.proton.me/index/\"
 checksum = \"3c14ef052727e0204ec5e80cf8df50786db38a83b6a6557a188b78a4c264f380\"
+
+[[package]]
+name = \"protun\"
+version = \"2.2.1\"
+source = \"git+https://github.com/ProtonVPN/protun?rev=12e7755a112f59b7b843da79290b3de25febf653#12e7755a112f59b7b843da79290b3de25febf653\"
 "
         .to_string()
     }
@@ -987,6 +1054,58 @@ capabilities:
             "an unverifiable checksum must fail, not pass vacuously"
         );
         fs::remove_file(&path).ok();
+    }
+
+    /// Round-8 X6: the ProTUN revision was compared only against the
+    /// PROTON_REVISION constant, so the manifest pin could drift from the
+    /// revision Cargo actually resolved — recorded in Cargo.lock as the
+    /// `git+…#<rev>` source fragment — with nothing comparing the two.
+    /// The pin must be cross-checked against the lockfile (the same
+    /// resolution authority the checksum rule uses), naming both values
+    /// on disagreement.
+    #[test]
+    fn protun_revision_must_match_the_lockfile_git_rev() {
+        // The lockfile resolved a DIFFERENT commit than the manifest pins
+        // (both well-formed, the manifest still equal to the constant
+        // pin): only the lockfile cross-check can see the disagreement.
+        let tampered = good_lockfile_text().replacen(
+            "12e7755a112f59b7b843da79290b3de25febf653",
+            "12e7755a112f59b7b843da79290b3de25febf654",
+            2,
+        );
+        let path = temp_yaml("protun-lock", &good_manifest_yaml());
+        assert!(
+            !validate(&path, &Lockfile::parse(&tampered).unwrap()).unwrap(),
+            "a manifest pin disagreeing with the resolved Cargo.lock revision must fail the gate"
+        );
+        fs::remove_file(&path).ok();
+
+        // A lockfile without a protun git entry cannot verify the pin:
+        // the gate must fail rather than pass vacuously.
+        let path = temp_yaml("protun-absent", &good_manifest_yaml());
+        assert!(
+            !validate(&path, &Lockfile::parse("version = 4\n").unwrap()).unwrap(),
+            "an unverifiable protun pin must fail, not pass vacuously"
+        );
+        fs::remove_file(&path).ok();
+
+        // The fixture agreeing with the lockfile still passes.
+        let path = temp_yaml("protun-ok", &good_manifest_yaml());
+        assert!(
+            validate(&path, &good_lock()).unwrap(),
+            "the fixture agreeing with the lockfile must pass"
+        );
+        fs::remove_file(&path).ok();
+
+        // The mismatch violation must NAME both revisions.
+        let doc: Manifest = serde_norway::from_str(&good_manifest_yaml()).unwrap();
+        assert!(
+            check_upstream(&doc, &Lockfile::parse(&tampered).unwrap())
+                .iter()
+                .any(|v| v.contains("12e7755a112f59b7b843da79290b3de25febf653")
+                    && v.contains("12e7755a112f59b7b843da79290b3de25febf654")),
+            "the violation must name the recorded pin and the resolved revision"
+        );
     }
 
     /// pr-champion round-6 triage, WO-W4: the six official-client baselines
