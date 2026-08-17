@@ -12,7 +12,7 @@
 //! state indefinitely. A drop therefore also MARKS the session
 //! (SessionEntry::overflowed); the session's forwarder observes the
 //! mark once it resumes draining and sends the client the reserved
-//! resync marker — see `server::handle_session`'s forwarder.
+//! resync marker — see `server::session::handle_session`'s forwarder.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
