@@ -259,7 +259,18 @@ impl ProtonwireClient {
                 // rewinding it into a spurious-gap state).
                 return self.resynchronize(None);
             }
-            let expected = self.last_seq.map_or(envelope.seq, |last| last + 1);
+            // checked_add (rust-review round 8): a pre-signal SDK that
+            // stored the reserved marker's seq sits at u64::MAX, and the
+            // plain `+ 1` was one add from a debug panic. Overflow now
+            // means resynchronize — no SDK build panics on cursor
+            // arithmetic.
+            let expected = match self.last_seq {
+                Some(last) => match last.checked_add(1) {
+                    Some(next) => next,
+                    None => return self.resynchronize(None),
+                },
+                None => envelope.seq,
+            };
             if envelope.seq > expected {
                 return self.resynchronize(Some(envelope.seq));
             }
@@ -528,6 +539,35 @@ mod tests {
         match client.next_event().unwrap() {
             ClientEvent::Event(envelope) => assert_eq!(envelope.seq, 3),
             ClientEvent::Resynchronized { .. } => panic!("unexpected resync"),
+        }
+    }
+
+    /// rust-review round 8 (Medium): a pre-signal SDK that stored the
+    /// reserved marker's seq leaves the cursor at u64::MAX; the next
+    /// normal event then hit `last + 1` — a debug panic one add away.
+    /// checked_add turns the overflow into a resynchronization.
+    #[test]
+    fn poisoned_cursor_resynchronizes_instead_of_panicking() {
+        let dir = tempfile::tempdir().unwrap();
+        let (server, handler) = spawn_server(&dir);
+        let path = server.socket_path().to_owned();
+        let mut client = dev_client(&path);
+        client.last_seq = Some(u64::MAX);
+        handler.bus.publish(ServerMessage::Event(EventEnvelope {
+            seq: 7,
+            event: Event::Notice {
+                level: NoticeLevel::Info,
+                message: "after poison".into(),
+            },
+        }));
+        match client.next_event().unwrap() {
+            ClientEvent::Resynchronized { resumed_at_seq, .. } => {
+                assert_eq!(resumed_at_seq, u64::MAX);
+            }
+            ClientEvent::Event(envelope) => panic!(
+                "expected a resync from the poisoned cursor, got event {}",
+                envelope.seq
+            ),
         }
     }
 

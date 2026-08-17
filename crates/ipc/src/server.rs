@@ -549,9 +549,15 @@ fn chown_socket_group(socket_path: &Path, name: &str, gid: nix::unistd::Gid) -> 
 /// The end-of-burst overflow marker (X4): a `ServerMessage::Event` whose
 /// seq is the reserved [`EVENT_SEQ_RESYNC_NOW`], carrying a real
 /// [`Event::Notice`] payload so the frame deserializes on every client —
-/// including ones that predate the signal, whose gap logic treats the
-/// impossible seq as a gap and resynchronizes on its own. Current SDKs
-/// intercept the envelope explicitly and never deliver it as an event.
+/// including ones that predate the signal. RELEASE builds of such an SDK
+/// self-recover: the impossible seq reads as a gap, and the wrapped
+/// cursor heals after one spurious resync (verified by both reviewers).
+/// DEBUG builds of a pre-signal SDK panicked on the cursor+1 overflow —
+/// current SDKs intercept the envelope before any cursor arithmetic, and
+/// the arithmetic itself is checked_add since rust-review round 8, so no
+/// build sits one add from a panic. Fully gating the marker behind the
+/// hello handshake remains a TRACK ITEM with sec's hard trigger:
+/// must-fix before any separately-shipped client artifact.
 fn resync_marker() -> ServerMessage {
     ServerMessage::Event(EventEnvelope {
         seq: EVENT_SEQ_RESYNC_NOW,
