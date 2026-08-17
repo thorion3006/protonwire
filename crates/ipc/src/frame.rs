@@ -110,11 +110,7 @@ pub fn write_msg_within<W: AsFd, T: Serialize>(
 /// whatever the fd's flags — so clones of the socket keep their blocking
 /// semantics), retries are paced by poll(2) inside the remaining budget,
 /// and expiry fails with `TimedOut`.
-fn write_all_within<W: AsFd>(
-    w: &mut W,
-    buf: &[u8],
-    deadline: Instant,
-) -> Result<(), FrameError> {
+fn write_all_within<W: AsFd>(w: &mut W, buf: &[u8], deadline: Instant) -> Result<(), FrameError> {
     use nix::poll::{PollFd, PollFlags, poll};
     use nix::sys::socket::{MsgFlags, send};
 

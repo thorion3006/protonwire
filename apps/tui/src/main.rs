@@ -580,8 +580,7 @@ mod tests {
 
     use super::{
         DashboardView, Flow, KeyInput, LoopState, RefreshWorker, STALE_AFTER, Snapshot,
-        StampedSnapshot, TERMINATE_REQUESTED, drive, install_terminate_handler,
-        termination_check,
+        StampedSnapshot, TERMINATE_REQUESTED, drive, install_terminate_handler, termination_check,
     };
 
     fn test_state() -> super::DaemonState {
