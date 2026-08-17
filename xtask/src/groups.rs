@@ -31,6 +31,17 @@ const REQUIRED_RANKING_POLICIES: &[&str] = &[
 ];
 const REGIONAL_RANKING_OVERRIDES: &[&str] = &["proton-score", "balanced", "load", "latency"];
 
+/// The exact `physical_country.forbidden_sources` set the v1 contract
+/// carries (docs/connection-groups.yaml): the five sources a physical
+/// country must never be inferred from.
+const EXPECTED_FORBIDDEN_SOURCES: &[&str] = &[
+    "vpn-exit",
+    "account-country",
+    "locale",
+    "timezone",
+    "third-party-geolocation",
+];
+
 const EXPECTED_REGIONS: &[(&str, &[&str])] = &[
     ("africa", &["002"]),
     ("asia", &["142"]),
@@ -418,15 +429,25 @@ fn check_physical_country(doc: &GroupsFile) -> Vec<String> {
         "physical_country.missing_policy",
     ));
 
+    // Round-8 X8: partial retention of the forbidden set passed — the
+    // old check required only `vpn-exit`. The exact five-source set is
+    // pinned: every missing source and every extra one is a named
+    // violation (an empty list is the all-missing case).
     match physical_country.forbidden_sources.as_deref() {
-        Some(sources) if !sources.is_empty() => {
-            if !sources.iter().any(|s| s == "vpn-exit") {
-                violations
-                    .push("physical_country.forbidden_sources must contain `vpn-exit`".to_string());
+        Some(sources) => {
+            let actual: BTreeSet<&str> = sources.iter().map(String::as_str).collect();
+            let expected: BTreeSet<&str> = EXPECTED_FORBIDDEN_SOURCES.iter().copied().collect();
+            for source in expected.difference(&actual) {
+                violations.push(format!(
+                    "physical_country.forbidden_sources must contain `{source}`"
+                ));
             }
-        }
-        Some(_) => {
-            violations.push("physical_country.forbidden_sources must not be empty".to_string())
+            for source in actual.difference(&expected) {
+                violations.push(format!(
+                    "physical_country.forbidden_sources must not contain `{source}` \
+                     (not part of the canonical five-source set)"
+                ));
+            }
         }
         None => violations.push("physical_country.forbidden_sources is missing".to_string()),
     }
@@ -855,7 +876,7 @@ contract:
 physical_country:
   on_demand_request_minimum_interval_hours: 3
   periodic_polling: forbidden
-  forbidden_sources: [vpn-exit, locale]
+  forbidden_sources: [vpn-exit, account-country, locale, timezone, third-party-geolocation]
   missing_policy: physical-country-required
 sources:
   un_m49:
@@ -996,13 +1017,52 @@ groups:
     #[test]
     fn missing_physical_country_source_fails() {
         let yaml = good_groups_yaml().replacen(
-            "forbidden_sources: [vpn-exit, locale]",
-            "forbidden_sources: [locale]",
+            "forbidden_sources: [vpn-exit, account-country, locale, timezone, third-party-geolocation]",
+            "forbidden_sources: [account-country, locale, timezone, third-party-geolocation]",
             1,
         );
         let path = temp_yaml("vpn-exit", &yaml);
         assert!(!validate(&path).unwrap());
         fs::remove_file(&path).ok();
+    }
+
+    /// Round-8 X8: partial retention of the forbidden-source set passed —
+    /// the check required only `vpn-exit`, so dropping any of the other
+    /// four documented sources (or adding a sixth) was silent drift. The
+    /// exact five-source set is pinned; every missing or extra source is
+    /// a violation naming it.
+    #[test]
+    fn partial_forbidden_sources_set_fails() {
+        let removed = serde_norway::from_str::<GroupsFile>(
+            "physical_country:\n  forbidden_sources: [vpn-exit, account-country, locale, third-party-geolocation]\n",
+        )
+        .unwrap();
+        let violations = check_physical_country(&removed);
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.contains("must contain `timezone`")),
+            "dropping `timezone` must be a violation naming it, got {violations:?}"
+        );
+
+        let extra = serde_norway::from_str::<GroupsFile>(
+            "physical_country:\n  forbidden_sources: [vpn-exit, account-country, locale, timezone, third-party-geolocation, ip-geolocation]\n",
+        )
+        .unwrap();
+        let violations = check_physical_country(&extra);
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.contains("must not contain `ip-geolocation`")),
+            "a sixth source must be a violation naming it, got {violations:?}"
+        );
+
+        let pinned: BTreeSet<&str> = EXPECTED_FORBIDDEN_SOURCES.iter().copied().collect();
+        assert_eq!(
+            pinned.len(),
+            5,
+            "the canonical forbidden-source set has exactly five members"
+        );
     }
 
     #[test]
