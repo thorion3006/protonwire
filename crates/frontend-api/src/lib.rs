@@ -20,7 +20,7 @@ pub mod proto;
 pub mod schema;
 pub mod state;
 
-pub use event::{Event, EventEnvelope, NoticeLevel};
+pub use event::{EVENT_SEQ_RESYNC_NOW, Event, EventEnvelope, NoticeLevel};
 pub use proto::{
     ClientInfo, ClientMessage, ClientSurface, ConnectTarget, HelloAck, HelloError,
     PROTOCOL_VERSION, Request, RequestResult, Response, RpcError, RpcErrorCode, ServerMessage,
