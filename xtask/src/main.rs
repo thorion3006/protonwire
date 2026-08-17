@@ -305,6 +305,12 @@ mod tests {
         let (missing, extra) = set_drift(&["a", "b", "c"], &actual);
         assert_eq!(missing, vec!["b"]);
         assert_eq!(extra, vec!["z"]);
+        // Multi-element, insertion-order input (rust-review refactor round): BOTH
+        // outputs arrive in canonical (sorted) order per the doc contract —
+        // insertion order would answer vec!["b","a"] and fail here.
+        let actual: BTreeSet<&str> = ["z", "c"].into_iter().collect();
+        assert_eq!(set_drift(&["b", "a"], &actual), (vec!["a", "b"], vec!["c", "z"]));
+
         // An exact match reports no drift in either direction.
         let pinned: BTreeSet<&str> = ["a", "c"].into_iter().collect();
         assert_eq!(set_drift(&["a", "c"], &pinned), (Vec::new(), Vec::new()));

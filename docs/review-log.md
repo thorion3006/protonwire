@@ -958,3 +958,26 @@ CI incident on 6eeddbf (attempt 1): the test job hung 20+ minutes in
 green locally under 2-CPU pinning; rerun on the same sha passed in
 48 s. Recorded as a runner/infra flake, one occurrence, no repro; if
 it recurs, the R9-2 window tests get per-test timeouts first.
+
+## 2026-08-17 — Refactor round (post-round-9): server split + set_drift
+
+The queued structural work, landed after the review queue emptied so
+it touched settled files: 177834d extracts the shared `set_drift`
+helper for the xtask pin families (capability ids, M49 codes — one
+violation message per drifted id, message wording at call sites);
+283f264 splits server.rs into bind/session modules. rust-reviewer
+PASS: behavior-preserving by region-by-region byte diffs beyond the
+multiset claim; all pinned tests compared verbatim, none weakened
+(the plan's "32 tests" was a miscount — the true pinned count is 34);
+visibility changes exactly the three disclosed artifacts; gates
+re-run raw and green.
+
+Verdict-Low dispositions: the stray `./true` root artifact (a
+mis-quoted shell redirect, content "echo R9-2:") deleted by the
+coordinator; this entry is the findings-land-in-the-log obligation;
+and the set_drift ordering contract is now pinned in-test — the
+multi-element insertion-order case answers BOTH lists in canonical
+sorted order (one honest correction to the reviewer's sketch: for
+the {z,c} fixture the extra list is ["c","z"], not ["z"] — the
+prescribed ordering pin is what landed, and the assert demonstrably
+has teeth: a wrong expectation fails it).
