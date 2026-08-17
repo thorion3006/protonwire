@@ -138,6 +138,33 @@ const EXPECTED_CONNECTION_TYPES: [(&str, &str); 7] = [
 const EXPECTED_SELECTION_AUTHORITIES: [(&str, &str); 1] =
     [("proton:random-country", "proton-backend-when-required")];
 
+/// Per-canonical-group `overrides` key->value pin, in the
+/// [`EXPECTED_GROUP_TARGET_KINDS`] style: most groups ship the empty map;
+/// the documented exceptions are streaming-us's protocol, gaming's nat,
+/// anti-censorship's protocol, max-security's lan_access, and
+/// work-school's protocol+lan_access (docs/connection-groups.yaml).
+/// Values are compact-JSON encodings, compared exactly against the
+/// deserialized document.
+const EXPECTED_GROUP_OVERRIDES: [(&str, &[(&str, &str)]); EXPECTED_GROUP_COUNT] = [
+    ("proton:anti-censorship", &[("protocol", "\"stealth\"")]),
+    ("proton:fastest-country", &[]),
+    ("proton:fastest-excluding-my-country", &[]),
+    ("proton:gaming", &[("nat", "\"moderate\"")]),
+    ("proton:max-security", &[("lan_access", "\"block\"")]),
+    ("proton:random-country", &[]),
+    ("proton:streaming-us", &[("protocol", "\"wireguard-udp\"")]),
+    (
+        "proton:work-school",
+        &[("lan_access", "\"block\""), ("protocol", "\"stealth\"")],
+    ),
+    ("protonwire:fastest-africa", &[]),
+    ("protonwire:fastest-asia", &[]),
+    ("protonwire:fastest-europe", &[]),
+    ("protonwire:fastest-north-america", &[]),
+    ("protonwire:fastest-oceania", &[]),
+    ("protonwire:fastest-south-america", &[]),
+];
+
 #[derive(Deserialize)]
 pub(crate) struct GroupsFile {
     schema_version: Option<i64>,
@@ -628,6 +655,53 @@ fn check_group(
         }
     }
 
+    violations.extend(expect_overrides(
+        &label,
+        group.id.as_deref(),
+        group.overrides.as_ref(),
+    ));
+
+    violations
+}
+
+/// Enforces one per-canonical-id overrides pin (the
+/// [`EXPECTED_GROUP_TARGET_KINDS`] style, applied to the override map):
+/// the key vocabulary alone left override VALUES unconstrained, so
+/// max-security's lan_access block->allow passed. Every canonical id's
+/// full key->value map is pinned — a flipped value, a dropped pinned
+/// key, or an added stray key is a named violation. Ids without a pin
+/// are unconstrained (every canonical id carries one, empty or not).
+fn expect_overrides(
+    label: &str,
+    id: Option<&str>,
+    actual: Option<&BTreeMap<String, serde_json::Value>>,
+) -> Vec<String> {
+    let Some((_, pinned)) = EXPECTED_GROUP_OVERRIDES
+        .iter()
+        .find(|(pinned_id, _)| Some(*pinned_id) == id)
+        .copied()
+    else {
+        return Vec::new();
+    };
+    let empty = BTreeMap::new();
+    let actual = actual.unwrap_or(&empty);
+    let mut violations = Vec::new();
+    for (key, value) in pinned {
+        match actual.get(*key).map(serde_json::Value::to_string) {
+            Some(json) if json == *value => {}
+            Some(json) => violations.push(format!(
+                "{label}: overrides.{key} must be {value}, got {json}"
+            )),
+            None => violations.push(format!("{label}: overrides.{key} must be {value}")),
+        }
+    }
+    for key in actual.keys() {
+        if !pinned.iter().any(|(pinned_key, _)| pinned_key == key) {
+            violations.push(format!(
+                "{label}: overrides key `{key}` is not part of the canonical override map"
+            ));
+        }
+    }
     violations
 }
 
@@ -807,43 +881,53 @@ groups:
         // The proton targets mirror docs/connection-groups.yaml exactly:
         // connection_type, selection_authority, exclude_physical_country,
         // country, and the secure-core entry/exit pair are each entry's
-        // pinned selection semantics, not decoration.
-        for (id, target) in [
+        // pinned selection semantics, not decoration — and so are the
+        // overrides (streaming-us protocol, gaming nat, anti-censorship
+        // protocol, max-security lan_access, work-school both).
+        for (id, target, overrides) in [
             (
                 "proton:fastest-country",
                 "{kind: fastest, connection_type: standard}",
+                "{}",
             ),
             (
                 "proton:fastest-excluding-my-country",
                 "{kind: fastest, connection_type: standard, exclude_physical_country: true}",
+                "{}",
             ),
             (
                 "proton:random-country",
                 "{kind: random, connection_type: standard, selection_authority: proton-backend-when-required}",
+                "{}",
             ),
             (
                 "proton:streaming-us",
                 "{kind: fastest-in-country, connection_type: standard, country: US}",
+                "{protocol: wireguard-udp}",
             ),
             (
                 "proton:gaming",
                 "{kind: fastest, connection_type: standard}",
+                "{nat: moderate}",
             ),
             (
                 "proton:anti-censorship",
                 "{kind: fastest, connection_type: standard, exclude_physical_country: true}",
+                "{protocol: stealth}",
             ),
             (
                 "proton:max-security",
                 "{kind: secure-core, entry_country: fastest, exit_country: fastest}",
+                "{lan_access: block}",
             ),
             (
                 "proton:work-school",
                 "{kind: fastest, connection_type: standard}",
+                "{protocol: stealth, lan_access: block}",
             ),
         ] {
             yaml.push_str(&format!(
-                "  - id: \"{id}\"\n    definition_source: official-client-compat\n    immutable: true\n    ranking_policy: proton-score\n    overrides: {{}}\n    sources: [docs]\n    target: {target}\n"
+                "  - id: \"{id}\"\n    definition_source: official-client-compat\n    immutable: true\n    ranking_policy: proton-score\n    overrides: {overrides}\n    sources: [docs]\n    target: {target}\n"
             ));
         }
         for region in [
@@ -1197,6 +1281,74 @@ groups:
             "a renamed canonical group id must fail validation"
         );
         fs::remove_file(&path).ok();
+    }
+
+    /// The per-group override map pins exactly the canonical ids (the
+    /// canonical_target_kind_map_is_pinned style): 9 groups with the
+    /// empty map, the 5 documented exceptions (streaming-us protocol,
+    /// gaming nat, anti-censorship protocol, max-security lan_access,
+    /// work-school protocol+lan_access), and every key inside the
+    /// allowed override-key vocabulary.
+    #[test]
+    fn canonical_override_map_is_pinned() {
+        let ids: BTreeSet<&str> = EXPECTED_GROUP_IDS.iter().copied().collect();
+        let pinned_ids: BTreeSet<&str> =
+            EXPECTED_GROUP_OVERRIDES.iter().map(|(id, _)| *id).collect();
+        assert_eq!(
+            pinned_ids, ids,
+            "the override map must cover exactly the canonical ids"
+        );
+        let mut non_empty = 0;
+        for (_, overrides) in EXPECTED_GROUP_OVERRIDES {
+            if !overrides.is_empty() {
+                non_empty += 1;
+            }
+            for (key, _) in overrides {
+                assert!(
+                    ALLOWED_OVERRIDE_KEYS.contains(key),
+                    "pinned override key `{key}` must be in the vocabulary"
+                );
+            }
+        }
+        assert_eq!(
+            non_empty, 5,
+            "exactly five canonical groups define non-empty overrides"
+        );
+    }
+
+    /// Round-8 X7: override VALUES were unconstrained — only the key
+    /// vocabulary was checked — so max-security's lan_access
+    /// block->allow passed, a pinned override could be dropped, and an
+    /// override could be added to a group the catalog defines without
+    /// one. Each mutation keeps every key inside ALLOWED_OVERRIDE_KEYS,
+    /// so only the per-group value pin can catch it.
+    #[test]
+    fn override_value_drift_fails() {
+        for (label, original, swapped) in [
+            (
+                "value flipped",
+                "overrides: {lan_access: block}",
+                "overrides: {lan_access: allow}",
+            ),
+            (
+                "pinned override dropped",
+                "overrides: {lan_access: block}",
+                "overrides: {}",
+            ),
+            (
+                "override added to a pinned-empty group",
+                "overrides: {}\n    sources: [docs]\n    target: {kind: fastest, connection_type: standard}\n  - id: \"proton:fastest-excluding-my-country\"",
+                "overrides: {protocol: stealth}\n    sources: [docs]\n    target: {kind: fastest, connection_type: standard}\n  - id: \"proton:fastest-excluding-my-country\"",
+            ),
+        ] {
+            let yaml = good_groups_yaml().replacen(original, swapped, 1);
+            let path = temp_yaml("override-drift", &yaml);
+            assert!(
+                !validate(&path).unwrap(),
+                "{label}: override drift must fail validation"
+            );
+            fs::remove_file(&path).ok();
+        }
     }
 
     #[test]
