@@ -58,6 +58,12 @@ const STOP_SLICE: Duration = Duration::from_millis(25);
 /// unreachable-daemon state.
 type Snapshot = Result<DaemonState, String>;
 
+/// A snapshot paired with the instant its fetch COMPLETED in the refresh
+/// worker (round 7): staleness measures from fetch time, so a snapshot
+/// that sat in the bounded channel — or was drained late by a slow render
+/// loop — still renders with its true age instead of passing as fresh.
+type StampedSnapshot = (Instant, Snapshot);
+
 #[derive(Debug)]
 struct Options {
     socket: Option<PathBuf>,
@@ -281,13 +287,13 @@ struct RefreshWorker {
 impl RefreshWorker {
     /// Production wiring: the SDK connect+GetState fetch on the
     /// [`REFRESH`] tick.
-    fn start_refresh(options: Options) -> (Self, Receiver<Snapshot>) {
+    fn start_refresh(options: Options) -> (Self, Receiver<StampedSnapshot>) {
         Self::start(move || fetch_snapshot(&options), REFRESH)
     }
 
     /// Core spawn with an injectable fetch, so the stall test can point
     /// the worker at an accepting-but-never-responding stub daemon.
-    fn start<F>(mut fetch: F, period: Duration) -> (Self, Receiver<Snapshot>)
+    fn start<F>(mut fetch: F, period: Duration) -> (Self, Receiver<StampedSnapshot>)
     where
         F: FnMut() -> Snapshot + Send + 'static,
     {
@@ -302,7 +308,12 @@ impl RefreshWorker {
                     // Depth-1 newest-wins: a full channel means the render
                     // loop still holds a newer snapshot, so dropping this
                     // one is correct (and never blocks this thread).
-                    let _ = tx.try_send(fetch());
+                    // Round 7: the timestamp is captured HERE, at fetch
+                    // completion — never at drain time — so the render
+                    // loop cannot launder an old snapshot as fresh.
+                    let snapshot = fetch();
+                    let fetched_at = Instant::now();
+                    let _ = tx.try_send((fetched_at, snapshot));
                     let next_tick = Instant::now() + period;
                     while !flag.load(Ordering::SeqCst) {
                         let remaining = next_tick.saturating_duration_since(Instant::now());
@@ -389,7 +400,10 @@ impl LoopState {
     }
 
     /// Records a snapshot drained from the refresh worker, stamped at
-    /// `at` (injected so staleness is deterministically testable).
+    /// `at` — the worker's fetch-completion instant (injected so
+    /// staleness is deterministically testable; round 7: the stamp is
+    /// taken at FETCH time in the worker, so a snapshot drained late by a
+    /// slow render loop still renders with its true age).
     fn on_snapshot(&mut self, snapshot: Snapshot, at: Instant) {
         self.snapshot = Some(snapshot);
         self.snapshot_at = Some(at);
@@ -470,7 +484,7 @@ fn run(terminal: &mut Term, options: Options) -> Result<(), ClientError> {
 /// SIGQUIT flag (R7-4) and takes the restore+exit path on the main
 /// thread.
 fn drive(
-    drain: &mut dyn FnMut() -> Option<Snapshot>,
+    drain: &mut dyn FnMut() -> Option<StampedSnapshot>,
     state: &mut LoopState,
     terminate: &AtomicBool,
     restore: &dyn Fn() -> std::io::Result<()>,
@@ -478,8 +492,11 @@ fn drive(
     poll: &mut dyn FnMut() -> std::io::Result<Option<KeyInput>>,
 ) -> std::io::Result<()> {
     loop {
-        while let Some(snapshot) = drain() {
-            state.on_snapshot(snapshot, Instant::now());
+        // Round 7: the worker's fetch-completion instant travels WITH the
+        // snapshot — stamping here (at drain time) would present a
+        // dropped-then-drained-late snapshot as fresh.
+        while let Some((fetched_at, snapshot)) = drain() {
+            state.on_snapshot(snapshot, fetched_at);
         }
         if let Flow::Exit = termination_check(terminate, restore) {
             return Ok(());
@@ -563,7 +580,8 @@ mod tests {
 
     use super::{
         DashboardView, Flow, KeyInput, LoopState, RefreshWorker, STALE_AFTER, Snapshot,
-        TERMINATE_REQUESTED, drive, install_terminate_handler, termination_check,
+        StampedSnapshot, TERMINATE_REQUESTED, drive, install_terminate_handler,
+        termination_check,
     };
 
     fn test_state() -> super::DaemonState {
@@ -782,13 +800,67 @@ mod tests {
     /// the render loop.
     #[test]
     fn a_full_snapshot_channel_drops_instead_of_blocking() {
-        let (tx, rx) = std::sync::mpsc::sync_channel::<Snapshot>(1);
-        tx.try_send(Err("first".into())).unwrap();
+        let (tx, rx) = std::sync::mpsc::sync_channel::<StampedSnapshot>(1);
+        let t0 = Instant::now();
+        tx.try_send((t0, Err("first".into()))).unwrap();
         let started = Instant::now();
-        let dropped = tx.try_send(Err("second".into()));
+        let dropped = tx.try_send((t0, Err("second".into())));
         assert!(started.elapsed() < Duration::from_millis(50));
         assert!(matches!(dropped, Err(TrySendError::Full(_))));
-        assert!(matches!(rx.try_recv(), Ok(Err(e)) if e == "first"));
+        assert!(
+            matches!(rx.try_recv(), Ok((at, Err(e))) if e == "first" && at == t0),
+            "the surviving snapshot must keep its own fetch stamp"
+        );
+    }
+
+    /// Round 7 (F5): staleness must measure from FETCH time, not drain
+    /// time. The worker stamps a snapshot when its fetch completes, so a
+    /// snapshot drained late by a slow render loop — the exact shape of a
+    /// dropped-then-rescheduled refresh — must render with the stale
+    /// marker, not pass as fresh. Red by mutation: reverting drive() to
+    /// stamp Instant::now() at drain makes this fail (the marker misses).
+    #[test]
+    fn a_snapshot_drained_late_is_stale_by_its_fetch_time() {
+        let stale_fetch_at = Instant::now() - STALE_AFTER - Duration::from_millis(50);
+        let stale_seen = Arc::new(AtomicBool::new(false));
+        let marker = Arc::clone(&stale_seen);
+        let mut drained = false;
+        let mut drain = move || {
+            if drained {
+                None
+            } else {
+                drained = true;
+                Some((stale_fetch_at, Ok(test_state())))
+            }
+        };
+        let mut draw = move |view: &DashboardView<'_>| -> io::Result<()> {
+            if view.snapshot.is_some() {
+                marker.store(view.stale, Ordering::SeqCst);
+            }
+            Ok(())
+        };
+        let mut poll = || -> io::Result<Option<KeyInput>> {
+            Ok(Some(KeyInput {
+                code: KeyCode::Char('q'),
+                ctrl: false,
+            }))
+        };
+        let mut state = LoopState::new();
+        let no_signal = AtomicBool::new(false);
+        drive(
+            &mut drain,
+            &mut state,
+            &no_signal,
+            &|| Ok(()),
+            &mut draw,
+            &mut poll,
+        )
+        .unwrap();
+        assert!(
+            stale_seen.load(Ordering::SeqCst),
+            "a snapshot fetched more than STALE_AFTER ago must render with \
+             the stale marker even though it was just drained"
+        );
     }
 
     /// pr-champion R7-3: shutdown must not wait out a stalled fetch — the
