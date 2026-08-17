@@ -48,10 +48,12 @@ const KNOWN_UNLICENSED: &[&str] = &[
 pub const CLEARANCE_MARKER: &str = "docs/LICENSE-CLEARANCE.md";
 
 /// SPDX IDs compatible with the workspace's GPL-3.0-or-later terms
-/// (NFR-35). `GPL-3.0` additionally accepts any `GPL-3.0-*` suffix form
-/// (`GPL-3.0-only`, `GPL-3.0-or-later`), and `LLVM-exception` is the one
-/// accepted exception suffix. Everything else is either a known
-/// incompatible GPL-2.0 form or unrecognized (fail loud).
+/// (NFR-35). The GPL-3.0 family accepts exactly the deprecated bare
+/// alias plus the two SPDX suffix forms (`GPL-3.0-only`,
+/// `GPL-3.0-or-later`), the GPL-2.0 family exactly `GPL-2.0-only` and
+/// `GPL-2.0-or-later`, and `LLVM-exception` is the one accepted
+/// exception suffix. Everything else is either a known incompatible
+/// GPL-2.0 form or unrecognized (fail loud).
 const GPL3_COMPATIBLE: &[&str] = &[
     "MIT",
     "MIT-0",
@@ -190,14 +192,17 @@ fn peek<'t>(tokens: &[&'t str], pos: usize) -> Option<&'t str> {
 
 /// The verdict for one bare SPDX ID.
 fn single(id: &str) -> Compatibility {
-    if GPL3_COMPATIBLE.contains(&id) || id == "GPL-3.0" || id.starts_with("GPL-3.0-") {
-        Compatibility::Compatible
-    } else if id == "GPL-2.0" || id.starts_with("GPL-2.0-") {
-        // GPL-2.0-only cannot be combined with GPL-3 code; the one
-        // compatible form (GPL-2.0-or-later) is allowlisted above.
-        Compatibility::Incompatible
-    } else {
-        Compatibility::Unrecognized
+    match id {
+        // The GPL-3.0 family, exactly: the deprecated bare alias and the
+        // two SPDX suffix forms. Any other suffix (GPL-3.0-proprietary,
+        // ...) is not an SPDX ID and fails loud for a human.
+        "GPL-3.0" | "GPL-3.0-only" | "GPL-3.0-or-later" => Compatibility::Compatible,
+        // The GPL-2.0 family, exactly: the deprecated bare alias and
+        // -only cannot be combined with GPL-3 code; the one compatible
+        // form (GPL-2.0-or-later) is allowlisted above.
+        "GPL-2.0" | "GPL-2.0-only" => Compatibility::Incompatible,
+        _ if GPL3_COMPATIBLE.contains(&id) => Compatibility::Compatible,
+        _ => Compatibility::Unrecognized,
     }
 }
 
@@ -394,6 +399,30 @@ mod tests {
         assert_eq!(classify("GPL-2.0"), Compatibility::Incompatible);
     }
 
+    /// Round-8 X2: `GPL-3.0-proprietary` classified Compatible (the
+    /// starts_with("GPL-3.0-") branch) and `GPL-2.0-proprietary`
+    /// Incompatible (the starts_with("GPL-2.0-") branch) — but neither is
+    /// an SPDX ID; the fail-loud contract makes any suffix other than the
+    /// known -only/-or-later forms Unrecognized, so a human classifies it.
+    #[test]
+    fn unknown_gpl_suffixes_fail_loud() {
+        assert_eq!(classify("GPL-3.0-proprietary"), Compatibility::Unrecognized);
+        assert_eq!(classify("GPL-2.0-proprietary"), Compatibility::Unrecognized);
+        // The exact accepted families stay classified.
+        assert_eq!(classify("GPL-3.0"), Compatibility::Compatible);
+        assert_eq!(classify("GPL-3.0-only"), Compatibility::Compatible);
+        assert_eq!(classify("GPL-3.0-or-later"), Compatibility::Compatible);
+        assert_eq!(classify("GPL-2.0-or-later"), Compatibility::Compatible);
+        assert_eq!(classify("GPL-2.0-only"), Compatibility::Incompatible);
+        // Unrecognized verdicts surface as violations at the scan level.
+        let violations = scan_licenses(&[(
+            "mystery-crate".to_string(),
+            "GPL-3.0-proprietary".to_string(),
+        )]);
+        assert_eq!(violations.len(), 1, "got {violations:?}");
+        assert!(violations[0].contains("unrecognized"), "in: {violations:?}");
+    }
+
     #[test]
     fn scan_licenses_flags_gpl2_only() {
         // The scan-level NFR-35 gate: a GPL-2.0-only dependency must fail
@@ -465,7 +494,7 @@ mod tests {
             "CDLA-Permissive-2.0",
             "bzip2-1.0.6",
             "WTFPL",
-            // GPL-3.0 accepts any suffix form.
+            // The GPL-3.0 family accepts exactly these three forms.
             "GPL-3.0",
             "GPL-3.0-only",
             "GPL-3.0-or-later",
