@@ -321,10 +321,13 @@ impl IpcClient {
         // R7-1 closes the residual write gap the same way the server's
         // writer threads got: the request write is codec-bounded by the
         // whole-request deadline (write_msg_within — poll-for-writability
-        // inside the remaining budget), because SO_SNDTIMEO is
-        // kernel-flavored (measured answering after ~2x the configured
-        // timeout here) and dribbling partial writes stretch past any
-        // per-syscall ceiling. The socket-wide SO_SNDTIMEO that
+        // inside the remaining budget), because SO_SNDTIMEO cannot bound a
+        // MESSAGE, for the two measured reasons in frame.rs's write-side
+        // record: it bounds each WAIT, not the message (progress resets
+        // it; a multi-syscall write multiplies it), and under steady
+        // drain it never expires at all — every dribbled byte that frees
+        // space starts a fresh wait (sec round-7 probe; review-log track
+        // item). The socket-wide SO_SNDTIMEO that
         // connect/set_timeout applied stays as a syscall-level backstop,
         // and the zero-budget guard remains load-bearing: a spent deadline
         // must not enter the write path at all.
