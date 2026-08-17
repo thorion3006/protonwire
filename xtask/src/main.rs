@@ -17,6 +17,7 @@ mod m49;
 mod manifest;
 mod schema_gen;
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -219,6 +220,25 @@ pub(crate) fn expect_value(actual: Option<&str>, expected: &str, what: &str) -> 
     }
 }
 
+/// The expected ids absent from `actual` (missing), and the actual ids
+/// absent from `expected` (extra), each in canonical (sorted) order.
+///
+/// The set-drift half of the pin-family helpers (capability ids, M49
+/// country codes): their contract is one violation message PER drifted
+/// id — never an aggregate count — so the gate output names the exact
+/// contract change. Message wording stays at each call site; this
+/// helper is set logic only.
+pub(crate) fn set_drift<'a>(
+    expected: &[&'a str],
+    actual: &BTreeSet<&'a str>,
+) -> (Vec<&'a str>, Vec<&'a str>) {
+    let expected: BTreeSet<&str> = expected.iter().copied().collect();
+    (
+        expected.difference(actual).copied().collect(),
+        actual.difference(&expected).copied().collect(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -277,5 +297,16 @@ mod tests {
             expect_value(None, "x", "thing"),
             Some("thing is missing".to_string())
         );
+    }
+
+    #[test]
+    fn set_drift_reports_missing_and_extra_in_canonical_order() {
+        let actual: BTreeSet<&str> = ["c", "a", "z"].into_iter().collect();
+        let (missing, extra) = set_drift(&["a", "b", "c"], &actual);
+        assert_eq!(missing, vec!["b"]);
+        assert_eq!(extra, vec!["z"]);
+        // An exact match reports no drift in either direction.
+        let pinned: BTreeSet<&str> = ["a", "c"].into_iter().collect();
+        assert_eq!(set_drift(&["a", "c"], &pinned), (Vec::new(), Vec::new()));
     }
 }

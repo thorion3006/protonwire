@@ -12,7 +12,7 @@ use anyhow::{Result, anyhow};
 use sha2::{Digest, Sha256};
 
 use crate::groups;
-use crate::{Reporter, is_sha256_hex};
+use crate::{Reporter, is_sha256_hex, set_drift};
 
 const DEFAULT_SNAPSHOT_PATH: &str = "resources/geo/un-m49.csv";
 const CSV_HEADER: &str = "m49_region_code,m49_code,iso_3166_1_alpha_2,name,region";
@@ -514,17 +514,18 @@ pub(crate) fn verify_csv(bytes: &[u8], mapping: &BTreeMap<String, String>) -> Cs
     // floor above passes a truncated snapshot (200 of 247 rows); every
     // missing country — and every code outside the set — is a named
     // violation.
-    let expected: BTreeSet<&str> = EXPECTED_M49_COUNTRIES
+    let expected: Vec<&str> = EXPECTED_M49_COUNTRIES
         .iter()
         .map(|(iso, _, _)| *iso)
         .collect();
     let actual: BTreeSet<&str> = seen.keys().map(String::as_str).collect();
-    for code in expected.difference(&actual) {
+    let (missing, outside) = set_drift(&expected, &actual);
+    for code in missing {
         outcome
             .violations
             .push(format!("canonical ISO code `{code}` is missing"));
     }
-    for code in actual.difference(&expected) {
+    for code in outside {
         outcome.violations.push(format!(
             "ISO code `{code}` is not part of the canonical 247-code country set"
         ));

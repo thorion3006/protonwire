@@ -13,7 +13,9 @@ use std::path::Path;
 use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
 
-use crate::{Reporter, expect_value, is_capability_id, is_git_revision, is_sha256_hex, is_test_id};
+use crate::{
+    Reporter, expect_value, is_capability_id, is_git_revision, is_sha256_hex, is_test_id, set_drift,
+};
 
 const PROTON_REVISION: &str = "12e7755a112f59b7b843da79290b3de25febf653";
 
@@ -632,12 +634,12 @@ fn check_capability_ids(doc: &Manifest) -> Vec<String> {
         .iter()
         .filter_map(|c| c.id.as_deref())
         .collect();
-    let expected: BTreeSet<&str> = EXPECTED_CAPABILITY_IDS.iter().copied().collect();
+    let (missing, invented) = set_drift(&EXPECTED_CAPABILITY_IDS, &actual);
     let mut violations = Vec::new();
-    for id in expected.difference(&actual) {
+    for id in missing {
         violations.push(format!("canonical capability `{id}` is missing"));
     }
-    for id in actual.difference(&expected) {
+    for id in invented {
         violations.push(format!(
             "capability `{id}` is not part of the canonical id set"
         ));
