@@ -1,0 +1,170 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "RequestResult",
+  "description": "Successful request outcomes.",
+  "oneOf": [
+    {
+      "description": "Reply to [`Request::Ping`].",
+      "type": "object",
+      "properties": {
+        "data": {
+          "type": "object",
+          "properties": {
+            "nonce": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "nonce"
+          ]
+        },
+        "result": {
+          "type": "string",
+          "const": "pong"
+        }
+      },
+      "required": [
+        "result",
+        "data"
+      ]
+    },
+    {
+      "description": "Reply to [`Request::GetState`].",
+      "type": "object",
+      "properties": {
+        "data": {
+          "type": "object",
+          "properties": {
+            "state": {
+              "$ref": "#/$defs/DaemonState"
+            }
+          },
+          "required": [
+            "state"
+          ]
+        },
+        "result": {
+          "type": "string",
+          "const": "state"
+        }
+      },
+      "required": [
+        "result",
+        "data"
+      ]
+    },
+    {
+      "description": "Reply to [`Request::Disconnect`] / [`Request::Shutdown`].",
+      "type": "object",
+      "properties": {
+        "result": {
+          "type": "string",
+          "const": "acknowledged"
+        }
+      },
+      "required": [
+        "result"
+      ]
+    }
+  ],
+  "$defs": {
+    "DaemonState": {
+      "description": "Full daemon state snapshot — the authoritative view clients resynchronize\nagainst (PRD FR-127D). Connection details (server, tunnel statistics,\nrequested-vs-applied features) join this struct in Milestone 4+ as\nadditive-optional fields, which are wire-compatible WITHOUT a protocol\nversion bump (old and new documents round-trip — see\n`snapshot_sequence_is_optional_on_the_wire` for the same rule on\n`latest_event_seq`). A version bump is reserved for representation\nchanges that break older readers: renaming or repurposing fields,\nchanging a field's type or semantics, or making a previously-optional\nfield mandatory.",
+      "type": "object",
+      "properties": {
+        "active_owner_uid": {
+          "description": "UID of the user who owns the active or most recent connection attempt,\nif any.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "daemon_version": {
+          "description": "Daemon build version.",
+          "type": "string"
+        },
+        "latest_event_seq": {
+          "description": "Sequence number of the newest event already reflected in this\nsnapshot. Daemons that predate the field omit it; clients treat\n`None` as \"sequence unknown\" and fall back to their gap event.\n\nThe resynchronization race this closes (Codex PR review round 2,\nfinding 1): `GetState` is a separate request, so events can be\npublished while it is in flight and the snapshot can reflect\nsequences newer than the gap event that triggered the resync.\nPairing the snapshot with its own sequence lets the SDK advance\nits cursor coherently instead of replaying older buffered events\nafter the newer snapshot.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "network_integration": {
+          "description": "Configured network integration mode (the configured value in Milestone\n1; the resolved adapter once Milestone 5 lands).",
+          "$ref": "#/$defs/NetworkIntegration"
+        },
+        "protocol_version": {
+          "description": "Protocol version the daemon speaks.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "vpn_state": {
+          "description": "Current VPN state.",
+          "$ref": "#/$defs/VpnState"
+        }
+      },
+      "required": [
+        "protocol_version",
+        "daemon_version",
+        "vpn_state",
+        "network_integration"
+      ]
+    },
+    "NetworkIntegration": {
+      "description": "Host network integration mode (PRD 6.6). ProtonWire always owns the tunnel\nand privacy policy; the mode only controls uplink observation and DNS\ncooperation.",
+      "oneOf": [
+        {
+          "description": "Pick NetworkManager or systemd-networkd when either owns the default\nuplink, otherwise native.",
+          "type": "string",
+          "const": "auto"
+        },
+        {
+          "description": "Observe netlink directly.",
+          "type": "string",
+          "const": "native"
+        },
+        {
+          "description": "Cooperate with NetworkManager.",
+          "type": "string",
+          "const": "network-manager"
+        },
+        {
+          "description": "Cooperate with systemd-networkd.",
+          "type": "string",
+          "const": "networkd"
+        }
+      ]
+    },
+    "VpnState": {
+      "description": "High-level VPN state machine states.",
+      "oneOf": [
+        {
+          "description": "No tunnel exists.",
+          "type": "string",
+          "const": "disconnected"
+        },
+        {
+          "description": "A connection attempt is in progress.",
+          "type": "string",
+          "const": "connecting"
+        },
+        {
+          "description": "A tunnel is up.",
+          "type": "string",
+          "const": "connected"
+        },
+        {
+          "description": "A teardown is in progress.",
+          "type": "string",
+          "const": "disconnecting"
+        }
+      ]
+    }
+  }
+}

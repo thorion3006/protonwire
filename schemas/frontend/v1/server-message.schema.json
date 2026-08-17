@@ -1,0 +1,560 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ServerMessage",
+  "description": "A daemon → client message.\n\nAdjacently tagged (`type` + `data`) so nested tagged enums such as\n[`Response`] keep their own discriminant without colliding with this\none on the wire.",
+  "oneOf": [
+    {
+      "description": "Successful handshake reply.",
+      "type": "object",
+      "properties": {
+        "data": {
+          "$ref": "#/$defs/HelloAck"
+        },
+        "type": {
+          "type": "string",
+          "const": "hello-ack"
+        }
+      },
+      "required": [
+        "type",
+        "data"
+      ]
+    },
+    {
+      "description": "Handshake refusal; the daemon closes the connection afterwards.",
+      "type": "object",
+      "properties": {
+        "data": {
+          "$ref": "#/$defs/HelloError"
+        },
+        "type": {
+          "type": "string",
+          "const": "hello-error"
+        }
+      },
+      "required": [
+        "type",
+        "data"
+      ]
+    },
+    {
+      "description": "Reply to a [`ClientMessage::Request`].",
+      "type": "object",
+      "properties": {
+        "data": {
+          "$ref": "#/$defs/Response"
+        },
+        "type": {
+          "type": "string",
+          "const": "response"
+        }
+      },
+      "required": [
+        "type",
+        "data"
+      ]
+    },
+    {
+      "description": "A daemon-pushed event.",
+      "type": "object",
+      "properties": {
+        "data": {
+          "$ref": "#/$defs/EventEnvelope"
+        },
+        "type": {
+          "type": "string",
+          "const": "event"
+        }
+      },
+      "required": [
+        "type",
+        "data"
+      ]
+    }
+  ],
+  "$defs": {
+    "DaemonState": {
+      "description": "Full daemon state snapshot — the authoritative view clients resynchronize\nagainst (PRD FR-127D). Connection details (server, tunnel statistics,\nrequested-vs-applied features) join this struct in Milestone 4+ as\nadditive-optional fields, which are wire-compatible WITHOUT a protocol\nversion bump (old and new documents round-trip — see\n`snapshot_sequence_is_optional_on_the_wire` for the same rule on\n`latest_event_seq`). A version bump is reserved for representation\nchanges that break older readers: renaming or repurposing fields,\nchanging a field's type or semantics, or making a previously-optional\nfield mandatory.",
+      "type": "object",
+      "properties": {
+        "active_owner_uid": {
+          "description": "UID of the user who owns the active or most recent connection attempt,\nif any.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "daemon_version": {
+          "description": "Daemon build version.",
+          "type": "string"
+        },
+        "latest_event_seq": {
+          "description": "Sequence number of the newest event already reflected in this\nsnapshot. Daemons that predate the field omit it; clients treat\n`None` as \"sequence unknown\" and fall back to their gap event.\n\nThe resynchronization race this closes (Codex PR review round 2,\nfinding 1): `GetState` is a separate request, so events can be\npublished while it is in flight and the snapshot can reflect\nsequences newer than the gap event that triggered the resync.\nPairing the snapshot with its own sequence lets the SDK advance\nits cursor coherently instead of replaying older buffered events\nafter the newer snapshot.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "network_integration": {
+          "description": "Configured network integration mode (the configured value in Milestone\n1; the resolved adapter once Milestone 5 lands).",
+          "$ref": "#/$defs/NetworkIntegration"
+        },
+        "protocol_version": {
+          "description": "Protocol version the daemon speaks.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "vpn_state": {
+          "description": "Current VPN state.",
+          "$ref": "#/$defs/VpnState"
+        }
+      },
+      "required": [
+        "protocol_version",
+        "daemon_version",
+        "vpn_state",
+        "network_integration"
+      ]
+    },
+    "Event": {
+      "description": "Daemon events. Milestone 1 carries state transitions and notices; richer\nevents (feature reconciliation, catalog refresh results, conflict\ndetection) are additive variants in later milestones.",
+      "oneOf": [
+        {
+          "description": "The VPN state machine transitioned.",
+          "type": "object",
+          "properties": {
+            "from": {
+              "description": "Previous state.",
+              "$ref": "#/$defs/VpnState"
+            },
+            "kind": {
+              "type": "string",
+              "const": "state-changed"
+            },
+            "to": {
+              "description": "New state.",
+              "$ref": "#/$defs/VpnState"
+            }
+          },
+          "required": [
+            "kind",
+            "from",
+            "to"
+          ]
+        },
+        {
+          "description": "An informational or warning notice worth surfacing in clients.",
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "notice"
+            },
+            "level": {
+              "description": "Severity of the notice.",
+              "$ref": "#/$defs/NoticeLevel"
+            },
+            "message": {
+              "description": "Already-redacted human-readable text.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "level",
+            "message"
+          ]
+        }
+      ]
+    },
+    "EventEnvelope": {
+      "description": "Envelope for every daemon-pushed event. `seq` is monotonic per daemon\nprocess lifetime; a client that observes a gap must resynchronize with a\n[`crate::Request::GetState`] request (PRD FR-127D). The one value a real\nevent never carries is [`EVENT_SEQ_RESYNC_NOW`], reserved as the\nend-of-burst overflow signal above.",
+      "type": "object",
+      "properties": {
+        "event": {
+          "description": "The event payload.",
+          "$ref": "#/$defs/Event"
+        },
+        "seq": {
+          "description": "Monotonic sequence number, never [`EVENT_SEQ_RESYNC_NOW`] for a\ngenuine event.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "seq",
+        "event"
+      ]
+    },
+    "HelloAck": {
+      "description": "Successful handshake reply.",
+      "type": "object",
+      "properties": {
+        "daemon_version": {
+          "description": "Daemon build version.",
+          "type": "string"
+        },
+        "latest_event_seq": {
+          "description": "Sequence number of the newest event emitted so far. A client that has\nseen a lower sequence performs a full-state resync via\n[`Request::GetState`].",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "protocol_version": {
+          "description": "The protocol version the daemon will speak on this connection\n(≤ the client's requested version).",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "protocol_version",
+        "daemon_version",
+        "latest_event_seq"
+      ]
+    },
+    "HelloError": {
+      "description": "Handshake refusal with a machine-readable reason.",
+      "type": "object",
+      "properties": {
+        "reason": {
+          "description": "Stable reason code, for example `unsupported-protocol-version`.",
+          "type": "string"
+        },
+        "supported_version": {
+          "description": "Highest protocol version the daemon supports.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "supported_version",
+        "reason"
+      ]
+    },
+    "NetworkIntegration": {
+      "description": "Host network integration mode (PRD 6.6). ProtonWire always owns the tunnel\nand privacy policy; the mode only controls uplink observation and DNS\ncooperation.",
+      "oneOf": [
+        {
+          "description": "Pick NetworkManager or systemd-networkd when either owns the default\nuplink, otherwise native.",
+          "type": "string",
+          "const": "auto"
+        },
+        {
+          "description": "Observe netlink directly.",
+          "type": "string",
+          "const": "native"
+        },
+        {
+          "description": "Cooperate with NetworkManager.",
+          "type": "string",
+          "const": "network-manager"
+        },
+        {
+          "description": "Cooperate with systemd-networkd.",
+          "type": "string",
+          "const": "networkd"
+        }
+      ]
+    },
+    "NoticeLevel": {
+      "description": "Severity for [`Event::Notice`].",
+      "oneOf": [
+        {
+          "description": "Informational.",
+          "type": "string",
+          "const": "info"
+        },
+        {
+          "description": "Warning.",
+          "type": "string",
+          "const": "warning"
+        },
+        {
+          "description": "Error.",
+          "type": "string",
+          "const": "error"
+        }
+      ]
+    },
+    "RequestResult": {
+      "description": "Successful request outcomes.",
+      "oneOf": [
+        {
+          "description": "Reply to [`Request::Ping`].",
+          "type": "object",
+          "properties": {
+            "data": {
+              "type": "object",
+              "properties": {
+                "nonce": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "nonce"
+              ]
+            },
+            "result": {
+              "type": "string",
+              "const": "pong"
+            }
+          },
+          "required": [
+            "result",
+            "data"
+          ]
+        },
+        {
+          "description": "Reply to [`Request::GetState`].",
+          "type": "object",
+          "properties": {
+            "data": {
+              "type": "object",
+              "properties": {
+                "state": {
+                  "$ref": "#/$defs/DaemonState"
+                }
+              },
+              "required": [
+                "state"
+              ]
+            },
+            "result": {
+              "type": "string",
+              "const": "state"
+            }
+          },
+          "required": [
+            "result",
+            "data"
+          ]
+        },
+        {
+          "description": "Reply to [`Request::Disconnect`] / [`Request::Shutdown`].",
+          "type": "object",
+          "properties": {
+            "result": {
+              "type": "string",
+              "const": "acknowledged"
+            }
+          },
+          "required": [
+            "result"
+          ]
+        }
+      ]
+    },
+    "Response": {
+      "description": "Reply to a request.",
+      "oneOf": [
+        {
+          "description": "Successful outcome.",
+          "type": "object",
+          "properties": {
+            "id": {
+              "description": "Correlation id of the answered request.",
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "result": {
+              "$ref": "#/$defs/RequestResult"
+            },
+            "type": {
+              "type": "string",
+              "const": "ok"
+            }
+          },
+          "required": [
+            "type",
+            "id",
+            "result"
+          ]
+        },
+        {
+          "description": "Failed outcome.",
+          "type": "object",
+          "properties": {
+            "error": {
+              "$ref": "#/$defs/RpcError"
+            },
+            "id": {
+              "description": "Correlation id of the answered request.",
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "type": {
+              "type": "string",
+              "const": "error"
+            }
+          },
+          "required": [
+            "type",
+            "id",
+            "error"
+          ]
+        }
+      ]
+    },
+    "RpcError": {
+      "description": "Structured RPC error payload.",
+      "type": "object",
+      "properties": {
+        "code": {
+          "description": "Machine-readable code; never localized.",
+          "$ref": "#/$defs/RpcErrorCode"
+        },
+        "details": {
+          "description": "Optional structured details."
+        },
+        "message": {
+          "description": "Human-readable diagnostic message, already redacted.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "code",
+        "message"
+      ]
+    },
+    "RpcErrorCode": {
+      "description": "Machine-readable error taxonomy crossing the IPC boundary. Codes align\nwith the PRD 9.8 exit codes where one exists; clients map them directly.",
+      "oneOf": [
+        {
+          "description": "The requested capability is planned but not implemented yet.",
+          "type": "string",
+          "const": "not-implemented"
+        },
+        {
+          "description": "The request parameters failed validation.",
+          "type": "string",
+          "const": "invalid-params"
+        },
+        {
+          "description": "The client requested an unsupported protocol version.",
+          "type": "string",
+          "const": "unsupported-protocol"
+        },
+        {
+          "description": "The authenticated peer is not allowed to perform the request.",
+          "type": "string",
+          "const": "permission-denied"
+        },
+        {
+          "description": "No authenticated session exists for the peer's UID.",
+          "type": "string",
+          "const": "not-authenticated"
+        },
+        {
+          "description": "The account is not entitled to the requested capability.",
+          "type": "string",
+          "const": "entitlement-missing"
+        },
+        {
+          "description": "No server satisfies the requested constraints.",
+          "type": "string",
+          "const": "no-eligible-server"
+        },
+        {
+          "description": "The network is unavailable.",
+          "type": "string",
+          "const": "network-unavailable"
+        },
+        {
+          "description": "The tunnel failed to establish or broke down.",
+          "type": "string",
+          "const": "tunnel-failed"
+        },
+        {
+          "description": "The kill switch could not be enforced.",
+          "type": "string",
+          "const": "kill-switch-failed"
+        },
+        {
+          "description": "DNS could not be configured as requested.",
+          "type": "string",
+          "const": "dns-config-failed"
+        },
+        {
+          "description": "Firewall (nftables) configuration failed.",
+          "type": "string",
+          "const": "firewall-failed"
+        },
+        {
+          "description": "Split-tunnel policy could not be applied.",
+          "type": "string",
+          "const": "split-tunnel-failed"
+        },
+        {
+          "description": "Port forwarding failed.",
+          "type": "string",
+          "const": "port-forwarding-failed"
+        },
+        {
+          "description": "The daemon is busy and the request was not queued.",
+          "type": "string",
+          "const": "daemon-busy"
+        },
+        {
+          "description": "The configuration failed validation.",
+          "type": "string",
+          "const": "config-invalid"
+        },
+        {
+          "description": "The configured credential backend is unavailable.",
+          "type": "string",
+          "const": "credential-backend-unavailable"
+        },
+        {
+          "description": "No Secure Core route satisfies the request.",
+          "type": "string",
+          "const": "secure-core-unavailable"
+        },
+        {
+          "description": "The requested protocol is unavailable.",
+          "type": "string",
+          "const": "protocol-unavailable"
+        },
+        {
+          "description": "An internal daemon error without a more specific code.",
+          "type": "string",
+          "const": "internal"
+        }
+      ]
+    },
+    "VpnState": {
+      "description": "High-level VPN state machine states.",
+      "oneOf": [
+        {
+          "description": "No tunnel exists.",
+          "type": "string",
+          "const": "disconnected"
+        },
+        {
+          "description": "A connection attempt is in progress.",
+          "type": "string",
+          "const": "connecting"
+        },
+        {
+          "description": "A tunnel is up.",
+          "type": "string",
+          "const": "connected"
+        },
+        {
+          "description": "A teardown is in progress.",
+          "type": "string",
+          "const": "disconnecting"
+        }
+      ]
+    }
+  }
+}

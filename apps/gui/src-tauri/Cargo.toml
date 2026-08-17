@@ -1,0 +1,27 @@
+[package]
+name = "protonwire-gui"
+description = "protonwire-gui — Tauri shell exposing an explicit allowlist of typed commands over the shared client SDK (PRD 9.10, FR-127G)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "protonwire-gui"
+path = "src/main.rs"
+
+[lints.rust]
+# The Tauri macro/FFI boundary expands to unsafe code the shell cannot
+# express safely itself; the allowlist below the boundary stays minimal.
+unsafe_code = "allow"
+
+[dependencies]
+protonwire-client = { workspace = true }
+protonwire-frontend-api = { workspace = true }
+tauri = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[build-dependencies]
+tauri-build = { workspace = true }

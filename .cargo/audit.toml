@@ -1,0 +1,18 @@
+# cargo-audit policy. Every ignore carries its justification and its
+# revisit trigger; empty justifications are rejected by convention.
+[advisories]
+ignore = [
+    # Marvin Attack (RSA timing sidechannel, medium 5.9). No fixed upgrade
+    # exists anywhere upstream. Reached only through the pinned engine
+    # chain rsa <- pgp <- proton-srp <- muon =2.6.1, which the PRD pins
+    # exactly; patching means forking the engine. Revisit on every Muon
+    # upgrade.
+    "RUSTSEC-2023-0071",
+    # quick-xml DoS advisories (high 7.5, fixed in >=0.41). quick-xml 0.38.4
+    # is resolved in the lockfile for a target/optional branch that no
+    # Linux build links (cargo tree finds no dependent on our targets), so
+    # the daemon and clients never execute it. Revisit if a member starts
+    # linking quick-xml or the referencing crate moves to 0.41.
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
+]

@@ -1,0 +1,1 @@
+{"default":{"identifier":"default","description":"Milestone 1 baseline: window control only; every product operation goes through the typed daemon_state command.","local":true,"windows":["main"],"permissions":["core:default"]}}

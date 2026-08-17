@@ -2279,6 +2279,10 @@ schema_version: 2
 
 daemon:
   socket_path: /run/protonwire/protonwire.sock
+  # Group the socket is chowned to so unprivileged clients can reach it.
+  # Defaults to the packaged `protonwire` group (the package creates it);
+  # an explicit null opts out of the chown.
+  socket_group: protonwire
   interface_name: protonwire0
   log_level: info
   network_integration: auto  # auto|native|network-manager|networkd

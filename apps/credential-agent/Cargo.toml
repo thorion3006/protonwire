@@ -1,0 +1,18 @@
+[package]
+name = "protonwire-credential-agent"
+description = "Optional unprivileged per-user keyring broker: same-UID Secret Service/KWallet access registering outbound to the root daemon (PRD 6.3, 7.1A)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "protonwire-credential-agent"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+clap = { workspace = true }

@@ -1,0 +1,248 @@
+m49_region_code,m49_code,iso_3166_1_alpha_2,name,region
+150,020,AD,Andorra,europe
+142,784,AE,United Arab Emirates,asia
+142,004,AF,Afghanistan,asia
+029,028,AG,Antigua and Barbuda,north-america
+029,660,AI,Anguilla,north-america
+150,008,AL,Albania,europe
+142,051,AM,Armenia,asia
+002,024,AO,Angola,africa
+005,032,AR,Argentina,south-america
+009,016,AS,American Samoa,oceania
+150,040,AT,Austria,europe
+009,036,AU,Australia,oceania
+029,533,AW,Aruba,north-america
+150,248,AX,Åland Islands,europe
+142,031,AZ,Azerbaijan,asia
+150,070,BA,Bosnia and Herzegovina,europe
+029,052,BB,Barbados,north-america
+142,050,BD,Bangladesh,asia
+150,056,BE,Belgium,europe
+002,854,BF,Burkina Faso,africa
+150,100,BG,Bulgaria,europe
+142,048,BH,Bahrain,asia
+002,108,BI,Burundi,africa
+002,204,BJ,Benin,africa
+029,652,BL,Saint Barthélemy,north-america
+021,060,BM,Bermuda,north-america
+142,096,BN,Brunei Darussalam,asia
+005,068,BO,Bolivia (Plurinational State of),south-america
+029,535,BQ,"Bonaire, Sint Eustatius and Saba",north-america
+005,076,BR,Brazil,south-america
+029,044,BS,Bahamas,north-america
+142,064,BT,Bhutan,asia
+005,074,BV,Bouvet Island,south-america
+002,072,BW,Botswana,africa
+150,112,BY,Belarus,europe
+013,084,BZ,Belize,north-america
+021,124,CA,Canada,north-america
+009,166,CC,Cocos (Keeling) Islands,oceania
+002,180,CD,Democratic Republic of the Congo,africa
+002,140,CF,Central African Republic,africa
+002,178,CG,Congo,africa
+150,756,CH,Switzerland,europe
+002,384,CI,Côte d’Ivoire,africa
+009,184,CK,Cook Islands,oceania
+005,152,CL,Chile,south-america
+002,120,CM,Cameroon,africa
+142,156,CN,China,asia
+005,170,CO,Colombia,south-america
+013,188,CR,Costa Rica,north-america
+029,192,CU,Cuba,north-america
+002,132,CV,Cabo Verde,africa
+029,531,CW,Curaçao,north-america
+009,162,CX,Christmas Island,oceania
+142,196,CY,Cyprus,asia
+150,203,CZ,Czechia,europe
+150,276,DE,Germany,europe
+002,262,DJ,Djibouti,africa
+150,208,DK,Denmark,europe
+029,212,DM,Dominica,north-america
+029,214,DO,Dominican Republic,north-america
+002,012,DZ,Algeria,africa
+005,218,EC,Ecuador,south-america
+150,233,EE,Estonia,europe
+002,818,EG,Egypt,africa
+002,732,EH,Western Sahara,africa
+002,232,ER,Eritrea,africa
+150,724,ES,Spain,europe
+002,231,ET,Ethiopia,africa
+150,246,FI,Finland,europe
+009,242,FJ,Fiji,oceania
+005,238,FK,Falkland Islands (Malvinas),south-america
+009,583,FM,Micronesia (Federated States of),oceania
+150,234,FO,Faroe Islands,europe
+150,250,FR,France,europe
+002,266,GA,Gabon,africa
+150,826,GB,United Kingdom of Great Britain and Northern Ireland,europe
+029,308,GD,Grenada,north-america
+142,268,GE,Georgia,asia
+005,254,GF,French Guiana,south-america
+150,831,GG,Guernsey,europe
+002,288,GH,Ghana,africa
+150,292,GI,Gibraltar,europe
+021,304,GL,Greenland,north-america
+002,270,GM,Gambia,africa
+002,324,GN,Guinea,africa
+029,312,GP,Guadeloupe,north-america
+002,226,GQ,Equatorial Guinea,africa
+150,300,GR,Greece,europe
+005,239,GS,South Georgia and the South Sandwich Islands,south-america
+013,320,GT,Guatemala,north-america
+009,316,GU,Guam,oceania
+002,624,GW,Guinea-Bissau,africa
+005,328,GY,Guyana,south-america
+142,344,HK,"China, Hong Kong Special Administrative Region",asia
+009,334,HM,Heard Island and McDonald Islands,oceania
+013,340,HN,Honduras,north-america
+150,191,HR,Croatia,europe
+029,332,HT,Haiti,north-america
+150,348,HU,Hungary,europe
+142,360,ID,Indonesia,asia
+150,372,IE,Ireland,europe
+142,376,IL,Israel,asia
+150,833,IM,Isle of Man,europe
+142,356,IN,India,asia
+002,086,IO,British Indian Ocean Territory,africa
+142,368,IQ,Iraq,asia
+142,364,IR,Iran (Islamic Republic of),asia
+150,352,IS,Iceland,europe
+150,380,IT,Italy,europe
+150,832,JE,Jersey,europe
+029,388,JM,Jamaica,north-america
+142,400,JO,Jordan,asia
+142,392,JP,Japan,asia
+002,404,KE,Kenya,africa
+142,417,KG,Kyrgyzstan,asia
+142,116,KH,Cambodia,asia
+009,296,KI,Kiribati,oceania
+002,174,KM,Comoros,africa
+029,659,KN,Saint Kitts and Nevis,north-america
+142,408,KP,Democratic People's Republic of Korea,asia
+142,410,KR,Republic of Korea,asia
+142,414,KW,Kuwait,asia
+029,136,KY,Cayman Islands,north-america
+142,398,KZ,Kazakhstan,asia
+142,418,LA,Lao People's Democratic Republic,asia
+142,422,LB,Lebanon,asia
+029,662,LC,Saint Lucia,north-america
+150,438,LI,Liechtenstein,europe
+142,144,LK,Sri Lanka,asia
+002,430,LR,Liberia,africa
+002,426,LS,Lesotho,africa
+150,440,LT,Lithuania,europe
+150,442,LU,Luxembourg,europe
+150,428,LV,Latvia,europe
+002,434,LY,Libya,africa
+002,504,MA,Morocco,africa
+150,492,MC,Monaco,europe
+150,498,MD,Republic of Moldova,europe
+150,499,ME,Montenegro,europe
+029,663,MF,Saint Martin (French Part),north-america
+002,450,MG,Madagascar,africa
+009,584,MH,Marshall Islands,oceania
+150,807,MK,North Macedonia,europe
+002,466,ML,Mali,africa
+142,104,MM,Myanmar,asia
+142,496,MN,Mongolia,asia
+142,446,MO,"China, Macao Special Administrative Region",asia
+009,580,MP,Northern Mariana Islands,oceania
+029,474,MQ,Martinique,north-america
+002,478,MR,Mauritania,africa
+029,500,MS,Montserrat,north-america
+150,470,MT,Malta,europe
+002,480,MU,Mauritius,africa
+142,462,MV,Maldives,asia
+002,454,MW,Malawi,africa
+013,484,MX,Mexico,north-america
+142,458,MY,Malaysia,asia
+002,508,MZ,Mozambique,africa
+002,516,NA,Namibia,africa
+009,540,NC,New Caledonia,oceania
+002,562,NE,Niger,africa
+009,574,NF,Norfolk Island,oceania
+002,566,NG,Nigeria,africa
+013,558,NI,Nicaragua,north-america
+150,528,NL,Netherlands (Kingdom of the),europe
+150,578,NO,Norway,europe
+142,524,NP,Nepal,asia
+009,520,NR,Nauru,oceania
+009,570,NU,Niue,oceania
+009,554,NZ,New Zealand,oceania
+142,512,OM,Oman,asia
+013,591,PA,Panama,north-america
+005,604,PE,Peru,south-america
+009,258,PF,French Polynesia,oceania
+009,598,PG,Papua New Guinea,oceania
+142,608,PH,Philippines,asia
+142,586,PK,Pakistan,asia
+150,616,PL,Poland,europe
+021,666,PM,Saint Pierre and Miquelon,north-america
+009,612,PN,Pitcairn,oceania
+029,630,PR,Puerto Rico,north-america
+142,275,PS,State of Palestine,asia
+150,620,PT,Portugal,europe
+009,585,PW,Palau,oceania
+005,600,PY,Paraguay,south-america
+142,634,QA,Qatar,asia
+002,638,RE,Réunion,africa
+150,642,RO,Romania,europe
+150,688,RS,Serbia,europe
+150,643,RU,Russian Federation,europe
+002,646,RW,Rwanda,africa
+142,682,SA,Saudi Arabia,asia
+009,090,SB,Solomon Islands,oceania
+002,690,SC,Seychelles,africa
+002,729,SD,Sudan,africa
+150,752,SE,Sweden,europe
+142,702,SG,Singapore,asia
+002,654,SH,Saint Helena,africa
+150,705,SI,Slovenia,europe
+150,744,SJ,Svalbard and Jan Mayen Islands,europe
+150,703,SK,Slovakia,europe
+002,694,SL,Sierra Leone,africa
+150,674,SM,San Marino,europe
+002,686,SN,Senegal,africa
+002,706,SO,Somalia,africa
+005,740,SR,Suriname,south-america
+002,728,SS,South Sudan,africa
+002,678,ST,Sao Tome and Principe,africa
+013,222,SV,El Salvador,north-america
+029,534,SX,Sint Maarten (Dutch part),north-america
+142,760,SY,Syrian Arab Republic,asia
+002,748,SZ,Eswatini,africa
+029,796,TC,Turks and Caicos Islands,north-america
+002,148,TD,Chad,africa
+002,260,TF,French Southern Territories,africa
+002,768,TG,Togo,africa
+142,764,TH,Thailand,asia
+142,762,TJ,Tajikistan,asia
+009,772,TK,Tokelau,oceania
+142,626,TL,Timor-Leste,asia
+142,795,TM,Turkmenistan,asia
+002,788,TN,Tunisia,africa
+009,776,TO,Tonga,oceania
+142,792,TR,Türkiye,asia
+029,780,TT,Trinidad and Tobago,north-america
+009,798,TV,Tuvalu,oceania
+002,834,TZ,United Republic of Tanzania,africa
+150,804,UA,Ukraine,europe
+002,800,UG,Uganda,africa
+009,581,UM,United States Minor Outlying Islands,oceania
+021,840,US,United States of America,north-america
+005,858,UY,Uruguay,south-america
+142,860,UZ,Uzbekistan,asia
+150,336,VA,Holy See,europe
+029,670,VC,Saint Vincent and the Grenadines,north-america
+005,862,VE,Venezuela (Bolivarian Republic of),south-america
+029,092,VG,British Virgin Islands,north-america
+029,850,VI,United States Virgin Islands,north-america
+142,704,VN,Viet Nam,asia
+009,548,VU,Vanuatu,oceania
+009,876,WF,Wallis and Futuna Islands,oceania
+009,882,WS,Samoa,oceania
+142,887,YE,Yemen,asia
+002,175,YT,Mayotte,africa
+002,710,ZA,South Africa,africa
+002,894,ZM,Zambia,africa
+002,716,ZW,Zimbabwe,africa

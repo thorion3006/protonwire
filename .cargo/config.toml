@@ -1,0 +1,9 @@
+# Proton's public sparse registry, required to resolve the pinned `muon` and
+# its transitive `pvpnclient` (PRD 16.2). Cargo reads registry configuration
+# only from this file, not from Cargo.toml.
+[registries.proton]
+index = "sparse+https://rust-registry.proton.me/index/"
+
+# `cargo xtask <subcommand>` (PRD-referenced invocation form).
+[alias]
+xtask = "run -p xtask --"

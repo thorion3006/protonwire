@@ -66,9 +66,9 @@ regional_taxonomy:
   normalized_country_code: ISO-3166-1-alpha-2
   vendored_snapshot:
     required_path: resources/geo/un-m49.csv
-    source_date: null
-    sha256: null
-    status: required-before-implementation-verification
+    source_date: "2026-08-14"
+    sha256: "5e52f9002ea74626657fa7a5f1ca1026951206a43ba99af0d29f5c97e675b627"
+    status: vendored
   unknown_country_policy: unmapped-and-ineligible
   primary_regions:
     africa:

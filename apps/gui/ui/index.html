@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>ProtonWire</title>
+    <style>
+      :root { color-scheme: light dark; font-family: system-ui, sans-serif; }
+      body { margin: 2rem; }
+      dl { display: grid; grid-template-columns: 12rem 1fr; gap: 0.4rem 1rem; }
+      dt { font-weight: 600; opacity: 0.8; }
+      dd { margin: 0; font-variant-numeric: tabular-nums; }
+      .error { color: #c0392b; }
+      footer { margin-top: 2rem; opacity: 0.6; font-size: 0.85rem; }
+    </style>
+  </head>
+  <body>
+    <h1>ProtonWire</h1>
+    <p role="status" id="status" aria-live="polite">Connecting to daemon…</p>
+    <dl id="state" hidden></dl>
+    <footer>
+      Dashboard skeleton. Views and controls land with the shared client
+      contract in later milestones (PRD 9.10).
+    </footer>
+    <script>
+      const status = document.getElementById("status");
+      const list = document.getElementById("state");
+      function render(state) {
+        status.textContent = "";
+        list.hidden = false;
+        list.innerHTML = "";
+        for (const [key, value] of Object.entries(state)) {
+          const dt = document.createElement("dt");
+          const dd = document.createElement("dd");
+          dt.textContent = key.replace(/_/g, " ");
+          dd.textContent = typeof value === "object" ? JSON.stringify(value) : String(value);
+          list.append(dt, dd);
+        }
+      }
+      function fail(message) {
+        status.textContent = message;
+        status.className = "error";
+      }
+      window.__TAURI__
+        .core.invoke("daemon_state")
+        .then(render)
+        .catch((e) => fail("daemon unavailable: " + e));
+    </script>
+  </body>
+</html>

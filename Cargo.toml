@@ -1,0 +1,115 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/core",
+    "crates/frontend-api",
+    "crates/client",
+    "crates/ipc",
+    "crates/api",
+    "crates/protocol",
+    "crates/net",
+    "crates/policy",
+    "crates/port-forwarding",
+    "crates/store",
+    "apps/daemon",
+    "apps/credential-agent",
+    "apps/cli",
+    "apps/tui",
+    "apps/gui/src-tauri",
+    "xtask",
+]
+# The Tauri GUI needs webkit2gtk/glib system libraries to compile, so it is a
+# workspace member (covered by this single root Cargo.lock) but not a default
+# member. CI builds it in a dedicated job with the required system packages.
+# `cargo build` at the workspace root builds everything except the GUI.
+default-members = [
+    "crates/core",
+    "crates/frontend-api",
+    "crates/client",
+    "crates/ipc",
+    "crates/api",
+    "crates/protocol",
+    "crates/net",
+    "crates/policy",
+    "crates/port-forwarding",
+    "crates/store",
+    "apps/daemon",
+    "apps/credential-agent",
+    "apps/cli",
+    "apps/tui",
+    "xtask",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+# Floor = lowest VERIFIED toolchain. PRD NFR-42 sets a 1.85 minimum; the
+# Proton registry crates (proton-vpn-netstack, proton-vpn-yaourt) use
+# language features that do not compile before ~1.94: probes of 1.85, 1.88,
+# 1.89, 1.90, and 1.93 all failed (details in docs/spike-2026-08.md).
+rust-version = "1.97"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/thorion3006/protonwire"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.dependencies]
+# --- Pinned Proton engines ------------------------------------------------
+# ProTUN pin (tag v2.2.1). The tag carries no upstream lockfile; the committed
+# root Cargo.lock of this repository is the resolution authority (PRD 6.5).
+protun = { git = "https://github.com/ProtonVPN/protun", rev = "12e7755a112f59b7b843da79290b3de25febf653", features = [
+    "linux",
+    "local-agent",
+] }
+# Muon pin from Proton's public sparse registry; configured in .cargo/config.toml.
+muon = { version = "=2.6.1", registry = "proton", default-features = false, features = [
+    "transport-hyper",
+    "lenient",
+    "other-product",
+    "unsealed",
+    "login",
+    "alternative-routing",
+] }
+
+# --- Serialization / schema ------------------------------------------------
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_norway = "0.9"
+schemars = "1"
+
+# --- Errors / logging ------------------------------------------------------
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+# --- System ---------------------------------------------------------------
+# `poll` backs the ipc tests' deterministic readability checks (WO-R4).
+nix = { version = "0.31", features = ["socket", "user", "fs", "signal", "poll"] }
+zeroize = "1"
+
+# Clients --------------------------------------------------------------
+clap = { version = "4", features = ["derive"] }
+ratatui = "0.30"
+# `wry` selects the webview runtime; `default-features = false` otherwise
+# leaves Builder<R: Runtime> without a runtime to infer.
+tauri = { version = "2", default-features = false, features = ["wry"] }
+tauri-build = { version = "2", default-features = false }
+
+# --- xtask tooling --------------------------------------------------------
+cargo_metadata = "0.23"
+toml = "1"
+sha2 = "0.11"
+
+# --- Workspace crates -----------------------------------------------------
+protonwire-core = { path = "crates/core", version = "0.1.0" }
+protonwire-frontend-api = { path = "crates/frontend-api", version = "0.1.0" }
+protonwire-client = { path = "crates/client", version = "0.1.0" }
+protonwire-ipc = { path = "crates/ipc", version = "0.1.0" }
+protonwire-api = { path = "crates/api", version = "0.1.0" }
+protonwire-protocol = { path = "crates/protocol", version = "0.1.0" }
+protonwire-net = { path = "crates/net", version = "0.1.0" }
+protonwire-policy = { path = "crates/policy", version = "0.1.0" }
+protonwire-pf = { path = "crates/port-forwarding", version = "0.1.0" }
+protonwire-store = { path = "crates/store", version = "0.1.0" }

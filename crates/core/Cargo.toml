@@ -1,0 +1,22 @@
+[package]
+name = "protonwire-core"
+description = "Sole application-behavior implementation: daemon state machine, error taxonomy, event sequencing, secret redaction (PRD FR-127C)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+protonwire-frontend-api = { workspace = true }
+protonwire-store = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+zeroize = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

@@ -1,0 +1,120 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "EventEnvelope",
+  "description": "Envelope for every daemon-pushed event. `seq` is monotonic per daemon\nprocess lifetime; a client that observes a gap must resynchronize with a\n[`crate::Request::GetState`] request (PRD FR-127D). The one value a real\nevent never carries is [`EVENT_SEQ_RESYNC_NOW`], reserved as the\nend-of-burst overflow signal above.",
+  "type": "object",
+  "properties": {
+    "event": {
+      "description": "The event payload.",
+      "$ref": "#/$defs/Event"
+    },
+    "seq": {
+      "description": "Monotonic sequence number, never [`EVENT_SEQ_RESYNC_NOW`] for a\ngenuine event.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    }
+  },
+  "required": [
+    "seq",
+    "event"
+  ],
+  "$defs": {
+    "Event": {
+      "description": "Daemon events. Milestone 1 carries state transitions and notices; richer\nevents (feature reconciliation, catalog refresh results, conflict\ndetection) are additive variants in later milestones.",
+      "oneOf": [
+        {
+          "description": "The VPN state machine transitioned.",
+          "type": "object",
+          "properties": {
+            "from": {
+              "description": "Previous state.",
+              "$ref": "#/$defs/VpnState"
+            },
+            "kind": {
+              "type": "string",
+              "const": "state-changed"
+            },
+            "to": {
+              "description": "New state.",
+              "$ref": "#/$defs/VpnState"
+            }
+          },
+          "required": [
+            "kind",
+            "from",
+            "to"
+          ]
+        },
+        {
+          "description": "An informational or warning notice worth surfacing in clients.",
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "notice"
+            },
+            "level": {
+              "description": "Severity of the notice.",
+              "$ref": "#/$defs/NoticeLevel"
+            },
+            "message": {
+              "description": "Already-redacted human-readable text.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "level",
+            "message"
+          ]
+        }
+      ]
+    },
+    "NoticeLevel": {
+      "description": "Severity for [`Event::Notice`].",
+      "oneOf": [
+        {
+          "description": "Informational.",
+          "type": "string",
+          "const": "info"
+        },
+        {
+          "description": "Warning.",
+          "type": "string",
+          "const": "warning"
+        },
+        {
+          "description": "Error.",
+          "type": "string",
+          "const": "error"
+        }
+      ]
+    },
+    "VpnState": {
+      "description": "High-level VPN state machine states.",
+      "oneOf": [
+        {
+          "description": "No tunnel exists.",
+          "type": "string",
+          "const": "disconnected"
+        },
+        {
+          "description": "A connection attempt is in progress.",
+          "type": "string",
+          "const": "connecting"
+        },
+        {
+          "description": "A tunnel is up.",
+          "type": "string",
+          "const": "connected"
+        },
+        {
+          "description": "A teardown is in progress.",
+          "type": "string",
+          "const": "disconnecting"
+        }
+      ]
+    }
+  }
+}

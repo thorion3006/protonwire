@@ -1,0 +1,24 @@
+[package]
+name = "protonwire-tui"
+description = "protonwire-tui — keyboard-only Ratatui client (PRD 9.9, FR-127F)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "protonwire-tui"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+# SIGTERM/SIGHUP flag handlers (R7-4). The workspace's pinned nix entry
+# already enables the "signal" feature, so no root Cargo.toml change and
+# no version change — same pattern as the ipc crate's nix usage.
+nix = { workspace = true }
+protonwire-client = { workspace = true }
+protonwire-frontend-api = { workspace = true }
+ratatui = { workspace = true }

@@ -1,0 +1,21 @@
+[package]
+name = "protonwire-cli"
+description = "protonwire — the complete non-interactive and automation surface (PRD 9.1, FR-127E)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "protonwire"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+protonwire-client = { workspace = true }
+protonwire-frontend-api = { workspace = true }
+clap = { workspace = true }
+serde_json = { workspace = true }
