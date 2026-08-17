@@ -767,3 +767,60 @@ crate, GUI-boundary precedent); FU-F any-further-entry rule test
 (revision-less extra upstream). Review-log notes, no code:
 duplicate-violation cosmetic, `dropped_events` consumer (M2 GUI/TUI
 surfaces), W6-2 mapping-scope gap.
+
+## 2026-08-16 — Codex round 7 + FU lane + verdict-fix lane (PR #3)
+
+Round 7 (4 findings, 01:45Z) plus the round-6 FU lane and the
+verdict-fix lane, all closed. Nine main commits + nine verdict-fix
+commits + one champion residual fix.
+
+| Finding | Verdict | Commit |
+|---------|---------|--------|
+| Enforce writer deadlines without SO_SNDTIMEO (P1, `server.rs`) | Fixed @ b3608e5 (+F1 774bc47, F3 faa3537, F2 dded3fc, F6 eb9288b, F7 c598ab0) | `write_msg_within`: MSG_DONTWAIT per chunk (the syscall never blocks), POLLOUT pacing inside the remaining budget, partial progress does not reset the deadline; expiry flows into the round-5 teardown. `ServeBudgets.write_timeout` injectable. rust PASS + sec PASS |
+| `reconnect` panicked in the refusal table (P2, `commands.rs`) | Fixed @ ef2d516 (champion) | missing `planned_milestone` arm + the two-layer class killer: every-variant dispatch walk + no-wildcard exhaustiveness match |
+| TUI refresh blocked the event loop (P2, `tui/main.rs`) | Fixed @ 0784acd (+F5 6ac6151) | background refresh thread, bounded newest-wins channel, STALE_AFTER marker; F5 stamps snapshots at FETCH time (mutation-red pinned) |
+| Terminal state lost on SIGTERM/SIGHUP (P2, `tui/main.rs`) | Fixed @ 4c144c9 (+F4/F8 a475be5) | nix sigaction flag-only handler (async-signal-safe single store), restore on the main thread; SIGINT/SIGQUIT armed too; no signal-hook dependency needed |
+
+FU lane (round-6/7 verdict residuals): FU-A @ b07aa72 daemon `run(args)`
+tracing seam; FU-B @ 9308905 dangling-symlink naming + four symlink
+pins; FU-C @ 25ef796 two-episode one-shot-warn pin
+([(44,44),(44,88)]); FU-D @ 8c49f00 + FU-F @ 9f4a87d PRD cross-check,
+contiguity/max-id pins, any-further-entry defender; FU-E @ 182ce83
+owned-secret single-allocation pin (dedicated test binary, scoped
+unsafe allow per the GUI precedent).
+
+**SO_SNDTIMEO track item — SUPERSEDED WORDING (sec round-7 probe).**
+The round-5 note said "never interrupted"; the round-7 first
+correction said "~2x". The measured model is two defects: (1)
+SO_SNDTIMEO bounds each WAIT, not the message — progress resets it,
+and a multi-syscall write multiplies it (a 0.9 MiB frame ≈ 4 syscalls
+≈ up to 4x the configured timeout); (2) under steady drain it never
+expires at all — the probe watched a draining peer stretch past 80 s
+under a 1 s timeout (round-5's 20 s-under-10 s observation sits
+inside this model). DoS arithmetic, pre/post R7-1: pre-fix, one
+never-reading peer pinned a writer + reserved slot indefinitely
+(64x = permanent MAX_SESSIONS wedge); post-fix, one peer costs at
+most one write_timeout per message and loses its session — the
+watchdog's userspace deadline is the only bound that holds on every
+kernel.
+
+F7 reshape note (independently verified at close): the round-3
+drain test's pinned-writer premise is gone post-R7-1 — the new
+invariant (drain_ceiling ≥ 3x write_timeout, asserted in
+serve_observed) makes a bounded writer unable to outlive the drain,
+so the force-down path's genuine customer is now the BLOCKED
+DISPATCH straggler; the pinned-writer class lives in the two
+watchdog tests.
+
+Track items: per-session write/idle ceiling (a slow-dribble client
+can still hold a session indefinitely — bounded by MAX_SESSIONS);
+queued-response memory amplification (~230 MiB/session possible from
+the 256-deep queue of near-MAX_FRAME_LEN responses — pre-existing);
+poll/send hot-loop spin under a perpetually-writable-but-unwritable
+socket (nit); single-test seam note (ServeBudgets assertions live in
+serve_observed); qa red-procedure notes incl. the R7-3 inline-fetch
+hang construction for stall tests.
+
+Process note: the IPC lane's `cargo fmt --all` reformatted the TUI
+lane's in-flight file mid-run (harmless, nothing staged of theirs) —
+concurrent lanes should use `-p`-scoped fmt.
