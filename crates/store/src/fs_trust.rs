@@ -164,6 +164,20 @@ fn component_chain<'a>(path: &'a Path, trust_root: &Path) -> Result<Vec<&'a Path
             path: trust_root.to_path_buf(),
         });
     }
+    // `.`/`..` components resolve against the live tree in the kernel,
+    // escaping the lexical walk — reject them before any inspection
+    // (rust-review round 8). `--config` is user input; the walk must never
+    // depend on how the kernel would normalize it.
+    for component in path.components() {
+        if matches!(
+            component,
+            std::path::Component::CurDir | std::path::Component::ParentDir
+        ) {
+            return Err(FsTrustError::RelativeComponent {
+                path: path.to_path_buf(),
+            });
+        }
+    }
     let mut chain = Vec::new();
     for ancestor in path.ancestors() {
         chain.push(ancestor);
@@ -229,6 +243,17 @@ pub enum FsTrustError {
     #[error("{path} must be an absolute path for the strict-mode trust walk")]
     NotAbsolute {
         /// The offending path.
+        path: PathBuf,
+    },
+    /// The path contains a `.` or `..` component (rust-review round 8).
+    /// The walk is lexical, but the kernel resolves those against the live
+    /// tree — silently escaping the very components the walk must inspect
+    /// — so such paths are rejected before any inspection.
+    #[error(
+        "{path} contains a `.` or `..` component; strict-mode paths must be normalized and absolute"
+    )]
+    RelativeComponent {
+        /// The rejected path.
         path: PathBuf,
     },
     /// The path never runs through the trust root.
@@ -402,6 +427,20 @@ mod tests {
             "{err}"
         );
         std::fs::set_permissions(ancestor, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // rust-review round 8 (Low): `.`/`..` components would let the
+        // kernel resolve the path against the live tree, escaping the
+        // lexical walk — rejected before any inspection.
+        let err = verify_trusted_path(
+            Path::new("/etc/../protonwire/config.yaml"),
+            Path::new("/"),
+            MissingLeaf::Reject,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, FsTrustError::RelativeComponent { .. }),
+            "{err}"
+        );
 
         // A directory where the document should be is a type defect.
         let dir_leaf = leaf.with_file_name("leafdir");
