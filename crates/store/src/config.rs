@@ -10,9 +10,11 @@
 //! `features.lan_access` configuration field (PRD section 10 closing rule).
 
 use std::collections::BTreeMap;
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+use crate::fs_trust::{FsTrustError, MissingLeaf, verify_trusted_path};
 use crate::yaml;
 
 /// Who may set a field (PRD section 10).
@@ -731,10 +733,11 @@ impl SystemConfig {
     /// Expected schema version of this generation of the document.
     pub const EXPECTED_SCHEMA_VERSION: u32 = 2;
 
-    /// Loads and validates the system configuration. Only *absence* is
-    /// soft: a missing file yields defaults (with a log record). A file
-    /// that cannot be read (an EACCES ancestor directory, for example) is
-    /// a hard error — `exists()` would read that as "missing" and hand the
+    /// Loads and validates the system configuration with the loader's
+    /// original read-anything semantics. Only *absence* is soft: a
+    /// missing file yields defaults (with a log record). A file that
+    /// cannot be read (an EACCES ancestor directory, for example) is a
+    /// hard error — `exists()` would read that as "missing" and hand the
     /// daemon silent defaults for its socket, credential, and protection
     /// policy — and an invalid file is equally hard.
     ///
@@ -742,7 +745,55 @@ impl SystemConfig {
     /// the defaults path was taken, so a caller whose subscriber is not up
     /// yet can re-emit the missing-file warning after initializing
     /// logging.
-    pub fn load(path: &std::path::Path) -> Result<LoadedSystemConfig, ConfigLoadError> {
+    ///
+    /// This entry point performs NO trust checks: the root daemon loads
+    /// through [`SystemConfig::load_strict`] (round-8 X5), and only it —
+    /// the per-UID overlay and ordinary test paths keep these semantics
+    /// (strictness is parameterized, not blanket-applied).
+    pub fn load(path: &Path) -> Result<LoadedSystemConfig, ConfigLoadError> {
+        Self::load_inner(path, None)
+    }
+
+    /// Loads and validates the system configuration in strict mode
+    /// (round-8 X5, sshd `StrictModes`-style): before the document is
+    /// read, [`crate::fs_trust`] walks the leaf AND every ancestor
+    /// directory up to and including `trust_root`, hard-rejecting any
+    /// component that is a symlink, has the wrong type, grants group or
+    /// world write, or is not owned by root (uid 0, gid 0). Anyone able
+    /// to plant or replace the document would otherwise control
+    /// root-daemon policy.
+    ///
+    /// Walk rule: production callers pass `/` as the trust root — the
+    /// sshd rule, and correct here because `/etc` and every parent is
+    /// root-owned 0755 on a real system, so the walk to `/` rejects only
+    /// genuinely hostile trees. A shallower root is an explicit opt-in
+    /// for hermetic tests, which construct the whole tree under the root
+    /// and trust everything above it by construction.
+    ///
+    /// Absence of the leaf stays soft exactly as in [`SystemConfig::load`]
+    /// (defaults, `used_defaults`), but the ancestors are still walked: a
+    /// symlinked ancestor does not become acceptable because the leaf it
+    /// would point at is absent. Like sshd's check this is a
+    /// happens-before-use walk, not an atomic guarantee against a
+    /// concurrent swap.
+    pub fn load_strict(
+        path: &Path,
+        trust_root: &Path,
+    ) -> Result<LoadedSystemConfig, ConfigLoadError> {
+        Self::load_inner(path, Some(trust_root))
+    }
+
+    /// The shared load body; `trust_root` selects the strict walk.
+    fn load_inner(
+        path: &Path,
+        trust_root: Option<&Path>,
+    ) -> Result<LoadedSystemConfig, ConfigLoadError> {
+        if let Some(trust_root) = trust_root {
+            // A missing LEAF stays soft (the read below yields defaults),
+            // but only through a clean tree: every ancestor is still
+            // walked, and a present leaf is fully checked before read.
+            verify_trusted_path(path, trust_root, MissingLeaf::Allow)?;
+        }
         let bytes = match std::fs::read(path) {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -887,6 +938,14 @@ pub enum ConfigLoadError {
         /// The underlying I/O failure.
         source: std::io::Error,
     },
+    /// Strict-mode trust walk failed (round-8 X5): the system
+    /// configuration file or one of its ancestor directories is a
+    /// symlink, has the wrong type, is not owned by root, or grants
+    /// group/world write. Anyone able to plant or replace the document
+    /// would control root-daemon policy, so the defect is hard: the
+    /// message names the offending component and what is wrong with it.
+    #[error("untrusted system configuration: {0}")]
+    UntrustedPath(#[from] FsTrustError),
     /// Cross-field validation failed.
     #[error("configuration validation failed:\n  - {}",
         violations.join("\n  - "))]
@@ -1047,6 +1106,261 @@ mod tests {
         assert!(
             message.contains("Permission denied"),
             "must name the underlying error: {message}"
+        );
+    }
+
+    /// Round-8 X5 [ZkI1F]: the root daemon applies whatever document sits
+    /// at the system config path, so that path is a privilege-escalation
+    /// surface — an unprivileged user able to plant or replace the file
+    /// (by owning it, sharing a writable group, or symlinking it)
+    /// controls root-daemon policy. The strict arms below pin the
+    /// sshd-`StrictModes`-style trust walk `load_strict` performs before
+    /// reading: root-owned, no group/world write, no symlinks, on the
+    /// leaf AND every ancestor up to the trust root.
+    ///
+    /// Fixture: a config tree under a tempdir that stands in for
+    /// `/etc/protonwire`, with the tempdir as the trust root — hermetic
+    /// tests control the whole tree under the temp root (the walk-to-`/`
+    /// rule itself is pinned by the daemon suite, which exercises the
+    /// production call).
+    fn strict_config_tree(root: &std::path::Path) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = root.join("etc").join("protonwire");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = dir.join("config.yaml");
+        std::fs::write(&path, "schema_version: 2\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        path
+    }
+
+    /// X5 mode arm (leaf), the finding's exact scenario: a group-writable
+    /// config file must be a hard rejection naming the file and the mode
+    /// defect. Fully provable unprivileged — chmod needs no privileges,
+    /// and the walk's mode pass runs before its ownership pass, so a
+    /// user-owned file never shadows the mode defect.
+    #[test]
+    fn strict_load_rejects_group_writable_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let path = strict_config_tree(root.path());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o664)).unwrap();
+        let err = SystemConfig::load_strict(&path, root.path()).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ConfigLoadError::UntrustedPath(
+                    crate::fs_trust::FsTrustError::GroupWorldWritable { .. }
+                )
+            ),
+            "must be the mode defect: {err}"
+        );
+        let message = err.to_string();
+        assert!(
+            message.contains("config.yaml"),
+            "must name the offending path: {message}"
+        );
+        assert!(
+            message.contains("group/world write"),
+            "must name the defect: {message}"
+        );
+    }
+
+    /// X5 ownership arm (leaf): the document must be owned by root uid
+    /// AND gid. Unprivileged runners construct the arm for free (their
+    /// files are non-root-owned by construction); root runners hand the
+    /// file to uid/gid 65534 (nobody). When neither construction is
+    /// possible the arm is unprovable and skipped — the suite's
+    /// established pattern (see the 0000-dir test above).
+    #[test]
+    fn strict_load_rejects_non_root_owned_file() {
+        use std::os::unix::fs::MetadataExt;
+        let root = tempfile::tempdir().unwrap();
+        let path = strict_config_tree(root.path());
+        if std::fs::metadata(&path).unwrap().uid() == 0 {
+            // Running as root: hand the file away.
+            let _ = std::os::unix::fs::chown(&path, Some(65534), Some(65534));
+        }
+        let meta = std::fs::metadata(&path).unwrap();
+        if meta.uid() == 0 && meta.gid() == 0 {
+            return; // cannot construct a non-root-owned file here
+        }
+        let err = SystemConfig::load_strict(&path, root.path()).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ConfigLoadError::UntrustedPath(crate::fs_trust::FsTrustError::NotRootOwned { .. })
+            ),
+            "must be the ownership defect: {err}"
+        );
+        assert!(
+            err.to_string().contains("owned by uid"),
+            "must name the ownership defect: {err}"
+        );
+    }
+
+    /// X5 mode arm (ancestor): a world-writable ancestor directory lets
+    /// any local user swap the document into place, so the walk rejects
+    /// the directory itself. Provable unprivileged for the same reason as
+    /// the leaf arm: mode is checked before ownership.
+    #[test]
+    fn strict_load_rejects_world_writable_ancestor_dir() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let path = strict_config_tree(root.path());
+        let dir = path.parent().unwrap(); // .../etc/protonwire
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let err = SystemConfig::load_strict(&path, root.path()).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ConfigLoadError::UntrustedPath(
+                    crate::fs_trust::FsTrustError::GroupWorldWritable { .. }
+                )
+            ),
+            "must be the ancestor's mode defect: {err}"
+        );
+        let message = err.to_string();
+        assert!(
+            message.contains("protonwire"),
+            "must name the offending directory: {message}"
+        );
+        assert!(
+            message.contains("group/world write"),
+            "must name the defect: {message}"
+        );
+    }
+
+    /// X5 symlink arm (leaf): a symlinked config.yaml is a hard rejection
+    /// even when its target is a perfectly clean file — the link itself
+    /// is the defect (every component is lstat'd, never followed).
+    #[test]
+    fn strict_load_rejects_symlinked_config_file() {
+        let root = tempfile::tempdir().unwrap();
+        let path = strict_config_tree(root.path());
+        let real = path.with_file_name("config.real.yaml");
+        std::fs::rename(&path, &real).unwrap();
+        std::os::unix::fs::symlink(&real, &path).unwrap();
+        let err = SystemConfig::load_strict(&path, root.path()).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ConfigLoadError::UntrustedPath(crate::fs_trust::FsTrustError::Symlink { .. })
+            ),
+            "must be the symlink defect: {err}"
+        );
+        let message = err.to_string();
+        assert!(
+            message.contains("config.yaml"),
+            "must name the link path: {message}"
+        );
+        assert!(
+            message.contains("symbolic link"),
+            "must name the defect: {message}"
+        );
+    }
+
+    /// X5 symlink arm (ancestor) plus the laundering attempt: a symlinked
+    /// ancestor is rejected when the leaf through it exists, and a
+    /// missing leaf does not launder it — absence stays soft only through
+    /// a clean tree.
+    #[test]
+    fn strict_load_rejects_symlinked_ancestor_even_with_missing_leaf() {
+        let root = tempfile::tempdir().unwrap();
+        // The real tree the link points at, and the linked path the
+        // loader is asked to trust.
+        let real_dir = root.path().join("real").join("protonwire");
+        std::fs::create_dir_all(&real_dir).unwrap();
+        let real_file = real_dir.join("config.yaml");
+        std::fs::write(&real_file, "schema_version: 2\n").unwrap();
+        let link = root.path().join("etc");
+        std::os::unix::fs::symlink(root.path().join("real"), &link).unwrap();
+        let via = link.join("protonwire").join("config.yaml");
+
+        let err = SystemConfig::load_strict(&via, root.path()).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ConfigLoadError::UntrustedPath(crate::fs_trust::FsTrustError::Symlink { .. })
+            ),
+            "must be the symlink defect: {err}"
+        );
+        assert!(
+            err.to_string().contains("etc"),
+            "must name the linked ancestor, not the leaf: {err}"
+        );
+
+        // Laundering attempt: delete the leaf so absence would read as
+        // "use defaults" — the symlinked ancestor must still reject.
+        std::fs::remove_file(&real_file).unwrap();
+        let err = SystemConfig::load_strict(&via, root.path()).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ConfigLoadError::UntrustedPath(crate::fs_trust::FsTrustError::Symlink { .. })
+            ),
+            "a missing leaf must not launder a symlinked ancestor: {err}"
+        );
+    }
+
+    /// X5 positive arm, root-gated per the established skip pattern: only
+    /// a runner whose created files read as root:root can construct the
+    /// accepted tree (unprivileged runners cannot chown to root). The
+    /// tree mimics the real deployment — root:root 0644 file, 0755
+    /// directories, up to the trust root — and must load; a missing leaf
+    /// through that clean tree must stay soft (defaults).
+    #[test]
+    fn strict_load_accepts_clean_root_owned_tree() {
+        use std::os::unix::fs::MetadataExt;
+        let root = tempfile::tempdir().unwrap();
+        let path = strict_config_tree(root.path());
+        let clean_and_root_owned = [
+            root.path().to_path_buf(),
+            root.path().join("etc"),
+            path.clone(),
+        ]
+        .iter()
+        .all(|component| {
+            let meta = std::fs::metadata(component).unwrap();
+            meta.uid() == 0 && meta.gid() == 0
+        });
+        if !clean_and_root_owned {
+            return; // uid-0 ownership arm unprovable for this runner
+        }
+        let loaded = SystemConfig::load_strict(&path, root.path()).unwrap();
+        assert!(
+            !loaded.used_defaults,
+            "a clean root-owned document must load"
+        );
+        assert_eq!(
+            loaded.config.schema_version,
+            SystemConfig::EXPECTED_SCHEMA_VERSION
+        );
+
+        // Absence stays soft in strict mode — through a clean tree a
+        // missing leaf yields defaults, exactly like plain `load`.
+        std::fs::remove_file(&path).unwrap();
+        let missing = SystemConfig::load_strict(&path, root.path()).unwrap();
+        assert!(
+            missing.used_defaults,
+            "a clean tree with no leaf must yield defaults"
+        );
+    }
+
+    /// X5 parameterization pin: strictness is the SYSTEM-authority load's
+    /// rule, not a blanket change — plain `load` (the semantics the
+    /// per-UID overlay and ordinary test paths keep) still reads a
+    /// group-writable file; only the daemon's strict call rejects it.
+    #[test]
+    fn plain_load_keeps_current_semantics_for_group_writable_files() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let path = strict_config_tree(root.path());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o664)).unwrap();
+        let loaded = SystemConfig::load(&path).unwrap();
+        assert!(
+            !loaded.used_defaults,
+            "plain load must keep its current read-anything semantics"
         );
     }
 

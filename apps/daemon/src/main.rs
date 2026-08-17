@@ -8,7 +8,7 @@
 //! and the startup body lives in [`run`] with the tracing factory
 //! injectable so the config-load-to-logging hand-off is too.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
@@ -41,7 +41,7 @@ struct Args {
 
 fn main() {
     let args = Args::parse();
-    let code = run(args, &init_tracing_filtered);
+    let code = run(args, &init_tracing_filtered, Some(Path::new("/")));
     if code != 0 {
         std::process::exit(code);
     }
@@ -53,11 +53,21 @@ fn main() {
 /// factory). Exit codes: 15 for a config load/validation failure (PRD
 /// 9.8), 1 for a bind failure, 0 after a clean shutdown.
 ///
+/// `trust_root` is the round-8 X5 seam: production passes `Some("/")` —
+/// the system document loads strict, sshd `StrictModes`-style, so the
+/// file and every ancestor up to `/` must be root-owned, free of
+/// group/world write bits, and symlink-free (anyone able to plant or
+/// replace the document would control the root daemon; a violation exits
+/// 15). `None` keeps the loader's plain semantics and exists for the
+/// pre-existing `run` tests, whose temp-tree paths an unprivileged
+/// runner cannot make root-owned (parameterized, not blanket-applied —
+/// the per-UID overlay and ordinary test paths are unchanged).
+///
 /// Configuration is loaded before tracing initializes so that
 /// `daemon.log_level` from the config applies (rust-review finding 7);
 /// a `--log-level` flag wins over the config, and RUST_LOG wins over
 /// both. Load failures predate the logger and go to stderr.
-fn run(args: Args, init_tracing: &dyn Fn(&str)) -> i32 {
+fn run(args: Args, init_tracing: &dyn Fn(&str), trust_root: Option<&Path>) -> i32 {
     let mut paths = ConfigPaths::system();
     if let Some(config) = &args.config {
         paths.system_config = config.clone();
@@ -66,7 +76,19 @@ fn run(args: Args, init_tracing: &dyn Fn(&str)) -> i32 {
         paths.socket_dir = socket_dir.clone();
     }
 
-    let loaded = match SystemConfig::load(&paths.system_config) {
+    // Round-8 X5 [ZkI1F]: the system document is root-daemon policy, so
+    // it loads strict — sshd `StrictModes`-style: the file and every
+    // ancestor up to the trust root must be root-owned, free of
+    // group/world write bits, and a real file/directory (no symlinks).
+    // Anyone able to plant or replace the document would otherwise
+    // control the root daemon. A violation is a hard load error and takes
+    // the exit-15 path below; the `--config` flag overrides WHERE the
+    // document lives, never the trust rule applied to it.
+    let loaded = match trust_root {
+        Some(trust_root) => SystemConfig::load_strict(&paths.system_config, trust_root),
+        None => SystemConfig::load(&paths.system_config),
+    };
+    let loaded = match loaded {
         Ok(loaded) => loaded,
         Err(e) => {
             eprintln!("protonwire-daemon: {e}");
@@ -251,7 +273,7 @@ mod tests {
             }
         };
 
-        let code = run(args, &init);
+        let code = run(args, &init, None);
         assert_eq!(code, 1, "the blocked socket directory must fail the bind");
 
         let entries = log.snapshot();
@@ -272,5 +294,52 @@ mod tests {
             warning > 0,
             "the warning must follow the init marker: {entries:?}"
         );
+    }
+
+    /// Round-8 X5 [ZkI1F]: the daemon applies the system configuration as
+    /// root, so the document's path is a privilege-escalation surface —
+    /// pre-fix, a group-writable config.yaml was read and applied without
+    /// a murmur (the red for this test: `run` sailed past config load and
+    /// died at the blocked socket directory with exit 1, not 15). The
+    /// strict load must reject the file before anything is applied from
+    /// it: exit 15, the existing config-failure path (PRD 9.8). This is
+    /// the production call: trust root `/`, the walk-to-`/` rule.
+    #[test]
+    fn strict_mode_rejects_group_writable_config_before_serving() {
+        use std::os::unix::fs::PermissionsExt;
+        // Hermetic scratch dir (FU-A pattern): the group-writable config
+        // under it is the finding's scenario; a regular file squatting on
+        // the socket-dir path guarantees the PRE-fix run terminates at the
+        // bind (exit 1) instead of ever serving, so the red is
+        // deterministic. The defect fires on the file component itself —
+        // the deepest in the walk — so the rejection holds whether the
+        // runner is root or not (the world-writable /tmp above the scratch
+        // dir is never reached).
+        let dir = std::env::temp_dir().join(format!("protonwire-daemon-x5-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let config_dir = dir.join("etc/protonwire");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let config = config_dir.join("config.yaml");
+        std::fs::write(&config, "schema_version: 2\n").unwrap();
+        std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o664)).unwrap();
+        let blocker = dir.join("not-a-directory");
+        std::fs::write(&blocker, b"").unwrap();
+
+        let args = Args {
+            config: Some(config),
+            socket_dir: Some(blocker),
+            log_level: None,
+        };
+        // No subscriber install here: the FU-A test owns the process's
+        // single global install; this test pins only the exit code (the
+        // defect naming is pinned by the store suite).
+        let init = |_level: &str| {};
+        let code = run(args, &init, Some(Path::new("/")));
+        assert_eq!(
+            code, 15,
+            "a group-writable system configuration must fail the strict load with \
+             the config exit code (PRD 9.8), never be applied silently"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -11,6 +11,7 @@
 //!   express system-only fields.
 
 pub mod config;
+pub mod fs_trust;
 pub mod paths;
 pub mod state;
 pub mod yaml;
