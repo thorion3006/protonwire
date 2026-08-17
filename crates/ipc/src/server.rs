@@ -5,7 +5,7 @@ use std::net::Shutdown;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
@@ -46,6 +46,47 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Three write ceilings: one blocked final write, one slow poll loop, and
 /// one in-flight dispatch each get a full chance to finish.
 const DRAIN_CEILING: Duration = WRITE_TIMEOUT.saturating_mul(3);
+
+/// R9-2 (round 9, P1): the per-session request-credit window — the
+/// dispatcher stops READING new requests while this many writer-channel
+/// messages remain unwritten.
+///
+/// The finding: `writer_tx` (`sync_channel(256)`, shared by responses and
+/// events) let a pipelining authorized client park ~230 MiB per session
+/// (~14 GiB across `MAX_SESSIONS` = 64) by stalling its reader. The
+/// dispatcher's blocking `send` was backpressure on the dispatch THREAD,
+/// never a bound on parked BYTES — and the R7-1 per-message write
+/// watchdog only ends one already-stuck write; it does nothing about the
+/// queue parked behind it.
+///
+/// Bound (by construction, approximate and deliberately conservative):
+/// every channel slot holds one typed `ServerMessage` whose heap is
+/// dominated by its payload strings, each bounded by the codec's
+/// [`crate::frame::MAX_FRAME_LEN`] payload check (wire shape: a 4-byte
+/// prefix plus a <=1 MiB payload per frame). Worst case parked per
+/// session is therefore ~(window + 1 mid-write + 1 mid-dispatch) x ~1 MiB
+/// ~= 18 MiB, against ~230 MiB for the full-channel pre-fix shape — and
+/// a burst past the window WAITS rather than buffers, so a hostile
+/// client just experiences flow control. No termination semantics.
+///
+/// Treatment of the other traffic on the same channel:
+/// - EVENTS never wait on the window (only the dispatcher does). They
+///   are daemon-authored, not client-amplifiable, and are bounded
+///   upstream by the bus's own 256-slot drop-and-resync queue (X4). They
+///   do COUNT toward it, deliberately: a session whose events are not
+///   draining should not read more of its client's requests either.
+/// - The hello ack and the X4 resync marker each occupy one slot of the
+///   same window; neither can wedge it — the marker is only sent after a
+///   successful event forward, and the ack precedes the first request
+///   read (the hello gate, WO-5, is an ORDERing device and composes: the
+///   ack is queued, the gate opens, and only then can any request
+///   consume window slots).
+const MAX_UNWRITTEN_MESSAGES: usize = 16;
+
+/// How often a dispatcher parked on the R9-2 window re-checks it. Small
+/// so a reopened window costs one poll of pipelining latency, not a
+/// read-timeout quantum.
+const WRITE_WINDOW_POLL: Duration = Duration::from_millis(10);
 
 /// Timing budgets for one `serve()` invocation. Production uses the
 /// defaults; tests inject shrunk values so drain, dribble, and
@@ -230,8 +271,12 @@ impl IpcServer {
     /// Each session runs on two threads (reader/dispatcher and writer) and is
     /// fully isolated: a misbehaving client only drops its own session.
     /// Sessions are bounded (64), must complete the handshake within 5 s,
-    /// and cannot pin a writer past 10 s per message (a userspace write
-    /// deadline, R7-1 — not just `SO_SNDTIMEO`).
+    /// cannot pin a writer past 10 s per message (a userspace write
+    /// deadline, R7-1 — not just `SO_SNDTIMEO`), and cannot park more than
+    /// `MAX_UNWRITTEN_MESSAGES` (16) unwritten output messages per session
+    /// (R9-2: the dispatcher pauses request reads at the window, so a
+    /// pipelining client that stalls its reader waits instead of parking
+    /// ~230 MiB of responses in the writer channel).
     ///
     /// Returning implies every session has drained or been given up on —
     /// the flush of stop-time responses is an ATTEMPT, not a delivery
@@ -646,6 +691,12 @@ fn handle_session<H: RequestHandler>(
         return;
     }
     let (writer_tx, writer_rx) = mpsc::sync_channel::<ServerMessage>(crate::bus::SESSION_QUEUE_LEN);
+    // R9-2: the request-credit window shared by every sender into the
+    // writer channel (dispatcher, forwarder) and the writer itself — see
+    // [`WriteWindow`] and [`MAX_UNWRITTEN_MESSAGES`] for the bound and its
+    // arithmetic.
+    let window = Arc::new(WriteWindow::new());
+    let writer_window = Arc::clone(&window);
     let write_stream = stream;
     let writer = std::thread::spawn(move || {
         let mut write_half = &*write_stream;
@@ -661,7 +712,18 @@ fn handle_session<H: RequestHandler>(
             if write_msg_within(&mut write_half, &message, deadline).is_err() {
                 break;
             }
+            // On the wire: release the message's window slot so the
+            // dispatcher may read another request. A write failure breaks
+            // WITHOUT releasing — the slot's message is dead but the
+            // writer is dying too, and the exit note below unparks any
+            // dispatcher waiting on the window.
+            writer_window.release();
         }
+        // Announce death BEFORE the channel receiver drops at scope exit:
+        // from that moment every sender's send fails, but a dispatcher
+        // parked on the WINDOW never sends — only this flag (checked on
+        // every window poll) tells it the counter can no longer decrease.
+        writer_window.note_writer_exit();
         // A dead writer takes the session with it (Codex round 5, P1):
         // every clone shares ONE socket, so shutting it down here also
         // fails the dispatcher's read half and drives `serve_messages`
@@ -701,13 +763,14 @@ fn handle_session<H: RequestHandler>(
     let (gate_tx, gate_rx) = mpsc::sync_channel::<()>(1);
     let event_forward = {
         let forward_tx = writer_tx.clone();
+        let forward_window = Arc::clone(&window);
         let overflowed = Arc::clone(&overflowed);
         std::thread::spawn(move || {
             if gate_rx.recv().is_err() {
                 return; // session ended before hello; nothing to forward
             }
             for message in event_rx {
-                if forward_tx.send(message).is_err() {
+                if forward_window.send_through(&forward_tx, message).is_err() {
                     break;
                 }
                 // X4 (round 8): answer an end-of-burst overflow without a
@@ -724,8 +787,14 @@ fn handle_session<H: RequestHandler>(
                 // The send blocks under the writer's own backpressure,
                 // exactly like a real event, and the marker rides the
                 // existing Event wire shape, so every client parses it.
+                // (R9-2: events and the marker reserve window slots — they
+                // occupy the same memory the window exists to bound — but
+                // the forwarder never WAITS on the window; see
+                // MAX_UNWRITTEN_MESSAGES.)
                 if overflowed.swap(false, Ordering::SeqCst)
-                    && forward_tx.send(resync_marker()).is_err()
+                    && forward_window
+                        .send_through(&forward_tx, resync_marker())
+                        .is_err()
                 {
                     break;
                 }
@@ -735,8 +804,11 @@ fn handle_session<H: RequestHandler>(
 
     let result = serve_messages(
         &mut read_half,
-        &writer_tx,
-        gate_tx,
+        SessionOutputs {
+            writer_tx: writer_tx.clone(),
+            gate_tx,
+            window,
+        },
         &handler,
         &peer,
         &stop,
@@ -760,20 +832,28 @@ fn handle_session<H: RequestHandler>(
 
 /// Handshake + request loop for one session.
 ///
-/// `gate_tx` opens the event gate the forwarder blocks on: it is sent ONE
-/// `()` immediately after the hello ack is queued — the writer channel is
-/// FIFO, so the ack reaches the wire before any forwarded event — and it is
-/// dropped on every exit path, which ends a forwarder still waiting on the
-/// gate (a session that never handshook).
+/// `outputs` carries the session's emit surface, taken BY VALUE so every
+/// exit path drops `gate_tx` — the writer channel is FIFO, the ack is
+/// queued before the gate's `()` is sent, and a session that never
+/// handshook ends a forwarder still waiting on the gate (pr-champion
+/// WO-5). Its window is the R9-2 request-credit window: the loop stops
+/// READING requests while [`MAX_UNWRITTEN_MESSAGES`] messages remain
+/// unwritten (see the const's arithmetic), and a parked loop leaves
+/// through the writer's exit note or the stop flag — never a failed
+/// send, because a parked loop is not sending.
 fn serve_messages(
     read_half: &mut UnixStream,
-    writer_tx: &mpsc::SyncSender<ServerMessage>,
-    gate_tx: mpsc::SyncSender<()>,
+    outputs: SessionOutputs,
     handler: &Arc<impl RequestHandler>,
     peer: &PeerCredentials,
     stop: &AtomicBool,
     hello_deadline: Duration,
 ) -> Result<(), FrameError> {
+    let SessionOutputs {
+        writer_tx,
+        gate_tx,
+        window,
+    } = outputs;
     let mut reader = FrameReader::new(read_half);
     let connected_at = Instant::now();
     let mut hello_done = false;
@@ -785,6 +865,22 @@ fn serve_messages(
                 reason: "hello-timeout".into(),
             }));
             return Ok(());
+        }
+        // R9-2: the request-credit window. While K responses (or events)
+        // remain unwritten, reading another request would only park more
+        // client-amplified output: the loop pauses INSTEAD of reading, so
+        // a pipelining client beyond the window waits rather than
+        // buffers. Exit paths from the pause: the window reopens (the
+        // writer put messages on the wire), the stop flag (checked at the
+        // loop top after `continue`), or the writer's death — a parked
+        // loop never sends, so only the window's exit note can tell it
+        // the session is over.
+        if hello_done && window.is_exhausted() {
+            if window.writer_is_gone() {
+                return Ok(());
+            }
+            std::thread::sleep(WRITE_WINDOW_POLL);
+            continue;
         }
         // Codex PR review round 2, finding 2: the deadline must hold DURING
         // a frame too. A peer trickling one byte per sub-READ_POLL interval
@@ -829,13 +925,16 @@ fn serve_messages(
                 }
                 let client = client.sanitized();
                 info!(uid = peer.uid, name = %client.name, "client connected");
-                if writer_tx
-                    .send(ServerMessage::HelloAck(HelloAck {
-                        // Speak the highest version both sides support.
-                        protocol_version: protocol_version.min(PROTOCOL_VERSION),
-                        daemon_version: handler.daemon_version().to_owned(),
-                        latest_event_seq: handler.latest_event_seq(),
-                    }))
+                if window
+                    .send_through(
+                        &writer_tx,
+                        ServerMessage::HelloAck(HelloAck {
+                            // Speak the highest version both sides support.
+                            protocol_version: protocol_version.min(PROTOCOL_VERSION),
+                            daemon_version: handler.daemon_version().to_owned(),
+                            latest_event_seq: handler.latest_event_seq(),
+                        }),
+                    )
                     .is_err()
                 {
                     // The writer is gone; a client waiting on the ack would
@@ -868,13 +967,103 @@ fn serve_messages(
                     Ok(result) => Response::Ok { id, result },
                     Err(error) => Response::Error { id, error },
                 };
-                if writer_tx.send(ServerMessage::Response(response)).is_err() {
+                if window
+                    .send_through(&writer_tx, ServerMessage::Response(response))
+                    .is_err()
+                {
                     return Ok(()); // writer is gone; nothing more to do
                 }
             }
         }
     }
     Ok(())
+}
+
+/// The R9-2 request-credit window for one session: how many messages sit
+/// queued on the session's writer channel but are not yet on the wire,
+/// plus the writer thread's liveness note.
+///
+/// Every send into the writer channel reserves one slot BEFORE the
+/// message is queued — the writer can never release a slot the senders
+/// have not counted, so the counter cannot underflow — and the writer
+/// releases it only after the message is fully on the wire. The
+/// dispatcher stops READING new requests while [`MAX_UNWRITTEN_MESSAGES`]
+/// slots are held, which bounds parked response bytes by construction
+/// (the const's doc carries the arithmetic).
+///
+/// `writer_gone` is the window's liveness escape: a dispatcher parked on
+/// the window is not sending, so it cannot learn of the writer's death
+/// from a failed send — the writer notes its exit BEFORE its channel
+/// receiver drops, and the parked dispatcher polls that note.
+#[derive(Debug, Default)]
+struct WriteWindow {
+    /// Messages queued on the writer channel but not yet on the wire.
+    unwritten: AtomicUsize,
+    /// Set by the writer thread just before its channel receiver drops.
+    writer_gone: AtomicBool,
+}
+
+impl WriteWindow {
+    /// A window with nothing parked and a live writer.
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// Reserves one slot for a message about to be queued.
+    fn reserve(&self) {
+        self.unwritten.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Releases one slot after its message reached the wire.
+    fn release(&self) {
+        self.unwritten.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    /// Whether the dispatcher must pause request reads: the window is
+    /// full of unwritten output.
+    fn is_exhausted(&self) -> bool {
+        self.unwritten.load(Ordering::SeqCst) >= MAX_UNWRITTEN_MESSAGES
+    }
+
+    /// Whether the writer thread has exited (a parked dispatcher's only
+    /// exit beside the stop flag).
+    fn writer_is_gone(&self) -> bool {
+        self.writer_gone.load(Ordering::SeqCst)
+    }
+
+    /// The writer's exit note — stored before its channel receiver drops
+    /// (see the struct doc).
+    fn note_writer_exit(&self) {
+        self.writer_gone.store(true, Ordering::SeqCst);
+    }
+
+    /// Queues `message` on `tx`, first reserving its window slot.
+    ///
+    /// A failed send leaks the reservation deliberately — a failed send
+    /// means the writer channel's receiver is gone, so the session is
+    /// ending and the window will never be consulted again.
+    fn send_through(
+        &self,
+        tx: &mpsc::SyncSender<ServerMessage>,
+        message: ServerMessage,
+    ) -> Result<(), mpsc::SendError<ServerMessage>> {
+        self.reserve();
+        tx.send(message)
+    }
+}
+
+/// The session's emit surface, handed to [`serve_messages`] BY VALUE:
+/// dropping `gate_tx` on every exit path is what ends a forwarder still
+/// waiting on the hello gate, and the writer sender clone gives the loop
+/// its queue handle while `handle_session` keeps its own for teardown.
+/// The window is the R9-2 bound both senders share with the writer.
+struct SessionOutputs {
+    /// The dispatcher's clone of the session writer channel.
+    writer_tx: mpsc::SyncSender<ServerMessage>,
+    /// Opens the event gate after the hello ack is queued.
+    gate_tx: mpsc::SyncSender<()>,
+    /// The shared request-credit window (R9-2).
+    window: Arc<WriteWindow>,
 }
 
 /// Authorization plus handler execution for one request.
@@ -3028,6 +3217,177 @@ mod tests {
         let _ = drainer.join();
         stop.store(true, Ordering::SeqCst);
         let _ = served.join();
+    }
+
+    /// R9-2 (round 9, P1 — the round's hardest): the session writer
+    /// channel (sync_channel(256), shared by responses AND events) let a
+    /// pipelining authorized client park ~230 MiB per session — ~14 GiB
+    /// across MAX_SESSIONS — by stalling its reader: the dispatcher's
+    /// send-blocking was backpressure on the dispatch THREAD, never a
+    /// bound on parked BYTES, and the per-message write watchdog (R7-1)
+    /// only ends an already-stuck write; it does nothing about the 256
+    /// deserialized responses parked behind it. The fix is a
+    /// request-credit window: the dispatcher stops READING new requests
+    /// while K responses remain unwritten, so a burst past the window
+    /// WAITS rather than buffers — memory bounded by construction, no
+    /// termination semantics, a hostile client just experiences flow
+    /// control.
+    ///
+    /// The memory proxy for the assert is the handler's dispatch count:
+    /// every dispatched request becomes exactly one queued response, so
+    /// "dispatches <= window + slack" is "parked responses <= window +
+    /// slack". Pre-fix the count runs away to the full channel (the red
+    /// run's evidence); post-fix it must stop inside the documented
+    /// window. The write ceiling is shrunk through ServeBudgets (the
+    /// established watchdog pattern) so the stalled writer dies in
+    /// seconds and teardown is prompt.
+    #[test]
+    fn pipelined_burst_against_a_stalled_reader_parks_only_the_window() {
+        use std::sync::atomic::AtomicUsize;
+
+        // Near-max responses: a nonce just under MAX_FRAME_LEN makes each
+        // Pong a ~0.9 MiB frame — the finding's per-message size.
+        const NONCE: usize = 900_000;
+        // More than the old 256-slot channel plus the blocked send, so
+        // pre-fix the dispatcher provably runs past any window-sized
+        // bound; the client never reads a byte of the responses.
+        const BURST: u64 = 280;
+        // The documented budget (R9-2): K unwritten messages per session,
+        // straight from the production constant so test and doc cannot
+        // drift. (The red run used a literal 16; the green binds it here.)
+        const MAX_UNWRITTEN: usize = MAX_UNWRITTEN_MESSAGES;
+        const SLACK: usize = 2; // one mid-dispatch, one mid-write
+
+        struct CountingEchoPong {
+            bus: Arc<EventBus>,
+            dispatched: Arc<AtomicUsize>,
+        }
+        impl RequestHandler for CountingEchoPong {
+            fn daemon_version(&self) -> &str {
+                "test"
+            }
+            fn latest_event_seq(&self) -> u64 {
+                0
+            }
+            fn handle(
+                &self,
+                _ctx: &SessionContext,
+                request: Request,
+            ) -> Result<RequestResult, RpcError> {
+                match request {
+                    Request::Ping { nonce } => {
+                        self.dispatched.fetch_add(1, Ordering::SeqCst);
+                        Ok(RequestResult::Pong { nonce })
+                    }
+                    _ => Err(RpcError::new(
+                        protonwire_frontend_api::RpcErrorCode::NotImplemented,
+                        "test handler",
+                    )),
+                }
+            }
+            fn event_bus(&self) -> &EventBus {
+                &self.bus
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let dispatched = Arc::new(AtomicUsize::new(0));
+        let handler = Arc::new(CountingEchoPong {
+            bus: Arc::new(EventBus::new()),
+            dispatched: Arc::clone(&dispatched),
+        });
+        let server = IpcServer::bind(dir.path(), "credit-window.sock").unwrap();
+        let path = server.socket_path().to_owned();
+        let stop = Arc::new(AtomicBool::new(false));
+        let write_ceiling = Duration::from_secs(2);
+        let served = {
+            let handler = Arc::clone(&handler);
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                server.serve_with(
+                    handler,
+                    stop,
+                    ServeBudgets {
+                        write_timeout: write_ceiling,
+                        ..ServeBudgets::default()
+                    },
+                )
+            })
+        };
+
+        // Handshake (so the ack is drained), then starve the receive path:
+        // the writer's first ~0.9 MiB frame cannot fit a 4 KiB peer and
+        // the session's output stops moving.
+        let mut stream = connect_and_hello(&path);
+        set_rcvbuf(&stream, 4096);
+
+        // Pipeline the whole burst without ever reading a response. The
+        // helper thread parks once the socket refuses more bytes — which
+        // is exactly the point: pre-fix that happens only when the kernel
+        // buffers saturate (hundreds of MiB already parked daemon-side),
+        // post-fix when the window closes.
+        let nonce = "x".repeat(NONCE);
+        let pipeliner = std::thread::spawn(move || {
+            for id in 1..=BURST {
+                if write_msg(
+                    &mut stream,
+                    &ClientMessage::Request {
+                        id,
+                        request: Request::Ping {
+                            nonce: nonce.clone(),
+                        },
+                    },
+                )
+                .is_err()
+                {
+                    break; // the session ended under us
+                }
+            }
+        });
+
+        // Watchdog: wait for the dispatch count to stabilize (unchanged
+        // across a poll gap), then hold it to the window. Pre-fix the
+        // count marches to the channel capacity — the red; post-fix it
+        // stops at the window and the assert holds.
+        let deadline = Instant::now() + Duration::from_secs(6);
+        let mut last_count = 0usize;
+        let mut last_change = Instant::now();
+        loop {
+            assert!(
+                Instant::now() < deadline,
+                "dispatch count never stabilized: {} dispatches and still \
+                 moving — the burst is being absorbed without a window",
+                last_count
+            );
+            std::thread::sleep(Duration::from_millis(25));
+            let count = dispatched.load(Ordering::SeqCst);
+            if count != last_count {
+                last_count = count;
+                last_change = Instant::now();
+                continue;
+            }
+            if last_count > 0 && last_change.elapsed() > Duration::from_millis(300) {
+                break; // stable
+            }
+        }
+        assert!(
+            last_count >= 1,
+            "the burst never reached the dispatcher — vacuous pass"
+        );
+        assert!(
+            last_count <= MAX_UNWRITTEN + SLACK,
+            "a stalled-reader burst parked {last_count} responses — the \
+             documented budget is {MAX_UNWRITTEN} (+{SLACK} in flight); \
+             pre-window shape this marched to the 256-slot channel, \
+             ~230 MiB per session"
+        );
+
+        // Teardown: stop the daemon; the dispatcher leaves the window on
+        // the stop flag, the writer dies at its (shrunk) deadline and
+        // shuts the socket down, which unblocks the parked pipeliner.
+        stop.store(true, Ordering::SeqCst);
+        let _ = served.join();
+        let _ = pipeliner.join();
     }
 
     /// Shrinks a stream's `SO_RCVBUF` (std exposes no UnixStream helper) so
