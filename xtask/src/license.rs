@@ -11,8 +11,13 @@
 //! branch, and anything the classifier does not recognize fails loud for a
 //! human to classify.
 //!
-//! `release-guard` fails unless `docs/LICENSE-CLEARANCE.md` exists — the
-//! documentation-only blocker becomes an enforced gate for tag builds.
+//! `release-guard` re-runs the live `license-scan` FIRST and then fails
+//! unless `docs/LICENSE-CLEARANCE.md` exists (R9-3): the marker is
+//! clearance evidence, the scan re-verifies the tree actually being
+//! tagged, so a tag on a commit that added an incompatible or
+//! unrecognized dependency cannot pass on stale clearance. The
+//! documentation-only blocker is thus an enforced AND re-verified gate
+//! for tag builds.
 
 use std::path::Path;
 
@@ -334,7 +339,36 @@ pub fn run(root: &Path) -> Result<bool> {
 
 /// `cargo xtask release-guard`
 pub fn release_guard(root: &Path) -> Result<bool> {
+    release_guard_with(root, run)
+}
+
+/// The distribution decision, composed (R9-3): the LIVE license scan runs
+/// first, then the clearance-marker check. The marker is only evidence
+/// that clearance happened at some past commit; the scan re-verifies the
+/// tree actually being tagged, so a tag on a commit that added an
+/// incompatible or unrecognized dependency fails even with the marker
+/// present, and an un-runnable scan (a `cargo metadata` failure) blocks
+/// the release too — a guard that cannot verify cannot pass.
+///
+/// The seam takes the scan operation so the composition is unit-testable
+/// against a mocked scan; running the real `cargo metadata` in a unit
+/// test would need a full fixture workspace with registry access.
+fn release_guard_with(root: &Path, scan: fn(&Path) -> Result<bool>) -> Result<bool> {
+    // BEFORE the marker check, by design: the guard's own output leads
+    // with the live re-verification, and a scan failure fails the guard
+    // even when the marker is present.
+    let scan_ok = scan(root)?;
     let mut reporter = Reporter::new("release-guard");
+    let scan_violations = if scan_ok {
+        Vec::new()
+    } else {
+        vec![
+            "the live license scan failed (see the license-scan lines above); \
+             the clearance marker does not cover the tree being tagged"
+                .to_string(),
+        ]
+    };
+    reporter.rule("live license scan re-verifies this tree", &scan_violations);
     let allowed = release_allowed(root.join(CLEARANCE_MARKER).is_file());
     match allowed {
         Ok(()) => {
@@ -344,15 +378,78 @@ pub fn release_guard(root: &Path) -> Result<bool> {
             reporter.rule("license clearance marker present", &[reason]);
         }
     }
-    Ok(reporter.finish("distribution gate (runs on release tags)"))
+    Ok(reporter
+        .finish("distribution gate: live license scan + clearance marker (runs on release tags)"))
 }
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::path::PathBuf;
+
     use super::*;
 
     fn set(names: &[&str]) -> Vec<String> {
         names.iter().map(|n| n.to_string()).collect()
+    }
+
+    /// Temp workspace root with (or without) the clearance marker, so the
+    /// guard's file check runs against a fixture instead of this repo
+    /// (which deliberately carries no marker while distribution is
+    /// blocked).
+    fn guard_root(name: &str, marker: bool) -> PathBuf {
+        let root =
+            std::env::temp_dir().join(format!("xtask-release-guard-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("docs")).unwrap();
+        if marker {
+            fs::write(root.join(CLEARANCE_MARKER), "clearance evidence\n").unwrap();
+        }
+        root
+    }
+
+    /// R9-3: a failing live license scan must fail release-guard EVEN
+    /// WHEN the clearance marker exists. The marker is clearance
+    /// evidence; the scan is the re-verification of the tree actually
+    /// being tagged — a tag on a commit that added an incompatible
+    /// dependency must not pass on stale clearance.
+    #[test]
+    fn scan_failure_fails_the_guard_even_with_the_marker() {
+        let root = guard_root("scan-fails", true);
+        let ok = release_guard_with(&root, |_| Ok(false)).expect("the guard must decide");
+        assert!(
+            !ok,
+            "a failed license scan must fail release-guard even with the marker present"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// An un-runnable scan (e.g. `cargo metadata` fails) must block the
+    /// release too: a guard that cannot verify cannot pass.
+    #[test]
+    fn unrunnable_scan_fails_the_guard() {
+        let root = guard_root("scan-errors", true);
+        let verdict = release_guard_with(&root, |_| Err(anyhow::anyhow!("cargo metadata failed")));
+        assert!(verdict.is_err(), "an un-runnable scan must fail the guard");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The pass-through pin: the guard passes only when BOTH the live
+    /// scan passes and the clearance marker exists.
+    #[test]
+    fn guard_passes_only_when_scan_passes_and_marker_exists() {
+        let with_marker = guard_root("pass", true);
+        let ok = release_guard_with(&with_marker, |_| Ok(true)).unwrap();
+        assert!(ok, "scan pass + marker must pass the guard");
+        let _ = fs::remove_dir_all(&with_marker);
+
+        let bare = guard_root("no-marker", false);
+        let ok = release_guard_with(&bare, |_| Ok(true)).unwrap();
+        assert!(
+            !ok,
+            "a missing marker must fail the guard even when the scan passes"
+        );
+        let _ = fs::remove_dir_all(&bare);
     }
 
     #[test]

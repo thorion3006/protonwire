@@ -32,7 +32,7 @@ subcommands:
   dep-graph              enforce monorepo dependency rules (forbidden edges, lockfiles, wildcards)
   schema-gen [--check]   regenerate (or check) JSON Schemas from protonwire-frontend-api
   license-scan           license inventory: unlicensed-baseline drift + GPL-3 compatibility (NFR-35)
-  release-guard          distribution gate: fails while Proton crate licenses are unresolved
+  release-guard          distribution gate: re-runs the live license scan, then requires the clearance marker
   sbom                   SBOM generation (stub; lands in Milestone 8)
   capability-matrix      client capability matrix (stub; lands in Milestone 8, T-24)
   all                    run every check above except release-guard (schema-gen in --check mode)

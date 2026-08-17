@@ -4,6 +4,13 @@ name: release-gate
 # registry crates carry no license, so no binary or source distribution
 # may be published. This workflow makes the blocker ENFORCED, not merely
 # documented: any v* tag fails until docs/LICENSE-CLEARANCE.md exists.
+# Since R9-3 the guard first re-runs the live license scan in-process
+# (`cargo xtask release-guard` composes `license-scan`), so a tag on a
+# commit that added an incompatible dependency fails even with stale
+# clearance. That composition needs `cargo metadata`, which only reads
+# public sources (crates.io, Proton's public sparse registry, the protun
+# git pin) — the same resolution building xtask already performs in this
+# job, so no extra workflow setup is required.
 on:
   push:
     tags: ["v*"]
@@ -14,7 +21,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Enforce the license-clearance gate
+      - name: Enforce the license gate (live scan + clearance marker)
         run: cargo xtask release-guard
       # Nothing may follow a failing guard; when clearance exists, the
       # Milestone 8 release pipeline (SBOM, reproducible build, packages)
