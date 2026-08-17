@@ -943,3 +943,18 @@ triage-and-dispose (P1 lean / P2 track / reject with evidence) IS the
 termination discipline. Two of five round-9 findings were our own
 deferred track items, escalated on schedule: the deferral discipline
 worked as designed.
+
+### Post-close severity-bar disposals (12:56Z batch + CI incident)
+
+Three further P2s, all groups.rs pin-family (target VALUES per id,
+ranking policy per id, source values): each verified genuine, each
+disposed as a TRACK ITEM (milestone 2). Recorded fix shape is
+STRUCTURAL: golden-document equality for the canonical groups table
+(subsuming every field-by-field pin) — the field-wise pattern has now
+admitted one-more-unpinned-field three rounds running.
+
+CI incident on 6eeddbf (attempt 1): the test job hung 20+ minutes in
+`cargo test --locked` (others <1 min). Evidence triage: identical sha
+green locally under 2-CPU pinning; rerun on the same sha passed in
+48 s. Recorded as a runner/infra flake, one occurrence, no repro; if
+it recurs, the R9-2 window tests get per-test timeouts first.
