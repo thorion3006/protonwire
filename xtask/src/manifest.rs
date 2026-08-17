@@ -2,8 +2,9 @@
 //! (schema version 3) against the parity-manifest contract.
 //!
 //! Enforces the pinned upstream revisions/checksums, the status vocabulary,
-//! capability id/area/owner/source/test invariants, and the T-19 evidence rule
-//! (`verified` capabilities must carry `verified_at`, tests, and sources).
+//! the typed non-empty source references, capability id/area/owner/source/
+//! test invariants, and the T-19 evidence rule (`verified` capabilities
+//! must carry `verified_at`, tests, and sources).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -244,6 +245,7 @@ fn validate(path: &Path, lock: &Lockfile) -> Result<bool> {
         "status_definitions completeness",
         &check_status_definitions(&doc),
     );
+    reporter.rule("source reference entries", &check_sources(&doc));
     reporter.rule("upstream pins", &check_upstream(&doc, lock));
     reporter.rule("canonical capability id set", &check_capability_ids(&doc));
     reporter.rule("capabilities", &check_capabilities(&doc));
@@ -305,6 +307,45 @@ fn check_status_definitions(doc: &Manifest) -> Vec<String> {
         violations.push(format!(
             "status_definitions contains `{status}`, which is outside the frozen vocabulary {REQUIRED_STATUSES:?}"
         ));
+    }
+    violations
+}
+
+/// The JSON kind of a malformed source entry, for violation wording.
+fn json_kind(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "a boolean",
+        serde_json::Value::Number(_) => "a number",
+        serde_json::Value::String(_) => "a string",
+        serde_json::Value::Array(_) => "an array",
+        serde_json::Value::Object(_) => "an object",
+    }
+}
+
+/// Round-8 X3: the top-level `sources` map's values were arbitrary JSON
+/// with only the KEYS checked — capabilities cite the keys as evidence
+/// references, so a null, empty, or non-string value passed while every
+/// capability citing it pointed at evidence that is not a reference at
+/// all. Every entry must be a defined, non-empty string; each violation
+/// names the key and the defect kind.
+fn check_sources(doc: &Manifest) -> Vec<String> {
+    let Some(sources) = &doc.sources else {
+        // The required-top-level-keys rule already reports the missing map.
+        return Vec::new();
+    };
+    let mut violations = Vec::new();
+    for (key, value) in sources {
+        match value {
+            serde_json::Value::String(text) if !text.trim().is_empty() => {}
+            serde_json::Value::String(_) => violations.push(format!(
+                "source `{key}` must be a non-empty string, got an empty string"
+            )),
+            other => violations.push(format!(
+                "source `{key}` must be a non-empty string, got {}",
+                json_kind(other)
+            )),
+        }
     }
     violations
 }
@@ -1036,6 +1077,74 @@ capabilities:
         let yaml = good_manifest_yaml().replacen("schema_version: 3", "schema_version: 2", 1);
         let path = temp_yaml("version", &yaml);
         assert!(!validate(&path, &good_lock()).unwrap());
+        fs::remove_file(&path).ok();
+    }
+
+    /// Round-8 X3: top-level source VALUES were never checked — `sources`
+    /// deserialized as arbitrary JSON and only its KEYS were consulted
+    /// (capability source membership), so a null, empty, or non-string
+    /// entry passed while every capability citing it pointed its evidence
+    /// at something that is not a reference at all. Each defect kind must
+    /// fail the gate, naming the key and the defect.
+    #[test]
+    fn source_entries_must_be_non_empty_strings() {
+        // Null.
+        let yaml = good_manifest_yaml().replacen("  docs: https://example.com", "  docs: ~", 1);
+        let path = temp_yaml("source-null", &yaml);
+        assert!(
+            !validate(&path, &good_lock()).unwrap(),
+            "a null source value must fail the gate"
+        );
+        fs::remove_file(&path).ok();
+
+        // Empty string.
+        let yaml = good_manifest_yaml().replacen("  docs: https://example.com", "  docs: \"\"", 1);
+        let path = temp_yaml("source-empty", &yaml);
+        assert!(
+            !validate(&path, &good_lock()).unwrap(),
+            "an empty source value must fail the gate"
+        );
+        fs::remove_file(&path).ok();
+
+        // Non-string (a number).
+        let yaml = good_manifest_yaml().replacen("  docs: https://example.com", "  docs: 42", 1);
+        let path = temp_yaml("source-number", &yaml);
+        assert!(
+            !validate(&path, &good_lock()).unwrap(),
+            "a non-string source value must fail the gate"
+        );
+        fs::remove_file(&path).ok();
+
+        // Each violation must NAME the key and the defect kind.
+        for (yaml, defect) in [
+            (
+                good_manifest_yaml().replacen("  docs: https://example.com", "  docs: ~", 1),
+                "null",
+            ),
+            (
+                good_manifest_yaml().replacen("  docs: https://example.com", "  docs: \"\"", 1),
+                "an empty string",
+            ),
+            (
+                good_manifest_yaml().replacen("  docs: https://example.com", "  docs: 42", 1),
+                "a number",
+            ),
+        ] {
+            let doc: Manifest = serde_norway::from_str(&yaml).unwrap();
+            assert!(
+                check_sources(&doc)
+                    .iter()
+                    .any(|v| v.contains("`docs`") && v.contains(defect)),
+                "the violation must name `docs` and the defect `{defect}`"
+            );
+        }
+
+        // The untampered fixture still passes.
+        let path = temp_yaml("source-ok", &good_manifest_yaml());
+        assert!(
+            validate(&path, &good_lock()).unwrap(),
+            "the well-formed fixture must still pass"
+        );
         fs::remove_file(&path).ok();
     }
 
