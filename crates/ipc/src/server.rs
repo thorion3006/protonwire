@@ -10,8 +10,8 @@ use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
 use protonwire_frontend_api::{
-    ClientInfo, ClientMessage, HelloAck, HelloError, PROTOCOL_VERSION, Request, RequestResult,
-    Response, RpcError, ServerMessage,
+    ClientInfo, ClientMessage, EVENT_SEQ_RESYNC_NOW, Event, EventEnvelope, HelloAck, HelloError,
+    NoticeLevel, PROTOCOL_VERSION, Request, RequestResult, Response, RpcError, ServerMessage,
 };
 use tracing::{debug, info, warn};
 
@@ -546,6 +546,22 @@ fn chown_socket_group(socket_path: &Path, name: &str, gid: nix::unistd::Gid) -> 
         .map_err(|e| io::Error::other(format!("cannot chown socket to group `{name}`: {e}")))
 }
 
+/// The end-of-burst overflow marker (X4): a `ServerMessage::Event` whose
+/// seq is the reserved [`EVENT_SEQ_RESYNC_NOW`], carrying a real
+/// [`Event::Notice`] payload so the frame deserializes on every client —
+/// including ones that predate the signal, whose gap logic treats the
+/// impossible seq as a gap and resynchronizes on its own. Current SDKs
+/// intercept the envelope explicitly and never deliver it as an event.
+fn resync_marker() -> ServerMessage {
+    ServerMessage::Event(EventEnvelope {
+        seq: EVENT_SEQ_RESYNC_NOW,
+        event: Event::Notice {
+            level: NoticeLevel::Warning,
+            message: "event queue overflowed; resynchronize".into(),
+        },
+    })
+}
+
 /// Serves one client connection until EOF, error, or daemon shutdown.
 fn handle_session<H: RequestHandler>(
     stream: Arc<UnixStream>,
@@ -617,7 +633,7 @@ fn handle_session<H: RequestHandler>(
         let _ = write_stream.shutdown(Shutdown::Both);
     });
 
-    let (session_id, event_rx) = handler.event_bus().subscribe();
+    let (session_id, event_rx, overflowed) = handler.event_bus().subscribe();
     // Drop-guard: unsubscribe runs on every exit path, including panics in
     // the dispatcher below.
     struct UnsubscribeOnDrop<'a> {
@@ -644,12 +660,32 @@ fn handle_session<H: RequestHandler>(
     let (gate_tx, gate_rx) = mpsc::sync_channel::<()>(1);
     let event_forward = {
         let forward_tx = writer_tx.clone();
+        let overflowed = Arc::clone(&overflowed);
         std::thread::spawn(move || {
             if gate_rx.recv().is_err() {
                 return; // session ended before hello; nothing to forward
             }
             for message in event_rx {
                 if forward_tx.send(message).is_err() {
+                    break;
+                }
+                // X4 (round 8): answer an end-of-burst overflow without a
+                // later publish. A full session queue dropped events (the
+                // bus marked this session) and the burst may have ENDED
+                // there — no later seq will ever arrive to make the gap
+                // observable, so the client would hold stale state
+                // indefinitely. The drop necessarily left events queued
+                // (the queue was full when it happened), so this check runs
+                // after forwarding one of them: clear the mark ATOMICALLY
+                // (one marker per observed episode) and send the reserved
+                // resync marker straight down the writer channel — the bus
+                // queue may still be full, so the marker must bypass it.
+                // The send blocks under the writer's own backpressure,
+                // exactly like a real event, and the marker rides the
+                // existing Event wire shape, so every client parses it.
+                if overflowed.swap(false, Ordering::SeqCst)
+                    && forward_tx.send(resync_marker()).is_err()
+                {
                     break;
                 }
             }
@@ -2383,6 +2419,95 @@ mod tests {
             ServerMessage::Event(envelope) => assert_eq!(envelope.seq, 1),
             other => panic!("expected the buffered event after the ack, got {other:?}"),
         }
+    }
+
+    /// X4 (round 8), wire-level pin: a burst that overflows the session
+    /// queue and ENDS there must still produce the reserved resync marker
+    /// on the wire — without any further publish. The raw socket below
+    /// never reads during the burst (so the queue provably fills and the
+    /// tail is dropped), then drains under a bounded watchdog until the
+    /// marker frame arrives.
+    #[test]
+    fn end_of_burst_overflow_emits_the_reserved_resync_marker() {
+        use crate::frame::FrameReader;
+
+        // 32 KiB payloads so the burst cannot hide in the socket send
+        // buffer: a few frames there + writer channel (256) + session
+        // queue (256) cannot hold 1024 events, so the tail is dropped.
+        const PAYLOAD: usize = 32 * 1024;
+        const BURST: u64 = 1024;
+
+        let dir = tempfile::tempdir().unwrap();
+        let handler = Arc::new(NullHandler {
+            version: "test".into(),
+            bus: EventBus::new(),
+        });
+        let server = spawn_server(&dir, Arc::clone(&handler));
+        let stream = connect_and_hello(server.socket_path());
+        // Short poll between frames; the FrameReader below keeps partial
+        // state, so a mid-frame expiry resumes instead of desynchronizing.
+        stream
+            .set_read_timeout(Some(Duration::from_millis(250)))
+            .unwrap();
+        let mut reader = FrameReader::new(stream);
+
+        // Wait for the subscription to exist (the accept loop polls at
+        // 250 ms), then burst without reading.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while handler.event_bus().session_count() != 1 {
+            assert!(Instant::now() < deadline, "session never subscribed");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let notice = "x".repeat(PAYLOAD);
+        for seq in 1..=BURST {
+            handler
+                .event_bus()
+                .publish(ServerMessage::Event(EventEnvelope {
+                    seq,
+                    event: Event::Notice {
+                        level: NoticeLevel::Info,
+                        message: notice.clone(),
+                    },
+                }));
+        }
+        // The burst ENDS here: nothing further is published below.
+
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut events = 0u64;
+        let mut marker = false;
+        while !marker {
+            assert!(
+                Instant::now() < deadline,
+                "the reserved resync marker never reached the wire: {events} \
+                 events drained, then silence — the end-of-burst drop is \
+                 invisible without a later publish (X4)"
+            );
+            match reader.read_msg::<ServerMessage>() {
+                Ok(ServerMessage::Event(envelope)) if envelope.seq == EVENT_SEQ_RESYNC_NOW => {
+                    marker = true
+                }
+                Ok(ServerMessage::Event(_)) => events += 1,
+                Err(FrameError::Io(e))
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    continue; // nothing readable yet; re-poll the watchdog
+                }
+                other => panic!("unexpected frame while draining: {other:?}"),
+            }
+        }
+        assert!(
+            events < BURST,
+            "the tail was dropped, so fewer than the whole burst can have \
+             been delivered before the marker; saw {events}"
+        );
+        assert_eq!(
+            handler.event_bus().session_count(),
+            1,
+            "retain-on-Full: the overflowed session must stay subscribed"
+        );
     }
 
     fn connect_error(path: &Path) -> io::Error {

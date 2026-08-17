@@ -11,8 +11,8 @@
 use std::path::{Path, PathBuf};
 
 use protonwire_frontend_api::{
-    ClientInfo, ClientSurface, ConnectTarget, DaemonState, EventEnvelope, Request, RequestResult,
-    RpcError, RpcErrorCode,
+    ClientInfo, ClientSurface, ConnectTarget, DaemonState, EVENT_SEQ_RESYNC_NOW, EventEnvelope,
+    Request, RequestResult, RpcError, RpcErrorCode,
 };
 use protonwire_ipc::{ConnectError, IpcClient, RequestError, SecurityChecks};
 
@@ -85,7 +85,9 @@ pub enum ClientEvent {
     /// A daemon event, in order and gap-free since the last delivery.
     Event(EventEnvelope),
     /// Events were missed (daemon restart or slow consumer); a fresh
-    /// full-state snapshot was fetched and is included.
+    /// full-state snapshot was fetched and is included. The daemon's
+    /// reserved overflow marker — a burst that ended on a drop while this
+    /// client lagged (X4) — surfaces here too, with no gap event involved.
     Resynchronized {
         /// The state after resynchronization.
         state: DaemonState,
@@ -236,20 +238,30 @@ impl ProtonwireClient {
     /// to the gap event on daemons that do not stamp), and buffered events
     /// the snapshot covers are dropped — replaying them after the newer
     /// snapshot would regress the client's view.
+    ///
+    /// The daemon's reserved marker envelope (seq
+    /// [`EVENT_SEQ_RESYNC_NOW`], X4) is intercepted BEFORE the gap logic
+    /// and never delivered as an event: it is the daemon's explicit
+    /// end-of-burst overflow signal — events were dropped while this
+    /// client lagged and no later seq is coming to reveal the gap — so it
+    /// triggers the same resynchronization immediately. The marker's seq
+    /// must never enter the cursor: it is unmatchable by design, and a
+    /// cursor holding it would swallow or gap-trigger on every subsequent
+    /// real event.
     pub fn next_event(&mut self) -> Result<ClientEvent, ClientError> {
         loop {
             let envelope = self.ipc.next_event()?;
+            if envelope.seq == EVENT_SEQ_RESYNC_NOW {
+                // No gap seq exists for the marker — the daemon did not
+                // say WHICH events were dropped, only that some were. The
+                // snapshot's stamp is the cursor (the fallback keeps the
+                // current cursor on an unstamped daemon instead of
+                // rewinding it into a spurious-gap state).
+                return self.resynchronize(None);
+            }
             let expected = self.last_seq.map_or(envelope.seq, |last| last + 1);
             if envelope.seq > expected {
-                let state = self.state()?;
-                let snapshot_seq = state.latest_event_seq.unwrap_or(envelope.seq);
-                let cursor = snapshot_seq.max(envelope.seq);
-                self.ipc.discard_events_through(cursor);
-                self.last_seq = Some(cursor);
-                return Ok(ClientEvent::Resynchronized {
-                    state,
-                    resumed_at_seq: cursor,
-                });
+                return self.resynchronize(Some(envelope.seq));
             }
             if envelope.seq < expected {
                 // Already seen: drop it and keep waiting. Delivering it
@@ -260,6 +272,28 @@ impl ProtonwireClient {
             self.last_seq = Some(envelope.seq);
             return Ok(ClientEvent::Event(envelope));
         }
+    }
+
+    /// The shared resynchronization tail (PRD FR-127D): fetch a fresh
+    /// snapshot, advance the cursor past everything it covers, drop the
+    /// buffered events it already reflects, and report the recovery.
+    ///
+    /// `gap_seq` is the seq that revealed the miss — the first event after
+    /// the gap, or `None` for the daemon's reserved marker, which carries
+    /// no real seq by construction. The cursor lands on the snapshot's
+    /// stamp (falling back to the revealing seq, or the current cursor
+    /// for the marker path), floored at that fallback so a lagging stamp
+    /// can never rewind the cursor below what the client has seen.
+    fn resynchronize(&mut self, gap_seq: Option<u64>) -> Result<ClientEvent, ClientError> {
+        let state = self.state()?;
+        let fallback = gap_seq.unwrap_or_else(|| self.last_seq.unwrap_or(0));
+        let cursor = state.latest_event_seq.unwrap_or(fallback).max(fallback);
+        self.ipc.discard_events_through(cursor);
+        self.last_seq = Some(cursor);
+        Ok(ClientEvent::Resynchronized {
+            state,
+            resumed_at_seq: cursor,
+        })
     }
 
     /// Identity reported by the SDK in the hello handshake.
@@ -494,6 +528,133 @@ mod tests {
         match client.next_event().unwrap() {
             ClientEvent::Event(envelope) => assert_eq!(envelope.seq, 3),
             ClientEvent::Resynchronized { .. } => panic!("unexpected resync"),
+        }
+    }
+
+    /// X4 (round 8): when a burst of events overflows the daemon-side
+    /// session queue (the round-1 retain-on-Full design) and the burst
+    /// ENDS there, the drop is invisible — no later seq arrives, so the
+    /// client's gap detection never fires and it holds stale state
+    /// indefinitely. The daemon must signal the overflow WITHOUT a
+    /// subsequent real publish: the client below never reads during the
+    /// burst (so the session's queue provably fills and drops), the burst
+    /// then stops, and after a grace period the client's `next_event`
+    /// must surface a resynchronization on its own — a bounded watchdog
+    /// turns the pre-fix indefinite silence into a failure.
+    #[test]
+    fn end_of_burst_overflow_reaches_the_client_without_a_later_publish() {
+        use std::time::{Duration, Instant};
+
+        // Sized so the burst provably overflows every buffer on the fan-out
+        // path while the client is not reading: socket send buffer (~MiBs at
+        // the most per message below) + writer channel (256) + session queue
+        // (256). 32 KiB payloads keep the socket-buffer share of the
+        // capacity at a handful-hundred messages on any default Linux
+        // wmem, so 1024 events cannot fit and the tail is dropped.
+        const PAYLOAD: usize = 32 * 1024;
+        const BURST: u64 = 1024;
+        // Generous overall watchdog: the green path only has to drain what
+        // was buffered (tens of MiB in-process), but a loaded CI machine
+        // gets room; the RED failure mode is the watchdog tripping after
+        // the client has gone silent past its own per-call timeouts.
+        const WATCHDOG: Duration = Duration::from_secs(20);
+
+        let dir = tempfile::tempdir().unwrap();
+        let (server, handler) = spawn_server(&dir);
+        let path = server.socket_path().to_owned();
+        let mut client = dev_client(&path);
+        // Short per-call timeout so an idle (pre-fix) `next_event` returns
+        // TimedOut quickly instead of blocking the watchdog out; still
+        // enough for the resync's GetState to read past the backlog.
+        client.set_request_timeout(Duration::from_millis(500));
+
+        // The burst: publish while the client is NOT reading. The session
+        // queue fills, the tail is dropped, the burst stops there.
+        let notice = "x".repeat(PAYLOAD);
+        for seq in 1..=BURST {
+            handler.seq.store(seq, Ordering::SeqCst);
+            handler.bus.publish(ServerMessage::Event(EventEnvelope {
+                seq,
+                event: Event::Notice {
+                    level: NoticeLevel::Info,
+                    message: notice.clone(),
+                },
+            }));
+        }
+        assert_eq!(
+            handler.seq.load(Ordering::SeqCst),
+            BURST,
+            "fixture sanity: the daemon's newest seq is the burst end"
+        );
+        // Grace: let the forwarder/writer settle into their blocked state
+        // before the client starts draining.
+        std::thread::sleep(Duration::from_millis(200));
+
+        // No further publish happens below until the client has learned.
+        let deadline = Instant::now() + WATCHDOG;
+        let mut delivered = 0u64;
+        let mut recovery = None;
+        while recovery.is_none() {
+            assert!(
+                Instant::now() < deadline,
+                "client never learned the end-of-burst overflow: {delivered} \
+                 events delivered, then silence — the drop is invisible \
+                 without a later publish (X4)"
+            );
+            match client.next_event() {
+                Ok(ClientEvent::Event(_)) => delivered += 1,
+                Ok(resync @ ClientEvent::Resynchronized { .. }) => recovery = Some(resync),
+                Err(ClientError::Io(io))
+                    if io.kind() == std::io::ErrorKind::TimedOut
+                        || io.kind() == std::io::ErrorKind::WouldBlock =>
+                {
+                    continue; // "no event yet": re-poll inside the watchdog
+                }
+                Err(other) => panic!("unexpected failure while draining: {other}"),
+            }
+        }
+        // The recovery was self-sufficed: the snapshot is stamped with the
+        // burst's END — the seq of events the client provably never saw.
+        match recovery.expect("the watchdog loop only exits with a recovery") {
+            ClientEvent::Resynchronized {
+                state,
+                resumed_at_seq,
+            } => {
+                assert_eq!(resumed_at_seq, BURST);
+                assert_eq!(state.latest_event_seq, Some(BURST));
+            }
+            ClientEvent::Event(envelope) => {
+                panic!("expected a resync, got event {:?}", envelope.event)
+            }
+        }
+        assert!(
+            delivered < BURST,
+            "the burst tail was dropped, so the client cannot have seen every \
+             event; {delivered} were delivered before the signal"
+        );
+
+        // Post-recovery checks — after the client has learned, NOT triggers
+        // for it: the overflowed session kept its subscription...
+        assert_eq!(
+            handler.bus.session_count(),
+            1,
+            "retain-on-Full: the overflowed session must stay subscribed"
+        );
+        // ...the cursor is a real seq (not poisoned by the signal), so the
+        // next genuine event flows without another resync.
+        handler.seq.store(BURST + 1, Ordering::SeqCst);
+        handler.bus.publish(ServerMessage::Event(EventEnvelope {
+            seq: BURST + 1,
+            event: Event::Notice {
+                level: NoticeLevel::Info,
+                message: "after recovery".into(),
+            },
+        }));
+        match client.next_event().unwrap() {
+            ClientEvent::Event(envelope) => assert_eq!(envelope.seq, BURST + 1),
+            ClientEvent::Resynchronized { .. } => {
+                panic!("post-recovery events must flow without another resync")
+            }
         }
     }
 
