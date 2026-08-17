@@ -252,6 +252,14 @@ impl IpcServer {
                     io::Error::other(format!("socket group `{name}` does not exist"))
                 })?;
                 chown(&socket_path, name, gid)?;
+                // sec-auditor round-9 verdict (R9-1 Low): operators must
+                // be able to audit WHAT was granted — AnyUser covers
+                // Connect/Disconnect, so the resolved gid earns a line.
+                info!(
+                    group = name,
+                    gid = gid.as_raw(),
+                    "socket chowned to the configured client group"
+                );
             }
         }
         info!(path = %socket_path.display(), "IPC server bound");
@@ -1015,6 +1023,17 @@ impl WriteWindow {
     }
 
     /// Releases one slot after its message reached the wire.
+    ///
+    /// EXCEPTION (sec-auditor round-9 verdict, R9-2 Low): the four
+    /// hello-error refusals are UNRESERVED terminal sends — the session
+    /// is ending and must not wait on the window — yet the writer still
+    /// releases them, so `unwritten` wraps below zero on those paths.
+    /// Benign by construction: the wrap only occurs on session-ending
+    /// refusals, after which no request is ever read again and the
+    /// counter's meaning ends with the session (is_exhausted compares
+    /// against the ceiling; a negative value is never "full"). Routing
+    /// the refusals through reserve would add a window wait to a path
+    /// whose whole point is to end NOW — the exception is deliberate.
     fn release(&self) {
         self.unwritten.fetch_sub(1, Ordering::SeqCst);
     }
