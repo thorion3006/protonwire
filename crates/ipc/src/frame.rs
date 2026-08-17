@@ -87,9 +87,9 @@ pub fn write_msg<W: Write, T: Serialize>(w: &mut W, msg: &T) -> Result<(), Frame
 /// deadline (one message, one budget).
 ///
 /// Takes [`AsFd`] only: every byte goes out through `send(fd, MSG_DONTWAIT)`
-/// in [`write_all_within`], so `std::io::Write` is never used (a `flush`
-/// would be a no-op on a socket anyway) and advertising the bound would
-/// imply a stdio-style writer is acceptable here.
+/// in the private `write_all_within`, so `std::io::Write` is never used (a
+/// `flush` would be a no-op on a socket anyway) and advertising the bound
+/// would imply a stdio-style writer is acceptable here.
 pub fn write_msg_within<W: AsFd, T: Serialize>(
     w: &mut W,
     msg: &T,
