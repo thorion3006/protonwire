@@ -122,8 +122,14 @@ fn write_all_within<W: Write + AsFd>(
         let budget_ms = ((deadline - now).as_millis().min(u16::MAX as u128) as u16).max(1);
         let mut writable = [PollFd::new(w.as_fd(), PollFlags::POLLOUT)];
         match poll(&mut writable, budget_ms) {
-            // Budget spent with no writability: the deadline's answer.
-            Ok(0) => return Err(write_deadline_exceeded()),
+            // Budget slice spent with no writability — NOT automatically
+            // the deadline's answer: a budget past the u16 range was
+            // clamped, so the spent slice can end well BEFORE the deadline
+            // (a 70 s deadline clamps to a ~65.5 s slice). Re-enter the
+            // loop and let the deadline check at the top decide: a spent
+            // real budget expires there on the very next pass, while a
+            // clamped slice re-polls inside whatever remains.
+            Ok(0) => continue,
             // Writable, or POLLERR/POLLHUP — the send attempt below
             // surfaces the peer's error instead of guessing at revents.
             Ok(_) => {}
@@ -600,5 +606,39 @@ mod tests {
 
         let follow_up = reader.join().unwrap();
         assert_eq!(follow_up["done"], true);
+    }
+
+    /// Rust-review round 7 (poll-clamp finding): a deadline MORE than one
+    /// clamped poll slice away (poll budgets top out at u16::MAX ms ≈
+    /// 65.5 s) must not expire the write early. The reachable variant: a
+    /// 70 s deadline — the shape a large `IpcClient::set_timeout` (or
+    /// `ProtonwireClient::set_request_timeout`) produces — against a
+    /// healthy, writable peer completes immediately.
+    ///
+    /// Honest disclosure: this test ALSO passes pre-fix. The bug's trigger
+    /// needs the socket to stay unwritable for a full clamped slice
+    /// (~65.5 s of stall), which cannot be wall-clock tested; the pre-fix
+    /// `Ok(0) => return Err(write_deadline_exceeded())` expired such a
+    /// write at ~65.5 s of a 70 s budget — evidence is code inspection
+    /// plus the existing stalled-peer deadline tests
+    /// (`write_msg_within_fails_at_the_deadline_against_a_stalled_peer`)
+    /// staying green, which pin that a spent REAL budget still expires.
+    #[test]
+    fn write_msg_within_completes_with_a_budget_past_the_poll_clamp() {
+        let (mut a, mut b) = std::os::unix::net::UnixStream::pair().unwrap();
+        // 70 s is past the clamp: the first poll slice is clamped to
+        // u16::MAX ms, and pre-fix that slice's timeout was mistaken for
+        // the deadline's answer.
+        let deadline = Instant::now() + std::time::Duration::from_secs(70);
+        let started = Instant::now();
+        write_msg_within(&mut a, &serde_json::json!({ "clamp": true }), deadline)
+            .expect("a healthy peer completes the write regardless of the clamp");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "the write must complete immediately against a writable peer, took {:?}",
+            started.elapsed()
+        );
+        let back: serde_json::Value = read_msg(&mut b).unwrap();
+        assert_eq!(back["clamp"], true);
     }
 }
