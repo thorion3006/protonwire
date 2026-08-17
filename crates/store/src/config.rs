@@ -1140,6 +1140,29 @@ mod tests {
     /// and the walk's mode pass runs before its ownership pass, so a
     /// user-owned file never shadows the mode defect.
     #[test]
+    /// rust-review round 8 (live-reproduced against the daemon): an ABSENT
+    /// ancestor directory under the trust root used to hard-fail the
+    /// strict walk — "untrusted ... could not inspect" (the misnomer; the
+    /// daemon exited 15) — when a missing component can carry no defect
+    /// and no leaf can exist beneath it. Absence stays soft; ancestors
+    /// that do exist are still verified. The unprivileged runner cannot
+    /// build an existing root-owned ancestor chain, so the chain here is
+    /// absent from a missing trust root down (the daemon-level repro
+    /// against `/` — exit 15 pre-fix, defaults post-fix — is recorded in
+    /// the fix commit).
+    #[test]
+    fn strict_load_missing_ancestor_dir_stays_soft() {
+        let root = tempfile::tempdir().unwrap();
+        let trust_root = root.path().join("not-there-yet");
+        let missing = trust_root.join("config.yaml");
+        let loaded = SystemConfig::load_strict(&missing, &trust_root).unwrap();
+        assert!(
+            loaded.used_defaults,
+            "an absent ancestor directory must select defaults, not exit 15"
+        );
+    }
+
+    #[test]
     fn strict_load_rejects_group_writable_file() {
         use std::os::unix::fs::PermissionsExt;
         let root = tempfile::tempdir().unwrap();

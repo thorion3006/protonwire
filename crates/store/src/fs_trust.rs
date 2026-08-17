@@ -86,11 +86,20 @@ pub fn verify_trusted_path(
         let meta = match std::fs::symlink_metadata(component) {
             Ok(meta) => Some(meta),
             Err(source)
-                if index == 0
-                    && source.kind() == std::io::ErrorKind::NotFound
+                if source.kind() == std::io::ErrorKind::NotFound
                     && missing_leaf == MissingLeaf::Allow =>
             {
-                None // the absent leaf itself is this caller's soft case
+                // Absent-and-SKIP on ANY component (rust-review round 8,
+                // live-reproduced against the daemon): a missing component
+                // can carry no defect — not a symlink, no write bits — and
+                // no leaf can exist beneath it, so the loader's subsequent
+                // read NotFound selects the defaults path, which stays
+                // safe. Ancestors that DO exist are still verified, so a
+                // symlinked or writable ancestor cannot launder an
+                // absence. Under MissingLeaf::Reject an absent leaf stays
+                // the caller's hard error, and other inspection failures
+                // stay hard (where "could not inspect" is accurate).
+                None
             }
             Err(source) => {
                 return Err(FsTrustError::Io {
