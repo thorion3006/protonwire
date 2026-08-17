@@ -10,7 +10,7 @@
 //! (X4, round 8): with nothing further published, no later seq ever
 //! arrives, the gap stays invisible, and the lagging client holds stale
 //! state indefinitely. A drop therefore also MARKS the session
-//! ([`SessionEntry::overflowed`]); the session's forwarder observes the
+//! (SessionEntry::overflowed); the session's forwarder observes the
 //! mark once it resumes draining and sends the client the reserved
 //! resync marker — see `server::handle_session`'s forwarder.
 
@@ -66,7 +66,7 @@ impl EventBus {
     }
 
     /// Registers a session and returns its inbound queue plus the overflow
-    /// mark the forwarder watches (see [`SessionEntry::overflowed`]).
+    /// mark the forwarder watches (see SessionEntry::overflowed).
     pub fn subscribe(&self) -> (u64, mpsc::Receiver<ServerMessage>, Arc<AtomicBool>) {
         let (tx, rx) = mpsc::sync_channel(SESSION_QUEUE_LEN);
         let overflowed = Arc::new(AtomicBool::new(false));
