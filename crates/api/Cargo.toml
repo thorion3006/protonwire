@@ -12,13 +12,35 @@ workspace = true
 
 [dependencies]
 muon = { workspace = true }
+# Peer-secret front door for wire-supplied credentials (M2 S4, S1's
+# finding-10 gate): zeroizing, unregistered storage for peer values.
+protonwire-core = { workspace = true }
 protonwire-frontend-api = { workspace = true }
 thiserror = { workspace = true }
+# The engine runtime (M2 S4): declared directly for M2 exactly as the
+# spike record anticipated ("tokio ... declared centrally when M2+ code
+# calls them directly"); already a lockfile transitive via the pinned
+# engines, so no new package enters the resolution.
+tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-thread", "net", "time"] }
+# Muon's own PRNG type, seeded from the OS CSPRNG (the plan's chosen
+# promotion for M2 randomness). Both already lockfile transitives.
+rand_chacha = "0.9"
+getrandom = "0.2"
+# Fido2Payload zeroize-on-drop (S0 deferral landed with S4).
+zeroize = { workspace = true }
 
 [dev-dependencies]
 # Test-only, for the S6 wire seam: drives the real muon hyper transport
 # against the loopback responder (tokio net/time) and blocks muon's async
 # engine from the sync trait (rt). Already a lockfile transitive via the
 # pinned engines; recorded in docs/spike-2026-08.md (S6 addendum).
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "time"] }
 tracing-subscriber = { workspace = true }
+# The S4 wire seam: a REAL SRP server for the loopback responder
+# (proton-srp is muon's own SRP implementation, already a lockfile
+# package via the pinned `login` feature — no new package, and the
+# server side is what the hermetic login tests verify against).
+proton-srp = { version = "0.8", registry = "proton", default-features = false, features = ["pgpinternal"] }
+# FR-7C envelope bridge: the adapter's observed credentials round-trip
+# through the store-side versioned envelope.
+protonwire-store = { workspace = true }
+serde_json = { workspace = true }

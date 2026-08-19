@@ -26,7 +26,9 @@
 
 pub use muon;
 
+pub mod auth;
 pub mod catalog;
+pub mod runtime;
 
 /// Authentication capabilities the adapter must expose.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -110,9 +112,10 @@ pub enum LoginStep {
 
 /// A WebAuthn assertion payload assembled by the client ceremony and
 /// submitted through Muon's `POST /auth/v4/2fa` `FIDO2` arm. Base64
-/// fields as on the wire (spike memo Q1); secret-handling (zeroize on
-/// drop) lands with the S4 implementation.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// fields as on the wire (spike memo Q1). Secret-handling per the S0
+/// deferral, landed with S4: `Debug` renders every field as
+/// `[redacted]` and the contents are zeroized on drop.
+#[derive(Clone, PartialEq, Eq)]
 pub struct Fido2Payload {
     /// `PublicKeyCredential.clientDataJSON`, base64.
     pub client_data: String,
@@ -124,14 +127,42 @@ pub struct Fido2Payload {
     pub credential_id: Vec<u8>,
 }
 
+impl std::fmt::Debug for Fido2Payload {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Fido2Payload")
+            .field("client_data", &protonwire_core::redact::REDACTED)
+            .field("authenticator_data", &protonwire_core::redact::REDACTED)
+            .field("signature", &protonwire_core::redact::REDACTED)
+            .field("credential_id", &protonwire_core::redact::REDACTED)
+            .finish()
+    }
+}
+
+impl Drop for Fido2Payload {
+    fn drop(&mut self) {
+        use zeroize::Zeroize as _;
+        self.client_data.zeroize();
+        self.authenticator_data.zeroize();
+        self.signature.zeroize();
+        self.credential_id.zeroize();
+    }
+}
+
 /// An opaque, single-use child-session fork selector minted by
 /// `AuthenticationApi::fork` (Muon's `POST /auth/v4/sessions/forks`).
-/// A session-bearing secret: never logged, never persisted beside the
+/// A session-bearing secret: never logged (its `Debug` renders
+/// `[redacted]`, landed with S4), never persisted beside the
 /// parent envelope, and never shared with ProTUN's `ApiSession` cache
 /// (PRD 6.5, FR-7C). Spike memo Q9: Muon logs selectors at `info`, so
 /// S1's suppression must cover the fork modules.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ForkSelector(String);
+
+impl std::fmt::Debug for ForkSelector {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ForkSelector([redacted])")
+    }
+}
 
 impl ForkSelector {
     /// Wrap a selector value produced by Muon.
@@ -234,6 +265,12 @@ pub enum ApiError {
     /// FR-7L instead of approximating the flow.
     #[error("unsupported challenge: {0}")]
     UnsupportedChallenge(&'static str),
+    /// The call does not fit the adapter's current state (submitting a
+    /// second factor with no challenge in progress, forking logged
+    /// out, importing over an active session). Fail-closed state
+    /// refusals (S4): the client surfaces orchestrate the order.
+    #[error("invalid adapter state: {0}")]
+    InvalidState(&'static str),
     /// The Proton API transport failed.
     #[error("transport failure: {0}")]
     Transport(String),
@@ -261,5 +298,25 @@ mod tests {
     fn fork_selector_stays_opaque() {
         let selector = ForkSelector::new("child-selector");
         assert_eq!(selector.as_str(), "child-selector");
+    }
+
+    /// S4: the selector and the FIDO2 assertion never render their
+    /// values through `Debug` — a `tracing` field or `{:?}` format of
+    /// either would otherwise disclose a session-bearing secret.
+    #[test]
+    fn secret_payloads_never_render_their_values() {
+        let selector = ForkSelector::new("child-selector-secret-value");
+        assert_eq!(format!("{selector:?}"), "ForkSelector([redacted])");
+        let payload = Fido2Payload {
+            client_data: "client-data-secret".into(),
+            authenticator_data: "auth-data-secret".into(),
+            signature: "signature-secret".into(),
+            credential_id: vec![1, 2, 3, 4],
+        };
+        let rendered = format!("{payload:?}");
+        assert!(!rendered.contains("client-data-secret"));
+        assert!(!rendered.contains("auth-data-secret"));
+        assert!(!rendered.contains("signature-secret"));
+        assert!(rendered.contains("[redacted]"));
     }
 }
