@@ -308,12 +308,29 @@ pub struct SecretSuppressFilter {
 /// because the leaking module sits behind a private `mod pvpnclient`
 /// (full target `pvpnclient::pvpnclient::supervisor::localagent`),
 /// brittle to name exactly.
-const MODULE_CAPS: [(&str, Level); 6] = [
+///
+/// A sixth muon site, found by S4's real-muon canary arm (absent from
+/// the S0 memo's Q9 table — the arm exists precisely to catch what
+/// source-reading misses):
+///
+/// - `muon::transport` — the WHOLE subtree, capped at ERROR.
+///   `transport::http::req` logs the complete request at WARN with the
+///   fork selector riding the PATH (`GET /auth/v4/sessions/forks/{selector}`),
+///   and `transport::http::hyper::sender` plus its http1 sibling log
+///   full request objects INCLUDING bodies at DEBUG/trace — every
+///   credential that travels a body (username, TOTP, FIDO assertions,
+///   refresh tokens, the fingerprint payload). Paths and bodies carry
+///   secrets at every level below ERROR, and neither is coverable by
+///   value scrubbing (peer-derived values must never enter the
+///   registry), so before-formatting suppression is the only control;
+///   the subtree's diagnostics are the price of closing the class.
+const MODULE_CAPS: [(&str, Level); 7] = [
     ("muon::auth::login", Level::WARN),
     ("muon::auth::from_fork", Level::WARN),
     ("muon::store", Level::WARN),
     ("muon::common::auth", Level::WARN),
     ("muon::client", Level::WARN),
+    ("muon::transport", Level::ERROR),
     ("pvpnclient", Level::DEBUG),
 ];
 
@@ -643,6 +660,33 @@ pub mod canary {
                 c.selector,
                 [c.cookie.as_str()]
             );
+            // muon::transport::http::req at WARN — the whole request, the
+            // fork selector riding the PATH (S4 real-muon canary finding;
+            // absent from the S0 memo's Q9 table).
+            tracing::event!(
+                target: "muon::transport::http::req",
+                tracing::Level::WARN,
+                "is using the default time constraint self=GET /auth/v4/sessions/forks/{}",
+                c.selector
+            );
+            // muon::transport::http::hyper::sender at DEBUG — full request
+            // objects INCLUDING bodies: every credential class that
+            // travels a request body.
+            tracing::event!(
+                target: "muon::transport::http::hyper::sender",
+                tracing::Level::DEBUG,
+                "sending request with hyper req=Request {{ .., body: Some(b\"{{\\\"Username\\\":\\\"{}\\\",\\\"TwoFactorCode\\\":\\\"{}\\\",\\\"ClientSecret\\\":\\\"{}\\\"}}\") }}",
+                c.username,
+                c.totp,
+                c.fido_payload
+            );
+            // The http1 sibling at trace — same object shape.
+            tracing::event!(
+                target: "muon::transport::http::hyper::http1",
+                tracing::Level::TRACE,
+                "http1 send req=Request {{ .., body: Some(b\"{{\\\"RefreshToken\\\":\\\"{}\\\"}}\") }}",
+                c.token
+            );
         }
     }
 
@@ -651,13 +695,16 @@ pub mod canary {
     /// event still formats its message — so these must never appear.
     /// This is the before-formatting property itself: the assertion a
     /// regex-post-processing "fix" cannot pass.
-    const SUPPRESSED_EVENT_MARKERS: [&str; 6] = [
+    const SUPPRESSED_EVENT_MARKERS: [&str; 9] = [
         "sending TOTP request with code",
         "acquiring forked session",
         "persisted auth state",
         "setting fingerprint",
         "registered session key",
         "received fork selector",
+        "is using the default time constraint",
+        "sending request with hyper",
+        "http1 send req=",
     ];
 
     /// Runs `emitter` through the exact production stack (redacting
@@ -908,6 +955,29 @@ mod suppression_policy_tests {
         ));
         // Debug survives: the cap drops exactly the leaking level.
         assert!(f.allows("pvpnclient::supervisor::localagent", &Level::DEBUG));
+    }
+
+    /// S4's real-muon canary arm found two transport-layer disclosure
+    /// sites the S0 memo's Q9 table missed (see MODULE_CAPS): the fork
+    /// selector rides the request PATH at WARN, and full request objects
+    /// INCLUDING bodies are logged at DEBUG/trace. Paths and bodies carry
+    /// credentials at every level below ERROR.
+    #[test]
+    fn muon_transport_subtree_is_capped_at_error_in_every_build() {
+        let f = SecretSuppressFilter::for_build(false);
+        // transport::http::req — the fork selector in the path at WARN.
+        assert!(!f.allows("muon::transport::http::req", &Level::WARN));
+        assert!(!f.allows("muon::transport::http::req", &Level::INFO));
+        // hyper::sender logs bodies at DEBUG; the http1 sibling at trace.
+        assert!(!f.allows("muon::transport::http::hyper::sender", &Level::DEBUG));
+        assert!(!f.allows("muon::transport::http::hyper::http1", &Level::TRACE));
+        // The subtree cap applies at the root and keeps ERROR only.
+        assert!(!f.allows("muon::transport", &Level::WARN));
+        assert!(f.allows("muon::transport", &Level::ERROR));
+        assert!(f.allows("muon::transport::http::req", &Level::ERROR));
+        // Boundary: near-name siblings keep their levels.
+        assert!(f.allows("muon::transportx", &Level::TRACE));
+        assert!(f.allows("muon::transporting::wire", &Level::DEBUG));
     }
 
     /// Target matching is boundary-correct: a cap on `muon::store` must
