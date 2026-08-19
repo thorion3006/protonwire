@@ -12,6 +12,7 @@
 
 pub mod catalog;
 pub mod config;
+pub mod deadlines;
 pub mod fs_trust;
 pub mod paths;
 pub mod session;
