@@ -138,10 +138,14 @@ pub fn from_slice<T: DeserializeOwned>(input: &[u8]) -> Result<T, YamlError> {
 /// original bytes.
 ///
 /// `*`/`&` detection deliberately keeps the looser round-1 boundary rule
-/// (any spacing/indicator character): a position like `{k:*x}` is a
-/// real alias site without a space after the colon, so tightening that
-/// arm to `at_node_start` would open a bypass, while leaving it loose
-/// only over-rejects — the safe direction for untrusted documents.
+/// (any spacing/indicator character). This is no longer forced by a
+/// known bypass: the flow `:` arm below arms `at_node_start`
+/// unconditionally inside flow collections, so an `at_node_start`-tight
+/// arm would also catch `{k:*x}`. Loose stays as pure policy — it is
+/// strictly the safe direction: a misfire (a `*`/`&` in plain-scalar
+/// prose such as `k: a *b`) only over-rejects a document, while any
+/// miss would be a bypass; over-reject-only is the standing rule for
+/// untrusted input.
 fn find_anchor_or_alias_token(input: &str) -> Option<usize> {
     // Line-keyed state must key on PARSER lines: normalize the YAML 1.1
     // break set into `\n` for the scan only (the parser in `from_str`
@@ -239,7 +243,21 @@ fn find_anchor_or_alias_token(input: &str) -> Option<usize> {
                         plain_pending = false;
                         flow_plain = false;
                     }
-                    '#' if prev_is_spacing => break, // comment runs to EOL
+                    '#' if prev_is_spacing => {
+                        // A comment runs to EOL — and ends any plain
+                        // scalar in flight: the parser never continues
+                        // a plain token across a comment, so the next
+                        // line head is a fresh node position BY
+                        // CONSTRUCTION. (The shape this protects — a
+                        // flow entry quoted on the line after an
+                        // in-flow comment — is rejected by the parser
+                        // today, pinned by
+                        // `comment_break_ends_plain_scalar_state_by_construction`;
+                        // the scan must not depend on that accident.)
+                        plain_pending = false;
+                        flow_plain = false;
+                        break;
+                    }
                     '*' | '&' if prev_is_spacing => {
                         // An anchor/alias token has a name; a lone
                         // indicator is not valid YAML anyway.
@@ -966,11 +984,10 @@ mod tests {
 
     /// Pin (green on round-1 HEAD): a `:` immediately followed by the
     /// value inside flow collections (`{k:*x}`) IS a live alias
-    /// position — serde_norway resolves it. This is why `*`/`&`
-    /// detection keeps the round-1 spacing-boundary rule (any boundary
-    /// character, conservative) instead of moving to `at_node_start`
-    /// (whose `:` requires space/EOL): over-detecting `*`/`&` only
-    /// over-rejects, while a missed one would be a bypass.
+    /// position — serde_norway resolves it. The `*`/`&` arm would catch
+    /// it even tightened to `at_node_start` (the flow `:` arm arms
+    /// unconditionally in flow), so loose is pure over-reject-only
+    /// policy here — see the scanner doc comment.
     #[test]
     fn flow_colon_alias_adjacency_still_flagged() {
         assert_policy_rejects("a: &x 1\ntop: {k:*x}\n", 1);
@@ -1148,5 +1165,53 @@ mod tests {
         // swallow works on normalized lines exactly as on `\n` ones).
         assert_accepts("k: v\r\nm: [1, 'q']\r\n");
         assert_accepts("text: |\r\n  *e&f;\r\nnext: 1\r\n");
+    }
+
+    /// Round-3 P2: the flow-separator guards are LOAD-BEARING, pinned
+    /// by the immediate-quote shapes. These are green on the committed
+    /// scanner by definition (they pin correct existing behavior), so
+    /// the red was demonstrated against the named mutations — see the
+    /// commit message for the runs: dropping the `if flow_depth > 0`
+    /// guard from the `,` arm (making it fire in block context), and
+    /// dropping the `flow_depth > 0 || at_node_start` guard from the
+    /// `[`/`{` arm. Under those mutations a separator inside a
+    /// block-context plain scalar arms a node start, and a quote
+    /// immediately after `separator + space` then OPENS quote state and
+    /// blinds the scan. (The round-2 shapes `a,b 'x` etc. survive the
+    /// mutations because the letter between separator and quote
+    /// consumes the node start before the quote arrives.)
+    #[test]
+    fn flow_separator_guards_are_load_bearing() {
+        for doc in [
+            "k: a, 'x\na: &a [1]\nb: [*a]\n",
+            "k: a[ 'x\na: &a [1]\nb: [*a]\n",
+            "k: a{ 'x\na: &a [1]\nb: [*a]\n",
+        ] {
+            assert_policy_rejects(doc, 2);
+        }
+    }
+
+    /// Round-3 Low: a `#` comment ends the line AND any plain scalar in
+    /// flight — the parser never continues a plain token across a
+    /// comment, so the post-comment line head must be a fresh node
+    /// position BY CONSTRUCTION, not by the accident of the parser
+    /// refusing the shape (pinned below: it refuses today). Red
+    /// pre-fix: `flow_plain` survived the comment break, the quote at
+    /// the next line head never opened, and the `*` inside what the
+    /// parser would read as a quoted scalar was misreported as an
+    /// alias token on line 2 (`Some(2)` instead of `Some(3)`).
+    #[test]
+    fn comment_break_ends_plain_scalar_state_by_construction() {
+        let doc = "k: [a # c\n  ' *b']\nd: &y 1\n";
+        assert!(
+            serde_norway::from_str::<serde_norway::Value>(doc).is_err(),
+            "the in-flow comment + quoted-continuation shape must not parse: {doc:?}"
+        );
+        assert_eq!(
+            find_anchor_or_alias_token(doc),
+            Some(3),
+            "the quote opens at the post-comment line head, `*b` is content, \
+             and the real anchor is flagged on line 3: {doc:?}"
+        );
     }
 }
