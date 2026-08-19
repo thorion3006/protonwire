@@ -297,6 +297,50 @@ impl SystemConfig {
                     .join(", ")
             ));
         }
+        // Rust-review S3 fix 2: the three PRD-attested selector shapes
+        // deliberately left as `String` (their vocabularies are a single
+        // attested value or open suffixes an enum would over-pin) are
+        // checked here, at validate.
+        //
+        // `ttl_policy`: section 10's example attests exactly one spelling.
+        for (index, rule) in self.split_tunnel.domains.rules.iter().enumerate() {
+            if rule.ttl_policy != "respect_dns_ttl" {
+                violations.push(format!(
+                    "split_tunnel.domains.rules[{index}].ttl_policy must be \
+                     `respect_dns_ttl` (found `{}`)",
+                    rule.ttl_policy
+                ));
+            }
+        }
+        // `mtu`: section 10 attests `auto`; the numeric arm accepts any
+        // realistic tunnel MTU. 128..=9000 is a sanity bound, not a
+        // product rule (disclosed in the message).
+        let mtu = &self.connection.protun.mtu;
+        let mtu_valid = mtu == "auto"
+            || mtu
+                .parse::<u16>()
+                .is_ok_and(|value| (128..=9000).contains(&value));
+        if !mtu_valid {
+            violations.push(format!(
+                "connection.protun.mtu must be `auto` or an integer between \
+                 128 and 9000 (found `{mtu}`)"
+            ));
+        }
+        // `default`: section 10's literal comment enumerates the accepted
+        // prefixes `fastest|random|last|group:<namespaced-id>|profile:<name>`.
+        // The prefix check accepts the open suffixes; the full selector
+        // grammar (country/state/city/server arms) is the CLI's, and S9's
+        // CLI grammar will be the stricter validator.
+        let default = &self.connection.default;
+        if !["fastest", "random", "last", "group:", "profile:"]
+            .iter()
+            .any(|prefix| default.starts_with(prefix))
+        {
+            violations.push(format!(
+                "connection.default must be one of `fastest`, `random`, `last`, \
+                 `group:<namespaced-id>`, `profile:<name>` (found `{default}`)"
+            ));
+        }
         if violations.is_empty() {
             Ok(())
         } else {

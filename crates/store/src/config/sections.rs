@@ -409,7 +409,11 @@ vocabulary! {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct ConnectionSection {
-    /// Default connect target.
+    /// Default connect target: `fastest`, `random`, `last`,
+    /// `group:<namespaced-id>`, or `profile:<name>` (PRD section 10's
+    /// literal enumeration; prefix-validated in the root document's
+    /// `validate` — S9's CLI selector grammar will be the stricter
+    /// validator).
     pub default: String,
     /// Default protocol (see [`ProtocolMode`]).
     pub protocol: ProtocolMode,
@@ -434,7 +438,9 @@ impl Default for ConnectionSection {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct ProtunSection {
-    /// MTU: `auto` or a number.
+    /// MTU: `auto`, or a quoted integer between 128 and 9000 (validated
+    /// in the root document's `validate`; the bound is a sanity range,
+    /// not a product rule).
     pub mtu: String,
     /// SNI strategy for TLS-based transports.
     pub sni_strategy: String,
@@ -722,7 +728,9 @@ pub struct SplitTunnelDomainRule {
     pub domain: String,
     /// Rule action (see [`SplitRuleAction`]).
     pub action: SplitRuleAction,
-    /// TTL handling policy.
+    /// TTL handling policy: `respect_dns_ttl` is the single
+    /// PRD-section-10-attested spelling (validated in the root document's
+    /// `validate`).
     pub ttl_policy: String,
 }
 
@@ -1186,6 +1194,109 @@ mod tests {
         );
     }
 
+    // ------------------------------------------------------------------
+    // rust-review S3 fix 2: the three PRD-attested selector shapes that
+    // stay `String` (single-attested-value or open-suffix vocabularies an
+    // enum would over-pin) are validated at `validate()`. Red evidence:
+    // behavioral — against the parent commit the typo documents below
+    // PARSE and VALIDATE cleanly, so the expect_err assertions fail.
+    // ------------------------------------------------------------------
+
+    /// PRD section 10 example: `ttl_policy: respect_dns_ttl` — the single
+    /// attested spelling. A typo must be a validation error naming the
+    /// field and the accepted spelling.
+    #[test]
+    fn ttl_policy_typo_rejected_by_validate() {
+        let parsed = parse_doc(
+            "schema_version: 2\nsplit_tunnel:\n  domains:\n    rules:\n      - ttl_policy: respect_dns_ttls\n",
+        );
+        let err = parsed
+            .validate()
+            .expect_err("a ttl_policy typo must not validate")
+            .to_string();
+        assert!(
+            err.contains("split_tunnel.domains.rules[0].ttl_policy"),
+            "must name the field: {err}"
+        );
+        assert!(
+            err.contains("respect_dns_ttl"),
+            "must name the accepted spelling: {err}"
+        );
+
+        let good = parse_doc(
+            "schema_version: 2\nsplit_tunnel:\n  domains:\n    rules:\n      - ttl_policy: respect_dns_ttl\n",
+        );
+        good.validate().unwrap();
+    }
+
+    /// PRD section 10 example: `mtu: auto`. The field is a string by
+    /// schema, so numeric MTUs are quoted strings (`mtu: "1380"`); the
+    /// sanity bound 128..=9000 is disclosed in the message. The typo
+    /// `atuo` must be a validation error naming both accepted shapes.
+    #[test]
+    fn protun_mtu_typo_and_out_of_range_rejected_by_validate() {
+        for good in ["auto", "\"128\"", "\"1380\"", "\"9000\""] {
+            let parsed = parse_doc(&format!(
+                "schema_version: 2\nconnection:\n  protun:\n    mtu: {good}\n"
+            ));
+            parsed.validate().unwrap();
+        }
+        for bad in ["atuo", "\"0\"", "\"127\"", "\"9001\"", "\"65536\"", "jumbo"] {
+            let parsed = parse_doc(&format!(
+                "schema_version: 2\nconnection:\n  protun:\n    mtu: {bad}\n"
+            ));
+            let err = parsed
+                .validate()
+                .expect_err("an unusable mtu must not validate")
+                .to_string();
+            assert!(
+                err.contains("connection.protun.mtu"),
+                "must name the field: {err}"
+            );
+            assert!(
+                err.contains("auto") && err.contains("128") && err.contains("9000"),
+                "must name the accepted shapes and the bound: {err}"
+            );
+        }
+    }
+
+    /// PRD section 10 example comment: `fastest|random|last|group:
+    /// <namespaced-id>|profile:<name>`. The prefix check rejects the typo
+    /// `quickest` while accepting every enumerated shape's suffixes. The
+    /// full selector grammar (country/city/server arms) is the CLI's; S9's
+    /// grammar will be the stricter validator when it lands.
+    #[test]
+    fn connection_default_typo_rejected_by_validate() {
+        let parsed = parse_doc("schema_version: 2\nconnection:\n  default: quickest\n");
+        let err = parsed
+            .validate()
+            .expect_err("a default-target typo must not validate")
+            .to_string();
+        assert!(
+            err.contains("connection.default"),
+            "must name the field: {err}"
+        );
+        for shape in ["fastest", "random", "last", "group:", "profile:"] {
+            assert!(
+                err.contains(shape),
+                "must name the accepted shape `{shape}`: {err}"
+            );
+        }
+
+        for good in [
+            "fastest",
+            "random",
+            "last",
+            "group:pw-regional-fastest-eu",
+            "profile:work",
+        ] {
+            let parsed = parse_doc(&format!(
+                "schema_version: 2\nconnection:\n  default: {good}\n"
+            ));
+            parsed.validate().unwrap();
+        }
+    }
+
     /// The enum spellings must survive a serialize/parse round trip so the
     /// daemon's render-and-reload paths (and `config get` output) are
     /// stable (M2 S3 contract; see also
@@ -1230,6 +1341,53 @@ mod tests {
         assert_eq!(
             SplitTunnelDomainRule::default().action,
             SplitRuleAction::Bypass
+        );
+    }
+
+    /// Rust-review S3 fix 3: the defaults-only pin above leaves the
+    /// NON-default spellings' serialize side untested — a variant whose
+    /// `as_str` drifted from its match arm would only surface when a
+    /// rendered document carrying it stopped reloading. This property
+    /// walks every vocabulary's FULL `VOCABULARY`: each spelling parses
+    /// to a variant, the variant serializes (both `Into<String>` and the
+    /// serde path) back to exactly that spelling, and the spelling
+    /// re-parses to the same variant; the default's spelling must itself
+    /// be a vocabulary entry. Inspection-level evidence (a pin, not a
+    /// red): the macro keeps the two sides in one match today and the
+    /// property holds on the parent commit — it exists to hold.
+    #[test]
+    fn vocabularies_round_trip_every_spelling() {
+        macro_rules! round_trip {
+            ($($ty:ty),* $(,)?) => {$(
+                for spelling in <$ty>::VOCABULARY {
+                    let parsed = <$ty>::try_from((*spelling).to_owned())
+                        .unwrap_or_else(|error| panic!("{}: {error}", <$ty>::FIELD));
+                    let rendered: String = parsed.into();
+                    assert_eq!(rendered, *spelling, "{}: serialize drifted", <$ty>::FIELD);
+                    let reloaded: $ty = serde_norway::from_str(&rendered)
+                        .unwrap_or_else(|error| panic!("{}: {error}", <$ty>::FIELD));
+                    assert_eq!(reloaded, parsed, "{}: round trip drifted", <$ty>::FIELD);
+                }
+                assert!(
+                    <$ty>::VOCABULARY.contains(&<$ty>::default().as_str()),
+                    "{}: the default spelling must be in the vocabulary",
+                    <$ty>::FIELD
+                );
+            )*};
+        }
+
+        round_trip!(
+            WritableSessionStore,
+            CredentialInputSource,
+            ProbeTransport,
+            RegionalRanking,
+            ProtocolMode,
+            Ipv6Mode,
+            DnsPolicy,
+            DnsLeakProtection,
+            SplitRuleAction,
+            ConnectionType,
+            ProfileRanking,
         );
     }
 
