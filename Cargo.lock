@@ -4607,11 +4607,18 @@ dependencies = [
 name = "protonwire-api"
 version = "0.1.0"
 dependencies = [
+ "getrandom 0.2.17",
  "muon",
+ "proton-srp",
+ "protonwire-core",
  "protonwire-frontend-api",
+ "protonwire-store",
+ "rand_chacha 0.9.0",
+ "serde_json",
  "thiserror 2.0.20",
  "tokio",
  "tracing-subscriber",
+ "zeroize",
 ]
 
 [[package]]
@@ -4638,6 +4645,7 @@ dependencies = [
 name = "protonwire-core"
 version = "0.1.0"
 dependencies = [
+ "getrandom 0.2.17",
  "protonwire-frontend-api",
  "protonwire-store",
  "tempfile",

@@ -13,6 +13,11 @@ workspace = true
 [dependencies]
 protonwire-frontend-api = { workspace = true }
 protonwire-store = { workspace = true }
+# S7 jitter RNG: the OS CSPRNG via getrandom (m2-plan decision 3) —
+# already a lockfile transitive (the api crate promotes it too), so no
+# new package enters the resolution; std has no RNG and hash-seeded
+# pseudo-randomness is forbidden for product jitter.
+getrandom = "0.2"
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
