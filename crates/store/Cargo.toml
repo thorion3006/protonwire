@@ -15,6 +15,10 @@ protonwire-frontend-api = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_norway = { workspace = true }
+# Session-envelope source digest (M2 S4): RustCrypto SHA-256 — no
+# hand-rolled hashing per the stdlib-first policy; already the workspace
+# xtask pin, so no new lockfile package.
+sha2 = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 
