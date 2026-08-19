@@ -555,9 +555,15 @@ mod wire_tests {
     }
 
     /// Builds the adapter against the loopback env on a dedicated
-    /// current-thread runtime (the sync trait blocks on it from the
-    /// test's plain thread — no ambient async context, which tokio
-    /// forbids blocking from).
+    /// MULTI-thread runtime (`worker_threads(2)`). Multi-thread is
+    /// load-bearing, not a preference: blocking a *current-thread*
+    /// runtime via `Handle::block_on` from a foreign (non-runtime)
+    /// thread deadlocks in the connector — the kernel completes the TCP
+    /// handshake but nothing pumps the IO driver, so the connect future
+    /// never wakes (spike-2026-08.md, "Adapter-facing facts for S4"),
+    /// while `new_multi_thread` blocks correctly from the caller's
+    /// thread. This is the canonical site S4's engine-runtime bridge
+    /// copies — keep the two synchronized.
     fn adapter_against(port: u16) -> (MuonCatalog, tokio::runtime::Runtime) {
         // Opt-in transport tracing for seam debugging: silent unless
         // RUST_LOG is set (e.g. RUST_LOG=muon=trace).
