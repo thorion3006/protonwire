@@ -284,16 +284,16 @@ mod wire_tests {
             .collect();
         // Drain any body the client claims (muon sends none on these
         // requests, but robustness is free).
-        if let Some((_, len)) = headers.iter().find(|(k, _)| k == "content-length") {
-            if let Ok(len) = len.parse::<usize>() {
-                let mut taken = 0;
-                while taken < len {
-                    let n = stream.read(&mut chunk).expect("responder body read");
-                    if n == 0 {
-                        break;
-                    }
-                    taken += n;
+        if let Some((_, len)) = headers.iter().find(|(k, _)| k == "content-length")
+            && let Ok(len) = len.parse::<usize>()
+        {
+            let mut taken = 0;
+            while taken < len {
+                let n = stream.read(&mut chunk).expect("responder body read");
+                if n == 0 {
+                    break;
                 }
+                taken += n;
             }
         }
         seen.lock().unwrap().push(Recorded {
@@ -460,7 +460,7 @@ mod wire_tests {
                     .map(|addrs| addrs.map(|a| a.ip()).collect())
             })
             .await
-            .map_err(|e| std::io::Error::other(e))?
+            .map_err(std::io::Error::other)?
         }
     }
 

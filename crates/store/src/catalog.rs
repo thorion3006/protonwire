@@ -69,10 +69,10 @@ pub const MAX_LOGICAL_SERVERS: usize = 16_384;
 /// fan-out is single digits; the cap bounds aggregate work per parse).
 pub const MAX_PHYSICAL_SERVERS_TOTAL: usize = 262_144;
 
-/// Depth note: JSON nesting in a catalog stops at five levels (envelope →
-/// servers → physical → per-protocol → ports); `serde_json`'s built-in
-/// 128-deep recursion limit is the backstop beneath the field-strict
-/// model, which cannot nest deeper than its declared shape.
+// Depth note: JSON nesting in a catalog stops at five levels (envelope →
+// servers → physical → per-protocol → ports); serde_json's built-in
+// 128-deep recursion limit is the backstop beneath the field-strict
+// model, which cannot nest deeper than its declared shape.
 
 /// Schema version of the cache document.
 pub const CATALOG_CACHE_SCHEMA_VERSION: u32 = 1;
