@@ -714,10 +714,12 @@ mod tests {
             ServerMessage::HelloError(err) => assert_eq!(err.reason, "duplicate-hello"),
             other => panic!("expected HelloError for duplicate hello, got {other:?}"),
         }
-        // The session ends: the next read hits EOF.
+        // The session ends: the next read hits EOF — at a FRAME BOUNDARY
+        // (the refusal was a complete frame), so the M2 S12 codec class
+        // it Closed, the informational hangup, not Truncated.
         assert!(matches!(
             read_msg::<_, ServerMessage>(&mut stream),
-            Err(crate::frame::FrameError::Truncated)
+            Err(crate::frame::FrameError::Closed)
         ));
     }
 
@@ -742,9 +744,10 @@ mod tests {
             ServerMessage::HelloError(err) => assert_eq!(err.reason, "request-before-hello"),
             other => panic!("expected HelloError for early request, got {other:?}"),
         }
+        // Boundary EOF after the complete refusal frame: Closed (M2 S12).
         assert!(matches!(
             read_msg::<_, ServerMessage>(&mut stream),
-            Err(crate::frame::FrameError::Truncated)
+            Err(crate::frame::FrameError::Closed)
         ));
     }
 
@@ -913,10 +916,11 @@ mod tests {
             }
             other => panic!("expected a hello-timeout refusal, got {other:?}"),
         }
-        // The session ends after the refusal.
+        // The session ends after the refusal — a boundary EOF, so the
+        // codec class it Closed (M2 S12), not mid-frame.
         assert!(matches!(
             read_msg::<_, ServerMessage>(&mut read_half),
-            Err(crate::frame::FrameError::Truncated)
+            Err(crate::frame::FrameError::Closed)
         ));
         dribbler.join().unwrap();
         stop.store(true, Ordering::SeqCst);
