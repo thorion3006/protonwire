@@ -110,9 +110,17 @@ pub enum ClientMessage {
         client: ClientInfo,
     },
     /// A request expecting exactly one [`ServerMessage::Response`].
+    ///
+    /// The wire shape is FLAT (recorded decision #1, 2026-08-17): the
+    /// `method`/`params` tags of the inner [`Request`] are flattened
+    /// directly into `data` beside the correlation id —
+    /// `data: {id, method, params}` — instead of the M1 nesting
+    /// `data: {id, request: {method, params}}`. Free until a client
+    /// ships; deferring past the freeze would cost a major version.
     Request {
         /// Client-side correlation id, echoed in the response.
         id: u64,
+        #[serde(flatten)]
         request: Request,
     },
 }
@@ -309,8 +317,14 @@ fn serde_plain_code(code: &RpcErrorCode) -> String {
 mod tests {
     use super::*;
 
+    /// Recorded decision #1 (2026-08-17, docs/m2-plan.md): the request
+    /// nesting is FLAT — `data: {id, method, params}`, not `data: {id,
+    /// request: {method, params}}`. Flattening is free until a client
+    /// ships (nothing has shipped; distribution is license-blocked), and
+    /// the round-6 reviewer recommended it before the protocol freezes.
+    /// This pins the serialization direction.
     #[test]
-    fn request_wire_shape_is_stable() {
+    fn request_wire_shape_is_flat() {
         let msg = ClientMessage::Request {
             id: 7,
             request: Request::Ping {
@@ -324,10 +338,28 @@ mod tests {
                 "type": "request",
                 "data": {
                     "id": 7,
-                    "request": { "method": "ping", "params": { "nonce": "abc" } }
+                    "method": "ping",
+                    "params": { "nonce": "abc" }
                 }
             })
         );
+    }
+
+    /// The flatten's other direction: a params-less method (GetState)
+    /// deserializes from the flat shape with the correlation id intact.
+    #[test]
+    fn flat_request_shape_round_trips() {
+        let json = serde_json::json!({
+            "type": "request",
+            "data": { "id": 9, "method": "get-state" }
+        });
+        match serde_json::from_value::<ClientMessage>(json).unwrap() {
+            ClientMessage::Request { id, request } => {
+                assert_eq!(id, 9);
+                assert!(matches!(request, Request::GetState));
+            }
+            other => panic!("unexpected message: {other:?}"),
+        }
     }
 
     #[test]

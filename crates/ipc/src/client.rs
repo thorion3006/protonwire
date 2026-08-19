@@ -701,6 +701,87 @@ mod tests {
         }
     }
 
+    /// Recorded decision #1 (2026-08-17, docs/m2-plan.md): the SDK's
+    /// request path emits the FLAT wire shape — `data: {id, method,
+    /// params}`. A scripted daemon reads the RAW frame bytes and inspects
+    /// the JSON itself, pinning what the typed round-trip never shows:
+    /// no `request` wrapper object may reappear on the wire.
+    #[test]
+    fn request_path_emits_the_flat_wire_shape() {
+        use std::os::unix::net::UnixListener;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("flat-wire.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let (seen_tx, seen_rx) = std::sync::mpsc::channel::<serde_json::Value>();
+        std::thread::spawn(move || {
+            let Ok((mut peer, _)) = listener.accept() else {
+                return;
+            };
+            let _ = crate::frame::read_msg::<_, ClientMessage>(&mut peer);
+            let _ = crate::frame::write_msg(
+                &mut peer,
+                &ServerMessage::HelloAck(protonwire_frontend_api::HelloAck {
+                    protocol_version: 1,
+                    daemon_version: "flat".into(),
+                    latest_event_seq: 0,
+                }),
+            );
+            // The raw frame the SDK's request path actually sent, parsed
+            // and reported so the test asserts on the peer's view.
+            let raw = match crate::frame::read_frame(&mut peer) {
+                Ok(raw) => raw,
+                Err(e) => panic!("request frame never arrived: {e}"),
+            };
+            let json: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+            let _ = seen_tx.send(json);
+            let _ = crate::frame::write_msg(
+                &mut peer,
+                &ServerMessage::Response(Response::Ok {
+                    id: 0,
+                    result: RequestResult::Pong { nonce: "p".into() },
+                }),
+            );
+            std::thread::sleep(Duration::from_secs(30));
+        });
+
+        let mut client = IpcClient::connect_with_timeout(
+            &path,
+            &test_client_info(),
+            SecurityChecks::dev_unchecked(),
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        client
+            .request(Request::Ping { nonce: "p".into() })
+            .expect("the scripted peer answers");
+
+        let json = seen_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("the peer reports the observed frame");
+        let data = json
+            .get("data")
+            .and_then(|d| d.as_object())
+            .unwrap_or_else(|| panic!("flat request frame must carry a data object: {json}"));
+        assert_eq!(
+            json["type"], "request",
+            "the frame discriminant must stay adjacent-tagged: {json}"
+        );
+        assert_eq!(data["id"], 0, "the correlation id rides in data: {json}");
+        assert_eq!(
+            data["method"], "ping",
+            "the method key rides directly in data (no wrapper): {json}"
+        );
+        assert_eq!(
+            data["params"]["nonce"], "p",
+            "the params key rides directly in data (no wrapper): {json}"
+        );
+        assert!(
+            !data.contains_key("request"),
+            "the nested `request` wrapper must not reappear on the wire: {json}"
+        );
+    }
+
     #[test]
     fn untrusted_socket_rejected_when_checks_strict() {
         let dir = tempfile::tempdir().unwrap();

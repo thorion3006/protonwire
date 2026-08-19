@@ -36,10 +36,11 @@
       ]
     },
     {
-      "description": "A request expecting exactly one [`ServerMessage::Response`].",
+      "description": "A request expecting exactly one [`ServerMessage::Response`].\n\nThe wire shape is FLAT (recorded decision #1, 2026-08-17): the\n`method`/`params` tags of the inner [`Request`] are flattened\ndirectly into `data` beside the correlation id —\n`data: {id, method, params}` — instead of the M1 nesting\n`data: {id, request: {method, params}}`. Free until a client\nships; deferring past the freeze would cost a major version.",
       "type": "object",
       "properties": {
         "data": {
+          "description": "Requests the daemon accepts (PRD FR-127). Milestone 1 implements\n`Ping`/`GetState` end to end and returns a typed\n[`RpcErrorCode::NotImplemented`] refusal for the connection lifecycle.",
           "type": "object",
           "properties": {
             "id": {
@@ -47,14 +48,102 @@
               "type": "integer",
               "format": "uint64",
               "minimum": 0
-            },
-            "request": {
-              "$ref": "#/$defs/Request"
             }
           },
+          "oneOf": [
+            {
+              "description": "Liveness probe; the daemon echoes the nonce.",
+              "type": "object",
+              "properties": {
+                "method": {
+                  "type": "string",
+                  "const": "ping"
+                },
+                "params": {
+                  "type": "object",
+                  "properties": {
+                    "nonce": {
+                      "description": "Arbitrary string echoed back in [`RequestResult::Pong`].",
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "nonce"
+                  ]
+                }
+              },
+              "required": [
+                "method",
+                "params"
+              ]
+            },
+            {
+              "description": "Full-state snapshot (the resynchronization primitive).",
+              "type": "object",
+              "properties": {
+                "method": {
+                  "type": "string",
+                  "const": "get-state"
+                }
+              },
+              "required": [
+                "method"
+              ]
+            },
+            {
+              "description": "Begin a connection. Refused until Milestone 4 wires the ProTUN engine.",
+              "type": "object",
+              "properties": {
+                "method": {
+                  "type": "string",
+                  "const": "connect"
+                },
+                "params": {
+                  "type": "object",
+                  "properties": {
+                    "target": {
+                      "$ref": "#/$defs/ConnectTarget"
+                    }
+                  },
+                  "required": [
+                    "target"
+                  ]
+                }
+              },
+              "required": [
+                "method",
+                "params"
+              ]
+            },
+            {
+              "description": "Tear down the active connection. Refused until Milestone 4.",
+              "type": "object",
+              "properties": {
+                "method": {
+                  "type": "string",
+                  "const": "disconnect"
+                }
+              },
+              "required": [
+                "method"
+              ]
+            },
+            {
+              "description": "Stop the daemon. Requires administrator (UID 0) peer credentials.",
+              "type": "object",
+              "properties": {
+                "method": {
+                  "type": "string",
+                  "const": "shutdown"
+                }
+              },
+              "required": [
+                "method"
+              ]
+            }
+          ],
           "required": [
-            "id",
-            "request"
+            "id"
           ]
         },
         "type": {
@@ -375,101 +464,6 @@
           "required": [
             "kind",
             "value"
-          ]
-        }
-      ]
-    },
-    "Request": {
-      "description": "Requests the daemon accepts (PRD FR-127). Milestone 1 implements\n`Ping`/`GetState` end to end and returns a typed\n[`RpcErrorCode::NotImplemented`] refusal for the connection lifecycle.",
-      "oneOf": [
-        {
-          "description": "Liveness probe; the daemon echoes the nonce.",
-          "type": "object",
-          "properties": {
-            "method": {
-              "type": "string",
-              "const": "ping"
-            },
-            "params": {
-              "type": "object",
-              "properties": {
-                "nonce": {
-                  "description": "Arbitrary string echoed back in [`RequestResult::Pong`].",
-                  "type": "string"
-                }
-              },
-              "required": [
-                "nonce"
-              ]
-            }
-          },
-          "required": [
-            "method",
-            "params"
-          ]
-        },
-        {
-          "description": "Full-state snapshot (the resynchronization primitive).",
-          "type": "object",
-          "properties": {
-            "method": {
-              "type": "string",
-              "const": "get-state"
-            }
-          },
-          "required": [
-            "method"
-          ]
-        },
-        {
-          "description": "Begin a connection. Refused until Milestone 4 wires the ProTUN engine.",
-          "type": "object",
-          "properties": {
-            "method": {
-              "type": "string",
-              "const": "connect"
-            },
-            "params": {
-              "type": "object",
-              "properties": {
-                "target": {
-                  "$ref": "#/$defs/ConnectTarget"
-                }
-              },
-              "required": [
-                "target"
-              ]
-            }
-          },
-          "required": [
-            "method",
-            "params"
-          ]
-        },
-        {
-          "description": "Tear down the active connection. Refused until Milestone 4.",
-          "type": "object",
-          "properties": {
-            "method": {
-              "type": "string",
-              "const": "disconnect"
-            }
-          },
-          "required": [
-            "method"
-          ]
-        },
-        {
-          "description": "Stop the daemon. Requires administrator (UID 0) peer credentials.",
-          "type": "object",
-          "properties": {
-            "method": {
-              "type": "string",
-              "const": "shutdown"
-            }
-          },
-          "required": [
-            "method"
           ]
         }
       ]
