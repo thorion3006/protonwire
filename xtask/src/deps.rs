@@ -297,10 +297,11 @@ fn walk_for_lock_files(dir: &Path, found: &mut Vec<PathBuf>) {
     }
 }
 
-/// Reject any dependency whose version is the wildcard `"*"`. Covers
-/// package manifests and the virtual workspace's root
-/// `[workspace.dependencies]`, where the external versions are actually
-/// declared (Codex PR review finding 15).
+/// Reject any dependency whose version requirement contains a wildcard
+/// `*` (the bare `"*"` and partial forms like `"1.*"`). Covers package
+/// manifests and the virtual workspace's root `[workspace.dependencies]`,
+/// where the external versions are actually declared (Codex PR review
+/// finding 15).
 pub(crate) fn wildcard_versions(manifest: &str) -> Vec<String> {
     let Ok(table) = toml::from_str::<toml::Table>(manifest) else {
         return vec!["manifest is not valid TOML".to_string()];
@@ -342,9 +343,14 @@ fn scan_dependency_entries(section: &str, entries: &toml::Value, violations: &mu
             toml::Value::Table(spec) => spec.get("version").and_then(toml::Value::as_str),
             _ => None,
         };
-        if version == Some("*") {
+        // Round-9: ANY `*` in a version requirement is a wildcard — the
+        // bare "*" and partial forms ("1.*", "0.4.*") resolve to the same
+        // anything-goes class of unpinned dependency — and no ordinary
+        // requirement shape (^, ~, =, ranges) contains one.
+        if version.is_some_and(|v| v.contains('*')) {
             violations.push(format!(
-                "[{section}] dependency `{name}` uses version \"*\""
+                "[{section}] dependency `{name}` uses a wildcard version (\"{}\")",
+                version.unwrap_or_default()
             ));
         }
     }
@@ -449,6 +455,85 @@ build-star = "*"
         assert!(!text.contains("`serde`"));
         assert!(!text.contains("`table-ok`"));
         assert!(!text.contains("`workspace-dep`"));
+    }
+
+    /// Round-9 final severity-bar disposal (P2): the wildcard check
+    /// compared version == "*" exactly, so a PARTIAL wildcard requirement
+    /// — "1.*", "0.4.*" — passed unseen, and semver wildcards resolve to
+    /// the same anything-goes class of unpinned dependency the exact-"*"
+    /// rule exists to reject. Every version string containing `*` (bare,
+    /// prefix, or table form, in every dependency section including the
+    /// root [workspace.dependencies]) must be reported.
+    #[test]
+    fn partial_wildcards_are_rejected() {
+        let manifest = r#"
+[dependencies]
+partial-bare = "1.*"
+partial-zero = "0.4.*"
+partial-table = { version = "2.*", features = ["x"] }
+
+[dev-dependencies]
+dev-partial = "1.*"
+
+[target.'cfg(unix)'.dependencies]
+nix-partial = "2.*"
+
+[target.'cfg(unix)'.build-dependencies]
+build-partial = "1.*"
+"#;
+        let violations = wildcard_versions(manifest);
+        let text = violations.join("\n");
+        for expected in [
+            "dependency `partial-bare`",
+            "dependency `partial-zero`",
+            "dependency `partial-table`",
+            "dependency `dev-partial`",
+            "dependency `nix-partial`",
+            "dependency `build-partial`",
+        ] {
+            assert!(
+                text.contains(expected),
+                "partial wildcard must be reported: missing {expected} in {text}"
+            );
+        }
+        // The violation must name the wildcard version, not just the dep.
+        assert!(
+            text.contains("\"1.*\""),
+            "the message must quote `1.*`: {text}"
+        );
+
+        // The root workspace table too (finding-15 class).
+        let root_manifest = r#"
+[workspace]
+members = ["crates/core"]
+
+[workspace.dependencies]
+root-partial = "1.*"
+root-partial-table = { version = "0.*" }
+"#;
+        let text = wildcard_versions(root_manifest).join("\n");
+        assert!(text.contains("dependency `root-partial`"), "got: {text}");
+        assert!(
+            text.contains("dependency `root-partial-table`"),
+            "got: {text}"
+        );
+
+        // Pinned requirements of every ordinary shape stay green.
+        let clean = r#"
+[dependencies]
+serde = "1"
+caret = "^1.0"
+tilde = "~1.2"
+gte = ">=1.0, <2"
+exact = "=1.0.7"
+rangey = "1.0.0 - 1.5"
+ws-star-name = { version = "1", package = "star*" }
+"#;
+        let violations = wildcard_versions(clean);
+        assert!(
+            violations.is_empty(),
+            "no ordinary version requirement contains `*`: got {violations:?}"
+        );
     }
 
     /// Codex PR review finding 15 (P2): this is a virtual workspace — the
