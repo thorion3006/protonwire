@@ -596,13 +596,20 @@ impl CatalogCache {
 
     /// Atomically stores `doc`: sibling temp file (mode 0644), fsync,
     /// rename — the [`crate::state`] precedent. The size cap is enforced
-    /// on the body before any I/O.
+    /// on the body before any I/O AND on the serialized envelope after
+    /// serialization (the [`crate::state`] post-serialization precedent):
+    /// pretty-printing adds escaping and layout, so a quote-dense body
+    /// just under the cap can serialize past it — and a file the loader
+    /// would reject must never be written.
     pub fn store(&self, doc: &CachedCatalog) -> Result<(), CatalogCacheError> {
         if doc.body.len() > MAX_CATALOG_BYTES {
             return Err(CatalogCacheError::TooLarge(doc.body.len()));
         }
         let bytes = serde_json::to_vec_pretty(doc)
             .map_err(|e| CatalogCacheError::Malformed(e.to_string()))?;
+        if bytes.len() > MAX_CATALOG_BYTES {
+            return Err(CatalogCacheError::TooLarge(bytes.len()));
+        }
         let parent = self.path.parent().unwrap_or(Path::new(".")).to_path_buf();
         create_cache_dir(&parent)?;
         let tmp = parent.join(format!(
@@ -843,6 +850,32 @@ mod tests {
     }
 
     #[test]
+    fn drift_guard_reaches_the_deepest_wire_struct() {
+        // `deny_unknown_fields` is per-struct, so it is pinned at the
+        // deepest nesting level the contract has: envelope → logical →
+        // physical → per-protocol map → ProtocolEndpoint. Removing the
+        // guard from any struct on that path's leaf previously survived
+        // the suite (qa P2-2: only envelope and logical were pinned);
+        // this injection closes that class by proving the discipline
+        // holds at full depth. Structural surgery via serde_json::Value,
+        // immune to fixture formatting (the round-6 anchor-drift note).
+        let mut value: serde_json::Value = serde_json::from_str(FIXTURE).unwrap();
+        let endpoint =
+            &mut value["LogicalServers"][0]["Servers"][0]["EntryPerProtocol"]["WireGuardUDP"];
+        assert_eq!(
+            endpoint.get("IPv4"),
+            Some(&serde_json::json!("185.242.4.10")),
+            "fixture anchor drifted: the CH#10 WireGuardUDP endpoint moved"
+        );
+        endpoint["QuantumPorts"] = serde_json::json!([1]);
+        let err = CatalogDocument::from_bytes(value.to_string().as_bytes()).unwrap_err();
+        assert!(
+            err.to_string().contains("QuantumPorts"),
+            "drift at the deepest wire struct must fail loudly: {err}"
+        );
+    }
+
+    #[test]
     fn malformed_documents_fail_loudly() {
         // Truncated JSON.
         let truncated = &FIXTURE[..FIXTURE.len() / 2];
@@ -902,6 +935,104 @@ mod tests {
         huge.push_str("]}");
         let err = CatalogDocument::from_bytes(huge.as_bytes()).unwrap_err();
         assert!(matches!(err, CatalogError::TooManyServers { .. }), "{err}");
+    }
+
+    /// Builds a valid document of `logicals` logical servers, each with
+    /// `physicals_each` minimal physical servers (`{"Domain","Status"}`
+    /// only — every field every client requires, nothing more).
+    fn catalog_with(logicals: usize, physicals_each: usize) -> String {
+        let mut doc = String::with_capacity(logicals * (physicals_each * 26 + 128) + 64);
+        doc.push_str(r#"{"Code":1000,"StatusID":"t","LogicalServers":["#);
+        for l in 0..logicals {
+            if l > 0 {
+                doc.push(',');
+            }
+            doc.push_str(&format!(
+                r#"{{"ID":"l{l}","Name":"L{l}","EntryCountry":"XX","ExitCountry":"XX","#,
+            ));
+            doc.push_str(r#""Tier":0,"Features":0,"Servers":["#);
+            for p in 0..physicals_each {
+                if p > 0 {
+                    doc.push(',');
+                }
+                doc.push_str(r#"{"Domain":"p","Status":1}"#);
+            }
+            doc.push_str("]}");
+        }
+        doc.push_str("]}");
+        doc
+    }
+
+    #[test]
+    fn aggregate_physical_cap_spans_logicals() {
+        // The TOTAL-physical cap aggregates across logical boundaries:
+        // two logicals, each unremarkable on its own, whose combined
+        // physicals exceed MAX_PHYSICAL_SERVERS_TOTAL are rejected. The
+        // document (~6.3 MiB) is well under the byte cap and its logical
+        // count (2) far under MAX_LOGICAL_SERVERS, so the aggregate
+        // physical arm is the only check that can fire.
+        let each = MAX_PHYSICAL_SERVERS_TOTAL / 2 + 1;
+        let doc = catalog_with(2, each);
+        assert!(
+            doc.len() < MAX_CATALOG_BYTES,
+            "fixture must stay under the byte cap: {}",
+            doc.len()
+        );
+        let err = CatalogDocument::from_bytes(doc.as_bytes()).unwrap_err();
+        let CatalogError::TooManyServers { logical, physical } = &err else {
+            panic!("the aggregate physical cap must fire, got: {err}");
+        };
+        assert_eq!(*logical, 2);
+        assert_eq!(
+            *physical,
+            2 * each,
+            "the SUM across logicals is what counts"
+        );
+    }
+
+    #[test]
+    fn at_cap_document_bytes_parse() {
+        // `>` semantics, not `>=`: a document of EXACTLY
+        // MAX_CATALOG_BYTES bytes parses; one byte more is TooLarge.
+        // The pad character adds exactly one byte per occurrence (ASCII,
+        // never escaped), so the padding is exact by construction.
+        let base = padded_catalog(0).len();
+        let doc = padded_catalog(MAX_CATALOG_BYTES - base);
+        assert_eq!(doc.len(), MAX_CATALOG_BYTES);
+        let parsed = CatalogDocument::from_bytes(doc.as_bytes()).unwrap();
+        assert_eq!(parsed.status_id.len(), MAX_CATALOG_BYTES - base);
+        let err =
+            CatalogDocument::from_bytes(padded_catalog(MAX_CATALOG_BYTES - base + 1).as_bytes())
+                .unwrap_err();
+        assert!(matches!(err, CatalogError::TooLarge(_)), "{err}");
+    }
+
+    #[test]
+    fn at_cap_logical_count_parses() {
+        // Exactly MAX_LOGICAL_SERVERS logical servers parse: `>`, not `>=`.
+        let doc = catalog_with(MAX_LOGICAL_SERVERS, 0);
+        let parsed = CatalogDocument::from_bytes(doc.as_bytes()).unwrap();
+        assert_eq!(parsed.logical_servers.len(), MAX_LOGICAL_SERVERS);
+    }
+
+    #[test]
+    fn at_cap_total_physicals_parse() {
+        // Exactly MAX_PHYSICAL_SERVERS_TOTAL physicals across the
+        // document parse: `>`, not `>=`.
+        let doc = catalog_with(2, MAX_PHYSICAL_SERVERS_TOTAL / 2);
+        let parsed = CatalogDocument::from_bytes(doc.as_bytes()).unwrap();
+        let total: usize = parsed.logical_servers.iter().map(|s| s.servers.len()).sum();
+        assert_eq!(total, MAX_PHYSICAL_SERVERS_TOTAL);
+    }
+
+    /// A minimal valid catalog whose `StatusID` carries `pad` padding
+    /// characters — one byte each in the document AND in the serialized
+    /// cache envelope (never escaped), making both sizes solvable.
+    fn padded_catalog(pad: usize) -> String {
+        format!(
+            r#"{{"Code":1000,"StatusID":"{}","LogicalServers":[]}}"#,
+            "x".repeat(pad)
+        )
     }
 
     // --- The /var/cache/protonwire cache (FR-10, FR-13B, FR-13E) -----------
@@ -999,6 +1130,59 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn store_rejects_bodies_that_serialize_past_the_cap() {
+        // Cap-semantics asymmetry: `store` capped only the raw body
+        // pre-serialization while `load_validated` caps the serialized
+        // envelope post-read — a quote-dense body just under the byte cap
+        // pretty-prints past it (every `"` escapes to `\"`), so the store
+        // succeeded and every later load failed TooLarge. The envelope
+        // cap must hold at STORE time: a file the loader will reject must
+        // never be written. (The body need not be valid JSON — `store`
+        // never parses it; only size and serialization see it.)
+        let quote_dense = "\"".repeat(MAX_CATALOG_BYTES - 1);
+        assert!(quote_dense.len() < MAX_CATALOG_BYTES, "under the body cap");
+        let dir = cache_dir();
+        let cache = CatalogCache::new(dir.path().join("servers.json"));
+        let err = cache.store(&cached(None, &quote_dense)).expect_err(
+            "a body whose serialized envelope exceeds the cap must be refused at store time",
+        );
+        assert!(
+            matches!(err, CatalogCacheError::TooLarge(n) if n > MAX_CATALOG_BYTES),
+            "the serialized envelope size is what must be reported: {err}"
+        );
+        // Refused before any I/O: no file, no residue.
+        assert!(cache.load_validated().unwrap().is_none());
+    }
+
+    #[test]
+    fn at_cap_cache_envelope_stores_and_loads_back() {
+        // `>` semantics end-to-end at the byte cap: a cache whose
+        // SERIALIZED envelope is exactly MAX_CATALOG_BYTES bytes stores
+        // and loads back (one byte more is the quote-dense/oversized
+        // territory above). The pad character contributes exactly one
+        // serialized byte per occurrence, so the envelope is solved to
+        // the byte against the serializer itself.
+        let base = cached(None, &padded_catalog(0));
+        let base_len = serde_json::to_vec_pretty(&base).unwrap().len();
+        let body = padded_catalog(MAX_CATALOG_BYTES - base_len);
+        let doc = cached(None, &body);
+        assert_eq!(
+            serde_json::to_vec_pretty(&doc).unwrap().len(),
+            MAX_CATALOG_BYTES
+        );
+        let dir = cache_dir();
+        let cache = CatalogCache::new(dir.path().join("servers.json"));
+        cache.store(&doc).unwrap();
+        assert_eq!(
+            std::fs::read(cache.path()).unwrap().len(),
+            MAX_CATALOG_BYTES,
+            "the written envelope must sit exactly at the cap"
+        );
+        let loaded = cache.load_validated().unwrap().expect("at-cap cache loads");
+        assert_eq!(loaded.body, body);
+    }
+
     /// The full strict loader (walk + validated load) happy path, run
     /// only where the runner can construct a root-owned tree — the same
     /// compromise as the config module's strict-load tests. Unprivileged
@@ -1015,7 +1199,17 @@ mod tests {
             .map(|m| m.uid() == 0 && m.gid() == 0)
             .unwrap_or(false);
         if !root_owned {
-            return; // ownership arm unprovable for this runner
+            // NOTICE skip (CONTRIBUTING rule 5, the a368775 idiom): the
+            // ownership pass of the fs_trust walk needs a root-owned
+            // tree, which an unprivileged runner cannot construct. The
+            // walk's mode arms are covered unprivileged below; visible
+            // under `cargo test -- --nocapture`.
+            eprintln!(
+                "NOTICE: skipping strict_load_walks_then_loads_for_root_runners: the \
+                 cache file is not root-owned on this runner — the ownership arm of \
+                 the fs_trust walk is unprovable unprivileged"
+            );
+            return;
         }
         let loaded = cache
             .load_strict(dir.path())
