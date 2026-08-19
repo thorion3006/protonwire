@@ -228,10 +228,10 @@ pub fn run(root: &Path) -> Result<bool> {
     // finding 6): an unreadable or unparseable Cargo.lock is a hard
     // error, not a skipped rule.
     let lock = Lockfile::read(&root.join("Cargo.lock"))?;
-    validate(&root.join("docs").join("official-parity.yaml"), &lock)
+    validate(&root.join("docs").join("official-parity.yaml"), root, &lock)
 }
 
-fn validate(path: &Path, lock: &Lockfile) -> Result<bool> {
+fn validate(path: &Path, root: &Path, lock: &Lockfile) -> Result<bool> {
     let text =
         fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
     let doc: Manifest = serde_norway::from_str(&text)
@@ -247,7 +247,7 @@ fn validate(path: &Path, lock: &Lockfile) -> Result<bool> {
         "status_definitions completeness",
         &check_status_definitions(&doc),
     );
-    reporter.rule("source reference entries", &check_sources(&doc));
+    reporter.rule("source reference entries", &check_sources(&doc, root));
     reporter.rule("upstream pins", &check_upstream(&doc, lock));
     reporter.rule("canonical capability id set", &check_capability_ids(&doc));
     reporter.rule("capabilities", &check_capabilities(&doc));
@@ -325,13 +325,15 @@ fn json_kind(value: &serde_json::Value) -> &'static str {
     }
 }
 
-/// Round-8 X3: the top-level `sources` map's values were arbitrary JSON
-/// with only the KEYS checked — capabilities cite the keys as evidence
-/// references, so a null, empty, or non-string value passed while every
-/// capability citing it pointed at evidence that is not a reference at
-/// all. Every entry must be a defined, non-empty string; each violation
-/// names the key and the defect kind.
-fn check_sources(doc: &Manifest) -> Vec<String> {
+/// Round-8 X3 + round-9 final disposal: the top-level `sources` map's
+/// values are the evidence capabilities cite, so each must be a defined,
+/// non-empty string (X3: null/empty/non-string passed while every
+/// citing capability pointed at nothing) AND usable evidence (round-9:
+/// non-empty is not enough) — a URL (http/https) or a repo-relative path
+/// that EXISTS in the tree, so a reviewer can always open what a
+/// capability's evidence claims to be. Each violation names the key and
+/// the defect.
+fn check_sources(doc: &Manifest, root: &Path) -> Vec<String> {
     let Some(sources) = &doc.sources else {
         // The required-top-level-keys rule already reports the missing map.
         return Vec::new();
@@ -339,7 +341,14 @@ fn check_sources(doc: &Manifest) -> Vec<String> {
     let mut violations = Vec::new();
     for (key, value) in sources {
         match value {
-            serde_json::Value::String(text) if !text.trim().is_empty() => {}
+            serde_json::Value::String(text) if !text.trim().is_empty() => {
+                if !is_evidence_url(text) && !is_in_tree_path(text, root) {
+                    violations.push(format!(
+                        "source `{key}` must be usable evidence — a URL (http/https) or a \
+                         repo-relative path that exists in the repository — got `{text}`"
+                    ));
+                }
+            }
             serde_json::Value::String(_) => violations.push(format!(
                 "source `{key}` must be a non-empty string, got an empty string"
             )),
@@ -350,6 +359,23 @@ fn check_sources(doc: &Manifest) -> Vec<String> {
         }
     }
     violations
+}
+
+/// A URL evidence reference. Only the web schemes are accepted: the
+/// document's evidence vocabulary is upstream docs and code links.
+fn is_evidence_url(text: &str) -> bool {
+    text.starts_with("https://") || text.starts_with("http://")
+}
+
+/// An in-tree evidence reference: repo-relative (no absolute paths, no
+/// `..` escapes) and actually present under the workspace root.
+fn is_in_tree_path(text: &str, root: &Path) -> bool {
+    let path = Path::new(text);
+    !path.is_absolute()
+        && !path
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+        && root.join(path).exists()
 }
 /// The recorded upstream digest must EQUAL the lockfile's checksum for the
 /// pinned version (Codex PR review round 2, finding 6): the lockfile is the
@@ -920,6 +946,13 @@ capabilities:
         manifest_yaml_with_ids(&EXPECTED_CAPABILITY_IDS)
     }
 
+    /// The real workspace root for the evidence-path rule: repo-relative
+    /// source paths resolve against the repository, not the temp dir the
+    /// fixture yaml lives in.
+    fn repo_root() -> std::path::PathBuf {
+        crate::workspace_root().expect("cannot derive the workspace root")
+    }
+
     fn temp_yaml(tag: &str, content: &str) -> std::path::PathBuf {
         let path =
             std::env::temp_dir().join(format!("xtask-manifest-{tag}-{}", std::process::id()));
@@ -931,7 +964,7 @@ capabilities:
     fn good_manifest_passes() {
         let path = temp_yaml("good", &good_manifest_yaml());
         assert!(
-            validate(&path, &good_lock()).unwrap(),
+            validate(&path, &repo_root(), &good_lock()).unwrap(),
             "expected the good fixture to pass"
         );
         fs::remove_file(&path).ok();
@@ -953,7 +986,7 @@ capabilities:
             .collect();
         let path = temp_yaml("missing-cap", &manifest_yaml_with_ids(&without));
         assert!(
-            !validate(&path, &good_lock()).unwrap(),
+            !validate(&path, &repo_root(), &good_lock()).unwrap(),
             "a manifest missing account.login must fail the gate"
         );
         fs::remove_file(&path).ok();
@@ -972,7 +1005,7 @@ capabilities:
         with_extra.push("account.magic");
         let path = temp_yaml("extra-cap", &manifest_yaml_with_ids(&with_extra));
         assert!(
-            !validate(&path, &good_lock()).unwrap(),
+            !validate(&path, &repo_root(), &good_lock()).unwrap(),
             "an invented capability id must fail the gate"
         );
         fs::remove_file(&path).ok();
@@ -1020,7 +1053,7 @@ capabilities:
         );
         let path = temp_yaml("checksum", &yaml);
         assert!(
-            !validate(&path, &good_lock()).unwrap(),
+            !validate(&path, &repo_root(), &good_lock()).unwrap(),
             "a digest that disagrees with Cargo.lock must fail the gate"
         );
         fs::remove_file(&path).ok();
@@ -1034,7 +1067,7 @@ capabilities:
         );
         let path = temp_yaml("checksum-pvpn", &yaml);
         assert!(
-            !validate(&path, &good_lock()).unwrap(),
+            !validate(&path, &repo_root(), &good_lock()).unwrap(),
             "a tampered pvpnclient digest must fail the gate too, not just muon's"
         );
         fs::remove_file(&path).ok();
@@ -1042,7 +1075,7 @@ capabilities:
         // The untampered manifest agrees with the lockfile and passes.
         let path = temp_yaml("checksum-ok", &good_manifest_yaml());
         assert!(
-            validate(&path, &good_lock()).unwrap(),
+            validate(&path, &repo_root(), &good_lock()).unwrap(),
             "the matching fixture must still pass"
         );
         fs::remove_file(&path).ok();
@@ -1052,7 +1085,7 @@ capabilities:
         let empty = Lockfile::parse("version = 4\n").unwrap();
         let path = temp_yaml("checksum-empty", &good_manifest_yaml());
         assert!(
-            !validate(&path, &empty).unwrap(),
+            !validate(&path, &repo_root(), &empty).unwrap(),
             "an unverifiable checksum must fail, not pass vacuously"
         );
         fs::remove_file(&path).ok();
@@ -1077,7 +1110,7 @@ capabilities:
         );
         let path = temp_yaml("protun-lock", &good_manifest_yaml());
         assert!(
-            !validate(&path, &Lockfile::parse(&tampered).unwrap()).unwrap(),
+            !validate(&path, &repo_root(), &Lockfile::parse(&tampered).unwrap()).unwrap(),
             "a manifest pin disagreeing with the resolved Cargo.lock revision must fail the gate"
         );
         fs::remove_file(&path).ok();
@@ -1086,7 +1119,12 @@ capabilities:
         // the gate must fail rather than pass vacuously.
         let path = temp_yaml("protun-absent", &good_manifest_yaml());
         assert!(
-            !validate(&path, &Lockfile::parse("version = 4\n").unwrap()).unwrap(),
+            !validate(
+                &path,
+                &repo_root(),
+                &Lockfile::parse("version = 4\n").unwrap()
+            )
+            .unwrap(),
             "an unverifiable protun pin must fail, not pass vacuously"
         );
         fs::remove_file(&path).ok();
@@ -1094,7 +1132,7 @@ capabilities:
         // The fixture agreeing with the lockfile still passes.
         let path = temp_yaml("protun-ok", &good_manifest_yaml());
         assert!(
-            validate(&path, &good_lock()).unwrap(),
+            validate(&path, &repo_root(), &good_lock()).unwrap(),
             "the fixture agreeing with the lockfile must pass"
         );
         fs::remove_file(&path).ok();
@@ -1128,7 +1166,7 @@ capabilities:
         );
         let path = temp_yaml("official-rev", &yaml);
         assert!(
-            !validate(&path, &good_lock()).unwrap(),
+            !validate(&path, &repo_root(), &good_lock()).unwrap(),
             "a swapped-but-valid official_linux_cli revision must fail the gate"
         );
         fs::remove_file(&path).ok();
@@ -1142,7 +1180,7 @@ capabilities:
         );
         let path = temp_yaml("official-rev-last", &yaml);
         assert!(
-            !validate(&path, &good_lock()).unwrap(),
+            !validate(&path, &repo_root(), &good_lock()).unwrap(),
             "a swapped-but-valid official_apple_app revision must fail the gate too"
         );
         fs::remove_file(&path).ok();
@@ -1163,7 +1201,7 @@ capabilities:
             );
         let path = temp_yaml("official-rev-swap", &yaml);
         assert!(
-            !validate(&path, &good_lock()).unwrap(),
+            !validate(&path, &repo_root(), &good_lock()).unwrap(),
             "two official revisions exchanged between their slots must fail the gate"
         );
         fs::remove_file(&path).ok();
@@ -1197,7 +1235,7 @@ capabilities:
     fn wrong_schema_version_fails() {
         let yaml = good_manifest_yaml().replacen("schema_version: 3", "schema_version: 2", 1);
         let path = temp_yaml("version", &yaml);
-        assert!(!validate(&path, &good_lock()).unwrap());
+        assert!(!validate(&path, &repo_root(), &good_lock()).unwrap());
         fs::remove_file(&path).ok();
     }
 
@@ -1213,7 +1251,7 @@ capabilities:
         let yaml = good_manifest_yaml().replacen("  docs: https://example.com", "  docs: ~", 1);
         let path = temp_yaml("source-null", &yaml);
         assert!(
-            !validate(&path, &good_lock()).unwrap(),
+            !validate(&path, &repo_root(), &good_lock()).unwrap(),
             "a null source value must fail the gate"
         );
         fs::remove_file(&path).ok();
@@ -1222,7 +1260,7 @@ capabilities:
         let yaml = good_manifest_yaml().replacen("  docs: https://example.com", "  docs: \"\"", 1);
         let path = temp_yaml("source-empty", &yaml);
         assert!(
-            !validate(&path, &good_lock()).unwrap(),
+            !validate(&path, &repo_root(), &good_lock()).unwrap(),
             "an empty source value must fail the gate"
         );
         fs::remove_file(&path).ok();
@@ -1231,7 +1269,7 @@ capabilities:
         let yaml = good_manifest_yaml().replacen("  docs: https://example.com", "  docs: 42", 1);
         let path = temp_yaml("source-number", &yaml);
         assert!(
-            !validate(&path, &good_lock()).unwrap(),
+            !validate(&path, &repo_root(), &good_lock()).unwrap(),
             "a non-string source value must fail the gate"
         );
         fs::remove_file(&path).ok();
@@ -1253,7 +1291,7 @@ capabilities:
         ] {
             let doc: Manifest = serde_norway::from_str(&yaml).unwrap();
             assert!(
-                check_sources(&doc)
+                check_sources(&doc, &repo_root())
                     .iter()
                     .any(|v| v.contains("`docs`") && v.contains(defect)),
                 "the violation must name `docs` and the defect `{defect}`"
@@ -1263,10 +1301,74 @@ capabilities:
         // The untampered fixture still passes.
         let path = temp_yaml("source-ok", &good_manifest_yaml());
         assert!(
-            validate(&path, &good_lock()).unwrap(),
+            validate(&path, &repo_root(), &good_lock()).unwrap(),
             "the well-formed fixture must still pass"
         );
         fs::remove_file(&path).ok();
+    }
+
+    /// Round-9 final severity-bar disposal (P2, incremental past round-8
+    /// X3): a source string that is merely non-empty is not yet evidence
+    /// — "see the internal wiki" and a path to nothing point a
+    /// capability's evidence at something no reviewer can open. Every
+    /// source value must be a URL (http/https) or a repo-relative path
+    /// that EXISTS in the repository. Red observed pre-change on both
+    /// tamper values (each passed the non-empty-only check).
+    #[test]
+    fn source_entries_must_be_usable_evidence() {
+        // Non-URL prose passed the non-empty check.
+        let yaml = good_manifest_yaml().replacen(
+            "  docs: https://example.com",
+            "  docs: see the internal wiki",
+            1,
+        );
+        let path = temp_yaml("source-prose", &yaml);
+        assert!(
+            !validate(&path, &repo_root(), &good_lock()).unwrap(),
+            "a prose source value must fail the gate"
+        );
+        fs::remove_file(&path).ok();
+
+        // A well-formed repo-relative path that does not exist.
+        let yaml = good_manifest_yaml().replacen(
+            "  docs: https://example.com",
+            "  docs: docs/no-such-evidence.md",
+            1,
+        );
+        let path = temp_yaml("source-phantom-path", &yaml);
+        assert!(
+            !validate(&path, &repo_root(), &good_lock()).unwrap(),
+            "a source path that exists nowhere in the repository must fail the gate"
+        );
+        fs::remove_file(&path).ok();
+
+        // Both accepted shapes pass: the URL fixture above, and a
+        // repo-relative path that exists in-tree.
+        let yaml = good_manifest_yaml().replacen(
+            "  docs: https://example.com",
+            "  docs: docs/PRD-proton-wire.md",
+            1,
+        );
+        let path = temp_yaml("source-in-tree", &yaml);
+        assert!(
+            validate(&path, &repo_root(), &good_lock()).unwrap(),
+            "an existing repo-relative evidence path must pass the gate"
+        );
+        fs::remove_file(&path).ok();
+
+        // The violation must NAME the key and the value.
+        let doc: Manifest = serde_norway::from_str(&good_manifest_yaml().replacen(
+            "  docs: https://example.com",
+            "  docs: see the internal wiki",
+            1,
+        ))
+        .unwrap();
+        assert!(
+            check_sources(&doc, &repo_root())
+                .iter()
+                .any(|v| v.contains("`docs`") && v.contains("usable evidence")),
+            "the violation must name `docs` and demand usable evidence"
+        );
     }
 
     /// pr-champion round-6 triage, WO-W6: `tests:` references were only
@@ -1279,7 +1381,7 @@ capabilities:
         let yaml = good_manifest_yaml().replacen("tests: [T-1]", "tests: [T-999999]", 1);
         let path = temp_yaml("phantom-test", &yaml);
         assert!(
-            !validate(&path, &good_lock()).unwrap(),
+            !validate(&path, &repo_root(), &good_lock()).unwrap(),
             "a tests reference to T-999999 must fail the gate"
         );
         fs::remove_file(&path).ok();
@@ -1441,7 +1543,7 @@ capabilities:
     fn tampered_proton_pin_fails() {
         let yaml = good_manifest_yaml().replacen("revision: 12e7755a", "revision: not-th", 1);
         let path = temp_yaml("pin", &yaml);
-        assert!(!validate(&path, &good_lock()).unwrap());
+        assert!(!validate(&path, &repo_root(), &good_lock()).unwrap());
         fs::remove_file(&path).ok();
     }
 
@@ -1461,7 +1563,7 @@ capabilities:
         );
         let path = temp_yaml("extra-status", &yaml);
         assert!(
-            !validate(&path, &good_lock()).unwrap(),
+            !validate(&path, &repo_root(), &good_lock()).unwrap(),
             "an extra status definition must fail the gate"
         );
         fs::remove_file(&path).ok();
@@ -1476,7 +1578,7 @@ capabilities:
             .replacen("    status: required", "    status: waived", 1);
         let path = temp_yaml("waived-cap", &yaml);
         assert!(
-            !validate(&path, &good_lock()).unwrap(),
+            !validate(&path, &repo_root(), &good_lock()).unwrap(),
             "a capability using an invented status must fail the gate"
         );
         fs::remove_file(&path).ok();
@@ -1489,7 +1591,7 @@ capabilities:
             1,
         );
         let path = temp_yaml("verified", &yaml);
-        assert!(!validate(&path, &good_lock()).unwrap());
+        assert!(!validate(&path, &repo_root(), &good_lock()).unwrap());
         fs::remove_file(&path).ok();
     }
 
@@ -1501,7 +1603,7 @@ capabilities:
             1,
         );
         let path = temp_yaml("blocked", &yaml);
-        assert!(!validate(&path, &good_lock()).unwrap());
+        assert!(!validate(&path, &repo_root(), &good_lock()).unwrap());
         fs::remove_file(&path).ok();
     }
 
