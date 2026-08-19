@@ -28,11 +28,13 @@ mod sections;
 pub use overlay::{OutputFormat, UserOverlay, UserPresentation};
 pub use sections::{
     AccountSection, AutoConnectRetry, AutoConnectSection, BalancedWeights, ConnectionGroupsSection,
-    ConnectionSection, DaemonSection, DnsMode, DnsSection, FeaturesSection, Ipv6Section,
-    KillSwitchMode, LanPolicy, LanSection, LatencyProbeSection, MetadataCacheSection, NatMode,
-    NetShieldLevel, NetworkIntegrationMode, ProfileDefault, ProfileSelection, ProfilesSection,
-    ProtunSection, SecureCoreSection, ServerSelectionSection, SplitTunnelDomainRule,
-    SplitTunnelDomains, SplitTunnelMode, SplitTunnelSection,
+    ConnectionSection, ConnectionType, CredentialInputSource, DaemonSection, DnsLeakProtection,
+    DnsMode, DnsPolicy, DnsSection, FeaturesSection, Ipv6Mode, Ipv6Section, KillSwitchMode,
+    LanPolicy, LanSection, LatencyProbeSection, MetadataCacheSection, NatMode, NetShieldLevel,
+    NetworkIntegrationMode, ProbeTransport, ProfileDefault, ProfileRanking, ProfileSelection,
+    ProfilesSection, ProtocolMode, ProtunSection, RegionalRanking, SecureCoreSection,
+    ServerSelectionSection, SplitRuleAction, SplitTunnelDomainRule, SplitTunnelDomains,
+    SplitTunnelMode, SplitTunnelSection, WritableSessionStore,
 };
 
 /// Who may set a field (PRD section 10).
@@ -259,22 +261,40 @@ impl SystemConfig {
             violations
                 .push("dns.mode=custom requires at least one dns.custom_servers entry".to_owned());
         }
-        if !matches!(
-            self.account.credential_input_source.as_str(),
-            "interactive" | "systemd"
-        ) {
-            violations.push(format!(
-                "account.credential_input_source must be interactive or systemd (found {})",
-                self.account.credential_input_source
-            ));
+        // FR-49: the off-tunnel DNS policies are deliberate leak
+        // exceptions and are only expressible with leak protection off.
+        if matches!(
+            self.dns.policy,
+            sections::DnsPolicy::BypassVpn | sections::DnsPolicy::SystemDefault
+        ) && self.dns.leak_protection != sections::DnsLeakProtection::Off
+        {
+            violations.push(
+                "dns.policy=bypass-vpn and dns.policy=system-default are leak exceptions \
+                 requiring dns.leak_protection=off (FR-49)"
+                    .to_owned(),
+            );
         }
-        if !matches!(
-            self.server_selection.latency_probe.transport.as_str(),
-            "tcp-udp" | "icmp"
-        ) {
+        // `auto` and `none` name resolution policy for
+        // `writable_session_store`; a priority list drives that resolution
+        // (S5a) and must name concrete stores (PRD section 10 example and
+        // section 9.6 migrate targets).
+        if self.account.writable_store_priority.iter().any(|store| {
+            !matches!(
+                store,
+                sections::WritableSessionStore::Keyring
+                    | sections::WritableSessionStore::Tpm2
+                    | sections::WritableSessionStore::EncryptedLocal
+            )
+        }) {
             violations.push(format!(
-                "server_selection.latency_probe.transport must be tcp-udp or icmp (found {})",
-                self.server_selection.latency_probe.transport
+                "account.writable_store_priority entries must be concrete stores \
+                 (`keyring`, `tpm2`, `encrypted-local`), not `auto` or `none` (found {})",
+                self.account
+                    .writable_store_priority
+                    .iter()
+                    .map(|store| store.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ));
         }
         if violations.is_empty() {
@@ -390,6 +410,16 @@ mod tests {
         assert_eq!(config.features.kill_switch, KillSwitchMode::On);
         assert_eq!(config.features.nat, NatMode::Strict);
         assert_eq!(config.dns.mode, DnsMode::Proton);
+        // M2 S3: the example's vocabulary values must land on the typed
+        // enums with their exact spellings.
+        assert_eq!(config.dns.policy, DnsPolicy::ThroughVpn);
+        assert_eq!(config.dns.leak_protection, DnsLeakProtection::Strict);
+        assert_eq!(config.connection.protocol, ProtocolMode::Smart);
+        assert_eq!(config.connection.ipv6.mode, Ipv6Mode::Auto);
+        assert_eq!(
+            config.server_selection.latency_probe.transport,
+            ProbeTransport::TcpUdp
+        );
         assert_eq!(config.lan.policy, LanPolicy::Allow);
         assert_eq!(config.lan.allowed_cidrs.len(), 5);
     }
@@ -813,14 +843,33 @@ mod tests {
         assert!(err.contains("custom_servers"), "got: {err}");
     }
 
+    /// M2 S3: `credential_input_source` and latency-probe `transport` are
+    /// typed vocabularies now — an invalid value is a PARSE error naming
+    /// the field and the accepted spellings (the sections suite carries
+    /// the per-field vocabulary tests; this pins the load path).
     #[test]
-    fn bad_credential_source_and_transport_rejected() {
-        let mut config = SystemConfig::default();
-        config.account.credential_input_source = "telepathy".into();
-        config.server_selection.latency_probe.transport = "carrier-pigeon".into();
-        let err = config.validate().unwrap_err().to_string();
+    fn bad_credential_source_and_transport_rejected_at_parse() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        std::fs::write(
+            &path,
+            "schema_version: 2\naccount:\n  credential_input_source: telepathy\n",
+        )
+        .unwrap();
+        let err = SystemConfig::load(&path).unwrap_err().to_string();
         assert!(err.contains("credential_input_source"), "got: {err}");
-        assert!(err.contains("tcp-udp or icmp"), "got: {err}");
+        assert!(err.contains("interactive"), "got: {err}");
+        assert!(err.contains("systemd"), "got: {err}");
+
+        std::fs::write(
+            &path,
+            "schema_version: 2\nserver_selection:\n  latency_probe:\n    transport: carrier-pigeon\n",
+        )
+        .unwrap();
+        let err = SystemConfig::load(&path).unwrap_err().to_string();
+        assert!(err.contains("transport"), "got: {err}");
+        assert!(err.contains("tcp-udp"), "got: {err}");
+        assert!(err.contains("icmp"), "got: {err}");
     }
 
     #[test]

@@ -17,8 +17,10 @@ pub mod state;
 pub mod yaml;
 
 pub use config::{
-    Authority, DnsMode, KillSwitchMode, LanPolicy, NatMode, NetShieldLevel, OutputFormat,
-    SystemConfig, UserOverlay,
+    Authority, ConnectionType, CredentialInputSource, DnsLeakProtection, DnsMode, DnsPolicy,
+    Ipv6Mode, KillSwitchMode, LanPolicy, NatMode, NetShieldLevel, OutputFormat, ProbeTransport,
+    ProfileRanking, ProtocolMode, RegionalRanking, SplitRuleAction, SystemConfig, UserOverlay,
+    WritableSessionStore,
 };
 pub use paths::ConfigPaths;
 pub use state::{StateFile, StateStore};
