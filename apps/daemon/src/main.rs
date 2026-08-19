@@ -10,7 +10,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use clap::Parser;
 use protonwire_core::redact::init_tracing_filtered;
@@ -47,6 +47,78 @@ fn main() {
     }
 }
 
+/// Set by the SIGTERM/SIGINT/SIGHUP/SIGQUIT handler (M2 S12, the TUI's
+/// R7-4 pattern); polled by the serve-loop watcher in [`run`].
+static TERMINATE_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// Terminating-signal landing pad (SIGTERM, SIGINT, SIGHUP, SIGQUIT).
+///
+/// ASYNC-SIGNAL-SAFETY CONSTRAINT (the TUI's R7-4 rule, verbatim in
+/// spirit): this runs on an arbitrary thread, interrupted from arbitrary
+/// code. The ENTIRE body is one store to a static atomic — no locks, no
+/// allocation, no I/O, and above all no daemon teardown, any of which
+/// could deadlock or corrupt state. The serve-loop watcher polls the
+/// flag at a 50 ms cadence and performs the graceful drain on the main
+/// thread: the daemon has no terminal to restore (the TUI's reason for
+/// the pattern), so "restore on the main thread" is here "set the serve
+/// stop flag and let `serve()`'s existing drain path finish" — sessions
+/// flush their final responses, the drain ceiling still bounds
+/// stragglers, and `run` returns 0.
+extern "C" fn record_termination(_signal: nix::libc::c_int) {
+    TERMINATE_REQUESTED.store(true, Ordering::Relaxed);
+}
+
+/// Installs the flag handler for SIGTERM, SIGINT, SIGHUP, and SIGQUIT
+/// (the TUI's signal set: SIGTERM is the systemd stop signal, Ctrl-C and
+/// Ctrl-\ bypass any CLI path, SIGHUP is the service manager's reload-
+/// and-stop habit; the handler body is signal-agnostic, so one flag
+/// store serves them all).
+///
+/// The workspace denies `unsafe_code`; this is the daemon's one audited
+/// unsafe block (the Tauri shell and the TUI's R7-4 handler are the
+/// other documented exceptions in kind), sound because the installed
+/// handler writes only a static atomic — see [`record_termination`].
+/// `SaFlags::empty()` — no SA_RESTART: the watcher must notice the
+/// flag, not have syscalls paper over the signal.
+#[allow(unsafe_code)]
+fn install_terminate_handler() -> nix::Result<()> {
+    use nix::sys::signal::{SaFlags, SigAction, SigHandler, Signal, sigaction};
+    let action = SigAction::new(
+        SigHandler::Handler(record_termination),
+        SaFlags::empty(),
+        nix::sys::signal::SigSet::empty(),
+    );
+    unsafe {
+        sigaction(Signal::SIGTERM, &action)?;
+        sigaction(Signal::SIGINT, &action)?;
+        sigaction(Signal::SIGHUP, &action)?;
+        sigaction(Signal::SIGQUIT, &action)?;
+    }
+    Ok(())
+}
+
+/// Bridges the signal flag to the serve loop's stop flag: polls
+/// [`TERMINATE_REQUESTED`] at a 50 ms cadence until either a signal
+/// lands (sets `stop`, so `serve()` drains and returns through the
+/// existing graceful path) or the stop flag is set by something else
+/// (an administrator's Shutdown request — the watcher then just
+/// leaves).
+fn watch_for_termination(stop: Arc<AtomicBool>) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        while !stop.load(Ordering::SeqCst) {
+            if TERMINATE_REQUESTED.load(Ordering::Relaxed) {
+                info!(
+                    "termination signal received; draining sessions through the \
+                     serve stop path"
+                );
+                stop.store(true, Ordering::SeqCst);
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    })
+}
+
 /// The daemon body with the tracing factory injectable — the same seam
 /// style as `IpcServer::bind_with_resolved` in crates/ipc (production
 /// passes the real [`init_tracing_filtered`]; tests pass a capturing
@@ -68,6 +140,16 @@ fn main() {
 /// a `--log-level` flag wins over the config, and RUST_LOG wins over
 /// both. Load failures predate the logger and go to stderr.
 fn run(args: Args, init_tracing: &dyn Fn(&str), trust_root: Option<&Path>) -> i32 {
+    // M2 S12: the terminating-signal handler goes in FIRST — a signal
+    // arriving during config load or bind is recorded in the flag, and
+    // the serve-loop watcher (spawned before serve) converts it into
+    // the stop flag the moment the loop exists, so a stop request can
+    // never be lost to a startup window. Failure only costs the
+    // signal-driven stop (the default disposition returns), so it is
+    // reported, not fatal.
+    if let Err(e) = install_terminate_handler() {
+        eprintln!("protonwire-daemon: cannot install SIGTERM/SIGINT/SIGHUP/SIGQUIT handlers: {e}");
+    }
     let mut paths = ConfigPaths::system();
     if let Some(config) = &args.config {
         paths.system_config = config.clone();
@@ -166,7 +248,13 @@ fn run(args: Args, init_tracing: &dyn Fn(&str), trust_root: Option<&Path>) -> i3
         version = env!("CARGO_PKG_VERSION"),
         "protonwire-daemon serving"
     );
+    // M2 S12: the signal flag's bridge into the serve loop. Joined after
+    // serve returns — the watcher leaves on the stop flag whichever way
+    // it was set (signal or administrator Shutdown), so the join is
+    // prompt and never outlives the drain it may itself have started.
+    let terminate_watcher = watch_for_termination(Arc::clone(&stop));
     server.serve(handler, stop);
+    let _ = terminate_watcher.join();
     info!("protonwire-daemon stopped");
     0
 }
@@ -297,6 +385,121 @@ mod tests {
             warning > 0,
             "the warning must follow the init marker: {entries:?}"
         );
+    }
+
+    /// M2 S12: the signal path end to end — delivery, flag, bridge, and
+    /// clean stop — with ONE signal. kill(getpid(), ...) from a spawned
+    /// thread must land in the handler (whose entire effect is a flag
+    /// store — async-signal-safe, benign for every other test in this
+    /// process), the flag must be observable by polling, and the serve
+    /// loop's watcher must convert it into the stop flag so `run`
+    /// returns the clean-shutdown code 0 after the graceful drain. A
+    /// handshaken client is connected before the signal so the drain
+    /// path is exercised for real (its session must be torn down by the
+    /// stop, not by us).
+    ///
+    /// Red (behavioral, observed at stage A — handler and flag present,
+    /// the serve loop not yet watching): SIGTERM landed, the flag was
+    /// observed set, and `run` kept serving until the watchdog fired —
+    /// nothing bridged the flag to the stop flag. (Without the handler
+    /// at all the signal would have killed the whole test process; the
+    /// flag handler ships first, the bridge second.)
+    ///
+    /// No separate delivery test: two tests signalling the process in
+    /// parallel reset each other's shared flag mid-observation (the
+    /// TUI's R7-4 suite runs its signals one at a time for exactly this
+    /// reason) — the first draft's standalone delivery test raced THIS
+    /// test's handshake with its own SIGTERM.
+    #[test]
+    fn delivered_sigterm_sets_the_flag_and_stops_the_serving_daemon_cleanly() {
+        use protonwire_frontend_api::{ClientMessage, ClientSurface, ServerMessage};
+        use std::os::unix::net::UnixStream;
+
+        install_terminate_handler().expect("handler installs");
+        TERMINATE_REQUESTED.store(false, Ordering::Relaxed);
+
+        let dir =
+            std::env::temp_dir().join(format!("protonwire-daemon-sigterm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let args = Args {
+            config: Some(dir.join("missing-config.yaml")),
+            socket_dir: Some(dir.clone()),
+            log_level: None,
+        };
+
+        let (exit_tx, exit_rx) = std::sync::mpsc::channel::<i32>();
+        std::thread::spawn(move || {
+            // No subscriber install (the FU-A test owns the process's
+            // single global install); trust_root None keeps the loader
+            // on its plain semantics for the scratch-tree path.
+            let _ = exit_tx.send(run(args, &|_level: &str| {}, None));
+        });
+
+        // Wait for the socket, then handshake a live session through it.
+        let socket = dir.join("protonwire.sock");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !socket.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the daemon never bound its socket"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        let mut stream = UnixStream::connect(&socket).expect("client connects");
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        protonwire_ipc::frame::write_msg(
+            &mut stream,
+            &ClientMessage::Hello {
+                protocol_version: 1,
+                client: protonwire_frontend_api::ClientInfo {
+                    name: "sigterm-test".into(),
+                    version: "0".into(),
+                    surface: ClientSurface::Other,
+                },
+            },
+        )
+        .unwrap();
+        match protonwire_ipc::frame::read_msg::<_, ServerMessage>(&mut stream).unwrap() {
+            ServerMessage::HelloAck(_) => {} // a live, handshaken session
+            other => panic!("expected the hello ack, got {other:?}"),
+        }
+
+        // SIGTERM to self from a helper — ONLY after the handshake: the
+        // accept loop polls at 250 ms, so a signal sent earlier can beat
+        // the accept entirely and the drain has nothing to drain (the
+        // un-accepted connect is reset with the listener instead).
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            nix::sys::signal::kill(nix::unistd::Pid::this(), nix::sys::signal::Signal::SIGTERM)
+                .unwrap();
+        });
+        // The flag half of the contract: the delivered signal was
+        // recorded, observable by polling (bounded by the same watchdog
+        // that expects run() to return).
+        let started = std::time::Instant::now();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !TERMINATE_REQUESTED.load(Ordering::Relaxed) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(
+            TERMINATE_REQUESTED.load(Ordering::Relaxed),
+            "delivered SIGTERM was not observed"
+        );
+        // And the stop half: the watcher bridged the flag to the serve
+        // loop, which drained and returned the clean-shutdown code.
+        let code = exit_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("run() must return after SIGTERM — pre-fix it served forever");
+        assert_eq!(code, 0, "a signalled stop is a clean shutdown");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "the signal-driven stop took {:?} — the drain must stay inside its ceiling",
+            started.elapsed()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Round-8 X5 [ZkI1F]: the daemon applies the system configuration as

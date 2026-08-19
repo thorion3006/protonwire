@@ -15,6 +15,11 @@ path = "src/main.rs"
 workspace = true
 
 [dependencies]
+# SIGTERM/SIGINT/SIGHUP/SIGQUIT flag handler (M2 S12) — the TUI's R7-4
+# pattern. The workspace's pinned nix entry already enables the
+# "signal" feature (the reserved feature this unit consumes), so no
+# root Cargo.toml change and no version change.
+nix = { workspace = true }
 protonwire-core = { workspace = true }
 protonwire-frontend-api = { workspace = true }
 protonwire-ipc = { workspace = true }
