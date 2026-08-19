@@ -57,14 +57,19 @@ impl IpcServer {
             &process_is_root,
             &resolve_group_gid,
             &chown_socket_group,
+            &bind_socket_staged,
         )
     }
 
-    /// The bind path with the root gate, group resolver, and chown ALL
-    /// injectable (tests pin the hand-off between them — root gate open:
-    /// resolver output to chown input, exactly once, with the bound path;
-    /// root gate closed: neither half runs — without a group database or
-    /// root; production goes through [`IpcServer::bind_with_group`]).
+    /// The bind path with the root gate, group resolver, chown, and
+    /// listener factory ALL injectable (tests pin the hand-off between
+    /// them — root gate open: resolver output to chown input, exactly
+    /// once, with the bound path; root gate closed: neither half runs —
+    /// without a group database or root; the listener factory is the
+    /// staging bind ([`bind_socket_staged`]) — injectable so a test can
+    /// wrap or replace the publish step itself; production goes through
+    /// [`IpcServer::bind_with_group`]).
+    #[allow(clippy::too_many_arguments)]
     fn bind_with_resolved(
         socket_dir: &Path,
         socket_name: &str,
@@ -72,8 +77,10 @@ impl IpcServer {
         is_root: &dyn Fn() -> bool,
         resolver: &dyn Fn(&str) -> io::Result<Option<nix::unistd::Gid>>,
         chown: &dyn Fn(&Path, &str, nix::unistd::Gid) -> io::Result<()>,
+        bind_listener: &dyn Fn(&Path, &Path) -> io::Result<UnixListener>,
     ) -> io::Result<Self> {
         std::fs::create_dir_all(socket_dir)?;
+        pin_runtime_dir(socket_dir)?;
         let socket_path = socket_dir.join(socket_name);
         // FU-B (round-6 residual): `Path::exists()` follows links, so a
         // DANGLING symlink at the bind path read as "the name is free"
@@ -89,7 +96,10 @@ impl IpcServer {
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => return Err(e),
         }
-        let listener = UnixListener::bind(&socket_path)?;
+        let listener = bind_listener(socket_dir, &socket_path)?;
+        // Idempotent re-pin of the published socket (the staging factory
+        // already applied 0o660 BEFORE publishing; this also covers
+        // injected factories that do not).
         set_socket_mode(&socket_path)?;
         if let Some(name) = group {
             // R9-1: the hand-off is a root-daemon contract. Non-root keeps
@@ -232,6 +242,128 @@ fn set_socket_mode(socket_path: &Path) -> io::Result<()> {
     std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o660))
 }
 
+/// Pins the runtime directory to mode `0o755` and fail-loud VERIFIES the
+/// pin held (M2 S12; round-4 track item (b), sharpened by the round-6
+/// sec item): `create_dir_all` inherits the process umask, so umask-0077
+/// produced a 0700 runtime dir — no traversal, defeating the R9-1 group
+/// hand-off for every member client — while umask-000 (or an operator's
+/// hand-made dir) shipped 0777, a planting surface for lookalike
+/// sockets. 0755 is the recorded contract: root:root-owned (the daemon's
+/// own chown discipline), traversable by everyone, writable by no one
+/// but root.
+fn pin_runtime_dir(socket_dir: &Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(socket_dir, std::fs::Permissions::from_mode(0o755)).map_err(|e| {
+        io::Error::other(format!(
+            "cannot pin the runtime directory {} to 0755: {e}",
+            socket_dir.display()
+        ))
+    })?;
+    // Fail-loud verify: whatever the filesystem, a concurrent chmod, or a
+    // stale mount did, a runtime dir that is not exactly 0755 must abort
+    // startup rather than serve from an unverified mode.
+    let mode = std::fs::metadata(socket_dir)
+        .map_err(|e| {
+            io::Error::other(format!(
+                "cannot verify the runtime directory {}: {e}",
+                socket_dir.display()
+            ))
+        })?
+        .permissions()
+        .mode()
+        & 0o777;
+    if mode != 0o755 {
+        return Err(io::Error::other(format!(
+            "runtime directory {} has mode {mode:#o} after the 0755 pin; refusing to serve",
+            socket_dir.display()
+        )));
+    }
+    Ok(())
+}
+
+/// Counter making each staging directory unique within a process (two
+/// concurrent binds in the same socket dir must not share one).
+static STAGING_SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The production listener factory (M2 S12; round-4 track item (a)):
+/// closes the bind-then-chmod window STRUCTURALLY. Sockets are born
+/// `0777 & ~umask`, so a plain bind at the public path left the socket
+/// world-CONNECTABLE for the moment before `set_socket_mode`'s 0o660
+/// chmod landed (connect(2) needs write permission on the socket
+/// inode). Instead the socket is born inside an owner-only staging
+/// directory — invisible and unreachable to any other uid — pinned to
+/// 0o660, and only then published under its final name with `link(2)`:
+/// the public name comes into existence exactly once, atomically,
+/// already 0o660, and never REPLACES anything (EEXIST fails loud, the
+/// same liveness discipline as the stale-socket guards above).
+///
+/// Why not the recorded `umask(2)` guard: umask is PROCESS-GLOBAL. The
+/// guard was implemented first and its red/green observed, but its live
+/// `0o117` window is inherited by EVERY concurrent file creation in the
+/// process — reproduced in this suite, where parallel tests' temp
+/// directories came out `0660` (no execute bit, EACCES storms, ~5% of
+/// runs; guard windows averaged 76 µs across ~30 binds per run). The
+/// daemon is multithreaded too; any startup-time creation racing the
+/// bind would inherit the same mask, and no lock can help (the racing
+/// creations do not cooperate). The staging shape carries no global
+/// state at all.
+fn bind_socket_staged(socket_dir: &Path, socket_path: &Path) -> io::Result<UnixListener> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let serial = STAGING_SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let staging = socket_dir.join(format!(".stage.{serial}.{}", socket_name_of(socket_path)));
+    // A crashed predecessor's staging dir must not wedge this bind; it
+    // held nothing public, so removing it is safe.
+    let _ = std::fs::remove_dir_all(&staging);
+    std::fs::create_dir(&staging)?;
+    if let Err(e) = std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o700)) {
+        let _ = std::fs::remove_dir_all(&staging);
+        return Err(e);
+    }
+    let staged_socket = staging.join("s.sock");
+    let listener = match UnixListener::bind(&staged_socket) {
+        Ok(listener) => listener,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&staging);
+            return Err(e);
+        }
+    };
+    // Mode FIRST, publish second: whatever mode the kernel gave the
+    // staged inode (umask-dependent), the public name only ever meets
+    // the pinned 0o660 one.
+    if let Err(e) = set_socket_mode(&staged_socket) {
+        let _ = std::fs::remove_dir_all(&staging);
+        return Err(e);
+    }
+    // link(2), not rename(2): rename would silently REPLACE an entry
+    // that appeared at the public name since the guards above ran —
+    // stealing a live daemon's socket. link fails EEXIST instead, the
+    // fail-loud answer bind(2) itself would have given.
+    if let Err(e) = std::fs::hard_link(&staged_socket, socket_path) {
+        let _ = std::fs::remove_dir_all(&staging);
+        return Err(io::Error::other(format!(
+            "cannot publish the staged socket at {}: {e} (another daemon may \
+             have bound it during startup)",
+            socket_path.display()
+        )));
+    }
+    // The staged name can go: the public hard link keeps the inode.
+    let _ = std::fs::remove_file(&staged_socket);
+    let _ = std::fs::remove_dir(&staging);
+    Ok(listener)
+}
+
+/// The file-name component of the staged socket's final path (staging
+/// names are per-target so concurrent binds to different sockets in one
+/// directory cannot collide even before the serial disambiguates).
+fn socket_name_of(socket_path: &Path) -> String {
+    socket_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("sock")
+        .to_owned()
+}
+
 /// Whether this daemon runs as root — the gate for the socket-group
 /// hand-off (R9-1; see [`IpcServer::bind_with_group`]). Injected through
 /// [`IpcServer::bind_with_resolved`] so the gate itself is testable
@@ -256,7 +388,9 @@ fn chown_socket_group(socket_path: &Path, name: &str, gid: nix::unistd::Gid) -> 
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
+    use std::sync::Arc;
     use std::sync::Mutex;
+    use std::sync::atomic::Ordering;
 
     use super::*;
 
@@ -315,6 +449,204 @@ mod tests {
             "live socket must abort bind, got: {err}"
         );
         drop(listener);
+    }
+
+    /// S12 item 2 (round-4 track item (b), sharpened by the round-6 sec
+    /// item): `create_dir_all` inherits the process umask, so a
+    /// umask-0077 daemon produced a 0700 runtime dir — no traversal, and
+    /// the R9-1 group hand-off was defeated for every member client.
+    /// bind must PIN the runtime dir to 0755 (root:root traversal without
+    /// plantability) whatever the umask left behind. Pre-fix red: the
+    /// pre-created 0700 dir survived bind untouched.
+    #[test]
+    fn bind_widens_an_over_tight_runtime_dir_to_0755() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = dir.path().join("runtime");
+        std::fs::create_dir(&runtime).unwrap();
+        std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let server = IpcServer::bind(&runtime, "s.sock").unwrap();
+        let mode = std::fs::metadata(server.socket_path().parent().unwrap())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o755, "the runtime dir must be pinned to 0755");
+    }
+
+    /// S12 item 2, the other direction: a permissive runtime dir
+    /// (umask-000, or an operator hand-making it) is a planting surface
+    /// for lookalike sockets — the strict client walk rejects it, but
+    /// bind must not ship it in the first place. The pin TIGHTENS too.
+    /// Pre-fix red: the 0777 dir survived bind untouched.
+    #[test]
+    fn bind_tightens_a_permissive_runtime_dir_to_0755() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = dir.path().join("runtime");
+        std::fs::create_dir(&runtime).unwrap();
+        std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let server = IpcServer::bind(&runtime, "s.sock").unwrap();
+        let mode = std::fs::metadata(server.socket_path().parent().unwrap())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o755, "the runtime dir must be pinned to 0755");
+    }
+
+    /// S12 item 2 (round-4 track item (a)): the pre-existing
+    /// bind-then-chmod window. Sockets are born `0777 & ~umask`, so under
+    /// a permissive umask a plain bind at the public path left the socket
+    /// world-CONNECTABLE for the moment before the 0o660 chmod landed
+    /// (connect(2) needs write permission on the socket inode). The
+    /// staging factory closes the window STRUCTURALLY: the socket is born
+    /// inside an owner-only directory, pinned to 0o660, and only then
+    /// published by an atomic `link(2)`.
+    ///
+    /// Red evidence (observed while developing, recorded here): with the
+    /// ambient umask at 0o000 and the socket bound plainly at the public
+    /// path, the observed creation mode was 0o777 (511) — the recorded
+    /// umask-guard variant was green against exactly that. The pin below
+    /// is the property the window violated, observed from OUTSIDE: a
+    /// poller stats the public path continuously while the main thread
+    /// rebinds in a loop, and EVERY observation of an existing entry must
+    /// report 0o660. The green is deterministic (a link(2) publish is
+    /// atomic); a plain-bind mutation reintroduces the window and fails
+    /// this on the first observed 0777/0755.
+    #[test]
+    fn bind_publishes_the_socket_only_at_its_final_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::atomic::AtomicBool;
+
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = dir.path().join("runtime");
+        std::fs::create_dir_all(&runtime).unwrap();
+        let public = runtime.join("s.sock");
+
+        let polling = Arc::new(AtomicBool::new(true));
+        let observed: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
+        let poller = {
+            let polling = Arc::clone(&polling);
+            let observed = Arc::clone(&observed);
+            let public = public.clone();
+            std::thread::spawn(move || {
+                while polling.load(Ordering::SeqCst) {
+                    if let Ok(meta) = std::fs::symlink_metadata(&public) {
+                        observed
+                            .lock()
+                            .unwrap()
+                            .push(meta.permissions().mode() & 0o777);
+                    }
+                }
+            })
+        };
+
+        for _ in 0..50 {
+            let server = IpcServer::bind_with_resolved(
+                &runtime,
+                "s.sock",
+                None,
+                &|| false,
+                &|_name| panic!("no group configured: the resolver must not run"),
+                &|_path, _name, _gid| panic!("no group configured: the chown must not run"),
+                &bind_socket_staged,
+            )
+            .unwrap();
+            drop(server); // Drop removes the public name; the loop rebinds.
+        }
+        polling.store(false, Ordering::SeqCst);
+        let _ = poller.join();
+
+        let observed = observed.lock().unwrap().clone();
+        assert!(
+            !observed.is_empty(),
+            "the poller never saw the public name — vacuous pass"
+        );
+        let odd = observed
+            .iter()
+            .filter(|mode| **mode != 0o660)
+            .copied()
+            .collect::<Vec<_>>();
+        assert!(
+            odd.is_empty(),
+            "the public socket was observable at {odd:?} — every existing \
+             observation must already be the published 0o660 mode"
+        );
+    }
+
+    /// S12 item 2, staging hygiene: a successful bind leaves no staging
+    /// litter in the runtime dir, and the publish step stays fail-loud —
+    /// a name taken between the stale-socket guards and the `link(2)`
+    /// (simulated here by the factory planting the entry itself) refuses
+    /// naming the collision instead of silently replacing it, and even
+    /// the FAILED publish cleans its staging directory up.
+    #[test]
+    fn staged_publish_is_fail_loud_on_a_taken_name_and_leaves_no_litter() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = dir.path().join("runtime");
+        std::fs::create_dir_all(&runtime).unwrap();
+
+        let server = IpcServer::bind(&runtime, "s.sock").unwrap();
+        let entries: Vec<String> = std::fs::read_dir(&runtime)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            entries,
+            vec!["s.sock".to_owned()],
+            "a successful bind must leave only the published socket — no \
+             staging litter: {entries:?}"
+        );
+        let mode = std::fs::metadata(server.socket_path())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o660);
+        drop(server);
+
+        // The publish arm: the public name is TAKEN after the guards ran
+        // (the injected factory plants it, then delegates to the real
+        // staging bind — link(2) must refuse, not replace).
+        let squatter = runtime.join("s.sock");
+        let planting = |_dir: &Path, path: &Path| -> io::Result<UnixListener> {
+            std::fs::write(&squatter, b"squatted after the guards").unwrap();
+            bind_socket_staged(_dir, path)
+        };
+        let err = IpcServer::bind_with_resolved(
+            &runtime,
+            "s.sock",
+            None,
+            &|| false,
+            &|_name| panic!("no group configured: the resolver must not run"),
+            &|_path, _name, _gid| panic!("no group configured: the chown must not run"),
+            &planting,
+        )
+        .map(|_| ())
+        .expect_err("a name taken between the guards and the link must refuse");
+        assert!(
+            err.to_string().contains("cannot publish"),
+            "the refusal must name the failed publish, got: {err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&squatter).unwrap(),
+            "squatted after the guards",
+            "the refusal must not have replaced the taken name"
+        );
+        let entries: Vec<String> = std::fs::read_dir(&runtime)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            entries,
+            vec!["s.sock".to_owned()],
+            "even a failed publish must clean its staging directory up: {entries:?}"
+        );
     }
 
     /// pr-champion round 6, WO-W1: a REGULAR file at the socket path also
@@ -574,6 +906,7 @@ mod tests {
             &|| true, // root gate open: the resolver failure must surface
             &|_name| Err(io::Error::other("group database on fire")),
             &|_path, _name, _gid| panic!("resolution failed first: the chown must not run"),
+            &bind_socket_staged,
         )
         .map(|_| ())
         .expect_err("a resolver failure must abort bind");
@@ -597,6 +930,7 @@ mod tests {
             &|| true, // root gate open: the unresolved name must fail loudly
             &|_name| Ok(None),
             &|_path, _name, _gid| panic!("no gid was resolved: the chown must not run"),
+            &bind_socket_staged,
         )
         .map(|_| ())
         .expect_err("an unresolvable group must abort bind");
@@ -626,6 +960,7 @@ mod tests {
             &|| true,
             &|_| panic!("no group configured: the resolver must not run"),
             &|_path, _name, _gid| panic!("no group configured: the chown must not run"),
+            &bind_socket_staged,
         )
         .unwrap();
         let meta = std::fs::metadata(server.socket_path()).unwrap();
@@ -674,6 +1009,7 @@ mod tests {
                     .push((path.to_owned(), name.to_owned(), gid.as_raw()));
                 Ok(())
             },
+            &bind_socket_staged,
         )
         .unwrap();
         assert!(
@@ -708,6 +1044,7 @@ mod tests {
                     .push((path.to_owned(), name.to_owned(), gid.as_raw()));
                 Ok(())
             },
+            &bind_socket_staged,
         )
         .unwrap();
         let recorded = calls.lock().unwrap();
@@ -743,6 +1080,7 @@ mod tests {
                     "cannot chown socket to group `{name}`: permission denied"
                 )))
             },
+            &bind_socket_staged,
         )
         .map(|_| ())
         .expect_err("a chown failure must abort bind");
@@ -782,6 +1120,7 @@ mod tests {
             &|| true, // root gate open: the real chgrp path runs
             &|_| Ok(Some(gid)),
             &chown_socket_group,
+            &bind_socket_staged,
         )
         .unwrap();
         let meta = std::fs::metadata(server.socket_path()).unwrap();

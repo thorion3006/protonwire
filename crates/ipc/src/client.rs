@@ -799,8 +799,7 @@ mod tests {
         std::os::unix::fs::symlink(&target, &via).unwrap();
 
         let err = verify_socket_trusted(&via)
-            .err()
-            .expect("a symlink at the socket path must never be trusted");
+            .expect_err("a symlink at the socket path must never be trusted");
         match err {
             ConnectError::Untrusted { path, reason } => {
                 assert_eq!(path, via, "the refusal must name the link's path");
@@ -834,10 +833,8 @@ mod tests {
         std::fs::set_permissions(&grandparent, std::fs::Permissions::from_mode(0o770)).unwrap();
         let socket = parent.join("protonwire.sock");
         drop(std::os::unix::net::UnixListener::bind(&socket).unwrap());
-
         let err = verify_socket_trusted(&socket)
-            .err()
-            .expect("a group/world-writable ancestor must never be trusted");
+            .expect_err("a group/world-writable ancestor must never be trusted");
         match err {
             ConnectError::Untrusted { reason, .. } => {
                 assert!(
@@ -866,8 +863,7 @@ mod tests {
         std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o666)).unwrap();
 
         let err = verify_socket_trusted(&socket)
-            .err()
-            .expect("a world-writable socket leaf must never be trusted");
+            .expect_err("a world-writable socket leaf must never be trusted");
         match err {
             ConnectError::Untrusted { reason, .. } => {
                 assert!(
