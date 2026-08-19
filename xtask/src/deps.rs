@@ -4,6 +4,7 @@
 //! exactly one workspace `Cargo.lock` exists, and no dependency uses a
 //! wildcard version.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -66,6 +67,7 @@ const FRONTEND_TECH: &[&str] = &[
 
 pub fn run(root: &Path) -> Result<bool> {
     let metadata = cargo_metadata(root)?;
+    let adjacency = resolve_adjacency(&metadata)?;
     let mut reporter = Reporter::new("dep-graph");
 
     let mut members: Vec<&Package> = metadata
@@ -97,6 +99,10 @@ pub fn run(root: &Path) -> Result<bool> {
     }
     reporter.rule("forbidden dependency edges", &edge_violations);
     reporter.rule("UI crate placement", &placement_violations);
+    reporter.rule(
+        "transitive forbidden edges (resolve graph)",
+        &transitive_forbidden_edges(&adjacency),
+    );
 
     let mut lockfile_violations = Vec::new();
     let expected_lockfile = root.join("Cargo.lock");
@@ -245,6 +251,140 @@ pub(crate) fn ui_crate_placement(manifest_rel: &str, deps: &[&str]) -> Vec<Strin
         if deps.contains(&crate_name) && !rel.starts_with("apps/gui/") {
             violations.push(format!(
                 "{crate_name} is only allowed under apps/gui/ (found {rel})"
+            ));
+        }
+    }
+    violations
+}
+
+/// The RESOLVED dependency graph as package-name adjacency: for every
+/// resolve node, the names of the packages Cargo actually linked it to
+/// (round-9 track item, M2 boundary-gate hardening: the direct-edge
+/// rules below see only each member's declared dependencies, so a
+/// neutral helper crate re-exporting a forbidden dependency bypassed
+/// them). Names, not package ids, because the forbidden targets are
+/// workspace crates — single-version path sources under the one
+/// committed root lockfile — so keying by name cannot conflate two
+/// versions of a target; two versions of an EXTERNAL package sharing a
+/// name merge into one node, which only over-approximates reachability
+/// (the conservative direction for a gate). Returns an error when the
+/// resolve graph is absent rather than checking nothing.
+pub(crate) fn resolve_adjacency(metadata: &Metadata) -> Result<BTreeMap<String, Vec<String>>> {
+    let resolve = metadata
+        .resolve
+        .as_ref()
+        .ok_or_else(|| anyhow!("cargo metadata returned no resolve graph (was --no-deps used?)"))?;
+    let names: BTreeMap<&cargo_metadata::PackageId, &str> = metadata
+        .packages
+        .iter()
+        .map(|package| (&package.id, package.name.as_str()))
+        .collect();
+    let mut adjacency: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for node in &resolve.nodes {
+        let Some(name) = names.get(&node.id).copied() else {
+            continue;
+        };
+        let deps: Vec<String> = node
+            .dependencies
+            .iter()
+            .filter_map(|id| names.get(id).copied())
+            .map(str::to_owned)
+            .collect();
+        adjacency.entry(name.to_owned()).or_default().extend(deps);
+    }
+    for deps in adjacency.values_mut() {
+        deps.sort();
+        deps.dedup();
+    }
+    Ok(adjacency)
+}
+
+/// Breadth-first closure of `root` over the resolved adjacency, mapping
+/// every reached package to its route from the root. `conduit` names the
+/// one package whose own dependencies are NOT traversed: for the
+/// frontend-ipc rule that is `protonwire-client`, the sanctioned channel
+/// (cli -> client -> ipc is the legal route), so any path that reaches
+/// `protonwire-ipc` without passing through the conduit is a bypass.
+fn closure_routes(
+    adjacency: &BTreeMap<String, Vec<String>>,
+    root: &str,
+    conduit: Option<&str>,
+) -> BTreeMap<String, Vec<String>> {
+    let mut parent: BTreeMap<String, Option<String>> = BTreeMap::new();
+    parent.insert(root.to_string(), None);
+    let mut frontier: Vec<String> = vec![root.to_string()];
+    while let Some(current) = frontier.pop() {
+        if conduit == Some(current.as_str()) {
+            continue;
+        }
+        let Some(deps) = adjacency.get(&current) else {
+            continue;
+        };
+        for dep in deps {
+            if parent.contains_key(dep) {
+                continue;
+            }
+            parent.insert(dep.clone(), Some(current.clone()));
+            frontier.push(dep.clone());
+        }
+    }
+    let mut routes = BTreeMap::new();
+    for (node, ancestor) in &parent {
+        let mut path = vec![node.clone()];
+        let mut ancestor = ancestor.clone();
+        while let Some(step) = ancestor {
+            path.push(step.clone());
+            ancestor = parent[&step].clone();
+        }
+        path.reverse();
+        routes.insert(node.clone(), path);
+    }
+    routes
+}
+
+/// The forbidden edges of the DIRECT rules, enforced TRANSITIVELY over
+/// the resolved graph from every client-side package (cli/tui/gui plus
+/// the SDK): (a) no client-side package may reach a deep crate
+/// (engines/adapters) through any chain of dependencies, and (b) a
+/// frontend app may reach `protonwire-ipc` only THROUGH
+/// `protonwire-client` — the SDK's socket trust policy, protocol
+/// negotiation, and resynchronization (T-23, round-2 finding 8) must not
+/// be sidestepped via a neutral helper. Each violation names the exact
+/// resolved route.
+pub(crate) fn transitive_forbidden_edges(adjacency: &BTreeMap<String, Vec<String>>) -> Vec<String> {
+    let deep: std::collections::BTreeSet<&str> = DEEP_DEPS.iter().copied().collect();
+    let mut violations = Vec::new();
+    for root in CLIENT_SIDE {
+        if !adjacency.contains_key(*root) {
+            violations.push(format!(
+                "{root}: client-side package is missing from the resolve graph"
+            ));
+            continue;
+        }
+        let routes = closure_routes(adjacency, root, None);
+        for dep in &deep {
+            if let Some(route) = routes.get(*dep) {
+                violations.push(format!(
+                    "{root}: resolved route {} reaches deep crate `{dep}` transitively — \
+                     frontends reach the service only through protonwire-client (T-23)",
+                    route.join(" -> ")
+                ));
+            }
+        }
+    }
+    for root in FRONTEND_APPS {
+        // FRONTEND_APPS ⊆ CLIENT_SIDE (pinned by test), so a missing app
+        // root is already named above.
+        if !adjacency.contains_key(*root) {
+            continue;
+        }
+        let routes = closure_routes(adjacency, root, Some("protonwire-client"));
+        if let Some(route) = routes.get("protonwire-ipc") {
+            violations.push(format!(
+                "{root}: resolved route {} reaches protonwire-ipc WITHOUT passing through \
+                 protonwire-client — frontends talk to the daemon only through the SDK \
+                 (T-23, round-2 finding 8)",
+                route.join(" -> ")
             ));
         }
     }
@@ -563,6 +703,156 @@ root-table-star = { version = "*" }
         assert_eq!(
             wildcard_versions("not [valid toml"),
             vec!["manifest is not valid TOML".to_string()]
+        );
+    }
+
+    /// Round-9 severity-bar disposal (P2, tracked to M2): the gate
+    /// checked DIRECT dependency names only, so a neutral helper crate
+    /// re-exporting a forbidden dependency bypassed it — cli -> helper ->
+    /// ipc speaks IPC without the SDK's trust policy, and client ->
+    /// shim -> muon drags an engine into the client side, with every
+    /// direct edge individually legal. The fixture builds exactly that
+    /// shape through cargo_metadata's resolve graph, proves the direct
+    /// rules pass it, and requires the transitive walk to name both
+    /// routes.
+    #[test]
+    fn neutral_helper_routes_fail_the_transitive_walk() {
+        // One declared package record (deps drive the DIRECT rules).
+        fn pkg(id: &str, name: &str, deps: &[&str]) -> serde_json::Value {
+            serde_json::json!({
+                "name": name,
+                "version": "0.1.0",
+                "id": id,
+                "manifest_path": format!("/w/{name}/Cargo.toml"),
+                "source": null,
+                "description": null,
+                "license": null,
+                "license_file": null,
+                "targets": [],
+                "features": {},
+                "readme": null,
+                "repository": null,
+                "homepage": null,
+                "documentation": null,
+                "links": null,
+                "publish": null,
+                "default_run": null,
+                "dependencies": deps.iter().map(|d| serde_json::json!({
+                    "name": d,
+                    "source": null,
+                    "req": "1",
+                    "kind": "normal",
+                    "optional": false,
+                    "uses_default_features": true,
+                    "features": [],
+                    "target": null,
+                    "rename": null,
+                    "registry": null,
+                    "path": null,
+                })).collect::<Vec<_>>(),
+            })
+        }
+        // The edges of the bypass shape: the sanctioned conduit
+        // (apps -> client -> ipc) PLUS the two neutral-helper routes.
+        let shape: &[(&str, &[&str])] = &[
+            (
+                "protonwire-cli",
+                &["protonwire-client", "protonwire-helper", "serde"],
+            ),
+            ("protonwire-tui", &["protonwire-client", "serde"]),
+            ("protonwire-gui", &["protonwire-client", "serde"]),
+            (
+                "protonwire-client",
+                &["protonwire-ipc", "protonwire-shim", "serde"],
+            ),
+            ("protonwire-helper", &["protonwire-ipc"]),
+            ("protonwire-shim", &["muon"]),
+            ("protonwire-ipc", &["serde"]),
+            ("muon", &[]),
+            ("serde", &[]),
+        ];
+        let packages: Vec<serde_json::Value> = shape
+            .iter()
+            .map(|(name, deps)| pkg(&format!("{name}#1"), name, deps))
+            .collect();
+        let nodes: Vec<serde_json::Value> = shape
+            .iter()
+            .map(|(name, deps)| {
+                serde_json::json!({
+                    "id": format!("{name}#1"),
+                    "dependencies": deps.iter().map(|d| format!("{d}#1")).collect::<Vec<_>>(),
+                })
+            })
+            .collect();
+        let metadata: Metadata = serde_json::from_value(serde_json::json!({
+            "packages": packages,
+            "workspace_members": [],
+            "resolve": {"root": null, "nodes": nodes},
+            "workspace_root": "/w",
+            "target_directory": "/w/target",
+            "build_directory": null,
+            "version": 1,
+        }))
+        .unwrap();
+
+        // The DIRECT rules pass this shape: every edge is individually
+        // legal (the helpers are not frontends, the SDK may speak IPC) —
+        // the recorded gap, reproduced.
+        for (name, deps) in shape {
+            let declared: Vec<&str> = deps.to_vec();
+            assert!(
+                forbidden_edges(name, &declared).is_empty(),
+                "fixture setup: {name} must pass the direct rules"
+            );
+        }
+
+        let adjacency = resolve_adjacency(&metadata).unwrap();
+        assert_eq!(
+            adjacency["protonwire-cli"],
+            ["protonwire-client", "protonwire-helper", "serde"],
+            "the adjacency must carry the resolved edges"
+        );
+
+        let violations = transitive_forbidden_edges(&adjacency);
+        let text = violations.join("\n");
+        assert!(
+            text.contains("protonwire-cli -> protonwire-helper -> protonwire-ipc")
+                && text.contains("protonwire-client"),
+            "the ipc bypass route must be named: got {text:?}"
+        );
+        assert!(
+            text.contains("protonwire-cli -> protonwire-client -> protonwire-shim -> muon")
+                || text.contains("protonwire-client -> protonwire-shim -> muon"),
+            "the transitive engine route must be named: got {text:?}"
+        );
+
+        // The sanctioned conduit alone stays green: apps reaching ipc
+        // only through protonwire-client is exactly the allowed shape.
+        let clean: BTreeMap<String, Vec<String>> = [
+            ("protonwire-cli", vec!["protonwire-client".to_string()]),
+            ("protonwire-tui", vec!["protonwire-client".to_string()]),
+            ("protonwire-gui", vec!["protonwire-client".to_string()]),
+            ("protonwire-client", vec!["protonwire-ipc".to_string()]),
+            ("protonwire-ipc", vec![]),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+        assert!(
+            transitive_forbidden_edges(&clean).is_empty(),
+            "the sanctioned app -> client -> ipc conduit must pass"
+        );
+
+        // A client-side package missing from the resolve graph fails
+        // loud rather than passing vacuously.
+        let mut gutted = clean.clone();
+        gutted.remove("protonwire-gui");
+        assert!(
+            transitive_forbidden_edges(&gutted)
+                .iter()
+                .any(|v| v.contains("protonwire-gui")
+                    && v.contains("missing from the resolve graph")),
+            "a missing client-side root must be named"
         );
     }
 
