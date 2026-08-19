@@ -26,6 +26,8 @@
 
 pub use muon;
 
+pub mod catalog;
+
 /// Authentication capabilities the adapter must expose.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LoginStatus {

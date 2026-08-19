@@ -14,3 +14,11 @@ workspace = true
 muon = { workspace = true }
 protonwire-frontend-api = { workspace = true }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+# Test-only, for the S6 wire seam: drives the real muon hyper transport
+# against the loopback responder (tokio net/time) and blocks muon's async
+# engine from the sync trait (rt). Already a lockfile transitive via the
+# pinned engines; recorded in docs/spike-2026-08.md (S6 addendum).
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "time"] }
+tracing-subscriber = { workspace = true }
