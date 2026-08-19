@@ -100,80 +100,298 @@ const ALLOWED_TARGET_KINDS: &[&str] = &[
     "secure-core",
 ];
 
-/// Per-canonical-group `target.kind` map, pinning each id's selection
-/// semantics the way [`EXPECTED_GROUP_IDS`] pins the id set: a kind edit
-/// must be a deliberate contract change, not silent drift.
-const EXPECTED_GROUP_TARGET_KINDS: [(&str, &str); EXPECTED_GROUP_COUNT] = [
-    ("proton:anti-censorship", "fastest"),
-    ("proton:fastest-country", "fastest"),
-    ("proton:fastest-excluding-my-country", "fastest"),
-    ("proton:gaming", "fastest"),
-    ("proton:max-security", "secure-core"),
-    ("proton:random-country", "random"),
-    ("proton:streaming-us", "fastest-in-country"),
-    ("proton:work-school", "fastest"),
-    ("protonwire:fastest-africa", "fastest-in-region"),
-    ("protonwire:fastest-asia", "fastest-in-region"),
-    ("protonwire:fastest-europe", "fastest-in-region"),
-    ("protonwire:fastest-north-america", "fastest-in-region"),
-    ("protonwire:fastest-oceania", "fastest-in-region"),
-    ("protonwire:fastest-south-america", "fastest-in-region"),
-];
-
-/// Per-canonical-group `target.exclude_physical_country` pin: the v1
-/// catalog sets the flag on exactly two groups
-/// (docs/connection-groups.yaml) — deleting it there (or adding it
-/// elsewhere) must be a deliberate contract change, not silent drift.
-const EXPECTED_EXCLUDE_PHYSICAL_COUNTRY: [(&str, bool); 2] = [
-    ("proton:anti-censorship", true),
-    ("proton:fastest-excluding-my-country", true),
-];
-
-/// Per-canonical-group `target.connection_type` pin: `standard` on every
-/// official group except proton:max-security, whose secure-core target
-/// defines none.
-const EXPECTED_CONNECTION_TYPES: [(&str, &str); 7] = [
-    ("proton:anti-censorship", "standard"),
-    ("proton:fastest-country", "standard"),
-    ("proton:fastest-excluding-my-country", "standard"),
-    ("proton:gaming", "standard"),
-    ("proton:random-country", "standard"),
-    ("proton:streaming-us", "standard"),
-    ("proton:work-school", "standard"),
-];
-
-/// Per-canonical-group `target.selection_authority` pin: only
-/// proton:random-country delegates the choice to the backend
-/// ("unless backend policy controls the choice", contract.
-/// ranking_policies.random-country-then-server).
-const EXPECTED_SELECTION_AUTHORITIES: [(&str, &str); 1] =
-    [("proton:random-country", "proton-backend-when-required")];
-
-/// Per-canonical-group `overrides` key->value pin, in the
-/// [`EXPECTED_GROUP_TARGET_KINDS`] style: most groups ship the empty map;
-/// the documented exceptions are streaming-us's protocol, gaming's nat,
-/// anti-censorship's protocol, max-security's lan_access, and
-/// work-school's protocol+lan_access (docs/connection-groups.yaml).
-/// Values are compact-JSON encodings, compared exactly against the
-/// deserialized document.
-const EXPECTED_GROUP_OVERRIDES: [(&str, &[(&str, &str)]); EXPECTED_GROUP_COUNT] = [
-    ("proton:anti-censorship", &[("protocol", "\"stealth\"")]),
-    ("proton:fastest-country", &[]),
-    ("proton:fastest-excluding-my-country", &[]),
-    ("proton:gaming", &[("nat", "\"moderate\"")]),
-    ("proton:max-security", &[("lan_access", "\"block\"")]),
-    ("proton:random-country", &[]),
-    ("proton:streaming-us", &[("protocol", "\"wireguard-udp\"")]),
+/// The golden canonical groups table (round-9 structural disposal): one
+/// FULLY-RENDERED definition per built-in group, keyed by id, generated
+/// from docs/connection-groups.yaml itself — the document IS the golden
+/// source; this constant records its rendering so the gate compares the
+/// validated document against the canonical table rather than against
+/// hand-transcribed per-field expectations. It replaces the retired
+/// field-by-field pin family (per-id target kinds, exclude flags,
+/// connection types, selection authorities, override maps), which had
+/// admitted one-more-unpinned-field three review rounds running: the
+/// rendering is produced from the RAW entry, so every field — including
+/// ones no typed struct deserializes, and fields added to the document
+/// after this constant was recorded — participates in the comparison.
+/// A deliberate contract change regenerates this constant from the
+/// edited document (see the test-only crosscheck against the real yaml).
+const GOLDEN_GROUP_ENTRIES: &[(&str, &str)] = &[
+    (
+        "proton:fastest-country",
+        r#"definition_source: official-client-compat
+entitlement: plan-dependent
+id: proton:fastest-country
+immutable: true
+label: Fastest country
+origin: proton
+overrides: {}
+ranking_policy: proton-score
+sources:
+- proton_default_connection
+- proton_connection_profiles
+target:
+  connection_type: standard
+  kind: fastest
+"#,
+    ),
+    (
+        "proton:fastest-excluding-my-country",
+        r#"definition_source: official-client-compat
+entitlement: plan-dependent
+id: proton:fastest-excluding-my-country
+immutable: true
+label: Fastest country (excluding my country)
+origin: proton
+overrides: {}
+ranking_policy: proton-score
+sources:
+- android_fastest_exclusion
+- proton_windows_release_notes
+target:
+  connection_type: standard
+  exclude_physical_country: true
+  kind: fastest
+"#,
+    ),
+    (
+        "proton:random-country",
+        r#"definition_source: official-client-compat
+entitlement: plan-dependent
+id: proton:random-country
+immutable: true
+label: Random country
+origin: proton
+overrides: {}
+ranking_policy: random-country-then-server
+sources:
+- proton_default_connection
+- proton_windows_release_notes
+target:
+  connection_type: standard
+  kind: random
+  selection_authority: proton-backend-when-required
+"#,
+    ),
+    (
+        "proton:streaming-us",
+        r#"definition_source: official-client-compat
+entitlement: target-and-feature-dependent
+id: proton:streaming-us
+immutable: true
+label: Streaming US
+origin: proton
+overrides:
+  protocol: wireguard-udp
+ranking_policy: proton-score
+sources:
+- android_initial_profiles
+target:
+  connection_type: standard
+  country: US
+  kind: fastest-in-country
+"#,
+    ),
+    (
+        "proton:gaming",
+        r#"definition_source: official-client-compat
+entitlement: target-and-feature-dependent
+id: proton:gaming
+immutable: true
+label: Gaming
+origin: proton
+overrides:
+  nat: moderate
+ranking_policy: proton-score
+sources:
+- android_initial_profiles
+target:
+  connection_type: standard
+  kind: fastest
+"#,
+    ),
+    (
+        "proton:anti-censorship",
+        r#"definition_source: official-client-compat
+entitlement: target-and-feature-dependent
+id: proton:anti-censorship
+immutable: true
+label: Anti-censorship
+origin: proton
+overrides:
+  protocol: stealth
+ranking_policy: proton-score
+sources:
+- android_initial_profiles
+- android_fastest_exclusion
+target:
+  connection_type: standard
+  exclude_physical_country: true
+  kind: fastest
+"#,
+    ),
+    (
+        "proton:max-security",
+        r#"definition_source: official-client-compat
+entitlement: target-and-feature-dependent
+id: proton:max-security
+immutable: true
+label: Max security
+origin: proton
+overrides:
+  lan_access: block
+ranking_policy: proton-score
+sources:
+- android_initial_profiles
+target:
+  entry_country: fastest
+  exit_country: fastest
+  kind: secure-core
+"#,
+    ),
     (
         "proton:work-school",
-        &[("lan_access", "\"block\""), ("protocol", "\"stealth\"")],
+        r#"definition_source: official-client-compat
+entitlement: target-and-feature-dependent
+id: proton:work-school
+immutable: true
+label: Work/School
+origin: proton
+overrides:
+  lan_access: block
+  protocol: stealth
+ranking_policy: proton-score
+sources:
+- android_initial_profiles
+target:
+  connection_type: standard
+  kind: fastest
+"#,
     ),
-    ("protonwire:fastest-africa", &[]),
-    ("protonwire:fastest-asia", &[]),
-    ("protonwire:fastest-europe", &[]),
-    ("protonwire:fastest-north-america", &[]),
-    ("protonwire:fastest-oceania", &[]),
-    ("protonwire:fastest-south-america", &[]),
+    (
+        "protonwire:fastest-africa",
+        r#"allowed_ranking_overrides:
+- balanced
+- load
+- latency
+definition_source: protonwire
+entitlement: paid-location-selection
+id: protonwire:fastest-africa
+immutable: true
+label: Fastest Africa
+origin: protonwire
+overrides: {}
+ranking_policy: proton-score
+sources:
+- un_m49
+target:
+  kind: fastest-in-region
+  region: africa
+"#,
+    ),
+    (
+        "protonwire:fastest-asia",
+        r#"allowed_ranking_overrides:
+- balanced
+- load
+- latency
+definition_source: protonwire
+entitlement: paid-location-selection
+id: protonwire:fastest-asia
+immutable: true
+label: Fastest Asia
+origin: protonwire
+overrides: {}
+ranking_policy: proton-score
+sources:
+- un_m49
+target:
+  kind: fastest-in-region
+  region: asia
+"#,
+    ),
+    (
+        "protonwire:fastest-europe",
+        r#"allowed_ranking_overrides:
+- balanced
+- load
+- latency
+definition_source: protonwire
+entitlement: paid-location-selection
+id: protonwire:fastest-europe
+immutable: true
+label: Fastest Europe
+origin: protonwire
+overrides: {}
+ranking_policy: proton-score
+sources:
+- un_m49
+target:
+  kind: fastest-in-region
+  region: europe
+"#,
+    ),
+    (
+        "protonwire:fastest-north-america",
+        r#"allowed_ranking_overrides:
+- balanced
+- load
+- latency
+definition_source: protonwire
+entitlement: paid-location-selection
+id: protonwire:fastest-north-america
+immutable: true
+label: Fastest North America
+origin: protonwire
+overrides: {}
+ranking_policy: proton-score
+sources:
+- un_m49
+target:
+  kind: fastest-in-region
+  region: north-america
+"#,
+    ),
+    (
+        "protonwire:fastest-south-america",
+        r#"allowed_ranking_overrides:
+- balanced
+- load
+- latency
+definition_source: protonwire
+entitlement: paid-location-selection
+id: protonwire:fastest-south-america
+immutable: true
+label: Fastest South America
+origin: protonwire
+overrides: {}
+ranking_policy: proton-score
+sources:
+- un_m49
+target:
+  kind: fastest-in-region
+  region: south-america
+"#,
+    ),
+    (
+        "protonwire:fastest-oceania",
+        r#"allowed_ranking_overrides:
+- balanced
+- load
+- latency
+definition_source: protonwire
+entitlement: paid-location-selection
+id: protonwire:fastest-oceania
+immutable: true
+label: Fastest Oceania
+origin: protonwire
+overrides: {}
+ranking_policy: proton-score
+sources:
+- un_m49
+target:
+  kind: fastest-in-region
+  region: oceania
+"#,
+    ),
 ];
 
 #[derive(Deserialize)]
@@ -239,21 +457,22 @@ struct Group {
     target: Option<Target>,
 }
 
-/// A group's selection target. Every field of the v1 catalog's target
-/// vocabulary is deserialized (FU-2): kind+region alone let `country`,
-/// `exclude_physical_country`, the secure-core entry/exit pair,
-/// `connection_type`, and `selection_authority` be silently dropped from
-/// the document without failing the gate.
+/// A group's selection target, carrying exactly the fields the STRUCTURAL
+/// rules consult: `kind` (vocabulary + per-kind semantics), `region`
+/// (primary-region membership), `country`, and the secure-core entry/exit
+/// pair (per-kind required fields, FU-2). The remaining target fields
+/// (`exclude_physical_country`, `connection_type`,
+/// `selection_authority`) used to be deserialized for the retired
+/// per-id value pins; their drift coverage moved to the golden-table
+/// rule, which compares the RAW entry — every target field, including
+/// ones this struct never names — against the golden rendering.
 #[derive(Deserialize)]
 struct Target {
     kind: Option<String>,
     region: Option<String>,
     country: Option<String>,
-    exclude_physical_country: Option<bool>,
     entry_country: Option<String>,
     exit_country: Option<String>,
-    connection_type: Option<String>,
-    selection_authority: Option<String>,
 }
 
 pub fn run(root: &Path) -> Result<bool> {
@@ -267,13 +486,25 @@ pub(crate) fn load(path: &Path) -> Result<GroupsFile> {
 }
 
 fn validate(path: &Path) -> Result<bool> {
-    let doc = load(path)?;
+    let text =
+        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let doc: GroupsFile = serde_norway::from_str(&text)
+        .with_context(|| format!("failed to parse {}", path.display()))?;
+    // The golden-table rule compares RAW entries (every field the document
+    // carries, not only the fields the typed structs deserialize), so the
+    // text is parsed a second time into an untyped value.
+    let raw: serde_json::Value = serde_norway::from_str(&text)
+        .with_context(|| format!("failed to parse {}", path.display()))?;
     let mut reporter = Reporter::new("groups-validate");
     reporter.rule("schema_version == 1", &check_schema_version(&doc));
     reporter.rule("catalog_revision present", &check_catalog_revision(&doc));
     reporter.rule("contract", &check_contract(&doc));
     reporter.rule("physical_country", &check_physical_country(&doc));
     reporter.rule("regional_taxonomy", &check_taxonomy(&doc));
+    reporter.rule(
+        "canonical groups table (golden document equality)",
+        &check_golden_groups_table(&raw),
+    );
     reporter.rule("groups", &check_groups(&doc));
 
     let total = doc.groups.as_ref().map_or(0, Vec::len);
@@ -517,6 +748,63 @@ fn check_taxonomy(doc: &GroupsFile) -> Vec<String> {
     violations
 }
 
+/// Canonical rendering of one RAW `groups` entry: the entry is
+/// re-serialized from its untyped JSON value, whose maps are
+/// BTreeMap-backed (no `preserve_order` anywhere in the workspace), so
+/// keys come out sorted and the rendering is invariant under key
+/// reordering in the source yaml. Two entries render identically iff
+/// they carry the same fields with the same values — the full canonical
+/// definition, not a hand-picked subset of it.
+fn render_group_entry(entry: &serde_json::Value) -> String {
+    serde_norway::to_string(entry).expect("a JSON value always re-serializes as YAML")
+}
+
+/// The round-9 structural disposal, in force: every built-in group's
+/// FULL canonical definition is compared against the golden rendering of
+/// docs/connection-groups.yaml ([`GOLDEN_GROUP_ENTRIES`]). This single
+/// rule subsumes the retired per-field pin family — any value flip,
+/// dropped field, added field (known or unknown to the typed structs),
+/// or cross-entry swap of any canonical value is drift — while the
+/// structural rules it does NOT subsume (id set, namespaces, target-kind
+/// vocabulary, per-kind required fields, cross-references into
+/// contract/sources/taxonomy) stay in `check_groups`/`check_target`.
+fn check_golden_groups_table(raw: &serde_json::Value) -> Vec<String> {
+    let Some(entries) = raw.get("groups").and_then(serde_json::Value::as_array) else {
+        // The `groups` structural rule already reports the missing list.
+        return Vec::new();
+    };
+    let golden: BTreeMap<&str, &str> = GOLDEN_GROUP_ENTRIES.iter().copied().collect();
+    let mut violations = Vec::new();
+    let mut actual_ids: Vec<&str> = Vec::new();
+    for (index, entry) in entries.iter().enumerate() {
+        let id = entry
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("#<no id>");
+        let rendered = render_group_entry(entry);
+        actual_ids.push(id);
+        match golden.get(id) {
+            Some(expected) if rendered == **expected => {}
+            Some(_) => violations.push(format!(
+                "{id}: full canonical definition drifted from the golden groups table \
+                 (docs/connection-groups.yaml is the golden source — a deliberate \
+                 contract change regenerates GOLDEN_GROUP_ENTRIES)"
+            )),
+            None => violations.push(format!(
+                "{id} (entry #{index}): group is not part of the golden canonical table"
+            )),
+        }
+    }
+    for id in golden.keys() {
+        if !actual_ids.contains(id) {
+            violations.push(format!(
+                "{id}: canonical golden group is missing from the document"
+            ));
+        }
+    }
+    violations
+}
+
 fn check_groups(doc: &GroupsFile) -> Vec<String> {
     let mut violations = Vec::new();
     let Some(groups) = &doc.groups else {
@@ -676,65 +964,19 @@ fn check_group(
         }
     }
 
-    violations.extend(expect_overrides(
-        &label,
-        group.id.as_deref(),
-        group.overrides.as_ref(),
-    ));
-
-    violations
-}
-
-/// Enforces one per-canonical-id overrides pin (the
-/// [`EXPECTED_GROUP_TARGET_KINDS`] style, applied to the override map):
-/// the key vocabulary alone left override VALUES unconstrained, so
-/// max-security's lan_access block->allow passed. Every canonical id's
-/// full key->value map is pinned — a flipped value, a dropped pinned
-/// key, or an added stray key is a named violation. Ids without a pin
-/// are unconstrained (every canonical id carries one, empty or not).
-fn expect_overrides(
-    label: &str,
-    id: Option<&str>,
-    actual: Option<&BTreeMap<String, serde_json::Value>>,
-) -> Vec<String> {
-    let Some((_, pinned)) = EXPECTED_GROUP_OVERRIDES
-        .iter()
-        .find(|(pinned_id, _)| Some(*pinned_id) == id)
-        .copied()
-    else {
-        return Vec::new();
-    };
-    let empty = BTreeMap::new();
-    let actual = actual.unwrap_or(&empty);
-    let mut violations = Vec::new();
-    for (key, value) in pinned {
-        match actual.get(*key).map(serde_json::Value::to_string) {
-            Some(json) if json == *value => {}
-            Some(json) => violations.push(format!(
-                "{label}: overrides.{key} must be {value}, got {json}"
-            )),
-            None => violations.push(format!("{label}: overrides.{key} must be {value}")),
-        }
-    }
-    for key in actual.keys() {
-        if !pinned.iter().any(|(pinned_key, _)| pinned_key == key) {
-            violations.push(format!(
-                "{label}: overrides key `{key}` is not part of the canonical override map"
-            ));
-        }
-    }
     violations
 }
 
 /// Target validation: every group MUST have a target, its `kind` must be
-/// in the vocabulary, the semantic fields each kind requires must be
+/// in the vocabulary, and the semantic fields each kind requires must be
 /// present (`fastest-in-country` names a country; `secure-core` names
-/// its entry and exit), `fastest-in-region` must name a primary region,
-/// and each canonical id's kind is pinned (a group that resolves
-/// nothing, or resolves it by unspecified means, is not a valid catalog
-/// entry). The remaining semantic fields (`exclude_physical_country`,
-/// `connection_type`, `selection_authority`) are pinned per canonical id
-/// where the catalog defines them.
+/// its entry and exit; `fastest-in-region` names a primary region) — a
+/// group that resolves nothing, or resolves it by unspecified means, is
+/// not a valid catalog entry. Per-canonical-id VALUE pins used to live
+/// here (kind, exclude flag, connection type, selection authority per
+/// id); they are retired, subsumed by the golden-table rule, which
+/// compares every entry's full definition — these fields included —
+/// against the golden rendering.
 fn check_target(label: &str, group: &Group, regions: &BTreeSet<&str>) -> Vec<String> {
     let Some(target) = &group.target else {
         return vec![format!("{label}: `target` is missing")];
@@ -784,57 +1026,7 @@ fn check_target(label: &str, group: &Group, regions: &BTreeSet<&str>) -> Vec<Str
             )),
         }
     }
-    if let Some((_, expected)) = EXPECTED_GROUP_TARGET_KINDS
-        .iter()
-        .find(|(id, _)| Some(*id) == group.id.as_deref())
-        && target.kind.as_deref().is_some_and(|kind| kind != *expected)
-    {
-        violations.push(format!("{label}: target.kind must be `{expected}`"));
-    }
-    violations.extend(expect_pinned(
-        label,
-        group.id.as_deref(),
-        &EXPECTED_EXCLUDE_PHYSICAL_COUNTRY,
-        target.exclude_physical_country,
-        "exclude_physical_country",
-    ));
-    violations.extend(expect_pinned(
-        label,
-        group.id.as_deref(),
-        &EXPECTED_CONNECTION_TYPES,
-        target.connection_type.as_deref(),
-        "connection_type",
-    ));
-    violations.extend(expect_pinned(
-        label,
-        group.id.as_deref(),
-        &EXPECTED_SELECTION_AUTHORITIES,
-        target.selection_authority.as_deref(),
-        "selection_authority",
-    ));
     violations
-}
-
-/// Enforces one per-canonical-id target-field pin (the
-/// [`EXPECTED_GROUP_TARGET_KINDS`] style, applied to the remaining
-/// semantic fields): where the v1 catalog defines the field on an id, a
-/// document whose value differs — or which drops it — is silent semantic
-/// drift, not a valid catalog. Ids without a pin are unconstrained.
-fn expect_pinned<T: PartialEq + std::fmt::Display>(
-    label: &str,
-    id: Option<&str>,
-    pins: &[(&str, T)],
-    actual: Option<T>,
-    field: &str,
-) -> Vec<String> {
-    let Some((_, expected)) = pins.iter().find(|(pinned, _)| Some(*pinned) == id) else {
-        return Vec::new();
-    };
-    if actual.as_ref() == Some(expected) {
-        Vec::new()
-    } else {
-        vec![format!("{label}: target.{field} must be `{expected}`")]
-    }
 }
 
 fn namespace_counts(doc: &GroupsFile) -> BTreeMap<String, usize> {
@@ -855,7 +1047,7 @@ mod tests {
     use super::*;
 
     fn good_groups_yaml() -> String {
-        let mut yaml = "\
+        let yaml = "\
 schema_version: 1
 catalog_revision: \"2026-01-01\"
 contract:
@@ -883,6 +1075,16 @@ sources:
     url: https://unstats.un.org/unsd/methodology/m49/
   docs:
     url: https://example.com
+  proton_default_connection:
+    url: https://protonvpn.com/support/default-connection
+  proton_connection_profiles:
+    url: https://protonvpn.com/support/connection-profiles
+  proton_windows_release_notes:
+    url: https://protonvpn.com/support/release-notes-windows
+  android_initial_profiles:
+    url: https://example.com/initial-profiles
+  android_fastest_exclusion:
+    url: https://example.com/fastest-exclusion
 regional_taxonomy:
   id: un-m49-six-continent-view
   vendored_snapshot:
@@ -897,72 +1099,211 @@ regional_taxonomy:
     south-america: {m49_codes: [\"005\"]}
     oceania: {m49_codes: [\"009\"]}
 groups:
+  - id: \"proton:fastest-country\"
+    label: Fastest country
+    origin: proton
+    definition_source: official-client-compat
+    immutable: true
+    entitlement: plan-dependent
+    target:
+      kind: fastest
+      connection_type: standard
+    ranking_policy: proton-score
+    overrides: {}
+    sources: [proton_default_connection, proton_connection_profiles]
+
+  - id: \"proton:fastest-excluding-my-country\"
+    label: Fastest country (excluding my country)
+    origin: proton
+    definition_source: official-client-compat
+    immutable: true
+    entitlement: plan-dependent
+    target:
+      kind: fastest
+      connection_type: standard
+      exclude_physical_country: true
+    ranking_policy: proton-score
+    overrides: {}
+    sources: [android_fastest_exclusion, proton_windows_release_notes]
+
+  - id: \"proton:random-country\"
+    label: Random country
+    origin: proton
+    definition_source: official-client-compat
+    immutable: true
+    entitlement: plan-dependent
+    target:
+      kind: random
+      connection_type: standard
+      selection_authority: proton-backend-when-required
+    ranking_policy: random-country-then-server
+    overrides: {}
+    sources: [proton_default_connection, proton_windows_release_notes]
+
+  - id: \"proton:streaming-us\"
+    label: Streaming US
+    origin: proton
+    definition_source: official-client-compat
+    immutable: true
+    entitlement: target-and-feature-dependent
+    target:
+      kind: fastest-in-country
+      connection_type: standard
+      country: US
+    ranking_policy: proton-score
+    overrides:
+      protocol: wireguard-udp
+    sources: [android_initial_profiles]
+
+  - id: \"proton:gaming\"
+    label: Gaming
+    origin: proton
+    definition_source: official-client-compat
+    immutable: true
+    entitlement: target-and-feature-dependent
+    target:
+      kind: fastest
+      connection_type: standard
+    ranking_policy: proton-score
+    overrides:
+      nat: moderate
+    sources: [android_initial_profiles]
+
+  - id: \"proton:anti-censorship\"
+    label: Anti-censorship
+    origin: proton
+    definition_source: official-client-compat
+    immutable: true
+    entitlement: target-and-feature-dependent
+    target:
+      kind: fastest
+      connection_type: standard
+      exclude_physical_country: true
+    ranking_policy: proton-score
+    overrides:
+      protocol: stealth
+    sources: [android_initial_profiles, android_fastest_exclusion]
+
+  - id: \"proton:max-security\"
+    label: Max security
+    origin: proton
+    definition_source: official-client-compat
+    immutable: true
+    entitlement: target-and-feature-dependent
+    target:
+      kind: secure-core
+      entry_country: fastest
+      exit_country: fastest
+    ranking_policy: proton-score
+    overrides:
+      lan_access: block
+    sources: [android_initial_profiles]
+
+  - id: \"proton:work-school\"
+    label: Work/School
+    origin: proton
+    definition_source: official-client-compat
+    immutable: true
+    entitlement: target-and-feature-dependent
+    target:
+      kind: fastest
+      connection_type: standard
+    ranking_policy: proton-score
+    overrides:
+      protocol: stealth
+      lan_access: block
+    sources: [android_initial_profiles]
+
+  - id: \"protonwire:fastest-africa\"
+    label: Fastest Africa
+    origin: protonwire
+    definition_source: protonwire
+    immutable: true
+    entitlement: paid-location-selection
+    target:
+      kind: fastest-in-region
+      region: africa
+    ranking_policy: proton-score
+    allowed_ranking_overrides: [balanced, load, latency]
+    overrides: {}
+    sources: [un_m49]
+
+  - id: \"protonwire:fastest-asia\"
+    label: Fastest Asia
+    origin: protonwire
+    definition_source: protonwire
+    immutable: true
+    entitlement: paid-location-selection
+    target:
+      kind: fastest-in-region
+      region: asia
+    ranking_policy: proton-score
+    allowed_ranking_overrides: [balanced, load, latency]
+    overrides: {}
+    sources: [un_m49]
+
+  - id: \"protonwire:fastest-europe\"
+    label: Fastest Europe
+    origin: protonwire
+    definition_source: protonwire
+    immutable: true
+    entitlement: paid-location-selection
+    target:
+      kind: fastest-in-region
+      region: europe
+    ranking_policy: proton-score
+    allowed_ranking_overrides: [balanced, load, latency]
+    overrides: {}
+    sources: [un_m49]
+
+  - id: \"protonwire:fastest-north-america\"
+    label: Fastest North America
+    origin: protonwire
+    definition_source: protonwire
+    immutable: true
+    entitlement: paid-location-selection
+    target:
+      kind: fastest-in-region
+      region: north-america
+    ranking_policy: proton-score
+    allowed_ranking_overrides: [balanced, load, latency]
+    overrides: {}
+    sources: [un_m49]
+
+  - id: \"protonwire:fastest-south-america\"
+    label: Fastest South America
+    origin: protonwire
+    definition_source: protonwire
+    immutable: true
+    entitlement: paid-location-selection
+    target:
+      kind: fastest-in-region
+      region: south-america
+    ranking_policy: proton-score
+    allowed_ranking_overrides: [balanced, load, latency]
+    overrides: {}
+    sources: [un_m49]
+
+  - id: \"protonwire:fastest-oceania\"
+    label: Fastest Oceania
+    origin: protonwire
+    definition_source: protonwire
+    immutable: true
+    entitlement: paid-location-selection
+    target:
+      kind: fastest-in-region
+      region: oceania
+    ranking_policy: proton-score
+    allowed_ranking_overrides: [balanced, load, latency]
+    overrides: {}
+    sources: [un_m49]
 "
         .to_string();
-        // The proton targets mirror docs/connection-groups.yaml exactly:
-        // connection_type, selection_authority, exclude_physical_country,
-        // country, and the secure-core entry/exit pair are each entry's
-        // pinned selection semantics, not decoration — and so are the
-        // overrides (streaming-us protocol, gaming nat, anti-censorship
-        // protocol, max-security lan_access, work-school both).
-        for (id, target, overrides) in [
-            (
-                "proton:fastest-country",
-                "{kind: fastest, connection_type: standard}",
-                "{}",
-            ),
-            (
-                "proton:fastest-excluding-my-country",
-                "{kind: fastest, connection_type: standard, exclude_physical_country: true}",
-                "{}",
-            ),
-            (
-                "proton:random-country",
-                "{kind: random, connection_type: standard, selection_authority: proton-backend-when-required}",
-                "{}",
-            ),
-            (
-                "proton:streaming-us",
-                "{kind: fastest-in-country, connection_type: standard, country: US}",
-                "{protocol: wireguard-udp}",
-            ),
-            (
-                "proton:gaming",
-                "{kind: fastest, connection_type: standard}",
-                "{nat: moderate}",
-            ),
-            (
-                "proton:anti-censorship",
-                "{kind: fastest, connection_type: standard, exclude_physical_country: true}",
-                "{protocol: stealth}",
-            ),
-            (
-                "proton:max-security",
-                "{kind: secure-core, entry_country: fastest, exit_country: fastest}",
-                "{lan_access: block}",
-            ),
-            (
-                "proton:work-school",
-                "{kind: fastest, connection_type: standard}",
-                "{protocol: stealth, lan_access: block}",
-            ),
-        ] {
-            yaml.push_str(&format!(
-                "  - id: \"{id}\"\n    definition_source: official-client-compat\n    immutable: true\n    ranking_policy: proton-score\n    overrides: {overrides}\n    sources: [docs]\n    target: {target}\n"
-            ));
-        }
-        for region in [
-            "africa",
-            "asia",
-            "europe",
-            "north-america",
-            "south-america",
-            "oceania",
-        ] {
-            yaml.push_str(&format!(
-                "  - id: \"protonwire:fastest-{region}\"\n    definition_source: protonwire\n    immutable: true\n    ranking_policy: proton-score\n    allowed_ranking_overrides: [balanced, load, latency]\n    overrides: {{}}\n    sources: [un_m49]\n    target: {{kind: fastest-in-region, region: {region}}}\n"
-            ));
-        }
+        // The groups table mirrors docs/connection-groups.yaml verbatim:
+        // it must stay byte-faithful to the canonical entries (only the
+        // surrounding sections — sources, taxonomy — are fixture-local),
+        // because the golden-table rule compares the fixture's table
+        // against the same pinned golden rendering as the real document.
         yaml
     }
 
@@ -980,6 +1321,98 @@ groups:
             "expected the good fixture to pass"
         );
         fs::remove_file(&path).ok();
+    }
+
+    /// Round-9 post-close disposal (structural): the field-by-field pin
+    /// family had admitted one-more-unpinned-field three review rounds
+    /// running — every per-id pin only ever covered the fields a past
+    /// review noticed. The first five edits each stay inside every
+    /// vocabulary and cross-reference the gate checks (a DEFINED ranking
+    /// policy, a defined source key, the allowed definition-source
+    /// vocabulary, a field no check deserializes), so the pre-golden
+    /// gate let them all through (observed red on landing: the first
+    /// case alone was enough to fail the suite pre-implementation). The
+    /// remaining cases are the retired pin family's mutations (FU-1
+    /// kind-swaps, the FU-2 exclude-flag deletion, round-8 X7 override
+    /// drift), folded in so their drift classes stay covered now that
+    /// the per-id pins are gone — every case must fail via the
+    /// golden-table rule.
+    #[test]
+    fn canonical_group_edits_fail_the_golden_table() {
+        let fastest_country_sources =
+            "overrides: {}\n    sources: [proton_default_connection, proton_connection_profiles]";
+        for (label, original, swapped) in [
+            (
+                "ranking policy swapped for another defined policy",
+                "ranking_policy: proton-score\n    overrides: {}\n    sources: [proton_default_connection",
+                "ranking_policy: load\n    overrides: {}\n    sources: [proton_default_connection",
+            ),
+            (
+                "cited source dropped from the list",
+                fastest_country_sources,
+                "overrides: {}\n    sources: [proton_default_connection]",
+            ),
+            (
+                "label edited",
+                "label: Fastest country\n    origin: proton",
+                "label: Fastest nation\n    origin: proton",
+            ),
+            (
+                "unknown field added to the entry",
+                "entitlement: plan-dependent\n    target:\n      kind: fastest\n      connection_type: standard\n    ranking_policy: proton-score",
+                "entitlement: plan-dependent\n    note: scratch\n    target:\n      kind: fastest\n      connection_type: standard\n    ranking_policy: proton-score",
+            ),
+            (
+                "definition source swapped within the vocabulary",
+                "  - id: \"proton:fastest-country\"\n    label: Fastest country\n    origin: proton\n    definition_source: official-client-compat",
+                "  - id: \"proton:fastest-country\"\n    label: Fastest country\n    origin: proton\n    definition_source: proton-api",
+            ),
+            // Retired FU-1 pin cases: kinds swapped for OTHER VALID kinds
+            // stay inside the vocabulary and resolve something.
+            (
+                "kind swapped for another valid kind (random)",
+                "target:\n      kind: random\n      connection_type: standard\n      selection_authority: proton-backend-when-required",
+                "target:\n      kind: fastest\n      connection_type: standard\n      selection_authority: proton-backend-when-required",
+            ),
+            (
+                "kind swapped for another valid kind (secure-core)",
+                "target:\n      kind: secure-core\n      entry_country: fastest\n      exit_country: fastest",
+                "target:\n      kind: fastest",
+            ),
+            // Retired FU-2 pin case: the exclude flag IS the group's
+            // meaning on the two ids the catalog sets it on.
+            (
+                "exclude_physical_country deleted",
+                "target:\n      kind: fastest\n      connection_type: standard\n      exclude_physical_country: true\n",
+                "target:\n      kind: fastest\n      connection_type: standard\n",
+            ),
+            // Retired round-8 X7 pin cases: override VALUE drift, a pinned
+            // override dropped, an override added to a pinned-empty group.
+            (
+                "override value flipped",
+                "overrides:\n      lan_access: block\n    sources: [android_initial_profiles]\n\n  - id: \"proton:work-school\"",
+                "overrides:\n      lan_access: allow\n    sources: [android_initial_profiles]\n\n  - id: \"proton:work-school\"",
+            ),
+            (
+                "pinned override dropped",
+                "overrides:\n      lan_access: block\n    sources: [android_initial_profiles]\n\n  - id: \"proton:work-school\"",
+                "overrides: {}\n    sources: [android_initial_profiles]\n\n  - id: \"proton:work-school\"",
+            ),
+            (
+                "override added to a pinned-empty group",
+                "overrides: {}\n    sources: [proton_default_connection, proton_connection_profiles]",
+                "overrides:\n      protocol: stealth\n    sources: [proton_default_connection, proton_connection_profiles]",
+            ),
+        ] {
+            let yaml = good_groups_yaml().replacen(original, swapped, 1);
+            let path = temp_yaml("golden-drift", &yaml);
+            assert!(
+                !validate(&path).unwrap(),
+                "{label}: editing a canonical group's full definition must fail \
+                 validation, not only the fields a past round happened to pin"
+            );
+            fs::remove_file(&path).ok();
+        }
     }
 
     #[test]
@@ -1079,8 +1512,11 @@ groups:
 
     #[test]
     fn group_count_is_locked() {
-        let yaml = good_groups_yaml()
-            .replacen("  - id: \"protonwire:fastest-oceania\"\n    definition_source: protonwire\n    immutable: true\n    ranking_policy: proton-score\n    allowed_ranking_overrides: [balanced, load, latency]\n    overrides: {}\n    sources: [un_m49]\n    target: {kind: fastest-in-region, region: oceania}\n", "", 1);
+        let yaml = good_groups_yaml().replacen(
+            "  - id: \"protonwire:fastest-oceania\"\n    label: Fastest Oceania\n    origin: protonwire\n    definition_source: protonwire\n    immutable: true\n    entitlement: paid-location-selection\n    target:\n      kind: fastest-in-region\n      region: oceania\n    ranking_policy: proton-score\n    allowed_ranking_overrides: [balanced, load, latency]\n    overrides: {}\n    sources: [un_m49]\n",
+            "",
+            1,
+        );
         let path = temp_yaml("count", &yaml);
         assert!(!validate(&path).unwrap());
         fs::remove_file(&path).ok();
@@ -1094,8 +1530,8 @@ groups:
     #[test]
     fn group_without_target_fails() {
         let yaml = good_groups_yaml().replacen(
-            "\n    target: {kind: fastest, connection_type: standard}\n",
-            "\n",
+            "\n    target:\n      kind: fastest\n      connection_type: standard\n    ranking_policy: proton-score\n    overrides: {}\n    sources: [proton_default_connection, proton_connection_profiles]",
+            "\n    ranking_policy: proton-score\n    overrides: {}\n    sources: [proton_default_connection, proton_connection_profiles]",
             1,
         );
         let path = temp_yaml("no-target", &yaml);
@@ -1110,8 +1546,8 @@ groups:
     #[test]
     fn typoed_target_kind_fails() {
         let yaml = good_groups_yaml().replacen(
-            "target: {kind: fastest, connection_type: standard}",
-            "target: {kind: fatest, connection_type: standard}",
+            "target:\n      kind: fastest\n      connection_type: standard\n    ranking_policy: proton-score\n    overrides: {}\n    sources: [proton_default_connection",
+            "target:\n      kind: fatest\n      connection_type: standard\n    ranking_policy: proton-score\n    overrides: {}\n    sources: [proton_default_connection",
             1,
         );
         let path = temp_yaml("typo-kind", &yaml);
@@ -1126,8 +1562,8 @@ groups:
     #[test]
     fn fastest_in_region_without_region_fails() {
         let yaml = good_groups_yaml().replacen(
-            "target: {kind: fastest-in-region, region: africa}",
-            "target: {kind: fastest-in-region}",
+            "target:\n      kind: fastest-in-region\n      region: africa\n",
+            "target:\n      kind: fastest-in-region\n",
             1,
         );
         let path = temp_yaml("no-region", &yaml);
@@ -1138,79 +1574,25 @@ groups:
         fs::remove_file(&path).ok();
     }
 
-    /// FU-1 (rust-review round-5 follow-up, Medium — the repo's own
-    /// red-test rule): swapping a canonical id's kind for ANOTHER VALID
-    /// kind stays inside the vocabulary and still resolves something, so
-    /// every other check passes — only the EXPECTED_GROUP_TARGET_KINDS
-    /// pin in `check_target` catches the drift. Deleting that enforcement
-    /// block used to leave every test AND the CI gate green (the real
-    /// document satisfies the pin, so only a mutated fixture can expose
-    /// the gap). Both target lines are unique in the fixture, so each
-    /// `replacen` targets exactly one group: `random` → `fastest` on
-    /// proton:random-country and `secure-core` → `fastest` on
-    /// proton:max-security (the non-ambiguous secure-core line); the
-    /// swapped targets keep every other pinned field (connection_type,
-    /// selection_authority, entry/exit) intact, so the kind pin is the
-    /// only rule that fires.
-    #[test]
-    fn kind_swapped_for_another_valid_kind_fails() {
-        for (original, swapped) in [
-            (
-                "target: {kind: random, connection_type: standard, selection_authority: proton-backend-when-required}",
-                "target: {kind: fastest, connection_type: standard, selection_authority: proton-backend-when-required}",
-            ),
-            (
-                "target: {kind: secure-core, entry_country: fastest, exit_country: fastest}",
-                "target: {kind: fastest}",
-            ),
-        ] {
-            let yaml = good_groups_yaml().replacen(original, swapped, 1);
-            let path = temp_yaml("kind-swap", &yaml);
-            assert!(
-                !validate(&path).unwrap(),
-                "swapping `{original}` for `{swapped}` must fail validation: a \
-                 canonical id's pinned target kind must not drift"
-            );
-            fs::remove_file(&path).ok();
-        }
-    }
-
     /// FU-2 (rust-review round-5 follow-up, Medium): `Target` used to
     /// deserialize only kind+region, so `country` was silently dropped —
     /// deleting it from proton:streaming-us left a `fastest-in-country`
     /// target with nothing to be fastest IN, and the gate stayed green.
+    /// (The per-id VALUE pins this used to lean on are retired — the
+    /// golden-table rule catches this edit too — but the per-kind
+    /// structural requirement stays: a fastest-in-country target with no
+    /// country resolves nothing its kind names.)
     #[test]
     fn fastest_in_country_without_country_fails() {
         let yaml = good_groups_yaml().replacen(
-            "target: {kind: fastest-in-country, connection_type: standard, country: US}",
-            "target: {kind: fastest-in-country, connection_type: standard}",
+            "target:\n      kind: fastest-in-country\n      connection_type: standard\n      country: US\n",
+            "target:\n      kind: fastest-in-country\n      connection_type: standard\n",
             1,
         );
         let path = temp_yaml("no-country", &yaml);
         assert!(
             !validate(&path).unwrap(),
             "fastest-in-country without target.country must fail validation"
-        );
-        fs::remove_file(&path).ok();
-    }
-
-    /// FU-2: same silent-drop gap for `exclude_physical_country` — the
-    /// flag IS the group's meaning on the two ids the catalog sets it on.
-    /// The first (and only, until anti-censorship's) occurrence of this
-    /// target line is proton:fastest-excluding-my-country, the fixture's
-    /// proton order.
-    #[test]
-    fn exclude_physical_country_deletion_fails() {
-        let yaml = good_groups_yaml().replacen(
-            "target: {kind: fastest, connection_type: standard, exclude_physical_country: true}",
-            "target: {kind: fastest, connection_type: standard}",
-            1,
-        );
-        let path = temp_yaml("no-exclude", &yaml);
-        assert!(
-            !validate(&path).unwrap(),
-            "deleting target.exclude_physical_country from a pinned canonical \
-             group must fail validation"
         );
         fs::remove_file(&path).ok();
     }
@@ -1222,8 +1604,8 @@ groups:
     #[test]
     fn secure_core_without_exit_country_fails() {
         let yaml = good_groups_yaml().replacen(
-            "target: {kind: secure-core, entry_country: fastest, exit_country: fastest}",
-            "target: {kind: secure-core, entry_country: fastest}",
+            "target:\n      kind: secure-core\n      entry_country: fastest\n      exit_country: fastest\n",
+            "target:\n      kind: secure-core\n      entry_country: fastest\n",
             1,
         );
         let path = temp_yaml("no-exit", &yaml);
@@ -1239,8 +1621,8 @@ groups:
     #[test]
     fn fastest_in_region_with_unknown_region_fails() {
         let yaml = good_groups_yaml().replacen(
-            "target: {kind: fastest-in-region, region: africa}",
-            "target: {kind: fastest-in-region, region: atlantis}",
+            "target:\n      kind: fastest-in-region\n      region: africa\n",
+            "target:\n      kind: fastest-in-region\n      region: atlantis\n",
             1,
         );
         let path = temp_yaml("bad-region", &yaml);
@@ -1300,35 +1682,6 @@ groups:
         );
     }
 
-    /// The per-group kind map pins exactly the canonical ids (no strays,
-    /// no gaps) with the v1 catalog's kind distribution: 5x fastest, 1x
-    /// random, 1x fastest-in-country, 1x secure-core, 6x fastest-in-region.
-    #[test]
-    fn canonical_target_kind_map_is_pinned() {
-        let ids: BTreeSet<&str> = EXPECTED_GROUP_IDS.iter().copied().collect();
-        let pinned_ids: BTreeSet<&str> = EXPECTED_GROUP_TARGET_KINDS
-            .iter()
-            .map(|(id, _)| *id)
-            .collect();
-        assert_eq!(
-            pinned_ids, ids,
-            "the kind map must cover exactly the canonical ids"
-        );
-        let mut distribution: BTreeMap<&str, usize> = BTreeMap::new();
-        for (_, kind) in EXPECTED_GROUP_TARGET_KINDS {
-            assert!(
-                ALLOWED_TARGET_KINDS.contains(&kind),
-                "pinned kind `{kind}` must be in the vocabulary"
-            );
-            *distribution.entry(kind).or_default() += 1;
-        }
-        assert_eq!(distribution.get("fastest"), Some(&5));
-        assert_eq!(distribution.get("random"), Some(&1));
-        assert_eq!(distribution.get("fastest-in-country"), Some(&1));
-        assert_eq!(distribution.get("secure-core"), Some(&1));
-        assert_eq!(distribution.get("fastest-in-region"), Some(&6));
-    }
-
     #[test]
     fn renamed_group_id_violates() {
         // The count check alone lets a renamed canonical id through; the
@@ -1343,79 +1696,65 @@ groups:
         fs::remove_file(&path).ok();
     }
 
-    /// The per-group override map pins exactly the canonical ids (the
-    /// canonical_target_kind_map_is_pinned style): 9 groups with the
-    /// empty map, the 5 documented exceptions (streaming-us protocol,
-    /// gaming nat, anti-censorship protocol, max-security lan_access,
-    /// work-school protocol+lan_access), and every key inside the
-    /// allowed override-key vocabulary.
+    /// The golden table pins exactly the canonical id set (the retired
+    /// canonical_target_kind_map/canonical_override_map coverage style):
+    /// one entry per built-in, no strays, no gaps — so the golden rule
+    /// cannot silently stop covering a canonical group, and cannot grow
+    /// an entry for an id outside the pinned set.
     #[test]
-    fn canonical_override_map_is_pinned() {
+    fn golden_table_pins_exactly_the_canonical_ids() {
         let ids: BTreeSet<&str> = EXPECTED_GROUP_IDS.iter().copied().collect();
-        let pinned_ids: BTreeSet<&str> =
-            EXPECTED_GROUP_OVERRIDES.iter().map(|(id, _)| *id).collect();
+        let golden_ids: BTreeSet<&str> = GOLDEN_GROUP_ENTRIES.iter().map(|(id, _)| *id).collect();
         assert_eq!(
-            pinned_ids, ids,
-            "the override map must cover exactly the canonical ids"
+            golden_ids, ids,
+            "GOLDEN_GROUP_ENTRIES must cover exactly the canonical ids"
         );
-        let mut non_empty = 0;
-        for (_, overrides) in EXPECTED_GROUP_OVERRIDES {
-            if !overrides.is_empty() {
-                non_empty += 1;
-            }
-            for (key, _) in overrides {
-                assert!(
-                    ALLOWED_OVERRIDE_KEYS.contains(key),
-                    "pinned override key `{key}` must be in the vocabulary"
-                );
-            }
+        // Every rendering must itself name its id: the per-id comparison
+        // keys on the tuple, and a rendering whose embedded id disagrees
+        // with its key would compare against the wrong entry forever.
+        for (id, rendered) in GOLDEN_GROUP_ENTRIES {
+            let entry: serde_json::Value = serde_norway::from_str(rendered)
+                .unwrap_or_else(|err| panic!("golden entry `{id}` is not valid YAML: {err}"));
+            assert_eq!(
+                entry.get("id").and_then(serde_json::Value::as_str),
+                Some(*id),
+                "golden entry `{id}` must render an entry whose id field is `{id}`"
+            );
         }
-        assert_eq!(
-            non_empty, 5,
-            "exactly five canonical groups define non-empty overrides"
-        );
     }
 
-    /// Round-8 X7: override VALUES were unconstrained — only the key
-    /// vocabulary was checked — so max-security's lan_access
-    /// block->allow passed, a pinned override could be dropped, and an
-    /// override could be added to a group the catalog defines without
-    /// one. Each mutation keeps every key inside ALLOWED_OVERRIDE_KEYS,
-    /// so only the per-group value pin can catch it.
+    /// TEST-ONLY crosscheck (the canonical_test_inventory_matches_the_prd
+    /// style): the GATE never reads the real document to validate itself —
+    /// the pinned golden is its single authority — but this test renders
+    /// the REAL docs/connection-groups.yaml with the same function and
+    /// asserts byte equality with the constant, so `cargo test` catches a
+    /// document edit that forgot the constant (or vice versa) even before
+    /// `cargo xtask all` runs. A deliberate contract change edits the
+    /// document AND regenerates the constant; this test is the
+    /// regeneration discipline.
     #[test]
-    fn override_value_drift_fails() {
-        for (label, original, swapped) in [
-            (
-                "value flipped",
-                "overrides: {lan_access: block}",
-                "overrides: {lan_access: allow}",
-            ),
-            (
-                "pinned override dropped",
-                "overrides: {lan_access: block}",
-                "overrides: {}",
-            ),
-            (
-                "override added to a pinned-empty group",
-                "overrides: {}\n    sources: [docs]\n    target: {kind: fastest, connection_type: standard}\n  - id: \"proton:fastest-excluding-my-country\"",
-                "overrides: {protocol: stealth}\n    sources: [docs]\n    target: {kind: fastest, connection_type: standard}\n  - id: \"proton:fastest-excluding-my-country\"",
-            ),
-        ] {
-            let yaml = good_groups_yaml().replacen(original, swapped, 1);
-            let path = temp_yaml("override-drift", &yaml);
-            assert!(
-                !validate(&path).unwrap(),
-                "{label}: override drift must fail validation"
-            );
-            fs::remove_file(&path).ok();
-        }
+    fn real_document_matches_the_golden_table() {
+        let path = crate::workspace_root()
+            .expect("cannot derive the workspace root")
+            .join("docs")
+            .join("connection-groups.yaml");
+        let text = fs::read_to_string(&path)
+            .unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()));
+        let raw: serde_json::Value = serde_norway::from_str(&text)
+            .unwrap_or_else(|err| panic!("failed to parse {}: {err}", path.display()));
+        let violations = check_golden_groups_table(&raw);
+        assert!(
+            violations.is_empty(),
+            "docs/connection-groups.yaml drifted from GOLDEN_GROUP_ENTRIES — a \
+             deliberate contract change regenerates the constant: {violations:?}"
+        );
     }
 
     #[test]
     fn unknown_override_key_fails() {
         let yaml = good_groups_yaml().replacen(
-            "  - id: \"proton:fastest-country\"\n    definition_source: official-client-compat\n    immutable: true\n    ranking_policy: proton-score\n    overrides: {}",
-            "  - id: \"proton:fastest-country\"\n    definition_source: official-client-compat\n    immutable: true\n    ranking_policy: proton-score\n    overrides: {color: red}",
+            "overrides: {}\n    sources: [proton_default_connection, proton_connection_profiles]",
+            "overrides: {color: red}\n    sources: [proton_default_connection, proton_connection_profiles]",
             1,
         );
         let path = temp_yaml("override-key", &yaml);
