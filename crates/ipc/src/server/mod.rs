@@ -47,6 +47,22 @@ const HELLO_DEADLINE: Duration = Duration::from_secs(5);
 /// slot — forever.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Default per-session idle ceiling (M2 S12): the longest a HANDSHAKEN
+/// session may go without a single readable byte from its peer before
+/// the daemon reclaims its slot. Post-hello reads are unbounded BY
+/// DESIGN — a live client may take as long as it needs between requests
+/// — but "as long as it needs" cannot be "forever": a client that
+/// handshakes and then holds its socket open silently (crashed TUI,
+/// suspended laptop, a hostile slot-squatter) pins one of the
+/// MAX_SESSIONS slots indefinitely, and 64 of them wedge the daemon.
+/// The ceiling is on the order of minutes — far past any legitimate
+/// inter-request gap of the current clients (the TUI re-polls in
+/// seconds), and reconnect is the client's existing recovery path. A
+/// DRIBBLING peer (bytes arriving, frame never completing) resets the
+/// clock byte-for-byte, matching the budget's wording: no ANY readable
+/// byte, not no complete frame.
+const IDLE_CEILING: Duration = Duration::from_secs(600);
+
 /// Overall ceiling on post-stop draining. `SO_SNDTIMEO` bounds each WRITE
 /// syscall, not the shutdown join: a session that keeps dribbling reads (or
 /// a handler that blocks) would otherwise hold `serve()` open indefinitely.
@@ -112,6 +128,11 @@ pub(crate) struct ServeBudgets {
     /// it, and under steady drain it never expires at all (sec round-7
     /// probe).
     pub(crate) write_timeout: Duration,
+    /// Per-session idle ceiling (M2 S12): the longest a handshaken
+    /// session may go without ANY readable byte from its peer before
+    /// its slot is reclaimed through the normal teardown. Tests inject
+    /// shrunk values; production keeps the minutes-scale default.
+    pub(crate) idle_timeout: Duration,
 }
 
 impl Default for ServeBudgets {
@@ -120,6 +141,7 @@ impl Default for ServeBudgets {
             hello_deadline: HELLO_DEADLINE,
             drain_ceiling: DRAIN_CEILING,
             write_timeout: WRITE_TIMEOUT,
+            idle_timeout: IDLE_CEILING,
         }
     }
 }
@@ -285,6 +307,7 @@ impl IpcServer {
                                 stop,
                                 budgets.hello_deadline,
                                 budgets.write_timeout,
+                                budgets.idle_timeout,
                             )
                         })) {
                             warn!("IPC session panicked and was dropped: {e:?}");

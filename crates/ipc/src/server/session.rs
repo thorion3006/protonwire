@@ -6,7 +6,7 @@ use std::io;
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -118,6 +118,7 @@ pub(super) fn handle_session<H: RequestHandler>(
     stop: Arc<AtomicBool>,
     hello_deadline: Duration,
     write_timeout: Duration,
+    idle_ceiling: Duration,
 ) {
     // The session slot the accept loop reserved is released on EVERY exit
     // path — early rejects below, dispatcher panics (the serve loop's
@@ -247,6 +248,7 @@ pub(super) fn handle_session<H: RequestHandler>(
         &peer,
         &stop,
         hello_deadline,
+        idle_ceiling,
     );
     // Teardown order is load-bearing: dropping our sender alone is not
     // enough — the forwarder holds a clone — so we must unsubscribe BEFORE
@@ -282,16 +284,31 @@ fn serve_messages(
     peer: &PeerCredentials,
     stop: &AtomicBool,
     hello_deadline: Duration,
+    idle_ceiling: Duration,
 ) -> Result<(), FrameError> {
     let SessionOutputs {
         writer_tx,
         gate_tx,
         window,
     } = outputs;
-    let mut reader = FrameReader::new(read_half);
+    // The idle ceiling (M2 S12) is byte-accurate on purpose: "no ANY
+    // readable byte", not "no complete frame". The counting wrapper
+    // observes every byte the kernel hands the reader — a peer that
+    // DRIBBLES bytes without ever completing a frame keeps resetting
+    // the clock (it is making the session live), while a peer that
+    // goes fully silent expires it.
+    let read_bytes = Arc::new(AtomicU64::new(0));
+    let mut reader = FrameReader::new(CountingRead {
+        inner: read_half,
+        counter: Arc::clone(&read_bytes),
+    });
     let connected_at = Instant::now();
     let mut hello_done = false;
     let mut client_info = None;
+    // The idle clock starts at the handshake (the budget covers
+    // HANDSHAKEN peers; the pre-hello phase is the hello deadline's).
+    let mut last_byte_at = connected_at;
+    let mut last_byte_count = 0u64;
     while !stop.load(Ordering::SeqCst) {
         if !hello_done && connected_at.elapsed() > hello_deadline {
             let _ = writer_tx.send(ServerMessage::HelloError(HelloError {
@@ -300,15 +317,34 @@ fn serve_messages(
             }));
             return Ok(());
         }
+        if hello_done {
+            let seen = read_bytes.load(Ordering::Relaxed);
+            if seen != last_byte_count {
+                last_byte_count = seen;
+                last_byte_at = Instant::now();
+            } else if last_byte_at.elapsed() > idle_ceiling {
+                info!(
+                    uid = peer.uid,
+                    idle_ms = last_byte_at.elapsed().as_millis() as u64,
+                    "session idle ceiling exceeded; releasing its slot (the \
+                     client reconnects through its existing recovery path)"
+                );
+                return Ok(());
+            }
+        }
         // R9-2: the request-credit window. While K responses (or events)
         // remain unwritten, reading another request would only park more
         // client-amplified output: the loop pauses INSTEAD of reading, so
         // a pipelining client beyond the window waits rather than
         // buffers. Exit paths from the pause: the window reopens (the
         // writer put messages on the wire), the stop flag (checked at the
-        // loop top after `continue`), or the writer's death — a parked
-        // loop never sends, so only the window's exit note can tell it
-        // the session is over.
+        // loop top after `continue`), the writer's death — a parked loop
+        // never sends, so only the window's exit note can tell it the
+        // session is over — and now the idle ceiling too: a peer parked
+        // on the window is by construction not draining, so expiring it
+        // at the ceiling is the reclaim this budget exists for (its
+        // unread-bytes requests, if any, cannot be read while parked and
+        // do not count as activity).
         if hello_done && window.is_exhausted() {
             if window.writer_is_gone() {
                 return Ok(());
@@ -517,6 +553,25 @@ struct SessionOutputs {
     gate_tx: mpsc::SyncSender<u32>,
     /// The shared request-credit window (R9-2).
     window: Arc<WriteWindow>,
+}
+
+/// Read-through byte counter backing the idle ceiling (M2 S12): wraps
+/// the session's read half so the dispatch loop can distinguish "the
+/// peer went fully silent" (expire) from "bytes keep arriving" (reset
+/// the clock, whatever the frame-completion state).
+struct CountingRead<'a> {
+    inner: &'a mut UnixStream,
+    counter: Arc<AtomicU64>,
+}
+
+impl std::io::Read for CountingRead<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        if n > 0 {
+            self.counter.fetch_add(n as u64, Ordering::Relaxed);
+        }
+        Ok(n)
+    }
 }
 
 /// Authorization plus handler execution for one request.
@@ -1538,6 +1593,162 @@ mod tests {
         // for exactly as long as the test needs it.
         hurry.store(true, Ordering::SeqCst);
         let _ = drainer.join();
+        stop.store(true, Ordering::SeqCst);
+        let _ = served.join();
+    }
+
+    /// S12 item 3 — the per-session idle ceiling. Post-hello reads are
+    /// unbounded by design ("a live session may take as long as its
+    /// client needs between requests", the loop's own comment), so a
+    /// peer that HANDSHAKES and then holds its socket open silently — a
+    /// crashed TUI, a suspended laptop, a hostile slot-squatter — kept
+    /// its reserved session slot FOREVER: the hello deadline governs
+    /// only the pre-hello phase, and nothing post-hello ever expires.
+    /// 64 such connections wedge the daemon at MAX_SESSIONS. The idle
+    /// ceiling (a [`ServeBudgets`] knob, minutes-scale by default)
+    /// releases the slot through the normal teardown after a budget with
+    /// ZERO readable bytes. Red (behavioral, observed with the budget
+    /// plumbed but unenforced): the watchdog below fired with the slot
+    /// still held 1.6 s into a 400 ms ceiling — the pre-fix shape,
+    /// held indefinitely.
+    #[test]
+    fn handshaken_silent_peer_releases_its_slot_at_the_idle_ceiling() {
+        let dir = tempfile::tempdir().unwrap();
+        let handler = Arc::new(NullHandler {
+            version: "test".into(),
+            bus: EventBus::new(),
+        });
+        let server = IpcServer::bind(dir.path(), "idle.sock").unwrap();
+        let path = server.socket_path().to_owned();
+        let stop = Arc::new(AtomicBool::new(false));
+        let idle_ceiling = Duration::from_millis(400);
+        let served = {
+            let handler = Arc::clone(&handler);
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                server.serve_with(
+                    handler,
+                    stop,
+                    ServeBudgets {
+                        idle_timeout: idle_ceiling,
+                        ..ServeBudgets::default()
+                    },
+                )
+            })
+        };
+
+        // Handshake normally, then go SILENT while holding the socket
+        // open — neither EOF nor a byte ever arrives from here on.
+        let _silent = connect_and_hello(&path);
+        // Let the session fully establish (the accept loop polls at
+        // 250 ms), past which the hello deadline no longer governs it.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while handler.event_bus().active_sessions() != 1 {
+            assert!(Instant::now() < deadline, "the session never established");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        // Wall-clock watchdog: the reserved slot must be back inside the
+        // ceiling plus polling slack. Pre-enforcement this ran out the
+        // full 5 s with the slot held (the recorded red).
+        let started = Instant::now();
+        while handler.event_bus().active_sessions() != 0 {
+            assert!(
+                Instant::now() < started + idle_ceiling + Duration::from_secs(2),
+                "the session outlived its idle ceiling — a handshaken-then-silent \
+                 peer is holding its slot {} ms into a {} ms ceiling",
+                started.elapsed().as_millis(),
+                idle_ceiling.as_millis()
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        // The teardown guards ran: the subscription went with the slot.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while handler.event_bus().session_count() != 0 {
+            assert!(
+                Instant::now() < deadline,
+                "subscription leaked after the idle-ceiling teardown"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        stop.store(true, Ordering::SeqCst);
+        let _ = served.join();
+    }
+
+    /// S12 item 3, the byte-accuracy pin: the ceiling is "no ANY
+    /// readable byte", NOT "no complete frame". A peer that dribbles
+    /// one byte every 100 ms never completes a frame — a
+    /// frame-completion clock would expire it — but every byte is the
+    /// peer making the session live, so the slot must SURVIVE well past
+    /// a 400 ms ceiling. (Mutation killer for a complete-frame-based
+    /// idle clock; the silent-peer expiry is the test above.)
+    #[test]
+    fn a_dribbling_peer_resets_the_idle_clock_byte_by_byte() {
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().unwrap();
+        let handler = Arc::new(NullHandler {
+            version: "test".into(),
+            bus: EventBus::new(),
+        });
+        let server = IpcServer::bind(dir.path(), "dribble-idle.sock").unwrap();
+        let path = server.socket_path().to_owned();
+        let stop = Arc::new(AtomicBool::new(false));
+        let idle_ceiling = Duration::from_millis(400);
+        let served = {
+            let handler = Arc::clone(&handler);
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                server.serve_with(
+                    handler,
+                    stop,
+                    ServeBudgets {
+                        idle_timeout: idle_ceiling,
+                        ..ServeBudgets::default()
+                    },
+                )
+            })
+        };
+
+        let mut stream = connect_and_hello(&path);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while handler.event_bus().active_sessions() != 1 {
+            assert!(Instant::now() < deadline, "the session never established");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        // Dribble for 4x the ceiling, one byte each 100 ms: a LEGAL frame
+        // length is announced up front (60_000 bytes, well under
+        // MAX_FRAME_LEN — announcing garbage would rightly end the
+        // session as TooLarge), then the payload arrives one byte at a
+        // time. The frame never completes, but every byte is activity.
+        let mut prefix = [0u8; 4];
+        prefix.copy_from_slice(&(60_000u32).to_be_bytes());
+        stream.write_all(&prefix[..3]).unwrap();
+        let _ = stream.flush();
+        let dribble_for = idle_ceiling * 4;
+        let started = Instant::now();
+        let mut byte = 0x78u8;
+        while started.elapsed() < dribble_for {
+            if stream.write_all(&[byte]).is_err() {
+                panic!(
+                    "the server hung up on a DRIBBLING peer {} ms into a {} ms \
+                     ceiling — the clock must reset byte-by-byte, not per frame",
+                    started.elapsed().as_millis(),
+                    idle_ceiling.as_millis()
+                );
+            }
+            let _ = stream.flush();
+            byte = byte.wrapping_add(1);
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert_eq!(
+            handler.event_bus().active_sessions(),
+            1,
+            "a peer that keeps sending bytes must hold its slot — the ceiling \
+             expires SILENCE, not slowness"
+        );
+        drop(stream);
         stop.store(true, Ordering::SeqCst);
         let _ = served.join();
     }
