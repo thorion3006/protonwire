@@ -305,23 +305,158 @@ impl SystemConfig {
     }
 
     /// Field-level authority report used by tests and diagnostics. Paths use
-    /// dotted notation against the document root.
+    /// dotted notation against the document root. CONTRACT (T-37
+    /// groundwork, PRD section 10: "the versioned schema must tag every
+    /// field with its authority class"): the table carries exactly one
+    /// entry per FIELD of the typed surface — the
+    /// `authority_report_covers_every_typed_field` test walks a
+    /// fully-populated document and fails if any field is missing or any
+    /// entry is stale. Sequence-of-structure fields list both the field
+    /// itself (the `rules: []` form) and each element field
+    /// (`rules[].action`). Classification mirrors the pre-S3 section-level
+    /// table (features/profiles per-user, everything else system);
+    /// per-field refinements land with T-37's overlay ceilings.
     pub fn authority_report(&self) -> Vec<(&'static str, Authority)> {
         vec![
-            ("daemon", Authority::System),
-            ("account", Authority::System),
-            ("server_selection.metadata_cache", Authority::System),
-            ("server_selection.latency_probe", Authority::System),
-            ("server_selection.balanced_weights", Authority::System),
-            ("server_selection.secure_core", Authority::System),
-            ("connection_groups", Authority::System),
-            ("connection", Authority::System),
-            ("dns", Authority::System),
-            ("lan", Authority::System),
-            ("split_tunnel", Authority::System),
-            ("auto_connect", Authority::System),
-            ("features", Authority::PerUser),
-            ("profiles", Authority::PerUser),
+            ("schema_version", Authority::System),
+            ("daemon.socket_path", Authority::System),
+            ("daemon.socket_group", Authority::System),
+            ("daemon.interface_name", Authority::System),
+            ("daemon.log_level", Authority::System),
+            ("daemon.network_integration", Authority::System),
+            ("account.writable_session_store", Authority::System),
+            ("account.writable_store_priority", Authority::System),
+            ("account.credential_input_source", Authority::System),
+            ("account.import_provisioned_session", Authority::System),
+            ("account.allow_password_storage", Authority::System),
+            ("account.prefer_token_storage", Authority::System),
+            ("account.encrypted_local_fallback", Authority::System),
+            ("account.systemd_credential_names", Authority::System),
+            (
+                "server_selection.metadata_cache.refresh_interval_hours",
+                Authority::System,
+            ),
+            (
+                "server_selection.metadata_cache.max_positive_jitter_minutes",
+                Authority::System,
+            ),
+            (
+                "server_selection.metadata_cache.conditional_requests",
+                Authority::System,
+            ),
+            (
+                "server_selection.metadata_cache.emergency_max_age_hours",
+                Authority::System,
+            ),
+            ("server_selection.latency_probe.enabled", Authority::System),
+            (
+                "server_selection.latency_probe.max_candidates",
+                Authority::System,
+            ),
+            (
+                "server_selection.latency_probe.timeout_ms",
+                Authority::System,
+            ),
+            (
+                "server_selection.latency_probe.parallelism",
+                Authority::System,
+            ),
+            (
+                "server_selection.latency_probe.result_min_age_minutes",
+                Authority::System,
+            ),
+            (
+                "server_selection.latency_probe.background_scan",
+                Authority::System,
+            ),
+            (
+                "server_selection.latency_probe.transport",
+                Authority::System,
+            ),
+            ("server_selection.balanced_weights.load", Authority::System),
+            (
+                "server_selection.balanced_weights.latency",
+                Authority::System,
+            ),
+            (
+                "server_selection.balanced_weights.stability",
+                Authority::System,
+            ),
+            (
+                "server_selection.balanced_weights.feature_match",
+                Authority::System,
+            ),
+            (
+                "server_selection.secure_core.enabled_by_default",
+                Authority::System,
+            ),
+            (
+                "server_selection.secure_core.preferred_entry_countries",
+                Authority::System,
+            ),
+            (
+                "server_selection.secure_core.excluded_entry_countries",
+                Authority::System,
+            ),
+            (
+                "server_selection.secure_core.excluded_exit_countries",
+                Authority::System,
+            ),
+            ("connection_groups.physical_country", Authority::System),
+            ("connection_groups.region_taxonomy", Authority::System),
+            (
+                "connection_groups.regional_default_ranking",
+                Authority::System,
+            ),
+            ("connection.default", Authority::System),
+            ("connection.protocol", Authority::System),
+            ("connection.protun.mtu", Authority::System),
+            ("connection.protun.sni_strategy", Authority::System),
+            ("connection.ipv6.mode", Authority::System),
+            ("dns.mode", Authority::System),
+            ("dns.custom_servers", Authority::System),
+            ("dns.policy", Authority::System),
+            ("dns.leak_protection", Authority::System),
+            ("dns.externally_managed_resolvers", Authority::System),
+            ("lan.policy", Authority::System),
+            ("lan.allowed_cidrs", Authority::System),
+            ("split_tunnel.mode", Authority::System),
+            ("split_tunnel.attach_existing_processes", Authority::System),
+            ("split_tunnel.domains.enabled", Authority::System),
+            (
+                "split_tunnel.domains.resolver_observation",
+                Authority::System,
+            ),
+            ("split_tunnel.domains.refresh_on_ttl", Authority::System),
+            ("split_tunnel.domains.rules", Authority::System),
+            ("split_tunnel.domains.rules[].domain", Authority::System),
+            ("split_tunnel.domains.rules[].action", Authority::System),
+            ("split_tunnel.domains.rules[].ttl_policy", Authority::System),
+            ("auto_connect.enabled", Authority::System),
+            ("auto_connect.target", Authority::System),
+            ("auto_connect.retry.max_attempts", Authority::System),
+            (
+                "auto_connect.retry.initial_delay_seconds",
+                Authority::System,
+            ),
+            ("auto_connect.retry.max_delay_seconds", Authority::System),
+            ("auto_connect.retry.jitter", Authority::System),
+            ("features.secure_core", Authority::PerUser),
+            ("features.kill_switch", Authority::PerUser),
+            ("features.split_tunnel", Authority::PerUser),
+            ("features.netshield", Authority::PerUser),
+            ("features.port_forwarding", Authority::PerUser),
+            ("features.nat", Authority::PerUser),
+            ("features.vpn_accelerator", Authority::PerUser),
+            ("profiles.default.connection_type", Authority::PerUser),
+            ("profiles.default.protocol", Authority::PerUser),
+            ("profiles.default.selection.mode", Authority::PerUser),
+            ("profiles.default.selection.by", Authority::PerUser),
+            (
+                "profiles.default.selection.exclude_countries",
+                Authority::PerUser,
+            ),
+            ("profiles.default.selection.require", Authority::PerUser),
         ]
     }
 }
@@ -930,18 +1065,145 @@ mod tests {
         assert!(config.validate().is_err());
     }
 
+    /// PRD section 10 closing rule: `lan.policy` is the sole global LAN
+    /// setting — no `features.lan_access` alias may exist. At field
+    /// granularity: `lan.policy` carries exactly one entry, every `lan.*`
+    /// entry is system authority, and no `features.lan_*` field appears.
     #[test]
     fn authority_report_has_single_lan_authority() {
         let config = SystemConfig::default();
         let report = config.authority_report();
-        assert!(report.contains(&("lan", Authority::System)));
-        // No second LAN field exists anywhere in the authority table; match
-        // the exact segment so unrelated words containing "lan" (as in
-        // "balanced_weights") do not false-positive.
-        let lan_entries = report
+        let lan_entries: Vec<_> = report
             .iter()
             .filter(|(path, _)| *path == "lan" || path.starts_with("lan."))
-            .count();
-        assert_eq!(lan_entries, 1);
+            .collect();
+        assert!(
+            !lan_entries.is_empty(),
+            "the lan fields must be in the table"
+        );
+        assert!(
+            lan_entries
+                .iter()
+                .all(|(_, authority)| *authority == Authority::System)
+        );
+        assert_eq!(
+            report
+                .iter()
+                .filter(|(path, _)| *path == "lan.policy")
+                .count(),
+            1,
+            "lan.policy must appear exactly once"
+        );
+        assert!(
+            !report
+                .iter()
+                .any(|(path, _)| path.starts_with("features.lan")),
+            "no features.lan_access alias may exist in the table"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // M2 S3 / T-37 groundwork: field-level authority coverage.
+    // ------------------------------------------------------------------
+
+    /// Walks every leaf field path of a serialized document. Sequences of
+    /// mappings contribute their element fields with an index-erased `[]`
+    /// segment; scalar (or empty) sequences are leaves at the field
+    /// itself. A mapping at a path that already carries an authority
+    /// entry is TERMINAL — the one such field
+    /// (`account.systemd_credential_names`) is a free-form map whose keys
+    /// are data (credential names), not schema, so its sub-keys must not
+    /// be walked as fields.
+    fn walk_leaf_paths(
+        value: &serde_norway::Value,
+        prefix: &str,
+        report: &[(&'static str, Authority)],
+        out: &mut Vec<String>,
+    ) {
+        match value {
+            serde_norway::Value::Mapping(mapping) => {
+                if !prefix.is_empty() && report.iter().any(|(path, _)| *path == prefix) {
+                    out.push(prefix.to_owned());
+                    return;
+                }
+                for (key, val) in mapping {
+                    let key = key.as_str().expect("config keys serialize as strings");
+                    let path = if prefix.is_empty() {
+                        key.to_owned()
+                    } else {
+                        format!("{prefix}.{key}")
+                    };
+                    walk_leaf_paths(val, &path, report, out);
+                }
+            }
+            serde_norway::Value::Sequence(sequence) => {
+                let of_mappings = !sequence.is_empty()
+                    && sequence
+                        .iter()
+                        .all(|element| matches!(element, serde_norway::Value::Mapping(_)));
+                if of_mappings {
+                    for element in sequence {
+                        walk_leaf_paths(element, &format!("{prefix}[]"), report, out);
+                    }
+                } else {
+                    out.push(prefix.to_owned());
+                }
+            }
+            _ => out.push(prefix.to_owned()),
+        }
+    }
+
+    /// A document with every repeated field populated, so the walk sees
+    /// element fields (`rules[].action`) and not just their empty lists.
+    fn maximal_config() -> SystemConfig {
+        let mut config = SystemConfig::default();
+        config
+            .split_tunnel
+            .domains
+            .rules
+            .push(SplitTunnelDomainRule::default());
+        config.dns.custom_servers.push("9.9.9.9".into());
+        config
+    }
+
+    /// T-37 groundwork contract (PRD section 10: "the versioned schema
+    /// must tag every field with its authority class"): every field of
+    /// the typed surface carries EXACTLY ONE authority entry, and no
+    /// entry is stale. Red evidence: against the section-level table the
+    /// walk finds `daemon.socket_path` with no entry, and section entries
+    /// like `daemon` match no walked leaf.
+    #[test]
+    fn authority_report_covers_every_typed_field() {
+        let config = maximal_config();
+        let rendered = serde_norway::to_value(&config).unwrap();
+        let report = config.authority_report();
+        let mut leaves = Vec::new();
+        walk_leaf_paths(&rendered, "", &report, &mut leaves);
+        assert!(!leaves.is_empty(), "the walk must find the document fields");
+
+        for leaf in &leaves {
+            let entries: Vec<_> = report
+                .iter()
+                .filter(|(path, _)| *path == leaf.as_str())
+                .collect();
+            assert_eq!(
+                entries.len(),
+                1,
+                "field {leaf} must carry exactly one authority entry (found {})",
+                entries.len()
+            );
+        }
+        for (path, _) in &report {
+            // An entry is justified only as a walked leaf, or as the
+            // list-field form of walked element fields (`rules` for
+            // `rules[].action`) — bare section entries must be gone.
+            let walked = leaves
+                .iter()
+                .any(|leaf| leaf == path || leaf.starts_with(&format!("{path}[]")));
+            assert!(
+                walked,
+                "authority entry {path} matches no typed field (stale?)"
+            );
+        }
     }
 }
