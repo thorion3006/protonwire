@@ -759,26 +759,22 @@ mod tests {
         let json = seen_rx
             .recv_timeout(Duration::from_secs(2))
             .expect("the peer reports the observed frame");
-        let data = json
-            .get("data")
-            .and_then(|d| d.as_object())
-            .unwrap_or_else(|| panic!("flat request frame must carry a data object: {json}"));
+        // Full-object JSON equality — `Value` equality is
+        // order-insensitive, the right equivalence for a frame: the
+        // observed bytes must be EXACTLY the flat shape, so no
+        // `request` wrapper, no extra key, and no missing one can ride
+        // the wire unasserted.
         assert_eq!(
-            json["type"], "request",
-            "the frame discriminant must stay adjacent-tagged: {json}"
-        );
-        assert_eq!(data["id"], 0, "the correlation id rides in data: {json}");
-        assert_eq!(
-            data["method"], "ping",
-            "the method key rides directly in data (no wrapper): {json}"
-        );
-        assert_eq!(
-            data["params"]["nonce"], "p",
-            "the params key rides directly in data (no wrapper): {json}"
-        );
-        assert!(
-            !data.contains_key("request"),
-            "the nested `request` wrapper must not reappear on the wire: {json}"
+            json,
+            serde_json::json!({
+                "type": "request",
+                "data": {
+                    "id": 0,
+                    "method": "ping",
+                    "params": { "nonce": "p" }
+                }
+            }),
+            "the SDK's request frame must be exactly the flat shape"
         );
     }
 

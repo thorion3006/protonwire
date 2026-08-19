@@ -371,8 +371,13 @@ impl ConfirmationRequirement {
     /// error carries one. Foreign or absent `details` decode to `None`
     /// rather than failing: `details` is an open JSON value, so a
     /// different payload is not a protocol violation for the reader.
+    /// The decode is gated on the code too — a confirmation-SHAPED
+    /// payload riding any other code is not a confirmation requirement
+    /// and must not decode as one.
     pub fn from_error(error: &RpcError) -> Option<Self> {
-        serde_json::from_value(error.details.clone()?).ok()
+        (error.code == RpcErrorCode::ConfirmationRequired)
+            .then(|| serde_json::from_value(error.details.clone()?).ok())
+            .flatten()
     }
 }
 
@@ -440,6 +445,60 @@ mod tests {
             }
             other => panic!("unexpected message: {other:?}"),
         }
+    }
+
+    /// Characterization pin (green-by-design, per the round-6
+    /// precedent): the flatten's deserialization side is open-world —
+    /// serde's flatten buffers every key the outer variant does not
+    /// name, and the internally tagged [`Request`] consumes only
+    /// `method`/`params` from that buffer. So (a) unknown keys inside
+    /// `data` are ignored, and (b) a frame carrying BOTH the flat keys
+    /// and a legacy `request` wrapper decodes with the FLAT keys
+    /// winning — the wrapper is just another ignored key. Pinned so a
+    /// future legacy-compat re-acceptance of the wrapper (or a
+    /// `deny_unknown_fields` tightening) cannot slip in unnoticed.
+    #[test]
+    fn flat_request_ignores_foreign_keys_and_the_legacy_wrapper() {
+        let json = serde_json::json!({
+            "type": "request",
+            "data": {
+                "id": 5,
+                "method": "ping",
+                "params": { "nonce": "n" },
+                "foreign": { "anything": [1, 2] },
+                "request": { "method": "shutdown", "params": null }
+            }
+        });
+        match serde_json::from_value::<ClientMessage>(json).unwrap() {
+            ClientMessage::Request { id, request } => {
+                assert_eq!(id, 5);
+                match request {
+                    Request::Ping { nonce } => assert_eq!(nonce, "n"),
+                    other => panic!("flat keys must win over a legacy wrapper: {other:?}"),
+                }
+            }
+            other => panic!("unexpected message: {other:?}"),
+        }
+    }
+
+    /// Characterization pin (green-by-design): the legacy M1 nesting
+    /// is REJECTED — with the flat `method` absent from `data`, the
+    /// internally tagged enum has no discriminant and fails with the
+    /// missing-field error, whatever the `request` wrapper carries.
+    /// The flatten tolerates the wrapper's PRESENCE (previous pin) but
+    /// never substitutes it for the flat keys.
+    #[test]
+    fn legacy_nested_request_shape_is_rejected() {
+        let json = serde_json::json!({
+            "type": "request",
+            "data": { "id": 3, "request": { "method": "shutdown" } }
+        });
+        let err = serde_json::from_value::<ClientMessage>(json)
+            .expect_err("the legacy nesting must not decode");
+        assert!(
+            err.to_string().contains("missing field `method`"),
+            "the rejection must be the missing flat method: {err}"
+        );
     }
 
     #[test]
@@ -552,6 +611,38 @@ mod tests {
         assert!(
             ConfirmationRequirement::from_error(&RpcError::new(RpcErrorCode::Internal, "x"))
                 .is_none()
+        );
+        // Present-but-unrelated details under the confirmation code
+        // also decode to None (the shape, not just presence, decides).
+        let unrelated = RpcError {
+            details: Some(serde_json::json!({ "unrelated": true })),
+            ..RpcError::new(RpcErrorCode::ConfirmationRequired, "x")
+        };
+        assert!(ConfirmationRequirement::from_error(&unrelated).is_none());
+    }
+
+    /// S2 rust-verdict Low: `from_error` must be gated on the error
+    /// CODE, not just the details shape — `details` is an open JSON
+    /// value that any code may carry, so a confirmation-SHAPED payload
+    /// riding a foreign code is not a confirmation requirement. Red
+    /// first: against the unguarded decode this arm returned `Some`
+    /// (the shape parsed under `Internal`), observed before the guard
+    /// landed.
+    #[test]
+    fn from_error_ignores_confirmation_details_under_a_foreign_code() {
+        let requirement = ConfirmationRequirement {
+            catalog_age_seconds: 60,
+            last_request_unix: None,
+            next_eligible_unix: 1_755_000_060,
+            warning: "forged shape".into(),
+            confirmation_token: "not-a-confirmation".into(),
+        };
+        let mut error = RpcError::new(RpcErrorCode::Internal, "unrelated failure");
+        error.details = serde_json::to_value(&requirement).ok();
+        assert!(
+            ConfirmationRequirement::from_error(&error).is_none(),
+            "a foreign code must not decode confirmation-shaped details: {}",
+            serde_plain_code(&error.code)
         );
     }
 

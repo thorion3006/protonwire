@@ -943,12 +943,27 @@ mod suppression_policy_tests {
         let debug_build = SecretSuppressFilter::for_build(false);
         assert!(debug_build.allows("protun::tunnel", &Level::TRACE));
     }
+
+    /// Characterization pin (green-by-design, S1 qa verdict): the
+    /// production constructor wires the release blanket to the BUILD
+    /// FLAVOR — `fr_7p()` carries exactly `cfg!(not(debug_assertions))`.
+    /// The in-tree release-blanket tests drive `for_build(true)` as a
+    /// seam, so nothing else fails if the production wiring drifts to
+    /// never-apply (qa's M3b survivor); this line does.
+    #[test]
+    fn fr_7p_wires_the_release_blanket_to_the_build_flavor() {
+        assert_eq!(
+            SecretSuppressFilter::fr_7p().release,
+            cfg!(not(debug_assertions))
+        );
+    }
 }
 
 /// The T-32 canary suite, stub arm (m2-plan S1). The real-muon arm rides
 /// with S4 and reuses [`canary::assert_no_secrets_reach_logs`] unchanged.
 #[cfg(test)]
 mod canary_suite_tests {
+    use super::canary::ALLOWED_LEVELS;
     use super::canary::assert_no_secrets_reach_logs;
     use super::canary::{Canaries, CanaryEmitter, StubDependencyEmitter};
 
@@ -970,6 +985,16 @@ mod canary_suite_tests {
     #[test]
     fn t32_stub_arm_no_secret_class_reaches_any_writer() {
         assert_no_secrets_reach_logs(&StubDependencyEmitter);
+    }
+
+    /// Characterization pin (green-by-design, S1 qa verdict): the
+    /// harness sweeps all FIVE allowed runtime levels. The green arm
+    /// above cannot see a shrunk sweep (qa's M6 survivor — dropping
+    /// levels from `ALLOWED_LEVELS` still passes it); this line pins
+    /// the breadth itself.
+    #[test]
+    fn allowed_levels_sweep_all_five_runtime_levels() {
+        assert_eq!(ALLOWED_LEVELS, ["error", "warn", "info", "debug", "trace"]);
     }
 
     /// QA mutation arm: an emitter leaking a canary through an
