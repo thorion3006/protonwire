@@ -25,3 +25,7 @@ zeroize = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
+# Test-only: the scheduler restart tests read the persisted deadlines
+# document directly (the root-owned strict walk is proven in the store
+# suite; here we prove the scheduler consumes the persisted state).
+serde_json = { workspace = true }

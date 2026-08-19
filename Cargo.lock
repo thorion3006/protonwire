@@ -4648,6 +4648,7 @@ dependencies = [
  "getrandom 0.2.17",
  "protonwire-frontend-api",
  "protonwire-store",
+ "serde_json",
  "tempfile",
  "thiserror 2.0.20",
  "tracing",
@@ -4667,6 +4668,7 @@ name = "protonwire-daemon"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "nix 0.31.3",
  "protonwire-core",
  "protonwire-frontend-api",
  "protonwire-ipc",

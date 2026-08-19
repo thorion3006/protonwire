@@ -45,6 +45,7 @@
 //! [`FetchFailure::Transport`]. The 429/503 wire-fixture obligation
 //! itself is tracked for S9.
 
+use protonwire_frontend_api::ConfirmationRequirement;
 use protonwire_store::config::MetadataCacheSection;
 use protonwire_store::deadlines::IntervalSource;
 
@@ -237,6 +238,654 @@ pub fn draw_jitter(max_seconds: u64) -> u64 {
             return value % range;
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Clock seam (E2E-22: the virtual-clock property suite is normative)
+// ---------------------------------------------------------------------------
+
+/// The time source every scheduler decision consults. Two readings:
+/// the wall clock (anchoring persisted deadlines) and a monotonic
+/// counter (detecting that the wall went *backward* while time actually
+/// passed). Injected everywhere — production gets [`SystemClock`], the
+/// property suites drive rolled-back, jumped-forward, and repeated
+/// virtual clocks.
+pub trait Clock: Send + Sync {
+    /// Current wall time in Unix seconds.
+    fn now_unix(&self) -> u64;
+    /// Milliseconds on a monotonic counter (any fixed origin).
+    fn monotonic_ms(&self) -> u64;
+}
+
+/// The production clock: wall from `SystemTime`, monotonic from a
+/// process-wide `Instant` anchor.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SystemClock;
+
+/// Process-wide monotonic anchor (lazily initialized once).
+static PROCESS_START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+impl Clock for SystemClock {
+    fn now_unix(&self) -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    }
+
+    fn monotonic_ms(&self) -> u64 {
+        PROCESS_START
+            .get_or_init(std::time::Instant::now)
+            .elapsed()
+            .as_millis() as u64
+    }
+}
+
+/// A fully controllable virtual clock (E2E-22): the wall and monotonic
+/// readings move only through explicit test direction, so rollback,
+/// jump-forward, and repeated-tamper scenarios are deterministic.
+/// Shared by handle (`Arc` inside), so the scheduler and the test move
+/// one clock.
+#[derive(Debug, Clone, Default)]
+pub struct VirtualClock(std::sync::Arc<std::sync::Mutex<VirtualClockInner>>);
+
+#[derive(Debug, Default)]
+struct VirtualClockInner {
+    wall_unix: u64,
+    mono_ms: u64,
+}
+
+impl VirtualClock {
+    /// A clock starting at `wall_unix`, monotonic counter at zero.
+    pub fn new(wall_unix: u64) -> Self {
+        Self(std::sync::Arc::new(std::sync::Mutex::new(
+            VirtualClockInner {
+                wall_unix,
+                mono_ms: 0,
+            },
+        )))
+    }
+
+    /// Sets the wall reading to any value — forward or backward
+    /// (a backward set is exactly the rollback scenario).
+    pub fn set_wall(&self, wall_unix: u64) {
+        self.0.lock().expect("virtual clock").wall_unix = wall_unix;
+    }
+
+    /// Moves both readings forward by `seconds` (time passing normally).
+    pub fn advance_secs(&self, seconds: u64) {
+        let mut inner = self.0.lock().expect("virtual clock");
+        inner.wall_unix += seconds;
+        inner.mono_ms += seconds * 1000;
+    }
+
+    /// Forces the monotonic counter (for adversarial combinations).
+    pub fn set_monotonic_ms(&self, ms: u64) {
+        self.0.lock().expect("virtual clock").mono_ms = ms;
+    }
+}
+
+impl Clock for VirtualClock {
+    fn now_unix(&self) -> u64 {
+        self.0.lock().expect("virtual clock").wall_unix
+    }
+
+    fn monotonic_ms(&self) -> u64 {
+        self.0.lock().expect("virtual clock").mono_ms
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The fetch seam (see the module docs' architecture note)
+// ---------------------------------------------------------------------------
+
+/// One conditional catalog fetch's success side — the mirror of the S6
+/// adapter's `CatalogFetch` (`Changed{etag,body}|NotModified`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FetchOutcome {
+    /// The catalog changed (or no ETag was supplied).
+    Changed {
+        /// The response `ETag` for the next conditional request.
+        etag: Option<String>,
+        /// The raw catalog body.
+        body: Vec<u8>,
+    },
+    /// The stored revision is still current (FR-13E).
+    NotModified,
+}
+
+/// The failure classification the scheduler's pacing policy consumes.
+/// The daemon's S9 bridge maps the adapter's `ApiError::RateLimited`
+/// onto the [`FetchFailure::RateLimited`] arm (see the module docs).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FetchFailure {
+    /// The upstream refused the request for pacing reasons (429/503
+    /// class). `retry_after_seconds` carries the parsed `Retry-After`
+    /// delay when the API supplied one; `None` still suppresses to the
+    /// greatest-of floor (Q4).
+    RateLimited { retry_after_seconds: Option<u64> },
+    /// Any other transport failure: no suppression, but the deadline
+    /// still resets from the attempt so failures cannot hammer either.
+    Transport(String),
+}
+
+/// The injected fetch service: `Fn(stored etag) -> fetch result` — the
+/// `&dyn CatalogApi` seam the daemon bridges (FR-13C: every read goes
+/// through the one scheduler).
+pub type CatalogFetch =
+    std::sync::Arc<dyn Fn(Option<&str>) -> Result<FetchOutcome, FetchFailure> + Send + Sync>;
+
+// ---------------------------------------------------------------------------
+// Outcomes and diagnostics
+// ---------------------------------------------------------------------------
+
+/// What one completed refresh did (the S2 `CatalogRefreshed` event and
+/// FR-123 status fields derive from this).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RefreshOutcome {
+    /// A new catalog revision was fetched.
+    Changed {
+        /// The new `ETag`.
+        etag: Option<String>,
+        /// The raw catalog body.
+        body: Vec<u8>,
+    },
+    /// The stored revision was still current.
+    NotModified,
+    /// The upstream rate-limited the request; the suppression deadline
+    /// is set from the greatest-of (Q4).
+    RateLimited {
+        /// The `Retry-After` delay the API supplied, if any.
+        retry_after_seconds: Option<u64>,
+    },
+    /// The fetch failed for transport reasons.
+    Failed {
+        /// Stable failure description (never peer-secret).
+        reason: String,
+    },
+}
+
+/// The report every refresh caller receives.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefreshReport {
+    /// What the refresh did.
+    pub outcome: RefreshOutcome,
+    /// `true` when this caller joined an already in-flight refresh and
+    /// received its result (T-25 single-flight coalescing).
+    pub coalesced: bool,
+    /// The next automatic eligibility the refresh set.
+    pub next_eligible_unix: u64,
+    /// The active suppression deadline after the refresh, if any.
+    pub suppression_until_unix: Option<u64>,
+}
+
+/// The result of [`Scheduler::refresh_automatic`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AutomaticOutcome {
+    /// A refresh ran (or was coalesced into one).
+    Due(RefreshReport),
+    /// The next eligibility has not arrived; the caller does nothing.
+    NotDue {
+        /// When the next automatic refresh becomes eligible.
+        next_eligible_unix: u64,
+    },
+}
+
+/// The result of [`Scheduler::refresh_manual`] (FR-11/FR-13I).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ManualOutcome {
+    /// A refresh ran (eligible outright, or confirmed).
+    Refreshed(RefreshReport),
+    /// The refresh is early: the caller must surface the carried
+    /// [`ConfirmationRequirement`] (warning + token) and replay the
+    /// token to proceed.
+    ConfirmationRequired(ConfirmationRequirement),
+    /// An active suppression refuses even a confirmed manual request
+    /// (ER-16/E2E-22); the manual override bypasses only the interval.
+    Suppressed {
+        /// When suppression ends.
+        until_unix: u64,
+    },
+}
+
+/// Scheduler facts for FR-123 status and FR-13I diagnostics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SchedulerDiagnostics {
+    /// Last upstream metadata request (any outcome).
+    pub last_request_unix: Option<u64>,
+    /// Last successful fetch (changed or not-modified).
+    pub last_success_unix: Option<u64>,
+    /// Next automatic eligibility.
+    pub next_eligible_unix: Option<u64>,
+    /// Which greatest-of component set it.
+    pub next_eligible_source: Option<IntervalSource>,
+    /// Active suppression deadline, if any.
+    pub suppression_until_unix: Option<u64>,
+    /// Completed automatic refreshes (separately counted, FR-13I).
+    pub automatic_refresh_count: u64,
+    /// Completed confirmed manual overrides (separately counted).
+    pub manual_refresh_count: u64,
+    /// Whether a wall-clock rollback was ever detected this run.
+    pub clock_rollback_detected: bool,
+    /// Catalog age in seconds (from the last successful fetch).
+    pub catalog_age_seconds: Option<u64>,
+}
+
+// ---------------------------------------------------------------------------
+// The scheduler
+// ---------------------------------------------------------------------------
+
+/// Pure rollback arithmetic, property-tested directly: the wall went
+/// backward while the monotonic counter did not — the only combination
+/// that cannot be ordinary time passing.
+pub fn wall_rolled_back(prev_wall: u64, prev_mono: u64, wall: u64, mono: u64) -> bool {
+    wall < prev_wall && mono >= prev_mono
+}
+
+/// A minted, not-yet-redeemed confirmation token (in-memory ONLY —
+/// FR-13I: approval is never a preference, and the persisted document's
+/// `deny_unknown_fields` makes a smuggled token a hard parse error).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingToken {
+    value: String,
+    expires_unix: u64,
+}
+
+/// Live rollback-tracking state (the persisted half is
+/// `SchedulerDeadlines::wall_high_water_unix`).
+#[derive(Debug, Clone, Copy, Default)]
+struct RollbackTracker {
+    last_wall_seen: u64,
+    last_mono_seen: u64,
+    detected: bool,
+}
+
+#[derive(Debug, Default)]
+struct Inner {
+    persisted: protonwire_store::deadlines::SchedulerDeadlines,
+    etag: Option<String>,
+    generation: u64,
+    in_flight: Option<u64>,
+    completed: Option<(u64, std::sync::Arc<RefreshReport>)>,
+    token: Option<PendingToken>,
+    rollback: RollbackTracker,
+}
+
+/// Which door a refresh came through (separate counters, FR-13I).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RefreshKind {
+    Automatic,
+    Manual,
+}
+
+/// One observed instant: the rollback-clamped effective time every
+/// deadline compares against (the raw wall/monotonic readings fed the
+/// rollback decision inside `observe_now`).
+#[derive(Debug, Clone, Copy)]
+struct ObservedNow {
+    effective: u64,
+}
+
+/// The daemon-wide single-flight server-metadata scheduler (FR-13C).
+/// Clone-free by design: share one `Arc<Scheduler>` per process.
+pub struct Scheduler {
+    config: SchedulerConfig,
+    clock: std::sync::Arc<dyn Clock>,
+    fetch: CatalogFetch,
+    store: protonwire_store::deadlines::DeadlineStore,
+    inner: std::sync::Mutex<Inner>,
+    cv: std::sync::Condvar,
+}
+
+impl Scheduler {
+    /// Builds a scheduler over already-loaded persisted state and the
+    /// injected collaborators (the clock and fetch seams, the deadline
+    /// store). Production construction (strict loads with `/` as trust
+    /// root, ConfigPaths-derived paths only) is [`Scheduler::production`].
+    pub fn new(
+        config: SchedulerConfig,
+        clock: std::sync::Arc<dyn Clock>,
+        fetch: CatalogFetch,
+        store: protonwire_store::deadlines::DeadlineStore,
+        persisted: protonwire_store::deadlines::SchedulerDeadlines,
+        etag: Option<String>,
+    ) -> Self {
+        Self {
+            config,
+            clock,
+            fetch,
+            store,
+            inner: std::sync::Mutex::new(Inner {
+                persisted,
+                etag,
+                generation: 0,
+                in_flight: None,
+                completed: None,
+                token: None,
+                rollback: RollbackTracker::default(),
+            }),
+            cv: std::sync::Condvar::new(),
+        }
+    }
+
+    /// A snapshot of the persisted deadlines (restart-survival tests,
+    /// FR-123 status fields).
+    pub fn persisted(&self) -> protonwire_store::deadlines::SchedulerDeadlines {
+        self.inner.lock().expect("scheduler lock").persisted.clone()
+    }
+
+    /// Current diagnostics (FR-123/FR-13I).
+    pub fn diagnostics(&self) -> SchedulerDiagnostics {
+        let guard = self.inner.lock().expect("scheduler lock");
+        let now = self.observe_wall(&guard);
+        SchedulerDiagnostics {
+            last_request_unix: guard.persisted.last_request_unix,
+            last_success_unix: guard.persisted.last_success_unix,
+            next_eligible_unix: guard.persisted.next_eligible_unix,
+            next_eligible_source: guard.persisted.next_eligible_source,
+            suppression_until_unix: guard.persisted.suppression_until_unix,
+            automatic_refresh_count: guard.persisted.automatic_refresh_count,
+            manual_refresh_count: guard.persisted.manual_refresh_count,
+            clock_rollback_detected: guard.rollback.detected,
+            catalog_age_seconds: guard
+                .persisted
+                .last_success_unix
+                .map(|success| now.saturating_sub(success)),
+        }
+    }
+
+    /// Reads the clock and applies the rollback clamp without touching
+    /// the live tracker (used where no mutation is wanted).
+    fn observe_wall(&self, guard: &Inner) -> u64 {
+        self.clock
+            .now_unix()
+            .max(guard.persisted.wall_high_water_unix)
+    }
+
+    /// Reads both clocks, updates the rollback tracker, and returns the
+    /// effective (high-water-clamped) time. Callers hold the lock.
+    fn observe_now(&self, guard: &mut Inner) -> ObservedNow {
+        let wall = self.clock.now_unix();
+        let mono = self.clock.monotonic_ms();
+        let tracker = &mut guard.rollback;
+        if wall_rolled_back(tracker.last_wall_seen, tracker.last_mono_seen, wall, mono) {
+            tracker.detected = true;
+        }
+        tracker.last_wall_seen = tracker.last_wall_seen.max(wall);
+        tracker.last_mono_seen = tracker.last_mono_seen.max(mono);
+        let effective = wall.max(guard.persisted.wall_high_water_unix);
+        ObservedNow { effective }
+    }
+
+    /// The automatic path (FR-13C: every automatic refresh, and every
+    /// coalesced join of one, goes through here).
+    pub fn refresh_automatic(&self) -> AutomaticOutcome {
+        let mut guard = self.inner.lock().expect("scheduler lock");
+        // T-25 single-flight: join an already-running refresh instead of
+        // piling a second request onto Proton.
+        loop {
+            let Some(running) = guard.in_flight else {
+                break;
+            };
+            let seen = running;
+            while guard.in_flight == Some(seen) {
+                guard = self.cv.wait(guard).expect("scheduler lock");
+            }
+            if let Some((done, report)) = &guard.completed
+                && *done == seen
+            {
+                let mut joined = (**report).clone();
+                joined.coalesced = true;
+                return AutomaticOutcome::Due(joined);
+            }
+            // The generation resolved without our report (impossible
+            // today — only the leader clears it while setting
+            // `completed` — but re-evaluating is the safe loop shape).
+        }
+        // Leader: is the next window open? (Rollback-clamped time.)
+        let now = self.observe_now(&mut guard);
+        if let Some(deadline) = guard.persisted.next_eligible_unix
+            && now.effective < deadline
+        {
+            return AutomaticOutcome::NotDue {
+                next_eligible_unix: deadline,
+            };
+        }
+        AutomaticOutcome::Due(self.lead_refresh(guard, RefreshKind::Automatic))
+    }
+
+    /// The manual path (FR-11/FR-13I): eligible refreshes proceed
+    /// outright; early ones require a fresh warned confirmation; an
+    /// active suppression refuses even a confirmed request (E2E-22).
+    pub fn refresh_manual(&self, token: Option<&str>) -> ManualOutcome {
+        let mut guard = self.inner.lock().expect("scheduler lock");
+        loop {
+            let Some(running) = guard.in_flight else {
+                break;
+            };
+            let seen = running;
+            while guard.in_flight == Some(seen) {
+                guard = self.cv.wait(guard).expect("scheduler lock");
+            }
+            if let Some((done, report)) = &guard.completed
+                && *done == seen
+            {
+                let mut joined = (**report).clone();
+                joined.coalesced = true;
+                return ManualOutcome::Refreshed(joined);
+            }
+        }
+        let now = self.observe_now(&mut guard);
+        // ER-16/E2E-22: suppression outranks confirmation — the manual
+        // override bypasses only the local interval, never a
+        // Proton-signalled rate limit.
+        if let Some(until) = guard.persisted.suppression_until_unix
+            && now.effective < until
+        {
+            return ManualOutcome::Suppressed { until_unix: until };
+        }
+        let due = guard
+            .persisted
+            .next_eligible_unix
+            .is_none_or(|deadline| now.effective >= deadline);
+        if due {
+            return ManualOutcome::Refreshed(self.lead_refresh(guard, RefreshKind::Manual));
+        }
+        match token {
+            Some(value) => {
+                let redeemable = guard.token.as_ref().is_some_and(|pending| {
+                    pending.value == value && now.effective <= pending.expires_unix
+                });
+                if redeemable {
+                    // Single-use: burned by the attempt itself, success
+                    // or failure (a retry must re-confirm, FR-13I).
+                    guard.token = None;
+                    ManualOutcome::Refreshed(self.lead_refresh(guard, RefreshKind::Manual))
+                } else {
+                    // Expired, already-burned, or foreign token: a fresh
+                    // ceremony, never a silent acceptance.
+                    ManualOutcome::ConfirmationRequired(
+                        self.mint_requirement(&mut guard, now.effective),
+                    )
+                }
+            }
+            None => ManualOutcome::ConfirmationRequired(
+                self.mint_requirement(&mut guard, now.effective),
+            ),
+        }
+    }
+
+    /// The next automatic eligibility (the daemon's timer target), on
+    /// the rollback-clamped clock.
+    pub fn next_due_unix(&self) -> Option<u64> {
+        let guard = self.inner.lock().expect("scheduler lock");
+        guard.persisted.next_eligible_unix
+    }
+
+    /// Mints one fresh confirmation requirement (and replaces any
+    /// outstanding token: confirmation is per-request, FR-13I). The
+    /// warning is the compile-time constant — no peer-derived value
+    /// enters it (see [`MANUAL_REFRESH_WARNING`]).
+    fn mint_requirement(&self, guard: &mut Inner, effective_now: u64) -> ConfirmationRequirement {
+        let token = mint_confirmation_token();
+        guard.token = Some(PendingToken {
+            value: token.clone(),
+            expires_unix: effective_now.saturating_add(CONFIRMATION_TOKEN_TTL_SECONDS),
+        });
+        ConfirmationRequirement {
+            catalog_age_seconds: guard
+                .persisted
+                .last_success_unix
+                .map(|success| effective_now.saturating_sub(success))
+                .unwrap_or(0),
+            last_request_unix: guard.persisted.last_request_unix,
+            next_eligible_unix: guard
+                .persisted
+                .next_eligible_unix
+                .unwrap_or(effective_now)
+                .max(guard.persisted.suppression_until_unix.unwrap_or(0)),
+            warning: MANUAL_REFRESH_WARNING.to_owned(),
+            confirmation_token: token,
+        }
+    }
+
+    /// Runs one fetch as the single-flight leader. `guard` is held on
+    /// entry and dropped for the fetch itself; the caller's outcome is
+    /// published to parked joiners on completion.
+    fn lead_refresh(
+        &self,
+        mut guard: std::sync::MutexGuard<'_, Inner>,
+        kind: RefreshKind,
+    ) -> RefreshReport {
+        guard.generation += 1;
+        let generation = guard.generation;
+        guard.in_flight = Some(generation);
+
+        // Pre-fetch persistence (FR-13H/T-26): the request is about to
+        // reach Proton; a crash after it must not forget that. Anchor
+        // every wall timestamp in the rollback-clamped effective time so
+        // the whole deadline space stays self-consistent.
+        let started = self.observe_now(&mut guard);
+        guard.persisted.last_request_unix = Some(started.effective);
+        guard.persisted.wall_high_water_unix =
+            guard.persisted.wall_high_water_unix.max(started.effective);
+        let etag = self
+            .config
+            .conditional_requests
+            .then(|| guard.etag.clone())
+            .flatten();
+        if let Err(error) = self.store.save(&guard.persisted) {
+            // Restart-persistence is at risk, not the refresh itself:
+            // warn loudly, keep going (data availability outranks local
+            // pacing bookkeeping), and re-attempt the post-fetch save.
+            tracing::warn!(error = %error, "persisting pre-fetch deadlines failed");
+        }
+        drop(guard);
+
+        // A panicking fetch bridge must not wedge the single-flight
+        // forever (joiners park on `in_flight`): convert a panic into a
+        // transport failure so the generation resolves either way.
+        let fetched = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            (self.fetch)(etag.as_deref())
+        }))
+        .unwrap_or_else(|_panic| {
+            tracing::error!("catalog fetch panicked inside the bridge");
+            Err(FetchFailure::Transport("fetch bridge panicked".to_owned()))
+        });
+
+        let mut guard = self.inner.lock().expect("scheduler lock");
+        let finished = self.observe_now(&mut guard);
+        // The fetch took monotonic time; effective time cannot have gone
+        // backward even if the wall did mid-fetch.
+        let effective_now = finished.effective.max(started.effective);
+        let jitter = draw_jitter(self.config.max_positive_jitter_seconds);
+        let retry_after = match &fetched {
+            Err(FetchFailure::RateLimited {
+                retry_after_seconds,
+            }) => *retry_after_seconds,
+            _ => None,
+        };
+        let deadline = next_deadline(&DeadlineInputs {
+            last_request_unix: Some(started.effective),
+            now_unix: effective_now,
+            configured_interval_seconds: self.config.refresh_interval_seconds,
+            // The adapter supplies no Proton cache lifetime today (spike
+            // memo Q4/Q8); the input stays wired so S8 can feed it.
+            proton_lifetime_seconds: None,
+            retry_after_seconds: retry_after,
+            jitter_seconds: jitter,
+        });
+        let outcome = match &fetched {
+            Ok(FetchOutcome::Changed { etag, body }) => {
+                guard.etag = etag.clone();
+                guard.persisted.last_success_unix = Some(effective_now);
+                RefreshOutcome::Changed {
+                    etag: etag.clone(),
+                    body: body.clone(),
+                }
+            }
+            Ok(FetchOutcome::NotModified) => {
+                guard.persisted.last_success_unix = Some(effective_now);
+                RefreshOutcome::NotModified
+            }
+            Err(FetchFailure::RateLimited {
+                retry_after_seconds,
+            }) => RefreshOutcome::RateLimited {
+                retry_after_seconds: *retry_after_seconds,
+            },
+            Err(FetchFailure::Transport(message)) => RefreshOutcome::Failed {
+                reason: message.clone(),
+            },
+        };
+        match kind {
+            RefreshKind::Automatic => guard.persisted.automatic_refresh_count += 1,
+            RefreshKind::Manual => guard.persisted.manual_refresh_count += 1,
+        }
+        // A lingering earlier suppression can outlive a fresh
+        // non-rate-limited deadline: keep the greater on both fields.
+        let suppression = guard
+            .persisted
+            .suppression_until_unix
+            .map(|existing| existing.max(deadline.suppression_until_unix.unwrap_or(0)))
+            .or(deadline.suppression_until_unix);
+        let next_eligible = deadline.next_eligible_unix.max(suppression.unwrap_or(0));
+        guard.persisted.next_eligible_unix = Some(next_eligible);
+        guard.persisted.next_eligible_source = Some(deadline.source);
+        guard.persisted.suppression_until_unix = suppression;
+        guard.persisted.wall_high_water_unix =
+            guard.persisted.wall_high_water_unix.max(effective_now);
+        if let Err(error) = self.store.save(&guard.persisted) {
+            tracing::warn!(error = %error, "persisting post-fetch deadlines failed");
+        }
+        let report = std::sync::Arc::new(RefreshReport {
+            outcome,
+            coalesced: false,
+            next_eligible_unix: next_eligible,
+            suppression_until_unix: suppression,
+        });
+        guard.completed = Some((generation, std::sync::Arc::clone(&report)));
+        guard.in_flight = None;
+        self.cv.notify_all();
+        RefreshReport {
+            outcome: report.outcome.clone(),
+            coalesced: false,
+            next_eligible_unix: report.next_eligible_unix,
+            suppression_until_unix: report.suppression_until_unix,
+        }
+    }
+}
+
+/// Mints one confirmation token: 32 CSPRNG bytes, hex-encoded
+/// (single-use, expiring; see [`PendingToken`]). Never derived from
+/// anything caller-controlled or hash-seeded.
+fn mint_confirmation_token() -> String {
+    let mut bytes = [0u8; 32];
+    if getrandom::getrandom(&mut bytes).is_err() {
+        // A broken CSPRNG must not become a bypass: refuse to mint by
+        // returning an unmatchable value — no confirmation can proceed.
+        return String::new();
+    }
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Test-support: a deterministic scenario generator for the property
@@ -597,6 +1246,972 @@ mod tests {
             assert_eq!(
                 labeled.0, greatest,
                 "label names a non-winning component for {inputs:?}"
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Runtime suite: single-flight, rollback, suppression, manual override —
+// driven on virtual clocks (E2E-22's virtual-clock harness is normative)
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod runtime_tests {
+    use std::collections::VecDeque;
+    use std::sync::Arc;
+    use std::sync::Mutex as StdMutex;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::mpsc;
+
+    use super::*;
+    use protonwire_store::deadlines::{DeadlineStore, SchedulerDeadlines};
+    use testkit::ScenarioRng;
+
+    const T0: u64 = 1_771_000_000;
+    /// The default jitter ceiling used across the suite (10 min, the
+    /// config default).
+    const JITTER: u64 = 600;
+
+    // --- fixtures -----------------------------------------------------------
+
+    /// Scripted fetch service: responses pop in order, the LAST repeats
+    /// forever. Counts every invocation; can gate its first invocation
+    /// until released (the single-flight race pin).
+    #[derive(Clone)]
+    struct FakeFetch(Arc<FetchInner>);
+
+    struct FetchInner {
+        calls: AtomicU64,
+        script: StdMutex<VecDeque<Result<FetchOutcome, FetchFailure>>>,
+        repeat: Result<FetchOutcome, FetchFailure>,
+        started: Option<mpsc::Sender<()>>,
+        release: StdMutex<Option<mpsc::Receiver<()>>>,
+    }
+
+    impl FakeFetch {
+        /// `script`'s last entry is the repeating fallback.
+        fn new(script: Vec<Result<FetchOutcome, FetchFailure>>) -> Self {
+            let mut script: VecDeque<_> = script.into();
+            let repeat = script.pop_back().expect("at least one scripted response");
+            Self(Arc::new(FetchInner {
+                calls: AtomicU64::new(0),
+                script: StdMutex::new(script),
+                repeat,
+                started: None,
+                release: StdMutex::new(None),
+            }))
+        }
+
+        /// Gates the first invocation: the fetch signals `started`, then
+        /// blocks until [`Gate::release`]. Deterministic single-flight
+        /// racing — while the gate holds, every additional caller must
+        /// park.
+        fn gated(mut self) -> (Self, mpsc::Receiver<()>, Gate) {
+            let (started_tx, started_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            let inner = Arc::get_mut(&mut self.0).expect("gated before any clone");
+            inner.started = Some(started_tx);
+            *inner.release.lock().unwrap() = Some(release_rx);
+            (self, started_rx, Gate { tx: release_tx })
+        }
+
+        fn calls(&self) -> u64 {
+            self.0.calls.load(Ordering::SeqCst)
+        }
+
+        fn service(&self) -> CatalogFetch {
+            let inner = Arc::clone(&self.0);
+            Arc::new(move |etag| inner.invoke(etag))
+        }
+    }
+
+    /// Releases the gated fetch.
+    struct Gate {
+        tx: mpsc::Sender<()>,
+    }
+
+    impl Gate {
+        fn release(self) {
+            let _ = self.tx.send(());
+        }
+    }
+
+    impl FetchInner {
+        fn invoke(&self, _etag: Option<&str>) -> Result<FetchOutcome, FetchFailure> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if let Some(started) = &self.started
+                && let Some(release) = self.release.lock().unwrap().take()
+            {
+                let _ = started.send(());
+                let _ = release.recv();
+            }
+            self.script
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| self.repeat.clone())
+        }
+    }
+
+    fn not_modified() -> Result<FetchOutcome, FetchFailure> {
+        Ok(FetchOutcome::NotModified)
+    }
+
+    fn rate_limited(retry_after_seconds: Option<u64>) -> Result<FetchOutcome, FetchFailure> {
+        Err(FetchFailure::RateLimited {
+            retry_after_seconds,
+        })
+    }
+
+    /// A scheduler over a temp deadline store, on the given clock.
+    fn harness(clock: &VirtualClock, fetch: &FakeFetch) -> (Arc<Scheduler>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let scheduler = Scheduler::new(
+            SchedulerConfig::new(FRESHNESS_FLOOR_SECONDS, JITTER, true).unwrap(),
+            Arc::new(clock.clone()),
+            fetch.service(),
+            DeadlineStore::new(dir.path().join("deadlines.json")),
+            SchedulerDeadlines::default(),
+            None,
+        );
+        (Arc::new(scheduler), dir)
+    }
+
+    /// A scheduler seeded as if a fetch completed at `last_request`
+    /// (restart-style: no bootstrap call).
+    fn seeded(
+        clock: &VirtualClock,
+        fetch: &FakeFetch,
+        last_request: u64,
+    ) -> (Arc<Scheduler>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let persisted = SchedulerDeadlines {
+            last_request_unix: Some(last_request),
+            last_success_unix: Some(last_request),
+            next_eligible_unix: Some(last_request + FRESHNESS_FLOOR_SECONDS),
+            next_eligible_source: Some(IntervalSource::ThreeHourFloor),
+            wall_high_water_unix: last_request,
+            ..SchedulerDeadlines::default()
+        };
+        let scheduler = Scheduler::new(
+            SchedulerConfig::new(FRESHNESS_FLOOR_SECONDS, JITTER, true).unwrap(),
+            Arc::new(clock.clone()),
+            fetch.service(),
+            DeadlineStore::new(dir.path().join("deadlines.json")),
+            persisted,
+            None,
+        );
+        (Arc::new(scheduler), dir)
+    }
+
+    /// Test-only restart: reads the persisted document directly (the
+    /// strict fs_trust walk is root-runner territory — the store's own
+    /// suite proves that arm; here we prove the SCHEDULER consumes the
+    /// persisted state).
+    fn restart(clock: &VirtualClock, fetch: &FakeFetch, dir: &tempfile::TempDir) -> Arc<Scheduler> {
+        let bytes = std::fs::read(dir.path().join("deadlines.json")).unwrap();
+        let persisted: SchedulerDeadlines = serde_json::from_slice(&bytes).unwrap();
+        let scheduler = Scheduler::new(
+            SchedulerConfig::new(FRESHNESS_FLOOR_SECONDS, JITTER, true).unwrap(),
+            Arc::new(clock.clone()),
+            fetch.service(),
+            DeadlineStore::new(dir.path().join("deadlines.json")),
+            persisted,
+            None,
+        );
+        Arc::new(scheduler)
+    }
+
+    /// The rollback-clamped effective time, as the test computes it.
+    fn effective_now(clock: &VirtualClock, scheduler: &Scheduler) -> u64 {
+        clock
+            .now_unix()
+            .max(scheduler.persisted().wall_high_water_unix)
+    }
+
+    // --- T-25: single-flight --------------------------------------------------
+
+    /// N racing callers at one eligibility window coalesce to exactly
+    /// one fetch; joiners receive the leader's result with
+    /// `coalesced: true` (T-25). The gated fetch makes the race
+    /// deterministic in the important direction: while the gate holds,
+    /// every additional caller MUST park — no caller can complete
+    /// before the release, so no second fetch can start.
+    #[test]
+    fn single_flight_coalesces_racing_callers() {
+        let clock = VirtualClock::new(T0);
+        let (fetch, started, gate) = FakeFetch::new(vec![not_modified()]).gated();
+        let (scheduler, _dir) = harness(&clock, &fetch);
+
+        const RACERS: usize = 8;
+        let (results_tx, results_rx) = mpsc::channel();
+        let mut handles = Vec::new();
+        for _ in 0..RACERS {
+            let scheduler = Arc::clone(&scheduler);
+            let results_tx = results_tx.clone();
+            handles.push(std::thread::spawn(move || {
+                results_tx.send(scheduler.refresh_automatic()).unwrap();
+            }));
+        }
+        // Deterministic park point: the leader is inside the gated fetch
+        // (calls == 1, started signaled); while the gate holds, every
+        // other racer can only park — none can complete, none can fetch.
+        started
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the leader must reach the fetch");
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert_eq!(fetch.calls(), 1, "the leader must be the only fetcher");
+        gate.release();
+
+        // Counted receive (Receiver::iter would block: the last sender
+        // clone only drops when every racer thread exits).
+        let outcomes: Vec<AutomaticOutcome> = (0..RACERS)
+            .map(|_| {
+                results_rx
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .expect("every racer must resolve")
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        assert_eq!(fetch.calls(), 1, "single-flight: exactly one fetch");
+        let mut leaders = 0;
+        let mut joiners = 0;
+        let mut stragglers = 0;
+        for outcome in &outcomes {
+            match outcome {
+                AutomaticOutcome::Due(report) => {
+                    assert!(matches!(report.outcome, RefreshOutcome::NotModified));
+                    if report.coalesced {
+                        joiners += 1;
+                    } else {
+                        leaders += 1;
+                    }
+                }
+                AutomaticOutcome::NotDue { .. } => {
+                    // A racer that arrived after completion sees the
+                    // reset deadline — correct single-flight behavior;
+                    // the herd still never happens (fetch count above).
+                    stragglers += 1;
+                }
+            }
+        }
+        assert_eq!(
+            leaders, 1,
+            "exactly one non-coalesced leader ({joiners} joiners, {stragglers} stragglers)"
+        );
+        assert!(
+            joiners >= 1,
+            "at least one racer must have joined the in-flight refresh \
+             ({stragglers} arrived after completion)"
+        );
+    }
+
+    // --- T-26: floor, jitter window, rollback, restart ------------------------
+
+    #[test]
+    fn bootstrap_is_due_immediately_then_the_floor_governs() {
+        let clock = VirtualClock::new(T0);
+        let fetch = FakeFetch::new(vec![not_modified()]);
+        let (scheduler, _dir) = harness(&clock, &fetch);
+
+        // FR-13F: no recorded request -> immediately due.
+        let report = match scheduler.refresh_automatic() {
+            AutomaticOutcome::Due(report) => report,
+            other => panic!("bootstrap must be due, got {other:?}"),
+        };
+        assert!(!report.coalesced);
+        assert!(matches!(report.outcome, RefreshOutcome::NotModified));
+        assert_eq!(fetch.calls(), 1);
+
+        // FR-12/FR-13D: the next window is [floor, floor + jitter].
+        let next = scheduler.next_due_unix().unwrap();
+        assert!(
+            next >= T0 + FRESHNESS_FLOOR_SECONDS && next <= T0 + FRESHNESS_FLOOR_SECONDS + JITTER,
+            "next {next} outside the floor+jitter window"
+        );
+        assert_eq!(
+            scheduler.persisted().next_eligible_source,
+            Some(IntervalSource::ThreeHourFloor)
+        );
+
+        // One second before: not due. At the deadline: due, one fetch.
+        clock.set_wall(next - 1);
+        assert!(matches!(
+            scheduler.refresh_automatic(),
+            AutomaticOutcome::NotDue { .. }
+        ));
+        clock.set_wall(next);
+        assert!(matches!(
+            scheduler.refresh_automatic(),
+            AutomaticOutcome::Due(_)
+        ));
+        assert_eq!(fetch.calls(), 2);
+    }
+
+    /// T-26's rollback guard: a wall clock that jumps backward — even
+    /// past the eligibility deadline, even repeatedly, even across a
+    /// restart — must not produce a refetch storm.
+    #[test]
+    fn rollback_never_triggers_a_refetch_storm() {
+        let clock = VirtualClock::new(T0);
+        let fetch = FakeFetch::new(vec![not_modified()]);
+        let (scheduler, dir) = harness(&clock, &fetch);
+
+        // Bootstrap at T0, then let the first window pass and refresh.
+        assert!(matches!(
+            scheduler.refresh_automatic(),
+            AutomaticOutcome::Due(_)
+        ));
+        clock.advance_secs(FRESHNESS_FLOOR_SECONDS + JITTER + 60);
+        assert!(matches!(
+            scheduler.refresh_automatic(),
+            AutomaticOutcome::Due(_)
+        ));
+        assert_eq!(fetch.calls(), 2);
+        let second_window = scheduler.next_due_unix().unwrap();
+        assert!(
+            second_window >= T0 + FRESHNESS_FLOOR_SECONDS + JITTER + 60 + FRESHNESS_FLOOR_SECONDS
+        );
+
+        // Roll the wall back to just after the very first fetch; the
+        // monotonic counter keeps running (the only shape that cannot be
+        // time passing).
+        clock.set_wall(T0 + 60);
+        for _ in 0..50 {
+            assert!(
+                matches!(
+                    scheduler.refresh_automatic(),
+                    AutomaticOutcome::NotDue { .. }
+                ),
+                "a rolled-back clock must never re-open a window"
+            );
+        }
+        assert_eq!(fetch.calls(), 2, "no storm across 50 repeated probes");
+        assert!(scheduler.diagnostics().clock_rollback_detected);
+
+        // Rollback survives the restart: the persisted high-water mark
+        // clamps the fresh process to the same conclusion.
+        let restarted = restart(&clock, &fetch, &dir);
+        assert!(matches!(
+            restarted.refresh_automatic(),
+            AutomaticOutcome::NotDue { .. }
+        ));
+        assert_eq!(fetch.calls(), 2);
+        assert!(
+            effective_now(&clock, &restarted) >= second_window
+                || restarted.next_due_unix().unwrap() > clock.now_unix()
+        );
+    }
+
+    /// The rollback clamp never LOCKS the scheduler out forever: once
+    /// the wall catches back up past the persisted deadline, the window
+    /// opens normally again (a forward jump, symmetrically, is just
+    /// elapsed time).
+    #[test]
+    fn the_guard_recovers_once_the_wall_catches_up() {
+        let clock = VirtualClock::new(T0);
+        let fetch = FakeFetch::new(vec![not_modified()]);
+        let (scheduler, _dir) = harness(&clock, &fetch);
+        assert!(matches!(
+            scheduler.refresh_automatic(),
+            AutomaticOutcome::Due(_)
+        ));
+        let next = scheduler.next_due_unix().unwrap();
+
+        // Jump the wall FAR forward, then roll it back below the
+        // deadline, then let real (monotonic) time carry the wall past
+        // the deadline again.
+        clock.set_wall(next + 10 * FRESHNESS_FLOOR_SECONDS);
+        clock.set_wall(T0 + 30);
+        for _ in 0..50 {
+            assert!(matches!(
+                scheduler.refresh_automatic(),
+                AutomaticOutcome::NotDue { .. }
+            ));
+        }
+        clock.set_wall(next + 5);
+        assert!(matches!(
+            scheduler.refresh_automatic(),
+            AutomaticOutcome::Due(_)
+        ));
+        assert_eq!(fetch.calls(), 2);
+    }
+
+    /// T-26: deadlines, suppression, and the diagnostic counters survive
+    /// the restart (FR-13H), and the FR-11 age anchor is the persisted
+    /// last-success time.
+    #[test]
+    fn deadlines_and_counters_survive_restart() {
+        let clock = VirtualClock::new(T0);
+        let fetch = FakeFetch::new(vec![rate_limited(Some(4 * 3600))]);
+        let (scheduler, dir) = harness(&clock, &fetch);
+
+        assert!(matches!(
+            scheduler.refresh_automatic(),
+            AutomaticOutcome::Due(RefreshReport {
+                outcome: RefreshOutcome::RateLimited { .. },
+                ..
+            })
+        ));
+        let persisted = scheduler.persisted();
+        assert_eq!(persisted.last_request_unix, Some(T0));
+        assert_eq!(persisted.automatic_refresh_count, 1);
+        let suppression = persisted.suppression_until_unix.unwrap();
+        assert_eq!(suppression, T0 + 4 * 3600, "Q4: Retry-After 4h > floor 3h");
+
+        let restarted = restart(&clock, &fetch, &dir);
+        let carried = restarted.persisted();
+        assert_eq!(carried.suppression_until_unix, Some(suppression));
+        assert_eq!(carried.automatic_refresh_count, 1);
+        // The automatic eligibility is the suppression plus the drawn
+        // jitter (0..=JITTER) — never below the hard floor.
+        let carried_next = carried.next_eligible_unix.unwrap();
+        assert!(
+            carried_next >= suppression && carried_next <= suppression + JITTER,
+            "next eligibility {carried_next} not in [suppression {suppression}, +{JITTER}]"
+        );
+        assert_eq!(
+            restarted.diagnostics().catalog_age_seconds,
+            None,
+            "no successful fetch yet"
+        );
+    }
+
+    // --- Q4 / ER-16 / E2E-22: suppression --------------------------------------
+
+    #[test]
+    fn retry_after_sets_the_greatest_of_suppression() {
+        // A Retry-After inside the floor loses to the floor.
+        let clock = VirtualClock::new(T0);
+        let fetch = FakeFetch::new(vec![rate_limited(Some(3600)), not_modified()]);
+        let (scheduler, _dir) = harness(&clock, &fetch);
+        match scheduler.refresh_automatic() {
+            AutomaticOutcome::Due(report) => {
+                assert!(matches!(
+                    report.outcome,
+                    RefreshOutcome::RateLimited {
+                        retry_after_seconds: Some(3600)
+                    }
+                ));
+                assert_eq!(
+                    report.suppression_until_unix,
+                    Some(T0 + FRESHNESS_FLOOR_SECONDS)
+                );
+            }
+            other => panic!("expected Due, got {other:?}"),
+        }
+        assert_eq!(
+            scheduler.persisted().next_eligible_source,
+            Some(IntervalSource::ThreeHourFloor)
+        );
+
+        // A Retry-After beyond the floor wins.
+        let clock = VirtualClock::new(T0);
+        let fetch = FakeFetch::new(vec![rate_limited(Some(6 * 3600)), not_modified()]);
+        let (scheduler, _dir) = harness(&clock, &fetch);
+        assert!(matches!(
+            scheduler.refresh_automatic(),
+            AutomaticOutcome::Due(_)
+        ));
+        assert_eq!(
+            scheduler.persisted().suppression_until_unix,
+            Some(T0 + 6 * 3600)
+        );
+        assert_eq!(
+            scheduler.persisted().next_eligible_source,
+            Some(IntervalSource::RetryAfter)
+        );
+    }
+
+    /// E2E-22: even a confirmed manual request and every restart honor
+    /// the persisted suppression deadline.
+    #[test]
+    fn suppression_refuses_even_confirmed_manual_requests() {
+        let clock = VirtualClock::new(T0);
+        let fetch = FakeFetch::new(vec![rate_limited(Some(6 * 3600)), not_modified()]);
+        let (scheduler, dir) = harness(&clock, &fetch);
+        assert!(matches!(
+            scheduler.refresh_automatic(),
+            AutomaticOutcome::Due(_)
+        ));
+        let suppression = T0 + 6 * 3600;
+
+        // Well inside the window the manual door is Suppressed — before
+        // any confirmation ceremony, and with a forged token too.
+        clock.set_wall(T0 + 3 * 3600 + 60);
+        assert_eq!(
+            scheduler.refresh_manual(None),
+            ManualOutcome::Suppressed {
+                until_unix: suppression
+            }
+        );
+        assert_eq!(
+            scheduler.refresh_manual(Some("forged-token")),
+            ManualOutcome::Suppressed {
+                until_unix: suppression
+            }
+        );
+        assert_eq!(fetch.calls(), 1, "no request may escape the suppression");
+
+        // The restart inherits it (FR-13H/ER-16).
+        let restarted = restart(&clock, &fetch, &dir);
+        assert_eq!(
+            restarted.refresh_manual(None),
+            ManualOutcome::Suppressed {
+                until_unix: suppression
+            }
+        );
+
+        // Past the jittered next eligibility the window reopens (the
+        // suppression floor itself is un-jittered; the automatic
+        // eligibility adds 0..=JITTER on top).
+        let reopened = restarted.next_due_unix().unwrap();
+        assert!(reopened >= suppression);
+        clock.set_wall(reopened + 1);
+        assert!(matches!(
+            restarted.refresh_automatic(),
+            AutomaticOutcome::Due(_)
+        ));
+    }
+
+    // --- T-27: warned + confirmed manual override -------------------------------
+
+    #[test]
+    fn early_manual_refresh_requires_a_fresh_confirmed_token() {
+        let clock = VirtualClock::new(T0);
+        let fetch = FakeFetch::new(vec![not_modified()]);
+        let (scheduler, _dir) = harness(&clock, &fetch);
+        assert!(matches!(
+            scheduler.refresh_automatic(),
+            AutomaticOutcome::Due(_)
+        ));
+
+        clock.set_wall(T0 + 600);
+        // (a) No token: the typed requirement with the warning.
+        let requirement = match scheduler.refresh_manual(None) {
+            ManualOutcome::ConfirmationRequired(requirement) => requirement,
+            other => panic!("expected ConfirmationRequired, got {other:?}"),
+        };
+        assert_eq!(requirement.catalog_age_seconds, 600);
+        assert_eq!(requirement.last_request_unix, Some(T0));
+        let next = scheduler.next_due_unix().unwrap();
+        assert_eq!(requirement.next_eligible_unix, next);
+        assert_eq!(requirement.warning, MANUAL_REFRESH_WARNING);
+        assert_eq!(requirement.confirmation_token.len(), 64);
+        assert!(
+            requirement
+                .confirmation_token
+                .chars()
+                .all(|c| c.is_ascii_hexdigit()),
+            "32 CSPRNG bytes, hex-encoded"
+        );
+
+        // The token is never persisted (FR-13I: approval is not a
+        // preference).
+        // (b) A wrong token never succeeds and forces a FRESH ceremony.
+        let second = match scheduler.refresh_manual(Some("wrong")) {
+            ManualOutcome::ConfirmationRequired(second) => second,
+            other => panic!("expected a fresh requirement, got {other:?}"),
+        };
+        assert_ne!(
+            second.confirmation_token, requirement.confirmation_token,
+            "confirmation is per-request: every refusal mints fresh"
+        );
+
+        // (c) The correct token performs exactly one refresh, counted
+        // separately, and resets the automatic deadline (FR-13I).
+        let report = match scheduler.refresh_manual(Some(&second.confirmation_token)) {
+            ManualOutcome::Refreshed(report) => report,
+            other => panic!("expected Refreshed, got {other:?}"),
+        };
+        assert!(matches!(report.outcome, RefreshOutcome::NotModified));
+        assert_eq!(fetch.calls(), 2);
+        let diagnostics = scheduler.diagnostics();
+        assert_eq!(diagnostics.manual_refresh_count, 1);
+        assert_eq!(diagnostics.automatic_refresh_count, 1);
+        assert!(
+            report.next_eligible_unix >= T0 + 600 + FRESHNESS_FLOOR_SECONDS,
+            "FR-13I: the confirmed request resets the next automatic window"
+        );
+
+        // (d) Single-use: replaying the burned token is a fresh refusal,
+        // never a second refresh.
+        match scheduler.refresh_manual(Some(&second.confirmation_token)) {
+            ManualOutcome::ConfirmationRequired(_) => {}
+            other => panic!("burned token must not refresh again: {other:?}"),
+        }
+        assert_eq!(fetch.calls(), 2);
+
+        // (e) The automatic door stays shut until the reset deadline.
+        assert!(matches!(
+            scheduler.refresh_automatic(),
+            AutomaticOutcome::NotDue { .. }
+        ));
+        assert_eq!(fetch.calls(), 2);
+    }
+
+    #[test]
+    fn a_manual_refresh_that_is_already_eligible_needs_no_confirmation() {
+        let clock = VirtualClock::new(T0);
+        let fetch = FakeFetch::new(vec![not_modified()]);
+        let (scheduler, _dir) = harness(&clock, &fetch);
+        assert!(matches!(
+            scheduler.refresh_automatic(),
+            AutomaticOutcome::Due(_)
+        ));
+        clock.set_wall(T0 + FRESHNESS_FLOOR_SECONDS + JITTER);
+        match scheduler.refresh_manual(None) {
+            ManualOutcome::Refreshed(report) => assert!(!report.coalesced),
+            other => panic!("an eligible manual refresh proceeds: {other:?}"),
+        }
+        assert_eq!(scheduler.diagnostics().manual_refresh_count, 1);
+    }
+
+    #[test]
+    fn confirmation_tokens_expire() {
+        let clock = VirtualClock::new(T0);
+        let fetch = FakeFetch::new(vec![not_modified()]);
+        let (scheduler, _dir) = harness(&clock, &fetch);
+        assert!(matches!(
+            scheduler.refresh_automatic(),
+            AutomaticOutcome::Due(_)
+        ));
+        clock.set_wall(T0 + 60);
+        let requirement = match scheduler.refresh_manual(None) {
+            ManualOutcome::ConfirmationRequired(requirement) => requirement,
+            other => panic!("expected a requirement, got {other:?}"),
+        };
+        // Beyond the TTL the token is dead, whatever the caller does.
+        clock.set_wall(T0 + 60 + CONFIRMATION_TOKEN_TTL_SECONDS + 1);
+        match scheduler.refresh_manual(Some(&requirement.confirmation_token)) {
+            ManualOutcome::ConfirmationRequired(fresh) => {
+                assert_ne!(fresh.confirmation_token, requirement.confirmation_token);
+            }
+            other => panic!("an expired token must force a fresh ceremony: {other:?}"),
+        }
+        assert_eq!(fetch.calls(), 1);
+    }
+
+    /// The minted token never reaches the persisted document (FR-13I)
+    /// even while it is live in memory.
+    #[test]
+    fn a_live_token_is_never_persisted() {
+        let clock = VirtualClock::new(T0);
+        let fetch = FakeFetch::new(vec![not_modified()]);
+        let (scheduler, dir) = harness(&clock, &fetch);
+        assert!(matches!(
+            scheduler.refresh_automatic(),
+            AutomaticOutcome::Due(_)
+        ));
+        clock.set_wall(T0 + 60);
+        let requirement = match scheduler.refresh_manual(None) {
+            ManualOutcome::ConfirmationRequired(requirement) => requirement,
+            other => panic!("expected a requirement, got {other:?}"),
+        };
+        let stored = std::fs::read_to_string(dir.path().join("deadlines.json")).unwrap();
+        assert!(
+            !stored.contains(&requirement.confirmation_token),
+            "the confirmation token must never persist"
+        );
+    }
+
+    // --- robustness --------------------------------------------------------------
+
+    /// A panicking fetch bridge must resolve its generation: joiners get
+    /// a failure report, later windows still work (no permanent wedge).
+    #[test]
+    fn a_panicking_fetch_does_not_wedge_single_flight() {
+        let clock = VirtualClock::new(T0);
+        let fetch: CatalogFetch = Arc::new(|_etag| panic!("bridge exploded"));
+        let dir = tempfile::tempdir().unwrap();
+        let scheduler = Scheduler::new(
+            SchedulerConfig::new(FRESHNESS_FLOOR_SECONDS, JITTER, true).unwrap(),
+            Arc::new(clock.clone()),
+            fetch,
+            DeadlineStore::new(dir.path().join("deadlines.json")),
+            SchedulerDeadlines::default(),
+            None,
+        );
+        let scheduler = Arc::new(scheduler);
+        let first = std::thread::spawn({
+            let scheduler = Arc::clone(&scheduler);
+            move || scheduler.refresh_automatic()
+        })
+        .join()
+        .expect("the panic is contained inside the scheduler");
+        match first {
+            AutomaticOutcome::Due(report) => {
+                assert!(matches!(report.outcome, RefreshOutcome::Failed { .. }));
+            }
+            other => panic!("expected a failure report, got {other:?}"),
+        }
+        // The window still advanced: the next caller is NotDue, not
+        // parked forever.
+        let second = std::thread::spawn({
+            let scheduler = Arc::clone(&scheduler);
+            move || scheduler.refresh_automatic()
+        })
+        .join()
+        .expect("the scheduler must not be wedged");
+        assert!(matches!(second, AutomaticOutcome::NotDue { .. }));
+    }
+
+    // --- E2E-22: the 24-virtual-hours suite -----------------------------------
+
+    /// E2E-22's automatic-window budget: 24 virtual hours on the default
+    /// policy yield at most eight automatic windows; a rate-limited
+    /// window's suppression then binds the manual door, restarts
+    /// included, until it passes.
+    #[test]
+    fn e2e22_twenty_four_virtual_hours() {
+        let clock = VirtualClock::new(T0);
+        let fetch = FakeFetch::new(vec![not_modified()]);
+        let (scheduler, dir) = seeded(&clock, &fetch, T0);
+
+        let mut automatic_windows = 0;
+        for hour in 1..=24u64 {
+            clock.set_wall(T0 + hour * 3600);
+            if matches!(scheduler.refresh_automatic(), AutomaticOutcome::Due(_)) {
+                automatic_windows += 1;
+            }
+        }
+        assert!(
+            automatic_windows <= 8,
+            "at most eight automatic windows in 24h, got {automatic_windows}"
+        );
+        assert!(
+            automatic_windows >= 6,
+            "positive jitter (<= {JITTER}s) may slip hourly checks by at most \
+             one hour per window; six windows is the floor, got {automatic_windows}"
+        );
+        assert_eq!(fetch.calls(), automatic_windows);
+
+        // Inject rate limiting on the next window: suppression greatest-of
+        // binds the confirmed manual door and every restart.
+        let gated = FakeFetch::new(vec![rate_limited(Some(4 * 3600)), not_modified()]);
+        let scheduler = restart(&clock, &gated, &dir);
+        let next_window = scheduler.next_due_unix().unwrap();
+        clock.set_wall(next_window + 1);
+        match scheduler.refresh_automatic() {
+            AutomaticOutcome::Due(report) => {
+                assert!(matches!(report.outcome, RefreshOutcome::RateLimited { .. }));
+            }
+            other => panic!("the injected window must run, got {other:?}"),
+        }
+        let suppression = scheduler.persisted().suppression_until_unix.unwrap();
+        assert_eq!(suppression, next_window + 1 + 4 * 3600);
+
+        // A fresh confirmation is minted but STILL refused — suppression
+        // outranks confirmation (E2E-22).
+        let requirement = match scheduler.refresh_manual(None) {
+            ManualOutcome::Suppressed { until_unix } => {
+                assert_eq!(until_unix, suppression);
+                // While suppressed the ceremony itself is refused; use a
+                // forged token to prove even a confirmed shape cannot pass.
+                assert_eq!(
+                    scheduler.refresh_manual(Some("confirmed-anyway")),
+                    ManualOutcome::Suppressed { until_unix }
+                );
+                None
+            }
+            ManualOutcome::ConfirmationRequired(requirement) => Some(requirement),
+            other => panic!("unexpected manual outcome: {other:?}"),
+        };
+        if let Some(requirement) = requirement {
+            // If the window had reopened past suppression, a confirmed
+            // request must still be single-flight and counted separately;
+            // here we only reach this arm when suppression already lapsed.
+            let _ = requirement;
+        }
+
+        // Every restart honors the persisted suppression deadline.
+        for _ in 0..3 {
+            let restarted = restart(&clock, &gated, &dir);
+            assert!(matches!(
+                restarted.refresh_automatic(),
+                AutomaticOutcome::NotDue { .. }
+            ));
+        }
+
+        // Past the jittered next eligibility the schedule resumes.
+        let resumed = scheduler.next_due_unix().unwrap();
+        assert!(resumed >= suppression);
+        clock.set_wall(resumed + 1);
+        assert!(matches!(
+            scheduler.refresh_automatic(),
+            AutomaticOutcome::Due(_)
+        ));
+    }
+
+    // --- E2E-22: the randomized virtual-clock property ------------------------
+
+    /// The normative property: over randomized virtual-clock walks
+    /// (advances, rollbacks, forward jumps) with interleaved automatic
+    /// and manual attempts, every performed fetch observes the greatest
+    /// deadline computed before it, and suppression is never violated.
+    #[test]
+    fn property_random_virtual_clock_walks_respect_every_deadline() {
+        for seed in [0x5EED_1001u64, 0x5EED_1002, 0x5EED_1003] {
+            let mut rng = ScenarioRng::new(seed);
+            let clock = VirtualClock::new(T0);
+            // The fetch behavior is scripted by the walk itself: normal
+            // windows are not-modified; rate limiting is injected
+            // occasionally via a shared script slot.
+            let script: Arc<StdMutex<VecDeque<Result<FetchOutcome, FetchFailure>>>> =
+                Arc::new(StdMutex::new(VecDeque::new()));
+            let calls = Arc::new(AtomicU64::new(0));
+            let service: CatalogFetch = {
+                let script = Arc::clone(&script);
+                let calls = Arc::clone(&calls);
+                Arc::new(move |_etag| {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    script
+                        .lock()
+                        .unwrap()
+                        .pop_front()
+                        .unwrap_or_else(|| Ok(FetchOutcome::NotModified))
+                })
+            };
+            let dir = tempfile::tempdir().unwrap();
+            let scheduler = Arc::new(Scheduler::new(
+                SchedulerConfig::new(FRESHNESS_FLOOR_SECONDS, JITTER, true).unwrap(),
+                Arc::new(clock.clone()),
+                service,
+                DeadlineStore::new(dir.path().join("deadlines.json")),
+                SchedulerDeadlines::default(),
+                None,
+            ));
+
+            let mut next_eligible: Option<u64> = None;
+            let mut suppression: Option<u64> = None;
+            let mut manual_windows = 0u64;
+            let mut outstanding_token: Option<String> = None;
+
+            for _step in 0..400 {
+                let choice = rng.next_u64() % 100;
+                match choice {
+                    0..=34 => clock.advance_secs(rng.between(1, 6 * 3600)),
+                    35..=49 => {
+                        // Rollback: wall drops, monotonic keeps running.
+                        let back = rng.between(1, 12 * 3600);
+                        let wall = clock.now_unix();
+                        clock.set_monotonic_ms(clock.monotonic_ms() + 1000);
+                        clock.set_wall(wall.saturating_sub(back).max(1));
+                    }
+                    50..=59 => {
+                        // Forward jump: wall only.
+                        clock.set_wall(clock.now_unix() + rng.between(1, 24 * 3600));
+                    }
+                    60..=79 => {
+                        // Occasionally inject rate limiting ahead of the
+                        // next fetch.
+                        if rng.next_u64().is_multiple_of(4) {
+                            script
+                                .lock()
+                                .unwrap()
+                                .push_back(Err(FetchFailure::RateLimited {
+                                    retry_after_seconds: Some(rng.between(1, 5 * 3600)),
+                                }));
+                        }
+                        let effective = effective_now(&clock, &scheduler);
+                        let eligible = next_eligible.is_none_or(|d| effective >= d);
+                        match scheduler.refresh_automatic() {
+                            AutomaticOutcome::Due(report) => {
+                                assert!(
+                                    eligible || report.coalesced,
+                                    "automatic fetch before its deadline at {:?} (seed {seed})",
+                                    report
+                                );
+                                if !report.coalesced {
+                                    next_eligible = Some(report.next_eligible_unix);
+                                    if let Some(until) = report.suppression_until_unix {
+                                        suppression = Some(
+                                            suppression.map_or(until, |old: u64| old.max(until)),
+                                        );
+                                    }
+                                }
+                            }
+                            AutomaticOutcome::NotDue { next_eligible_unix } => {
+                                assert_eq!(Some(next_eligible_unix), next_eligible);
+                            }
+                        }
+                    }
+                    80..=99 => {
+                        // The manual door, with and without a token.
+                        let effective = effective_now(&clock, &scheduler);
+                        let suppressed = suppression.is_some_and(|until| effective < until);
+                        let token = if rng.next_u64().is_multiple_of(2) {
+                            outstanding_token.as_deref()
+                        } else {
+                            None
+                        };
+                        match scheduler.refresh_manual(token) {
+                            ManualOutcome::Suppressed { .. } => {
+                                assert!(suppressed, "unsuppressed manual refused (seed {seed})");
+                            }
+                            ManualOutcome::ConfirmationRequired(requirement) => {
+                                assert!(!suppressed, "suppressed manual minted a ceremony");
+                                outstanding_token = Some(requirement.confirmation_token);
+                            }
+                            ManualOutcome::Refreshed(report) => {
+                                if !report.coalesced {
+                                    manual_windows += 1;
+                                }
+                                // A confirmed refresh is legal inside the
+                                // interval but NEVER inside a suppression.
+                                assert!(
+                                    !suppressed,
+                                    "manual refresh escaped suppression (seed {seed})"
+                                );
+                                if !report.coalesced {
+                                    next_eligible = Some(report.next_eligible_unix);
+                                    if let Some(until) = report.suppression_until_unix {
+                                        suppression = Some(
+                                            suppression.map_or(until, |old: u64| old.max(until)),
+                                        );
+                                    }
+                                    outstanding_token = None; // burned
+                                }
+                            }
+                        }
+                    }
+                    _ => unreachable!(),
+                }
+                // The persisted view always agrees with the tracked view.
+                let persisted = scheduler.persisted();
+                assert_eq!(persisted.next_eligible_unix, next_eligible);
+                assert_eq!(persisted.suppression_until_unix, suppression);
+                assert_eq!(persisted.manual_refresh_count, manual_windows);
+            }
+        }
+    }
+
+    // --- wall_rolled_back pure properties --------------------------------------
+
+    #[test]
+    fn wall_rolled_back_matches_its_defining_combination() {
+        // Wall down + monotonic up (or equal) => rollback.
+        assert!(wall_rolled_back(100, 50, 99, 60));
+        assert!(wall_rolled_back(100, 50, 99, 50));
+        // Wall down + monotonic down => not this predicate's claim.
+        assert!(!wall_rolled_back(100, 50, 99, 49));
+        // Wall up is never a rollback, whatever the monotonic did.
+        assert!(!wall_rolled_back(100, 50, 101, 49));
+        assert!(!wall_rolled_back(100, 50, 101, 60));
+        // Property over random pairs.
+        let mut rng = ScenarioRng::new(0x5EED_0003);
+        for _ in 0..4_000 {
+            let (prev_wall, prev_mono, wall, mono) = (
+                rng.between(0, 10_000),
+                rng.between(0, 10_000),
+                rng.between(0, 10_000),
+                rng.between(0, 10_000),
+            );
+            assert_eq!(
+                wall_rolled_back(prev_wall, prev_mono, wall, mono),
+                wall < prev_wall && mono >= prev_mono
             );
         }
     }
