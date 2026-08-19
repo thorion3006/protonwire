@@ -76,6 +76,15 @@ pub fn rpc_exit_code(code: RpcErrorCode) -> u8 {
         C::CredentialBackendUnavailable => 16,
         C::SecureCoreUnavailable => 17,
         C::ProtocolUnavailable => 18,
+        // M2 S2 additions: PRD 9.8 has no dedicated slots for the
+        // auth/refresh failure modes, so they map to the general error
+        // until the S9 client surface assigns any it owns; persistence
+        // unhealthy IS the credential-backend slot's semantics.
+        C::UpstreamCapabilityBlocked
+        | C::UnsupportedChallenge
+        | C::ConfirmationRequired
+        | C::RateLimited => 1,
+        C::CredentialPersistenceUnhealthy => 16,
     }
 }
 
@@ -1180,6 +1189,15 @@ mod tests {
             (C::CredentialBackendUnavailable, 16),
             (C::SecureCoreUnavailable, 17),
             (C::ProtocolUnavailable, 18),
+            // M2 S2 additions: PRD 9.8 has no dedicated slots for the
+            // auth/refresh failure modes, so they map to the general
+            // error until the S9 client surface assigns any it owns;
+            // persistence-unhealthy IS the credential-backend slot.
+            (C::UpstreamCapabilityBlocked, 1),
+            (C::UnsupportedChallenge, 1),
+            (C::ConfirmationRequired, 1),
+            (C::RateLimited, 1),
+            (C::CredentialPersistenceUnhealthy, 16),
             (C::Internal, 1),
             (C::PermissionDenied, 14),
         ];

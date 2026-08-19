@@ -269,6 +269,29 @@ pub enum RpcErrorCode {
     SecureCoreUnavailable,
     /// The requested protocol is unavailable.
     ProtocolUnavailable,
+    /// The requested capability has no verified public upstream flow
+    /// (human verification, organization SSO, guest mode, feedback):
+    /// fail closed with a stable code and remediation, never an
+    /// automatic retry or an undocumented endpoint (ER-17).
+    UpstreamCapabilityBlocked,
+    /// The upstream presented an authentication challenge this daemon
+    /// cannot continue — an unknown 2FA or verification shape (PRD §7).
+    /// Fail closed: no retry, no untrusted URL, no approximation.
+    UnsupportedChallenge,
+    /// The request requires explicit user confirmation before it may
+    /// proceed — the FR-11 early manual catalog refresh now, the FR-7D
+    /// raw-password-storage and FR-7EA none-store confirmations later.
+    /// `details` carries the typed [`ConfirmationRequirement`]
+    /// envelope; a confirmed retry echoes its single-use token.
+    ConfirmationRequired,
+    /// The request was refused by a local suppression deadline or an
+    /// upstream rate limit; the carried eligibility time governs the
+    /// next attempt and no path may bypass it (ER-16).
+    RateLimited,
+    /// The writable credential store failed its health check: restart
+    /// persistence is at risk and operations that require durable
+    /// login must fail (ER-18).
+    CredentialPersistenceUnhealthy,
     /// An internal daemon error without a more specific code.
     Internal,
 }
@@ -293,6 +316,63 @@ impl RpcError {
             message: message.into(),
             details: None,
         }
+    }
+
+    /// Builds a [`RpcErrorCode::ConfirmationRequired`] refusal carrying
+    /// the typed [`ConfirmationRequirement`] envelope in `details`.
+    pub fn confirmation_required(
+        message: impl Into<String>,
+        requirement: ConfirmationRequirement,
+    ) -> Self {
+        Self {
+            code: RpcErrorCode::ConfirmationRequired,
+            message: message.into(),
+            details: serde_json::to_value(&requirement).ok(),
+        }
+    }
+}
+
+/// The typed confirmation-requirement envelope (M2 S2): what a
+/// [`RpcErrorCode::ConfirmationRequired`] refusal carries in
+/// [`RpcError::details`] so a client can render the warning with the
+/// scheduler's eligibility facts instead of parsing prose.
+///
+/// One shape serves every confirming flow — the FR-11 early manual
+/// catalog refresh now and the FR-7D raw-password-storage /
+/// FR-7EA none-store confirmations later; the `warning` text is the
+/// flow's own. The `confirmation_token` placeholder fixes the wire
+/// shape here; the S7 scheduler mints the real single-use token
+/// (FR-13I: fresh per request, never stored as a preference).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ConfirmationRequirement {
+    /// Age of the protected resource when confirmation was demanded —
+    /// for FR-11, the server catalog's age in seconds.
+    pub catalog_age_seconds: u64,
+    /// Unix time of the last recorded upstream request touching the
+    /// resource; absent when none has been recorded yet.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_request_unix: Option<u64>,
+    /// Earliest Unix time the request would be eligible WITHOUT
+    /// confirmation (the greatest-of deadline the S7 scheduler
+    /// computes).
+    pub next_eligible_unix: u64,
+    /// Already-redacted warning the client must display before
+    /// confirming — the FR-11 rate-limit warning, the FR-7D
+    /// raw-password warning.
+    pub warning: String,
+    /// Single-use confirmation token the confirmed request echoes
+    /// (FR-13I). Placeholder shape in S2: an opaque non-empty string;
+    /// S7 replaces the minting without changing the wire shape.
+    pub confirmation_token: String,
+}
+
+impl ConfirmationRequirement {
+    /// Decodes the envelope from a [`RpcError`]'s `details`, if the
+    /// error carries one. Foreign or absent `details` decode to `None`
+    /// rather than failing: `details` is an open JSON value, so a
+    /// different payload is not a protocol violation for the reader.
+    pub fn from_error(error: &RpcError) -> Option<Self> {
+        serde_json::from_value(error.details.clone()?).ok()
     }
 }
 
@@ -387,6 +467,91 @@ mod tests {
         assert_eq!(
             serde_plain_code(&RpcErrorCode::DnsConfigFailed),
             "dns-config-failed"
+        );
+    }
+
+    /// M2 S2: the five new failure-mode codes render kebab-case like
+    /// the rest of the taxonomy — clients map them off the stable
+    /// string, never the debug name.
+    #[test]
+    fn m2_error_codes_render_kebab_case() {
+        for (code, rendered) in [
+            (
+                RpcErrorCode::UpstreamCapabilityBlocked,
+                "upstream-capability-blocked",
+            ),
+            (RpcErrorCode::UnsupportedChallenge, "unsupported-challenge"),
+            (RpcErrorCode::ConfirmationRequired, "confirmation-required"),
+            (RpcErrorCode::RateLimited, "rate-limited"),
+            (
+                RpcErrorCode::CredentialPersistenceUnhealthy,
+                "credential-persistence-unhealthy",
+            ),
+        ] {
+            assert_eq!(serde_plain_code(&code), rendered);
+        }
+    }
+
+    /// M2 S2: the typed confirmation envelope rides
+    /// `ConfirmationRequired` refusals in `details` and decodes back —
+    /// one shape for the FR-11 servers-refresh confirmation now and the
+    /// FR-7D raw-password-storage confirmation later. The token is the
+    /// S7 placeholder shape (an opaque single-use string the scheduler
+    /// will mint).
+    #[test]
+    fn confirmation_requirement_round_trips_through_error_details() {
+        let requirement = ConfirmationRequirement {
+            catalog_age_seconds: 3600,
+            last_request_unix: Some(1_755_000_000),
+            next_eligible_unix: 1_755_010_800,
+            warning: "Unnecessary refreshes may be rate-limited or blocked by Proton.".into(),
+            confirmation_token: "s7-placeholder".into(),
+        };
+        let error = RpcError::confirmation_required(
+            "manual refresh before the next eligible time",
+            requirement.clone(),
+        );
+        assert_eq!(error.code, RpcErrorCode::ConfirmationRequired);
+        assert_eq!(
+            ConfirmationRequirement::from_error(&error).as_ref(),
+            Some(&requirement),
+            "the envelope must decode from details"
+        );
+
+        // On the wire: the details carry the typed fields...
+        let json = serde_json::to_value(&Response::Error { id: 4, error }).unwrap();
+        assert_eq!(json["error"]["code"], "confirmation-required");
+        assert_eq!(json["error"]["details"]["catalog_age_seconds"], 3600);
+        assert_eq!(json["error"]["details"]["last_request_unix"], 1_755_000_000);
+        assert_eq!(
+            json["error"]["details"]["next_eligible_unix"],
+            1_755_010_800
+        );
+        assert_eq!(
+            json["error"]["details"]["confirmation_token"],
+            "s7-placeholder"
+        );
+
+        // ...and a never-requested resource keeps `None` off the wire.
+        let never_requested = ConfirmationRequirement {
+            last_request_unix: None,
+            ..requirement
+        };
+        let json = serde_json::to_value(RpcError::confirmation_required(
+            "manual refresh",
+            never_requested,
+        ))
+        .unwrap();
+        assert!(
+            json["details"].get("last_request_unix").is_none(),
+            "an absent last request must not serialize: {json}"
+        );
+
+        // A foreign or absent details payload decodes to None, not a
+        // protocol failure for the reader.
+        assert!(
+            ConfirmationRequirement::from_error(&RpcError::new(RpcErrorCode::Internal, "x"))
+                .is_none()
         );
     }
 

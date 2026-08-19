@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ConfirmationRequirement",
+  "description": "The typed confirmation-requirement envelope (M2 S2): what a\n[`RpcErrorCode::ConfirmationRequired`] refusal carries in\n[`RpcError::details`] so a client can render the warning with the\nscheduler's eligibility facts instead of parsing prose.\n\nOne shape serves every confirming flow — the FR-11 early manual\ncatalog refresh now and the FR-7D raw-password-storage /\nFR-7EA none-store confirmations later; the `warning` text is the\nflow's own. The `confirmation_token` placeholder fixes the wire\nshape here; the S7 scheduler mints the real single-use token\n(FR-13I: fresh per request, never stored as a preference).",
+  "type": "object",
+  "properties": {
+    "catalog_age_seconds": {
+      "description": "Age of the protected resource when confirmation was demanded —\nfor FR-11, the server catalog's age in seconds.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "confirmation_token": {
+      "description": "Single-use confirmation token the confirmed request echoes\n(FR-13I). Placeholder shape in S2: an opaque non-empty string;\nS7 replaces the minting without changing the wire shape.",
+      "type": "string"
+    },
+    "last_request_unix": {
+      "description": "Unix time of the last recorded upstream request touching the\nresource; absent when none has been recorded yet.",
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint64",
+      "minimum": 0
+    },
+    "next_eligible_unix": {
+      "description": "Earliest Unix time the request would be eligible WITHOUT\nconfirmation (the greatest-of deadline the S7 scheduler\ncomputes).",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "warning": {
+      "description": "Already-redacted warning the client must display before\nconfirming — the FR-11 rate-limit warning, the FR-7D\nraw-password warning.",
+      "type": "string"
+    }
+  },
+  "required": [
+    "catalog_age_seconds",
+    "next_eligible_unix",
+    "warning",
+    "confirmation_token"
+  ]
+}

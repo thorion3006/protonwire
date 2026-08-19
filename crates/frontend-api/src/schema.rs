@@ -3,8 +3,8 @@
 use schemars::schema_for;
 
 use crate::{
-    ClientMessage, ConnectTarget, DaemonState, Event, EventEnvelope, Request, RequestResult,
-    Response, RpcError, RpcErrorCode, ServerMessage,
+    ClientMessage, ConfirmationRequirement, ConnectTarget, DaemonState, Event, EventEnvelope,
+    Request, RequestResult, Response, RpcError, RpcErrorCode, ServerMessage,
 };
 
 /// Named root schemas emitted by the generator, in stable order.
@@ -18,6 +18,10 @@ pub fn root_schemas() -> Vec<(&'static str, schemars::Schema)> {
         ("connect-target", schema_for!(ConnectTarget)),
         ("rpc-error", schema_for!(RpcError)),
         ("rpc-error-code", schema_for!(RpcErrorCode)),
+        (
+            "confirmation-requirement",
+            schema_for!(ConfirmationRequirement),
+        ),
         ("daemon-state", schema_for!(DaemonState)),
         ("event", schema_for!(Event)),
         ("event-envelope", schema_for!(EventEnvelope)),
@@ -30,7 +34,7 @@ mod tests {
 
     #[test]
     fn every_root_schema_generates() {
-        assert_eq!(root_schemas().len(), 11);
+        assert_eq!(root_schemas().len(), 12);
         for (name, schema) in root_schemas() {
             assert!(
                 serde_json::to_value(&schema).is_ok(),

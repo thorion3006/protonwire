@@ -22,6 +22,26 @@ use crate::state::VpnState;
 /// sequence cursor.
 pub const EVENT_SEQ_RESYNC_NOW: u64 = u64::MAX;
 
+/// Protocol version that introduced the reserved resync marker (X4,
+/// round 8). The marker landed inside version 1 — before any client
+/// shipped — so every in-tree client understands it and sessions
+/// negotiated at 1 or above receive it. The constant exists so the
+/// outbound fan-out filters by DECLARED introduction version instead of
+/// an ad-hoc comparison; the next reserved outbound marker registers
+/// its introduction version beside this one and reuses the same
+/// reaches-version filter.
+pub const RESYNC_MARKER_INTRODUCED_IN: u32 = 1;
+
+/// Per-version outbound filter for the reserved resync marker: a
+/// session negotiated below [`RESYNC_MARKER_INTRODUCED_IN`] must not
+/// receive the reserved seq — such a peer recovers through the ordinary
+/// sequence-gap resynchronization on the next real event instead of a
+/// signal it cannot interpret. The daemon's session forwarder consults
+/// this with the version negotiated at hello.
+pub fn resync_marker_reaches(version: u32) -> bool {
+    version >= RESYNC_MARKER_INTRODUCED_IN
+}
+
 /// Envelope for every daemon-pushed event. `seq` is monotonic per daemon
 /// process lifetime; a client that observes a gap must resynchronize with a
 /// [`crate::Request::GetState`] request (PRD FR-127D). The one value a real
@@ -36,9 +56,10 @@ pub struct EventEnvelope {
     pub event: Event,
 }
 
-/// Daemon events. Milestone 1 carries state transitions and notices; richer
-/// events (feature reconciliation, catalog refresh results, conflict
-/// detection) are additive variants in later milestones.
+/// Daemon events. Milestone 1 carries state transitions and notices;
+/// Milestone 2 adds the catalog-refresh summary, the account-change
+/// signal, and the scheduler notice (S2). Richer events remain additive
+/// variants in later milestones.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum Event {
@@ -55,6 +76,48 @@ pub enum Event {
         level: NoticeLevel,
         /// Already-redacted human-readable text.
         message: String,
+    },
+    /// A server-catalog refresh finished; the result summary lets
+    /// status surfaces report the last refresh outcome (FR-123) and
+    /// tells clients when server data changed (FR-9).
+    CatalogRefreshed {
+        /// Outcome summary of the finished refresh.
+        result: CatalogRefreshResult,
+    },
+    /// The authenticated account changed — login, logout, session
+    /// refresh or import, or a stored-credential mutation. A bare
+    /// signal: clients re-query account state (FR-7H) on receipt.
+    AccountChanged,
+    /// The single-flight metadata scheduler surfaced a condition worth
+    /// displaying: the FR-11/FR-13I manual-refresh warning or an
+    /// ER-16 suppression notice. Same level+message shape as
+    /// [`Event::Notice`], attributable to the scheduler so clients can
+    /// route it.
+    SchedulerNotice {
+        /// Severity of the notice.
+        level: NoticeLevel,
+        /// Already-redacted human-readable text.
+        message: String,
+    },
+}
+
+/// Outcome summary carried by [`Event::CatalogRefreshed`] (M2 S2):
+/// mirrors the S0 catalog seam's `fetch(etag) → Changed | NotModified`
+/// plus the stable refusal code on failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "outcome", rename_all = "kebab-case")]
+pub enum CatalogRefreshResult {
+    /// The refresh fetched and committed a new catalog revision.
+    Changed,
+    /// The upstream reported no change since the last fetch (an ETag
+    /// match); the existing catalog stays authoritative.
+    NotModified,
+    /// The refresh was refused or failed; `code` is the stable
+    /// machine-readable reason (for example a persisted ER-16
+    /// suppression surfacing as [`crate::RpcErrorCode::RateLimited`]).
+    Failed {
+        /// Stable refusal code.
+        code: crate::RpcErrorCode,
     },
 }
 
@@ -108,5 +171,83 @@ mod tests {
         assert_eq!(json["seq"], u64::MAX);
         let back: EventEnvelope = serde_json::from_value(json).unwrap();
         assert_eq!(back.seq, EVENT_SEQ_RESYNC_NOW);
+    }
+
+    /// X4 gating (M2 S2): the marker's introduction version is declared
+    /// beside the marker and the outbound filter is exactly "reaches
+    /// versions >= introduced-in". The forced pre-marker peer (version
+    /// below the introduction) must not receive it; version 1 — the
+    /// marker's introduction version and the oldest on the wire — does,
+    /// as does everything newer.
+    #[test]
+    fn resync_marker_reaches_versions_at_its_introduction() {
+        assert_eq!(
+            RESYNC_MARKER_INTRODUCED_IN, 1,
+            "the marker landed inside protocol version 1 (round 8, unshipped)"
+        );
+        assert!(
+            !resync_marker_reaches(RESYNC_MARKER_INTRODUCED_IN - 1),
+            "a pre-marker session must not receive the reserved seq"
+        );
+        assert!(resync_marker_reaches(RESYNC_MARKER_INTRODUCED_IN));
+        assert!(resync_marker_reaches(crate::PROTOCOL_VERSION));
+    }
+
+    /// M2 S2 additive events: the wire shapes for the catalog-refresh
+    /// summary, the account-changed signal, and the scheduler notice.
+    #[test]
+    fn m2_event_wire_shapes() {
+        use crate::proto::RpcErrorCode;
+
+        // The refresh summary: outcome-tagged, with the failure arm
+        // carrying the stable refusal code.
+        let refresh = EventEnvelope {
+            seq: 10,
+            event: Event::CatalogRefreshed {
+                result: CatalogRefreshResult::NotModified,
+            },
+        };
+        let json = serde_json::to_value(&refresh).unwrap();
+        assert_eq!(json["seq"], 10);
+        assert_eq!(json["event"]["kind"], "catalog-refreshed");
+        assert_eq!(json["event"]["result"]["outcome"], "not-modified");
+        let back: EventEnvelope = serde_json::from_value(json).unwrap();
+        assert!(matches!(
+            back.event,
+            Event::CatalogRefreshed {
+                result: CatalogRefreshResult::NotModified
+            }
+        ));
+        let changed = serde_json::to_value(Event::CatalogRefreshed {
+            result: CatalogRefreshResult::Changed,
+        })
+        .unwrap();
+        assert_eq!(changed["result"]["outcome"], "changed");
+        let failed = serde_json::to_value(Event::CatalogRefreshed {
+            result: CatalogRefreshResult::Failed {
+                code: RpcErrorCode::RateLimited,
+            },
+        })
+        .unwrap();
+        assert_eq!(failed["result"]["outcome"], "failed");
+        assert_eq!(failed["result"]["code"], "rate-limited");
+
+        // AccountChanged is a bare signal: no payload to version.
+        let account = serde_json::to_value(Event::AccountChanged).unwrap();
+        assert_eq!(account["kind"], "account-changed");
+        assert_eq!(account.as_object().map(|o| o.len()), Some(1));
+
+        // The scheduler notice mirrors Notice's level+message shape.
+        let scheduler = serde_json::to_value(Event::SchedulerNotice {
+            level: NoticeLevel::Warning,
+            message: "refresh suppressed; next attempt after the deadline".into(),
+        })
+        .unwrap();
+        assert_eq!(scheduler["kind"], "scheduler-notice");
+        assert_eq!(scheduler["level"], "warning");
+        assert_eq!(
+            scheduler["message"],
+            "refresh suppressed; next attempt after the deadline"
+        );
     }
 }

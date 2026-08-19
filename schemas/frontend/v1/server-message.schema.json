@@ -73,6 +73,55 @@
     }
   ],
   "$defs": {
+    "CatalogRefreshResult": {
+      "description": "Outcome summary carried by [`Event::CatalogRefreshed`] (M2 S2):\nmirrors the S0 catalog seam's `fetch(etag) → Changed | NotModified`\nplus the stable refusal code on failure.",
+      "oneOf": [
+        {
+          "description": "The refresh fetched and committed a new catalog revision.",
+          "type": "object",
+          "properties": {
+            "outcome": {
+              "type": "string",
+              "const": "changed"
+            }
+          },
+          "required": [
+            "outcome"
+          ]
+        },
+        {
+          "description": "The upstream reported no change since the last fetch (an ETag\nmatch); the existing catalog stays authoritative.",
+          "type": "object",
+          "properties": {
+            "outcome": {
+              "type": "string",
+              "const": "not-modified"
+            }
+          },
+          "required": [
+            "outcome"
+          ]
+        },
+        {
+          "description": "The refresh was refused or failed; `code` is the stable\nmachine-readable reason (for example a persisted ER-16\nsuppression surfacing as [`crate::RpcErrorCode::RateLimited`]).",
+          "type": "object",
+          "properties": {
+            "code": {
+              "description": "Stable refusal code.",
+              "$ref": "#/$defs/RpcErrorCode"
+            },
+            "outcome": {
+              "type": "string",
+              "const": "failed"
+            }
+          },
+          "required": [
+            "outcome",
+            "code"
+          ]
+        }
+      ]
+    },
     "DaemonState": {
       "description": "Full daemon state snapshot — the authoritative view clients resynchronize\nagainst (PRD FR-127D). Connection details (server, tunnel statistics,\nrequested-vs-applied features) join this struct in Milestone 4+ as\nadditive-optional fields, which are wire-compatible WITHOUT a protocol\nversion bump (old and new documents round-trip — see\n`snapshot_sequence_is_optional_on_the_wire` for the same rule on\n`latest_event_seq`). A version bump is reserved for representation\nchanges that break older readers: renaming or repurposing fields,\nchanging a field's type or semantics, or making a previously-optional\nfield mandatory.",
       "type": "object",
@@ -122,7 +171,7 @@
       ]
     },
     "Event": {
-      "description": "Daemon events. Milestone 1 carries state transitions and notices; richer\nevents (feature reconciliation, catalog refresh results, conflict\ndetection) are additive variants in later milestones.",
+      "description": "Daemon events. Milestone 1 carries state transitions and notices;\nMilestone 2 adds the catalog-refresh summary, the account-change\nsignal, and the scheduler notice (S2). Richer events remain additive\nvariants in later milestones.",
       "oneOf": [
         {
           "description": "The VPN state machine transitioned.",
@@ -154,6 +203,60 @@
             "kind": {
               "type": "string",
               "const": "notice"
+            },
+            "level": {
+              "description": "Severity of the notice.",
+              "$ref": "#/$defs/NoticeLevel"
+            },
+            "message": {
+              "description": "Already-redacted human-readable text.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "level",
+            "message"
+          ]
+        },
+        {
+          "description": "A server-catalog refresh finished; the result summary lets\nstatus surfaces report the last refresh outcome (FR-123) and\ntells clients when server data changed (FR-9).",
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "catalog-refreshed"
+            },
+            "result": {
+              "description": "Outcome summary of the finished refresh.",
+              "$ref": "#/$defs/CatalogRefreshResult"
+            }
+          },
+          "required": [
+            "kind",
+            "result"
+          ]
+        },
+        {
+          "description": "The authenticated account changed — login, logout, session\nrefresh or import, or a stored-credential mutation. A bare\nsignal: clients re-query account state (FR-7H) on receipt.",
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "account-changed"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "description": "The single-flight metadata scheduler surfaced a condition worth\ndisplaying: the FR-11/FR-13I manual-refresh warning or an\nER-16 suppression notice. Same level+message shape as\n[`Event::Notice`], attributable to the scheduler so clients can\nroute it.",
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "scheduler-notice"
             },
             "level": {
               "description": "Severity of the notice.",
@@ -523,6 +626,31 @@
           "description": "The requested protocol is unavailable.",
           "type": "string",
           "const": "protocol-unavailable"
+        },
+        {
+          "description": "The requested capability has no verified public upstream flow\n(human verification, organization SSO, guest mode, feedback):\nfail closed with a stable code and remediation, never an\nautomatic retry or an undocumented endpoint (ER-17).",
+          "type": "string",
+          "const": "upstream-capability-blocked"
+        },
+        {
+          "description": "The upstream presented an authentication challenge this daemon\ncannot continue — an unknown 2FA or verification shape (PRD §7).\nFail closed: no retry, no untrusted URL, no approximation.",
+          "type": "string",
+          "const": "unsupported-challenge"
+        },
+        {
+          "description": "The request requires explicit user confirmation before it may\nproceed — the FR-11 early manual catalog refresh now, the FR-7D\nraw-password-storage and FR-7EA none-store confirmations later.\n`details` carries the typed [`ConfirmationRequirement`]\nenvelope; a confirmed retry echoes its single-use token.",
+          "type": "string",
+          "const": "confirmation-required"
+        },
+        {
+          "description": "The request was refused by a local suppression deadline or an\nupstream rate limit; the carried eligibility time governs the\nnext attempt and no path may bypass it (ER-16).",
+          "type": "string",
+          "const": "rate-limited"
+        },
+        {
+          "description": "The writable credential store failed its health check: restart\npersistence is at risk and operations that require durable\nlogin must fail (ER-18).",
+          "type": "string",
+          "const": "credential-persistence-unhealthy"
         },
         {
           "description": "An internal daemon error without a more specific code.",

@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use protonwire_frontend_api::{
     ClientMessage, EVENT_SEQ_RESYNC_NOW, Event, EventEnvelope, HelloAck, HelloError, NoticeLevel,
     PROTOCOL_VERSION, Request, RequestResult, Response, RpcError, ServerMessage,
+    resync_marker_reaches,
 };
 use tracing::{debug, info, warn};
 
@@ -33,9 +34,11 @@ use crate::server::{
 /// DEBUG builds of a pre-signal SDK panicked on the cursor+1 overflow —
 /// current SDKs intercept the envelope before any cursor arithmetic, and
 /// the arithmetic itself is checked_add since rust-review round 8, so no
-/// build sits one add from a panic. Fully gating the marker behind the
-/// hello handshake remains a TRACK ITEM with sec's hard trigger:
-/// must-fix before any separately-shipped client artifact.
+/// build sits one add from a panic. The marker is GATED on the hello
+/// handshake's negotiated version (S2): the forwarder emits it only for
+/// versions the marker reaches (see [`resync_marker_reaches`]); a peer
+/// below the introduction version never sees the reserved seq and
+/// recovers through the ordinary sequence-gap resynchronization.
 fn resync_marker() -> ServerMessage {
     ServerMessage::Event(EventEnvelope {
         seq: EVENT_SEQ_RESYNC_NOW,
@@ -44,6 +47,68 @@ fn resync_marker() -> ServerMessage {
             message: "event queue overflowed; resynchronize".into(),
         },
     })
+}
+
+/// The session's event forwarder: after the hello gate opens, forwards
+/// bus events onto the writer channel and answers an end-of-burst
+/// overflow with the reserved resync marker — but only when the
+/// session's NEGOTIATED protocol version is one the marker reaches
+/// (X4 gating, S2).
+///
+/// The gate channel carries the negotiated version (a `u32`) instead of
+/// a bare open signal: the gate still opens only after the ack is
+/// queued (WO-5), and the version it hands the forwarder drives the
+/// per-version filtering of reserved outbound markers for the rest of
+/// the session — the version cannot change after hello, because a
+/// duplicate hello ends the session. A session that ends pre-hello
+/// drops the gate sender and the forwarder leaves without forwarding.
+fn forward_events(
+    gate_rx: mpsc::Receiver<u32>,
+    event_rx: mpsc::Receiver<ServerMessage>,
+    forward_tx: mpsc::SyncSender<ServerMessage>,
+    forward_window: Arc<WriteWindow>,
+    overflowed: Arc<AtomicBool>,
+) {
+    let Ok(negotiated_version) = gate_rx.recv() else {
+        return; // session ended before hello; nothing to forward
+    };
+    for message in event_rx {
+        if forward_window.send_through(&forward_tx, message).is_err() {
+            break;
+        }
+        // X4 (round 8): answer an end-of-burst overflow without a
+        // later publish. A full session queue dropped events (the bus
+        // marked this session) and the burst may have ENDED there — no
+        // later seq will ever arrive to make the gap observable, so the
+        // client would hold stale state indefinitely. The drop
+        // necessarily left events queued (the queue was full when it
+        // happened), so this check runs after forwarding one of them:
+        // clear the mark ATOMICALLY (one marker per observed episode)
+        // and send the reserved resync marker straight down the writer
+        // channel — the bus queue may still be full, so the marker must
+        // bypass it. The send blocks under the writer's own
+        // backpressure, exactly like a real event, and the marker rides
+        // the existing Event wire shape, so every client parses it.
+        // (R9-2: events and the marker reserve window slots — they
+        // occupy the same memory the window exists to bound — but the
+        // forwarder never WAITS on the window; see
+        // MAX_UNWRITTEN_MESSAGES.)
+        //
+        // S2 gating: the marker reaches only versions at or above its
+        // DECLARED introduction version. The swap above consumes the
+        // episode either way — a withheld marker must not leave the
+        // episode armed to fire later — and a pre-marker peer recovers
+        // through the ordinary sequence-gap resynchronization on the
+        // next real event instead of a signal it cannot interpret.
+        if overflowed.swap(false, Ordering::SeqCst)
+            && resync_marker_reaches(negotiated_version)
+            && forward_window
+                .send_through(&forward_tx, resync_marker())
+                .is_err()
+        {
+            break;
+        }
+    }
 }
 
 /// Serves one client connection until EOF, error, or daemon shutdown.
@@ -155,48 +220,19 @@ pub(super) fn handle_session<H: RequestHandler>(
     // handshake on purpose (events published mid-handshake must not be
     // lost), but unguarded the forwarder raced them onto the socket ahead
     // of HelloAck — and a client rejects any non-ack frame while
-    // handshaking. The gate opens only after the ack is queued; a session
-    // that ends pre-hello drops `gate_tx`, which unblocks (and ends) the
-    // forwarder instead of stranding it on the closed gate.
-    let (gate_tx, gate_rx) = mpsc::sync_channel::<()>(1);
+    // handshaking. The gate opens only after the ack is queued, and it
+    // carries the session's NEGOTIATED protocol version (S2): the
+    // forwarder's per-version filtering of reserved outbound markers (X4
+    // gating) is driven by that value. A session that ends pre-hello
+    // drops `gate_tx`, which unblocks (and ends) the forwarder instead of
+    // stranding it on the closed gate.
+    let (gate_tx, gate_rx) = mpsc::sync_channel::<u32>(1);
     let event_forward = {
         let forward_tx = writer_tx.clone();
         let forward_window = Arc::clone(&window);
         let overflowed = Arc::clone(&overflowed);
         std::thread::spawn(move || {
-            if gate_rx.recv().is_err() {
-                return; // session ended before hello; nothing to forward
-            }
-            for message in event_rx {
-                if forward_window.send_through(&forward_tx, message).is_err() {
-                    break;
-                }
-                // X4 (round 8): answer an end-of-burst overflow without a
-                // later publish. A full session queue dropped events (the
-                // bus marked this session) and the burst may have ENDED
-                // there — no later seq will ever arrive to make the gap
-                // observable, so the client would hold stale state
-                // indefinitely. The drop necessarily left events queued
-                // (the queue was full when it happened), so this check runs
-                // after forwarding one of them: clear the mark ATOMICALLY
-                // (one marker per observed episode) and send the reserved
-                // resync marker straight down the writer channel — the bus
-                // queue may still be full, so the marker must bypass it.
-                // The send blocks under the writer's own backpressure,
-                // exactly like a real event, and the marker rides the
-                // existing Event wire shape, so every client parses it.
-                // (R9-2: events and the marker reserve window slots — they
-                // occupy the same memory the window exists to bound — but
-                // the forwarder never WAITS on the window; see
-                // MAX_UNWRITTEN_MESSAGES.)
-                if overflowed.swap(false, Ordering::SeqCst)
-                    && forward_window
-                        .send_through(&forward_tx, resync_marker())
-                        .is_err()
-                {
-                    break;
-                }
-            }
+            forward_events(gate_rx, event_rx, forward_tx, forward_window, overflowed)
         })
     };
 
@@ -323,12 +359,15 @@ fn serve_messages(
                 }
                 let client = client.sanitized();
                 info!(uid = peer.uid, name = %client.name, "client connected");
+                // Speak the highest version both sides support; the
+                // session's outbound paths (the forwarder's reserved
+                // markers, S2) filter on this value from here on.
+                let negotiated_version = protocol_version.min(PROTOCOL_VERSION);
                 if window
                     .send_through(
                         &writer_tx,
                         ServerMessage::HelloAck(HelloAck {
-                            // Speak the highest version both sides support.
-                            protocol_version: protocol_version.min(PROTOCOL_VERSION),
+                            protocol_version: negotiated_version,
                             daemon_version: handler.daemon_version().to_owned(),
                             latest_event_seq: handler.latest_event_seq(),
                         }),
@@ -343,9 +382,11 @@ fn serve_messages(
                 // The ack is queued ahead of anything the gated forwarder
                 // holds, and the writer drains its channel in FIFO order —
                 // so the ack is the first frame the client reads. Open the
-                // gate; buffered pre-hello events follow the ack onto the
-                // wire instead of beating it (pr-champion WO-5).
-                let _ = gate_tx.send(());
+                // gate WITH the negotiated version: buffered pre-hello
+                // events follow the ack onto the wire instead of beating
+                // it (pr-champion WO-5), and the forwarder's per-version
+                // marker filtering is armed for the session (S2).
+                let _ = gate_tx.send(negotiated_version);
                 client_info = Some(client);
                 hello_done = true;
             }
@@ -465,12 +506,15 @@ impl WriteWindow {
 /// dropping `gate_tx` on every exit path is what ends a forwarder still
 /// waiting on the hello gate, and the writer sender clone gives the loop
 /// its queue handle while `handle_session` keeps its own for teardown.
-/// The window is the R9-2 bound both senders share with the writer.
+/// The window is the R9-2 bound both senders share with the writer. The
+/// gate carries the hello-negotiated protocol version (S2) so the
+/// forwarder filters reserved outbound markers per version.
 struct SessionOutputs {
     /// The dispatcher's clone of the session writer channel.
     writer_tx: mpsc::SyncSender<ServerMessage>,
-    /// Opens the event gate after the hello ack is queued.
-    gate_tx: mpsc::SyncSender<()>,
+    /// Opens the event gate (with the negotiated version) after the
+    /// hello ack is queued.
+    gate_tx: mpsc::SyncSender<u32>,
     /// The shared request-credit window (R9-2).
     window: Arc<WriteWindow>,
 }
@@ -1025,6 +1069,88 @@ mod tests {
             handler.event_bus().session_count(),
             1,
             "retain-on-Full: the overflowed session must stay subscribed"
+        );
+    }
+
+    /// X4 gating (M2 S2): the reserved resync marker reaches only
+    /// sessions negotiated at or above the marker's DECLARED
+    /// introduction version. The forwarder is driven directly with a
+    /// FORCED negotiated version — the handshake refuses anything below
+    /// the oldest supported version (1), so the pre-marker peer is
+    /// simulated exactly where production carries the decision: the
+    /// hello gate hands the forwarder the negotiated version, and the
+    /// outbound path filters the marker per version.
+    #[test]
+    fn resync_marker_is_withheld_below_its_introduction_version() {
+        /// One forwarded episode at `negotiated`: returns
+        /// `(delivered, marker_seen)` — what crossed the writer channel.
+        fn episode_at(negotiated: u32) -> (ServerMessage, bool) {
+            let (event_tx, event_rx) = mpsc::channel::<ServerMessage>();
+            let (writer_tx, writer_rx) = mpsc::sync_channel::<ServerMessage>(16);
+            let (gate_tx, gate_rx) = mpsc::sync_channel::<u32>(1);
+            let overflowed = Arc::new(AtomicBool::new(true));
+            let forwarder = {
+                let writer_tx = writer_tx.clone();
+                let overflowed = Arc::clone(&overflowed);
+                let window = Arc::new(WriteWindow::new());
+                std::thread::spawn(move || {
+                    forward_events(gate_rx, event_rx, writer_tx, window, overflowed)
+                })
+            };
+            // The overflow mark is already set (the drop necessarily
+            // left events queued), one event is queued, and the gate
+            // opens at the forced version.
+            event_tx
+                .send(ServerMessage::Event(EventEnvelope {
+                    seq: 7,
+                    event: Event::Notice {
+                        level: NoticeLevel::Info,
+                        message: "last delivered of the burst".into(),
+                    },
+                }))
+                .unwrap();
+            gate_tx.send(negotiated).unwrap();
+            let delivered = writer_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("the queued event is forwarded");
+            // Bounded silence probe: whatever is NOT the forwarded event
+            // within the window is the marker's absence.
+            let marker_seen = match writer_rx.recv_timeout(Duration::from_millis(300)) {
+                Ok(ServerMessage::Event(envelope)) => envelope.seq == EVENT_SEQ_RESYNC_NOW,
+                Ok(other) => panic!("unexpected frame after the event: {other:?}"),
+                Err(mpsc::RecvTimeoutError::Timeout) => false,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    panic!("the forwarder died mid-episode")
+                }
+            };
+            // End the episode regardless of outcome, then prove the
+            // overflow mark was consumed either way: a withheld marker
+            // must not leave the episode armed to fire later.
+            drop(event_tx);
+            drop(writer_tx);
+            let _ = forwarder.join();
+            assert!(
+                !overflowed.load(Ordering::SeqCst),
+                "the overflow episode must be consumed exactly once, marker or not"
+            );
+            (delivered, marker_seen)
+        }
+
+        let (delivered, marker_at_one) = episode_at(1);
+        assert!(
+            matches!(delivered, ServerMessage::Event(envelope) if envelope.seq == 7),
+            "the queued event must deliver before any marker"
+        );
+        assert!(
+            marker_at_one,
+            "version 1 (the introduction version) receives the marker"
+        );
+
+        let (_, marker_at_zero) = episode_at(0);
+        assert!(
+            !marker_at_zero,
+            "a forced pre-marker version must NOT receive the reserved seq — it \
+             recovers through the ordinary sequence-gap resynchronization instead"
         );
     }
 
