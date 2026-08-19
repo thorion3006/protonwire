@@ -107,10 +107,16 @@ pub fn from_slice<T: DeserializeOwned>(input: &[u8]) -> Result<T, YamlError> {
 /// (single/double, including multi-line), comments (`#` after spacing),
 /// and block-scalar bodies (`|`/`>` headers swallow their more-indented
 /// content lines) and flags `*`/`&` that start a token anywhere else.
-/// False positives would require a legitimate unquoted scalar beginning
-/// with `*` or `&`, which is not valid YAML — it parses as an indicator.
-/// The scanner is deliberately conservative; it errs toward rejecting,
-/// which is the safe direction for untrusted documents.
+/// Every one of those states — quote, comment, block header — only OPENS
+/// at a token boundary (after spacing or a flow indicator): a quote or
+/// `|`/`>` inside a plain scalar (`don't`, `5"`, `k: 1|2`) is scalar
+/// content, and treating it as an opening would blind or desync the scan
+/// until the next matching character (closing states stay unconditional
+/// — a closing quote always closes). False positives would require a
+/// legitimate unquoted scalar beginning with `*` or `&`, which is not
+/// valid YAML — it parses as an indicator. The scanner is deliberately
+/// conservative; it errs toward rejecting, which is the safe direction
+/// for untrusted documents.
 fn find_anchor_or_alias_token(input: &str) -> Option<usize> {
     let mut in_double_quote = false;
     let mut in_single_quote = false;
@@ -149,8 +155,14 @@ fn find_anchor_or_alias_token(input: &str) -> Option<usize> {
                 }
             } else {
                 match c {
-                    '"' => in_double_quote = true,
-                    '\'' => in_single_quote = true,
+                    // Opening quote/block states only open at a token
+                    // boundary (the same rule as `*`/`&` below): a quote
+                    // or `|`/`>` inside a plain scalar is content, and
+                    // opening on it would blind the scan until the next
+                    // matching character. Closing quotes stay
+                    // unconditional — handled in the branches above.
+                    '"' if prev_is_spacing => in_double_quote = true,
+                    '\'' if prev_is_spacing => in_single_quote = true,
                     '#' if prev_is_spacing => break, // comment runs to EOL
                     '*' | '&' if prev_is_spacing => {
                         // An anchor/alias token has a name; a lone
@@ -161,10 +173,11 @@ fn find_anchor_or_alias_token(input: &str) -> Option<usize> {
                             return Some(line_no);
                         }
                     }
-                    '|' | '>' => {
-                        // A block-scalar header when the rest of the line
-                        // is only indentation indicators/chomping markers
-                        // (digits, +/-) or a trailing comment.
+                    // A block-scalar header only starts a node (after
+                    // spacing), and only when the rest of the line is
+                    // indentation indicators/chomping markers (digits,
+                    // +/-) or a trailing comment.
+                    '|' | '>' if prev_is_spacing => {
                         let rest: String = chars[index + 1..]
                             .iter()
                             .take_while(|rc| !matches!(rc, '#' | ' ' | '\t'))
@@ -437,5 +450,93 @@ mod tests {
     fn block_scalar_content_with_indicators_is_not_rejected() {
         let doc = "text: |\n  *emphasis* and &entity; lines\n  continued content\nnext: 1\n";
         assert!(from_str::<serde_norway::Value>(doc).is_ok());
+    }
+
+    // ------------------------------------------------------------------
+    // Scanner quote/block state opens only at token boundaries
+    // (rust-review S3): quote state used to open on ANY quote character,
+    // so an apostrophe or inch-mark inside a plain scalar (`don't`, `5"`)
+    // blinded the scan until the next matching quote — real `&anchor` /
+    // `*alias` tokens on later lines passed the policy. The block-scalar
+    // heuristic had the same defect for `|`/`>` (`k: 1|2` read as a block
+    // header, swallowing the more-indented lines that followed).
+    // ------------------------------------------------------------------
+
+    /// The bypass, live: a plain scalar carrying an apostrophe must not
+    /// open single-quote state. Red pre-fix: the apostrophe in `don't`
+    /// swallowed every later line, the wide-ish fan-out below parsed
+    /// cleanly under serde_norway (toggle arm), and `from_str` returned
+    /// `Ok` instead of the policy rejection.
+    #[test]
+    fn apostrophe_in_plain_scalar_does_not_blind_the_policy() {
+        let doc = "note: don't panic\na: &a [1, 2, 3]\nb: [*a, *a, *a]\n";
+        assert_eq!(find_anchor_or_alias_token(doc), Some(2));
+        assert!(
+            serde_norway::from_str::<serde_norway::Value>(doc).is_ok(),
+            "toggle-red: the un-hardened path accepts (and expands) this document"
+        );
+        let err = from_str::<serde_norway::Value>(doc).unwrap_err();
+        assert!(
+            matches!(err, YamlError::AnchorsForbidden(_)),
+            "must be the anchor/alias policy rejection: {err}"
+        );
+    }
+
+    /// The double-quote twin of the apostrophe bypass: `5"` mid-scalar
+    /// must not open double-quote state. Red pre-fix: the policy scan
+    /// desynced on the inch-mark and returned `Ok` for an anchored,
+    /// alias-expanding document.
+    #[test]
+    fn double_quote_in_plain_scalar_does_not_blind_the_policy() {
+        let doc = "width: 5\" clearance\na: &a [1]\nb: [*a]\n";
+        assert_eq!(find_anchor_or_alias_token(doc), Some(2));
+        assert!(
+            serde_norway::from_str::<serde_norway::Value>(doc).is_ok(),
+            "toggle-red: the un-hardened path accepts (and expands) this document"
+        );
+        assert!(matches!(
+            from_str::<serde_norway::Value>(doc).unwrap_err(),
+            YamlError::AnchorsForbidden(_)
+        ));
+    }
+
+    /// Precision arm, single quotes (only the double-quoted form was
+    /// pinned before): a single-quoted scalar whose content STARTS with
+    /// `*` is quoted content, not an alias — and processing it must not
+    /// blind the scan for the real alias on the next line.
+    #[test]
+    fn single_quoted_star_name_is_content_not_an_alias() {
+        let clean = "pattern: '*.example.com'\nnote: 'a *b c'\nnext: true\n";
+        assert!(from_str::<serde_norway::Value>(clean).is_ok());
+
+        let aliased = "pattern: '*.example.com'\nb: *a\n";
+        assert_eq!(find_anchor_or_alias_token(aliased), Some(2));
+        assert!(matches!(
+            from_str::<serde_norway::Value>(aliased).unwrap_err(),
+            YamlError::AnchorsForbidden(_)
+        ));
+    }
+
+    /// The block-scalar heuristic aggravator: `|` mid-token (`k: 1|2` —
+    /// a plain scalar, since block indicators only start a node) was
+    /// misread as a block header with explicit-indent marker `2`, and the
+    /// more-indented lines after it were swallowed as block content —
+    /// the `&x` anchor on line 2 passed the policy scan. Pre-fix the
+    /// scan returned `None` (red); the policy, not a parser diagnostic,
+    // owns anchor refusal.
+    #[test]
+    fn pipe_mid_scalar_is_not_a_block_header() {
+        let doc = "k: 1|2\n  a: &x 1\n";
+        assert_eq!(find_anchor_or_alias_token(doc), Some(2));
+        assert!(matches!(
+            from_str::<serde_norway::Value>(doc).unwrap_err(),
+            YamlError::AnchorsForbidden(_)
+        ));
+
+        // The true header keeps working: `|` after spacing is a real
+        // block scalar, and the anchored-looking content inside it stays
+        // content (block scalars themselves cannot carry anchors mid-doc).
+        let real = "k: |\n  a: &x 1\nnext: 1\n";
+        assert!(from_str::<serde_norway::Value>(real).is_ok());
     }
 }
