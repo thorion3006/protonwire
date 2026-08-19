@@ -108,7 +108,21 @@ pub enum ClientEvent {
 /// A connected client session with the daemon.
 pub struct ProtonwireClient {
     ipc: IpcClient,
+    /// The cursor: the seq of the last event actually DELIVERED to the
+    /// client's stream (or, after a resync, the seq the snapshot covers).
+    /// `None` until the first delivery — the hello stamp is NOT a
+    /// delivery, so it never seeds this (S14, FR-127D: the session
+    /// subscribes before the stamp is read, and events buffered in that
+    /// window sit at or below the stamp; a stamp-seeded cursor classified
+    /// them stale and silently dropped them).
     last_seq: Option<u64>,
+    /// The hello ack's `latest_event_seq` — the daemon's newest seq at
+    /// handshake time. Not a delivery; it is the FLOOR for gap detection
+    /// until the first delivery initializes the cursor: a first forwarded
+    /// seq already beyond `stamp + 1` means events between the stamp and
+    /// it were lost before this client subscribed, which is the same
+    /// miss the stamp exists to detect.
+    hello_seq: u64,
     surface: ClientSurface,
     name: &'static str,
     version: &'static str,
@@ -152,10 +166,19 @@ impl ProtonwireClient {
             surface,
         };
         let ipc = IpcClient::connect(path, &info, checks)?;
-        let last_seq = Some(ipc.hello().latest_event_seq);
+        // S14 (FR-127D): the cursor does NOT seed from the ack stamp.
+        // The daemon's session subscribes to the event bus BEFORE the
+        // stamp is read, so events buffered in that window are forwarded
+        // at or below the stamp — a stamp-seeded cursor classified them
+        // stale on arrival and silently dropped them. Deliver-then-
+        // advance instead: the cursor stays uninitialized until the first
+        // delivery; the stamp is kept only as the gap-detection floor
+        // (see [`ProtonwireClient::next_event`]).
+        let hello_seq = ipc.hello().latest_event_seq;
         Ok(Self {
             ipc,
-            last_seq,
+            last_seq: None,
+            hello_seq,
             surface,
             name,
             version,
@@ -240,6 +263,18 @@ impl ProtonwireClient {
     /// numbers (daemon restart, reordering) are skipped without rewinding
     /// the cursor (rust-review finding 9).
     ///
+    /// The cursor advances ONLY on a delivery (or a loud snapshot
+    /// resync) — deliver-then-advance (S14, FR-127D): until the first
+    /// delivery initializes it, the hello stamp acts as the gap-detection
+    /// floor and nothing else. A first forwarded seq at or below
+    /// `stamp + 1` is DELIVERED — the daemon's session subscribes before
+    /// the stamp is read, so pre-hello-buffered events legitimately sit
+    /// at or below the stamp, and the pre-fix stamp-seeded cursor
+    /// silently dropped exactly those. A first seq beyond `stamp + 1`
+    /// means events between the stamp and it were lost before this
+    /// client subscribed — the same miss the stamp exists to detect —
+    /// and resynchronizes.
+    ///
     /// The snapshot is paired with its own sequence (Codex PR review round
     /// 2, finding 1): `GetState` is a separate request, so events published
     /// while it was in flight are already reflected in the returned state.
@@ -268,17 +303,35 @@ impl ProtonwireClient {
                 // rewinding it into a spurious-gap state).
                 return self.resynchronize(None);
             }
-            // checked_add (rust-review round 8): a pre-signal SDK that
-            // stored the reserved marker's seq sits at u64::MAX, and the
-            // plain `+ 1` was one add from a debug panic. Overflow now
-            // means resynchronize — no SDK build panics on cursor
-            // arithmetic.
             let expected = match self.last_seq {
                 Some(last) => match last.checked_add(1) {
                     Some(next) => next,
+                    // checked_add (rust-review round 8): a pre-signal SDK
+                    // that stored the reserved marker's seq sits at
+                    // u64::MAX; overflow means resynchronize — no SDK
+                    // build panics on cursor arithmetic.
                     None => return self.resynchronize(None),
                 },
-                None => envelope.seq,
+                None => {
+                    // S14 deliver-then-advance: the first delivery
+                    // initializes the cursor, whatever its seq — the
+                    // hello stamp is a floor, not a delivery, so a
+                    // pre-hello-buffered event at or below it is
+                    // delivered instead of classified stale. Only a
+                    // first seq beyond the floor (stamp + 1, checked —
+                    // a stamp AT the reserved marker value cannot be
+                    // exceeded by any real seq, so overflow means the
+                    // gap branch is vacuously false) resynchronizes.
+                    if self
+                        .hello_seq
+                        .checked_add(1)
+                        .is_some_and(|floor| envelope.seq > floor)
+                    {
+                        return self.resynchronize(Some(envelope.seq));
+                    }
+                    self.last_seq = Some(envelope.seq);
+                    return Ok(ClientEvent::Event(envelope));
+                }
             };
             if envelope.seq > expected {
                 return self.resynchronize(Some(envelope.seq));
@@ -747,6 +800,224 @@ mod tests {
                 assert_eq!(notice, "fresh after stale");
             }
             ClientEvent::Resynchronized { .. } => panic!("stale event must not trigger resync"),
+        }
+    }
+
+    /// FR-127D / round-9 severity-bar disposition (M2 S14): the session
+    /// subscribes to the event bus at ACCEPT — before the hello ack's
+    /// `latest_event_seq` stamp is read — so events published in that
+    /// window are BOTH buffered for the client AND at or below the stamp.
+    /// The pre-fix cursor seeded itself from the stamp (`Some(stamp)`),
+    /// so every pre-hello-buffered event classified as stale on arrival
+    /// and was silently discarded: the daemon forwarded it, the client's
+    /// event stream never saw it, and `next_event` went on waiting as if
+    /// nothing had happened.
+    ///
+    /// The handler reproduces the window deterministically: the real
+    /// server stamps the ack from `latest_event_seq()` (session.rs), so
+    /// publishing INSIDE that call guarantees the events are queued (the
+    /// session subscribed at accept, long before hello) before the stamp
+    /// is read by the same call. The hello gate holds them until after
+    /// the ack (WO-5), so the wire order is ack first, then the window's
+    /// events — exactly the pre-hello-buffered shape.
+    struct PreHelloWindowHandler {
+        bus: EventBus,
+        /// `(seq, message)` pairs published inside the stamp call, in
+        /// order. The reserved marker seq may appear among them to
+        /// interleave an X4 signal into the window.
+        window: &'static [(u64, &'static str)],
+    }
+
+    impl PreHelloWindowHandler {
+        /// The daemon's newest REAL seq — side-effect free, so GetState
+        /// can stamp without re-publishing. The marker's reserved MAX
+        /// never models the daemon's progress and is excluded.
+        fn stamp(&self) -> u64 {
+            self.window
+                .iter()
+                .map(|&(seq, _)| seq)
+                .filter(|&seq| seq != EVENT_SEQ_RESYNC_NOW)
+                .max()
+                .unwrap_or(0)
+        }
+    }
+
+    impl protonwire_ipc::RequestHandler for PreHelloWindowHandler {
+        fn daemon_version(&self) -> &str {
+            "test-daemon"
+        }
+        fn latest_event_seq(&self) -> u64 {
+            for &(seq, message) in self.window {
+                self.bus.publish(ServerMessage::Event(EventEnvelope {
+                    seq,
+                    event: Event::Notice {
+                        level: NoticeLevel::Info,
+                        message: message.into(),
+                    },
+                }));
+            }
+            self.stamp()
+        }
+        fn handle(
+            &self,
+            _ctx: &protonwire_ipc::SessionContext,
+            request: Request,
+        ) -> Result<RequestResult, RpcError> {
+            match request {
+                Request::Ping { nonce } => Ok(RequestResult::Pong { nonce }),
+                Request::GetState => Ok(RequestResult::State {
+                    state: DaemonState {
+                        protocol_version: PROTOCOL_VERSION,
+                        daemon_version: "test-daemon".into(),
+                        vpn_state: VpnState::Disconnected,
+                        network_integration: NetworkIntegration::Auto,
+                        active_owner_uid: None,
+                        latest_event_seq: Some(self.stamp()),
+                    },
+                }),
+                other => Err(RpcError::new(
+                    RpcErrorCode::NotImplemented,
+                    format!("{other:?}"),
+                )),
+            }
+        }
+        fn event_bus(&self) -> &EventBus {
+            &self.bus
+        }
+    }
+
+    /// S14 deliver-then-advance pin (the exactly-once invariant, part 1 —
+    /// the pre-hello window): EVERY event the daemon forwarded reaches
+    /// the client's event stream exactly once. Here events 1 and 2 are
+    /// forwarded while both sit at or below the ack stamp 2 — the
+    /// pre-fix code silently dropped both and then blocked on an empty
+    /// queue until timeout.
+    #[test]
+    fn pre_hello_buffered_events_are_delivered_not_dropped() {
+        let window: &'static [(u64, &'static str)] = &[(1, "buffered one"), (2, "buffered two")];
+        let dir = tempfile::tempdir().unwrap();
+        let handler = Arc::new(PreHelloWindowHandler {
+            bus: EventBus::new(),
+            window,
+        });
+        let server = protonwire_ipc::test_util::TestServer::start(
+            dir.path(),
+            "pre-hello.sock",
+            Arc::clone(&handler),
+        )
+        .expect("test server binds");
+        let path = server.socket_path().to_owned();
+        let mut client = dev_client(&path);
+        // Short timeout so the pre-fix silent drop fails fast instead of
+        // hanging: both forwarded events are swallowed as "stale" and
+        // `next_event` is left waiting on an empty stream.
+        client.set_request_timeout(std::time::Duration::from_millis(300));
+
+        for (seq, message) in window {
+            match client.next_event().unwrap() {
+                ClientEvent::Event(envelope) => {
+                    assert_eq!(envelope.seq, *seq);
+                    match envelope.event {
+                        Event::Notice { message: got, .. } => assert_eq!(got, *message),
+                        other => panic!("expected notice, got {other:?}"),
+                    }
+                }
+                ClientEvent::Resynchronized { .. } => {
+                    panic!("a pre-hello-buffered event is not a gap: seq {seq}")
+                }
+            }
+        }
+
+        // Beyond the stamp the stream continues gap-free — the seeded
+        // state must not manufacture a spurious resync either.
+        handler.bus.publish(ServerMessage::Event(EventEnvelope {
+            seq: 3,
+            event: Event::Notice {
+                level: NoticeLevel::Info,
+                message: "after the stamp".into(),
+            },
+        }));
+        match client.next_event().unwrap() {
+            ClientEvent::Event(envelope) => assert_eq!(envelope.seq, 3),
+            ClientEvent::Resynchronized { .. } => panic!("unexpected resync"),
+        }
+    }
+
+    /// S14 pin (the exactly-once invariant, part 2 — a marker
+    /// interleaving): the daemon's reserved X4 marker inside the
+    /// pre-hello window must be intercepted BEFORE any cursor
+    /// arithmetic even while the cursor is still uninitialized — it
+    /// never reaches the stream as an Event, its unmatchable seq never
+    /// enters the cursor, and the recovery is LOUD: a resync whose
+    /// snapshot accounts for the window's remaining buffered events, so
+    /// nothing the daemon forwarded vanishes silently.
+    #[test]
+    fn marker_interleaved_in_the_pre_hello_window_resyncs_loudly() {
+        let window: &'static [(u64, &'static str)] = &[
+            (1, "buffered one"),
+            (
+                EVENT_SEQ_RESYNC_NOW,
+                "event queue overflowed; resynchronize",
+            ),
+            (2, "buffered two"),
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        let handler = Arc::new(PreHelloWindowHandler {
+            bus: EventBus::new(),
+            window,
+        });
+        let server = protonwire_ipc::test_util::TestServer::start(
+            dir.path(),
+            "pre-hello-marker.sock",
+            Arc::clone(&handler),
+        )
+        .expect("test server binds");
+        let path = server.socket_path().to_owned();
+        let mut client = dev_client(&path);
+        client.set_request_timeout(std::time::Duration::from_millis(300));
+
+        // The window opens with a real delivery: event 1 initializes the
+        // cursor (deliver-then-advance), even though it sits below the
+        // stamp 2.
+        match client.next_event().unwrap() {
+            ClientEvent::Event(envelope) => assert_eq!(envelope.seq, 1),
+            ClientEvent::Resynchronized { .. } => {
+                panic!("the first forwarded event must be delivered, not resynced past")
+            }
+        }
+
+        // The interleaved marker: a loud resync, never an Event, with the
+        // cursor landing on the snapshot's stamp 2 — the reserved seq
+        // must not poison it.
+        match client.next_event().unwrap() {
+            ClientEvent::Resynchronized {
+                state,
+                resumed_at_seq,
+            } => {
+                assert_eq!(
+                    resumed_at_seq, 2,
+                    "the marker's reserved seq must never enter the cursor"
+                );
+                assert_eq!(state.latest_event_seq, Some(2));
+            }
+            ClientEvent::Event(envelope) => {
+                panic!("the reserved marker surfaced as an event: {envelope:?}")
+            }
+        }
+
+        // Buffered event 2 was discarded as snapshot-covered by the loud
+        // resync above; the first event BEYOND the stamp flows with no
+        // spurious gap — proving the cursor holds the real seq 2, not MAX.
+        handler.bus.publish(ServerMessage::Event(EventEnvelope {
+            seq: 3,
+            event: Event::Notice {
+                level: NoticeLevel::Info,
+                message: "after the marker".into(),
+            },
+        }));
+        match client.next_event().unwrap() {
+            ClientEvent::Event(envelope) => assert_eq!(envelope.seq, 3),
+            ClientEvent::Resynchronized { .. } => panic!("unexpected resync after the marker"),
         }
     }
 
