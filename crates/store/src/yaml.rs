@@ -25,6 +25,7 @@
 //! a fork, so this layer's depth and node caps are enforced independently,
 //! between parsing and typed deserialization.
 
+use std::borrow::Cow;
 use std::io;
 
 use serde::de::DeserializeOwned;
@@ -129,12 +130,24 @@ pub fn from_slice<T: DeserializeOwned>(input: &[u8]) -> Result<T, YamlError> {
 /// YAML double-quoted scalars escape (with `\\` escaping the
 /// backslash), so the close counts the preceding backslash run.
 ///
+/// The scan runs on a line-break-normalized COPY of the input (see
+/// [`normalize_line_breaks`]): the parser also breaks lines on lone
+/// `\r`, U+0085, U+2028 and U+2029, which a line-keyed scan over
+/// `str::lines()` would never see. The copy lives only inside this
+/// function — callers (and the parser in [`from_str`]) keep the
+/// original bytes.
+///
 /// `*`/`&` detection deliberately keeps the looser round-1 boundary rule
 /// (any spacing/indicator character): a position like `{k:*x}` is a
 /// real alias site without a space after the colon, so tightening that
 /// arm to `at_node_start` would open a bypass, while leaving it loose
 /// only over-rejects — the safe direction for untrusted documents.
 fn find_anchor_or_alias_token(input: &str) -> Option<usize> {
+    // Line-keyed state must key on PARSER lines: normalize the YAML 1.1
+    // break set into `\n` for the scan only (the parser in `from_str`
+    // keeps the original bytes).
+    let input = normalize_line_breaks(input);
+    let input: &str = input.as_ref();
     let mut in_double_quote = false;
     let mut in_single_quote = false;
     // (minimum-indent threshold of the open block scalar, header line no.)
@@ -322,6 +335,49 @@ fn find_anchor_or_alias_token(input: &str) -> Option<usize> {
         }
     }
     None
+}
+
+/// YAML 1.1 line-break normalization, FOR THE POLICY SCAN ONLY (round 3
+/// P1). The parser under serde_norway (libyaml lineage) treats a lone
+/// `\r`, U+0085 (NEL), U+2028 (LS) and U+2029 (PS) as line breaks in
+/// addition to `\n`, and `\r\n` as a SINGLE break — Rust's
+/// `str::lines()` splits on `\n` alone, so every line-keyed mechanism
+/// in [`find_anchor_or_alias_token`] (`at_node_start` arming at line
+/// heads, the `prev_is_spacing` reset, block-scalar swallow, line
+/// numbers) was blind to anchors/aliases at a parser-fresh line head
+/// after those bytes. The scan therefore runs on a copy in which every
+/// parser-visible break is exactly one `\n`:
+///
+/// * `\r\n` (2 bytes) collapses to ONE `\n` — never two breaks;
+/// * a lone `\r` becomes `\n`;
+/// * U+0085 (2 UTF-8 bytes), U+2028 and U+2029 (3 bytes each) become
+///   `\n`.
+///
+/// The mapping is strictly one-parser-break to one-`\n`, so line
+/// numbers stay aligned with the parser's, and a break inside a quoted
+/// or block scalar remains a break: quote state carries across it
+/// exactly as across a literal `\n` (pinned by the round-3 tests).
+fn normalize_line_breaks(input: &str) -> Cow<'_, str> {
+    // 0xC2/0xE2 are NEL's and LS/PS's UTF-8 lead bytes; plain LF
+    // documents (the overwhelming majority) never allocate.
+    if !input.bytes().any(|b| matches!(b, b'\r' | 0xC2 | 0xE2)) {
+        return Cow::Borrowed(input);
+    }
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\r' => {
+                if chars.peek() == Some(&'\n') {
+                    chars.next(); // `\r\n` is one parser break
+                }
+                out.push('\n');
+            }
+            '\u{85}' | '\u{2028}' | '\u{2029}' => out.push('\n'),
+            _ => out.push(c),
+        }
+    }
+    Cow::Owned(out)
 }
 
 /// Enforces the structural caps (T-36) on a parsed document: depth
@@ -957,5 +1013,140 @@ mod tests {
             err.to_string().contains("anchor"),
             "must be the anchor/alias policy rejection: {err}"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Round 3 (third scoped re-review): the scanner was line-keyed on
+    // `str::lines()`, which splits on `\n` only — but the parser under
+    // serde_norway (libyaml lineage, YAML 1.1) also breaks lines on a
+    // lone `\r`, U+0085 (NEL), U+2028 (LS) and U+2029 (PS), with `\r\n`
+    // as ONE break. An anchor/alias at a parser-fresh line head after
+    // any of those bytes was invisible to every line-keyed mechanism
+    // (`at_node_start` arming, `prev_is_spacing` reset, block-scalar
+    // swallow, line numbers). Probe-verified LIVE bypass: every shape
+    // below parses to an anchored/alias-expanding document under raw
+    // serde_norway while the pre-fix scan returned `None`. Fix: the scan
+    // runs on a strictly one-to-one break-normalized copy (see
+    // [`normalize_line_breaks`]); the parser keeps the original bytes.
+    // ------------------------------------------------------------------
+
+    /// The bypass, live (red pre-fix: scan `None` on all eight shapes,
+    /// raw parse `Ok` on all eight): each document puts `&x` at a line
+    /// head only the parser can see — after a lone CR (including at the
+    /// very start of the document, after a comment, after a document
+    /// start marker, doubled, and after a `%YAML` directive) and after
+    /// NEL, LS and PS.
+    #[test]
+    fn non_lf_line_breaks_are_a_live_bypass() {
+        for (doc, line) in [
+            ("\r&x 1", 2),
+            ("# c\r&x 1", 2),
+            ("---\r&x 1", 2),
+            ("\r\r&x 1", 3),
+            ("%YAML 1.1\r---\r&x 1", 3),
+            ("\u{85}&x 1", 2),
+            ("\u{2028}&x 1", 2),
+            ("\u{2029}&x 1", 2),
+        ] {
+            assert_policy_rejects(doc, line);
+        }
+    }
+
+    /// The bypass is not cosmetic — the alias RESOLVES (red pre-fix:
+    /// scan `None` while raw serde_norway materializes `a == [1, 1]`
+    /// for all four break characters): an anchored flow entry and its
+    /// alias, each at a parser-only line head after `[`/`,`.
+    #[test]
+    fn non_lf_line_breaks_live_alias_resolves() {
+        let expanded: serde_norway::Value =
+            serde_norway::from_str("[1, 1]").expect("static fixture");
+        for doc in [
+            "a: [\r&x 1,\r*x]",
+            "a: [\u{85}&x 1,\u{85}*x]",
+            "a: [\u{2028}&x 1,\u{2028}*x]",
+            "a: [\u{2029}&x 1,\u{2029}*x]",
+        ] {
+            let value: serde_norway::Value = serde_norway::from_str(doc)
+                .unwrap_or_else(|e| panic!("must parse un-hardened: {doc:?}: {e}"));
+            assert_eq!(
+                value["a"], expanded,
+                "the alias must RESOLVE under the un-hardened parser: {doc:?}"
+            );
+            assert_eq!(
+                find_anchor_or_alias_token(doc),
+                Some(2),
+                "policy scan must flag the &x line: {doc:?}"
+            );
+            assert!(matches!(
+                from_str::<serde_norway::Value>(doc).unwrap_err(),
+                YamlError::AnchorsForbidden(_)
+            ));
+        }
+    }
+
+    /// Capstone (red pre-fix: scan `None`, hardened loader `Ok` — the
+    /// wide fan-out was ACCEPTED): the committed
+    /// `wide_alias_fanout_rejected` payload with every entry separator
+    /// turned into `,\r`. A bare `,` arms the loose `*`/`&` boundary and
+    /// already flags; a `,` followed by a parser-only line break made
+    /// the whole document ONE line to the scan. The loader must refuse
+    /// the fan-out BY POLICY, before any expansion work starts.
+    #[test]
+    fn non_lf_line_breaks_wide_fanout_capstone() {
+        let mut doc = String::from("m: [\r&f [");
+        doc.push_str(&"1,".repeat(300));
+        doc.push(']');
+        for _ in 0..300 {
+            doc.push_str(",\r*f");
+        }
+        doc.push(']');
+        assert!(
+            serde_norway::from_str::<serde_norway::Value>(&doc).is_ok(),
+            "toggle-red: the un-hardened path accepts (and expands) this document"
+        );
+        assert_eq!(
+            find_anchor_or_alias_token(&doc),
+            Some(2),
+            "the &f anchor sits at a parser line head the scan must see"
+        );
+        assert!(matches!(
+            from_str::<serde_norway::Value>(&doc).unwrap_err(),
+            YamlError::AnchorsForbidden(_)
+        ));
+    }
+
+    /// Normalization pin — a break INSIDE a quoted scalar is still a
+    /// break (line counts stay 1:1, quote state carries across exactly
+    /// as across a literal `\n`): the parser folds `'a\r*x'` to the
+    /// string `a *x`, so the quoted `*x` is content and the real anchor
+    /// sits on line 3. Red pre-fix: the scan saw one line and reported
+    /// line 2 — the quoted `*x` was not misflagged, but the reported
+    /// line number was parser-misaligned.
+    #[test]
+    fn non_lf_break_inside_quoted_scalar_keeps_lines_aligned() {
+        assert_policy_rejects("k: 'a\r*x'\nd: &y 1\n", 3);
+        assert_accepts("k: 'a\r*x'\n");
+        // Double-quoted twin with an ESCAPED break (`\` + CR folds to
+        // nothing): still exactly one parser break, quote state intact.
+        assert_policy_rejects("k: \"a\\\r*b\"\nd: &y 1\n", 3);
+        assert_accepts("k: \"a\\\r*b\"\n");
+    }
+
+    /// Normalization pin — the CRLF collapse is EXACT: `\r\n` is ONE
+    /// parser break and must become ONE `\n`, never two. The first arm
+    /// was green on the pre-fix scanner too (`str::lines()` strips a
+    /// trailing `\r`); together the arms kill the naive-normalization
+    /// mutation (`\r` → `\n` per byte, doubling CRLF), which would
+    /// report line 3 for the anchor that sits on line 2.
+    #[test]
+    fn crlf_collapse_is_exactly_one_break() {
+        assert_policy_rejects("k: a\r\nb: &x 1\r\n", 2);
+        // Two lone CRs: BOTH must count — line 3, not 2 or 4.
+        assert_policy_rejects("\r\r&x 1", 3);
+        // Clean CRLF documents keep parsing and keep NOT flagging:
+        // plain mappings, flow collections, and block scalars (the
+        // swallow works on normalized lines exactly as on `\n` ones).
+        assert_accepts("k: v\r\nm: [1, 'q']\r\n");
+        assert_accepts("text: |\r\n  *e&f;\r\nnext: 1\r\n");
     }
 }
