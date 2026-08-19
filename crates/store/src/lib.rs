@@ -10,6 +10,7 @@
 //!   are a distinct document from the system configuration and can never
 //!   express system-only fields.
 
+pub mod catalog;
 pub mod config;
 pub mod fs_trust;
 pub mod paths;
