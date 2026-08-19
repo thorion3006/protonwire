@@ -283,6 +283,15 @@ impl ProtonwireClient {
     /// the snapshot covers are dropped — replaying them after the newer
     /// snapshot would regress the client's view.
     ///
+    /// Ordering caveat for callers composing this with
+    /// [`ProtonwireClient::state`]: pre-hello-window events — delivered
+    /// first by the rule above — may predate a snapshot `state()` fetched
+    /// before the window drained. The snapshot reflects the daemon's
+    /// CURRENT state, so it is strictly newer than those buffered events;
+    /// applying them onto it would regress the view. Callers using both
+    /// surfaces should compare each event's seq against
+    /// `state.latest_event_seq` and skip what the snapshot already covers.
+    ///
     /// The daemon's reserved marker envelope (seq
     /// [`EVENT_SEQ_RESYNC_NOW`], X4) is intercepted BEFORE the gap logic
     /// and never delivered as an event: it is the daemon's explicit
@@ -601,6 +610,92 @@ mod tests {
         match client.next_event().unwrap() {
             ClientEvent::Event(envelope) => assert_eq!(envelope.seq, 3),
             ClientEvent::Resynchronized { .. } => panic!("unexpected resync"),
+        }
+    }
+
+    /// QA S14 round (P2-1, mutation C): the Some-arm mid-stream gap
+    /// branch had zero post-S14 coverage — every gap fixture entered
+    /// through the None arm (a FIRST delivery beyond the hello floor) or
+    /// the reserved overflow marker, so deleting the Some-arm resync
+    /// passed the whole suite. Here the cursor is seeded by contiguous
+    /// deliveries first (1..=3, each exactly the expected next seq), and
+    /// only then does a gap arrive: seq 5 with NO marker after the
+    /// client was left expecting 4. The Some arm must fire — a LOUD
+    /// resync, never a silent delivery of the gap event as contiguous.
+    /// Mutation evidence: deleting the `envelope.seq > expected` resync
+    /// turns the second phase into exactly that silent delivery and this
+    /// test red; recorded in the fix commit's message.
+    #[test]
+    fn mid_stream_gap_after_seeding_resyncs_loudly() {
+        let dir = tempfile::tempdir().unwrap();
+        let (server, handler) = spawn_server(&dir);
+        let path = server.socket_path().to_owned();
+        let mut client = dev_client(&path);
+        // Handshake stamps seq 0, so the client expects event 1 next.
+
+        // Seed the cursor with contiguous deliveries: events 1, 2, 3.
+        for seq in 1..=3u64 {
+            handler.seq.store(seq, Ordering::SeqCst);
+            handler.bus.publish(ServerMessage::Event(EventEnvelope {
+                seq,
+                event: Event::Notice {
+                    level: NoticeLevel::Info,
+                    message: format!("contiguous {seq}"),
+                },
+            }));
+            match client.next_event().unwrap() {
+                ClientEvent::Event(envelope) => assert_eq!(envelope.seq, seq),
+                ClientEvent::Resynchronized { .. } => {
+                    panic!("contiguous event {seq} must deliver, not resync")
+                }
+            }
+        }
+
+        // The mid-stream gap: event 4 is never published; 5 arrives with
+        // no marker while the cursor holds Some(3), so expected = 4 and
+        // 5 > expected — the Some arm.
+        handler.seq.store(5, Ordering::SeqCst);
+        handler.bus.publish(ServerMessage::Event(EventEnvelope {
+            seq: 5,
+            event: Event::Notice {
+                level: NoticeLevel::Info,
+                message: "gap event".into(),
+            },
+        }));
+        match client.next_event().unwrap() {
+            ClientEvent::Resynchronized {
+                state,
+                resumed_at_seq,
+            } => {
+                // The resync snapshot is stamped 5 (the daemon's newest
+                // seq), so the cursor lands ON the gap event's seq: the
+                // client has seen up to 5 through the snapshot.
+                assert_eq!(resumed_at_seq, 5);
+                assert_eq!(state.latest_event_seq, Some(5));
+            }
+            ClientEvent::Event(envelope) => panic!(
+                "the mid-stream gap event {} was delivered as contiguous — \
+                 a lost event vanished silently (Some-arm resync deleted?)",
+                envelope.seq
+            ),
+        }
+
+        // Exactly once per the resync contract: the gap event 5 is
+        // accounted for by the snapshot and never replayed as an Event,
+        // and the next delivery is the first event BEYOND the snapshot —
+        // a cursor left anywhere else would either resync again or
+        // swallow 6 as stale.
+        handler.seq.store(6, Ordering::SeqCst);
+        handler.bus.publish(ServerMessage::Event(EventEnvelope {
+            seq: 6,
+            event: Event::Notice {
+                level: NoticeLevel::Info,
+                message: "after the gap".into(),
+            },
+        }));
+        match client.next_event().unwrap() {
+            ClientEvent::Event(envelope) => assert_eq!(envelope.seq, 6),
+            ClientEvent::Resynchronized { .. } => panic!("unexpected second resync"),
         }
     }
 
@@ -946,11 +1041,22 @@ mod tests {
     /// S14 pin (the exactly-once invariant, part 2 — a marker
     /// interleaving): the daemon's reserved X4 marker inside the
     /// pre-hello window must be intercepted BEFORE any cursor
-    /// arithmetic even while the cursor is still uninitialized — it
-    /// never reaches the stream as an Event, its unmatchable seq never
-    /// enters the cursor, and the recovery is LOUD: a resync whose
-    /// snapshot accounts for the window's remaining buffered events, so
-    /// nothing the daemon forwarded vanishes silently.
+    /// arithmetic — in the pinned scenario the cursor holds a DELIVERED
+    /// seq (1) below the snapshot stamp (2). The marker never reaches
+    /// the stream as an Event, its unmatchable seq never enters the
+    /// cursor, and the recovery is LOUD: a resync whose snapshot
+    /// accounts for the window's remaining buffered events, so nothing
+    /// the daemon forwarded vanishes silently. (The interception itself
+    /// is cursor-state-independent — the reserved-seq check precedes the
+    /// cursor match — but an earlier draft of this comment claimed the
+    /// pin covered the marker arriving "while the cursor is still
+    /// uninitialized". It does not, and that state is
+    /// production-unreachable: the forwarder emits the marker only
+    /// AFTER forwarding a real event (session.rs `forward_events`), and
+    /// the writer's FIFO hands the SDK that real event — initializing
+    /// the cursor, by delivery or by the floor resync — before the
+    /// marker. Claim corrected in the S14 review round per the round-2
+    /// precedent.)
     #[test]
     fn marker_interleaved_in_the_pre_hello_window_resyncs_loudly() {
         let window: &'static [(u64, &'static str)] = &[

@@ -506,9 +506,17 @@ impl IpcClient {
 
     /// Events dropped from the pending queue after it hit
     /// PENDING_EVENTS_CAP (cumulative across the connection's life).
-    /// Observability only: after a drop-induced seq gap, correctness is
-    /// recovered by resynchronizing from `latest_event_seq`, not by this
-    /// count.
+    /// Observability only — this count recovers nothing. How a drop is
+    /// healed depends on the SDK cursor's state: once it holds a
+    /// delivered seq, the induced seq gap is healed by resynchronizing
+    /// from `latest_event_seq` (the next event beyond the gap, or the
+    /// daemon's reserved marker, triggers it). While the cursor is still
+    /// uninitialized, head-drops leave the oldest survivor at or below
+    /// the hello floor and it DELIVERS with no resync at all — warn
+    /// only, snapshot-covered by the handshake stamp's floor semantics
+    /// (pre-S14, the stamp-seeded cursor dropped strictly more there:
+    /// it classified the below-stamp survivors stale and silently
+    /// discarded them too).
     pub fn dropped_events(&self) -> u64 {
         self.dropped_events
     }
