@@ -596,11 +596,32 @@ mod tests {
         write_msg(&mut expected, &serde_json::json!(&big)).unwrap();
         let expected = expected.len();
 
+        // No-hang gate (the WO-R4 precedent): every peer read below is
+        // bounded, so a regression that stalls the writer mid-drain fails
+        // fast with WouldBlock instead of hanging the suite — the unfixed
+        // fixture's other failure mode (see the boundary note below).
+        b.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .expect("read timeout applies");
+
         let reader = std::thread::spawn(move || {
             let mut got = 0;
             let mut chunk = [0u8; 16_384];
             while got < expected {
-                got += b.read(&mut chunk).expect("peer keeps draining");
+                // NEVER read past the big frame's boundary. The writer
+                // queues the follow-up frame the instant the big one is
+                // done, so while the big frame's tail is still unread a
+                // single read returns tail PLUS follow-up bytes — they are
+                // contiguous in the receive queue — and `got` overshoots
+                // `expected`. The over-consumed bytes then desynchronize
+                // read_msg: eating the follow-up's 4-byte prefix makes it
+                // parse `{"do` as a length (reproduced under pinned-CPU
+                // stress: TooLarge(2065851503) = 0x7B22646F); eating 1-3
+                // prefix bytes, or all 17, leaves it blocked forever.
+                // Bounding each read to `expected - got` keeps the drain
+                // exact whatever the scheduler does — the follow-up frame
+                // stays wholly unread for read_msg.
+                let room = (expected - got).min(chunk.len());
+                got += b.read(&mut chunk[..room]).expect("peer keeps draining");
             }
             let follow_up: serde_json::Value =
                 read_msg(&mut b).expect("the follow-up frame arrives");
