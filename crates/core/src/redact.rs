@@ -299,8 +299,11 @@ pub struct SecretSuppressFilter {
 /// - `muon::store` — `Auth` Debug output carrying user_id + UID
 ///   (`store.rs:206`, `:215`; token values are redacted upstream, the
 ///   IDs are not).
-/// - `muon::common::auth` — UID fields throughout, and the device
-///   fingerprint: `"setting fingerprint {fingerprint}"` (`:351`).
+/// - `muon::common::auth` — REMOVED from this table and dropped
+///   entirely (see [`MODULE_DROP_ALL`]): its info sites carry UID fields
+///   and the device fingerprint (`"setting fingerprint {fingerprint}"`,
+///   `:351`), and the S4 sec review found its WARN/ERROR sites carry the
+///   UID at exactly the levels a floor cap keeps — so no floor suffices.
 /// - `muon::client` — session keys (`client/mod.rs:621`).
 ///
 /// pvpnclient 3.0.3 traces the fork selector and the whole cookie jar
@@ -324,15 +327,39 @@ pub struct SecretSuppressFilter {
 ///   value scrubbing (peer-derived values must never enter the
 ///   registry), so before-formatting suppression is the only control;
 ///   the subtree's diagnostics are the price of closing the class.
-const MODULE_CAPS: [(&str, Level); 7] = [
+const MODULE_CAPS: [(&str, Level); 8] = [
     ("muon::auth::login", Level::WARN),
     ("muon::auth::from_fork", Level::WARN),
     ("muon::store", Level::WARN),
-    ("muon::common::auth", Level::WARN),
     ("muon::client", Level::WARN),
     ("muon::transport", Level::ERROR),
+    // S4 sec review round 1: RetryHandler logs the whole response —
+    // full HeaderMap, `Set-Cookie` un-stripped (it sits BELOW
+    // CookieSender in the sender stack) — at DEBUG on EVERY send;
+    // `RetryPolicy::never()` only kills the retry loop, not this
+    // `inspect` (retry.rs:42 via res.rs:59-67). Its WARN sites carry
+    // only status/delay strings, so WARN keeps the diagnostics.
+    ("muon::common::retry", Level::WARN),
+    // S4 sec review round 1: doh logs resolved IP sets at DEBUG/TRACE
+    // (`?res` / `RData {rd:?}`, doh.rs:142/:158) and full DNS responses
+    // at trace — FR-121 forbids full IP addresses. INFO keeps the safe
+    // `info!(%err)` shape (:282).
+    ("muon::doh", Level::INFO),
     ("pvpnclient", Level::DEBUG),
 ];
+
+/// Targets dropped ENTIRELY — every event, every level, every build.
+///
+/// For modules whose own ERROR sites carry FR-121-forbidden classes: a
+/// `Level` floor in [`MODULE_CAPS`] can never drop ERROR, so documenting
+/// a deviation would be the only alternative — and FR-121 is not
+/// deviable. `muon::common::auth` (S4 sec review round 1) logs the UID
+/// at WARN (`session unauthorized`, `:103`) and ERROR (`:121`) — the
+/// levels its previous WARN cap deliberately kept — and the WARN path
+/// fires at the DEFAULT production level on the routine token-expiry
+/// cycle. Diagnostics lost here are compensated adapter-side: redacted,
+/// protonwire-owned events where the typed `AuthErr` surfaces.
+const MODULE_DROP_ALL: [&str; 1] = ["muon::common::auth"];
 
 /// Release blanket (FR-121): targets outside this repository's own
 /// crates (`protonwire*`) are capped at DEBUG — dependency `trace` is
@@ -368,8 +395,15 @@ impl SecretSuppressFilter {
     ///
     /// `tracing` levels order by verbosity (`TRACE > DEBUG > INFO >
     /// WARN > ERROR`), so "more verbose than the cap" — the side the cap
-    /// exists to drop — is `level > cap`.
+    /// exists to drop — is `level > cap`. Drop-all targets are checked
+    /// FIRST and unconditionally: no level, including ERROR, formats.
     fn allows(&self, target: &str, level: &Level) -> bool {
+        if MODULE_DROP_ALL
+            .iter()
+            .any(|module| target_matches(target, module))
+        {
+            return false;
+        }
         if MODULE_CAPS
             .iter()
             .any(|(module, cap)| level > cap && target_matches(target, module))
@@ -687,6 +721,39 @@ pub mod canary {
                 "http1 send req=Request {{ .., body: Some(b\"{{\\\"RefreshToken\\\":\\\"{}\\\"}}\") }}",
                 c.token
             );
+            // muon::common::retry at DEBUG — the whole response with the
+            // full HeaderMap on EVERY send; Set-Cookie rides it un-stripped
+            // (RetryHandler sits below CookieSender in the stack) (S4 sec
+            // review round 1; retry.rs:42 via res.rs:59-67).
+            tracing::event!(
+                target: "muon::common::retry",
+                tracing::Level::DEBUG,
+                "received HttpRes {{ status: 200, headers: {{\\\"set-cookie\\\": \\\"Session-Id={}; path=/;\\\"}} }}",
+                c.cookie
+            );
+            // muon::common::auth at WARN and ERROR — the UID at exactly the
+            // levels a WARN cap keeps (S4 sec review round 1; :103/:121/:129).
+            // The module is dropped entirely; these must never format.
+            tracing::event!(
+                target: "muon::common::auth",
+                tracing::Level::WARN,
+                uid = %c.uid,
+                "session unauthorized"
+            );
+            tracing::event!(
+                target: "muon::common::auth",
+                tracing::Level::ERROR,
+                uid = %c.uid,
+                "auth session no longer exists"
+            );
+            // muon::doh at DEBUG — resolved IP sets (FR-121 forbids full
+            // IPs; S4 sec review round 1; doh.rs:142/:158).
+            tracing::event!(
+                target: "muon::doh",
+                tracing::Level::DEBUG,
+                "found records RData {:?}",
+                ["192.0.2.1", "198.51.100.7"]
+            );
         }
     }
 
@@ -695,7 +762,7 @@ pub mod canary {
     /// event still formats its message — so these must never appear.
     /// This is the before-formatting property itself: the assertion a
     /// regex-post-processing "fix" cannot pass.
-    const SUPPRESSED_EVENT_MARKERS: [&str; 9] = [
+    const SUPPRESSED_EVENT_MARKERS: [&str; 13] = [
         "sending TOTP request with code",
         "acquiring forked session",
         "persisted auth state",
@@ -705,6 +772,10 @@ pub mod canary {
         "is using the default time constraint",
         "sending request with hyper",
         "http1 send req=",
+        "received HttpRes",
+        "session unauthorized",
+        "auth session no longer exists",
+        "RData",
     ];
 
     /// Runs `emitter` through the exact production stack (redacting
@@ -926,21 +997,75 @@ mod suppression_policy_tests {
         assert!(!f.allows("muon::auth::from_fork", &Level::INFO));
         // store: Auth Debug with user_id + UID (store.rs:206, :215).
         assert!(!f.allows("muon::store", &Level::INFO));
-        // common::auth: UID fields + device fingerprint (:351).
-        assert!(!f.allows("muon::common::auth", &Level::INFO));
         // client: session keys (client/mod.rs:621) — including the
         // builder submodule.
         assert!(!f.allows("muon::client", &Level::INFO));
         assert!(!f.allows("muon::client::builder", &Level::INFO));
         // Every capped module keeps warn+.
-        for module in [
-            "muon::auth::from_fork",
-            "muon::store",
-            "muon::common::auth",
-            "muon::client",
-        ] {
+        for module in ["muon::auth::from_fork", "muon::store", "muon::client"] {
             assert!(f.allows(module, &Level::WARN), "{module} keeps WARN");
         }
+    }
+
+    /// S4 sec review (round 1): `muon::common::retry` logs the whole
+    /// response — full HeaderMap, `Set-Cookie` un-stripped (it sits BELOW
+    /// CookieSender in the stack) — at DEBUG on EVERY send, and
+    /// `RetryPolicy::never()` does not kill this `inspect`. Cookies are a
+    /// named FR-121 class, so the module caps at WARN (its own WARN sites
+    /// carry only status/delay strings).
+    #[test]
+    fn muon_common_retry_is_capped_at_warn_in_every_build() {
+        let f = SecretSuppressFilter::for_build(false);
+        // The leaking site: `debug!("received {res}")` with the full
+        // HeaderMap including Set-Cookie (retry.rs:42 via res.rs:59-67).
+        assert!(!f.allows("muon::common::retry", &Level::DEBUG));
+        assert!(!f.allows("muon::common::retry", &Level::INFO));
+        // Safe diagnostics survive.
+        assert!(f.allows("muon::common::retry", &Level::WARN));
+        assert!(f.allows("muon::common::retry", &Level::ERROR));
+    }
+
+    /// S4 sec review (round 1): `muon::common::auth` carries the UID at
+    /// WARN (`session unauthorized`, :103) and ERROR (:121) — the levels a
+    /// WARN cap KEEPS — so the module is dropped ENTIRELY (the S1 WARN cap
+    /// was set when only its info sites were known). The warn path fires
+    /// at the DEFAULT production level on the routine token-expiry cycle.
+    /// Diagnostics are compensated adapter-side (redacted, owned events
+    /// where the typed AuthErr surfaces); nothing from this module may
+    /// format at any level.
+    #[test]
+    fn muon_common_auth_is_dropped_entirely_in_every_build() {
+        let f = SecretSuppressFilter::for_build(false);
+        for level in [
+            Level::ERROR,
+            Level::WARN,
+            Level::INFO,
+            Level::DEBUG,
+            Level::TRACE,
+        ] {
+            assert!(
+                !f.allows("muon::common::auth", &level),
+                "muon::common::auth must never format at {level}"
+            );
+            assert!(
+                !f.allows("muon::common::auth::refresh", &level),
+                "submodules drop with it at {level}"
+            );
+        }
+    }
+
+    /// S4 sec review (round 1): `muon::doh` logs resolved IP sets at
+    /// DEBUG/TRACE (`debug!(?res, "found")`, `debug!("RData {rd:?}")`,
+    /// full DNS responses at trace) — FR-121 forbids full IP addresses.
+    /// INFO keeps the safe `info!(%err)` shape (doh.rs:282).
+    #[test]
+    fn muon_doh_is_capped_at_info_in_every_build() {
+        let f = SecretSuppressFilter::for_build(false);
+        assert!(!f.allows("muon::doh", &Level::DEBUG));
+        assert!(!f.allows("muon::doh", &Level::TRACE));
+        assert!(f.allows("muon::doh", &Level::INFO));
+        assert!(f.allows("muon::doh", &Level::WARN));
+        assert!(f.allows("muon::doh", &Level::ERROR));
     }
 
     #[test]
