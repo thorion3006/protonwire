@@ -13,6 +13,7 @@
 pub mod config;
 pub mod fs_trust;
 pub mod paths;
+pub mod session;
 pub mod state;
 pub mod yaml;
 
