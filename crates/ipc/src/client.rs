@@ -7,7 +7,6 @@
 
 use std::collections::VecDeque;
 use std::io;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -540,51 +539,35 @@ fn map_frame_error(e: crate::frame::FrameError) -> io::Error {
     }
 }
 
-/// Verifies the daemon socket is root-owned and lives in a root-owned,
-/// non-group/world-writable directory.
+/// Verifies the daemon socket is trustworthy before connecting: strict
+/// walk of every path component from the socket leaf to `/` — no
+/// symlinks, the leaf a socket without world write, every ancestor a
+/// root-owned directory without group/world write (the M2 S12
+/// consolidation onto the `fs_trust` walker's semantics; see
+/// [`crate::peer`] for the walk rule and the disclosed duplication
+/// decision).
+///
+/// A missing socket (the leaf's `lstat` answering NotFound) reports
+/// [`ConnectError::Unreachable`] — "daemon not there" — while every
+/// other inspection failure is an [`ConnectError::Untrusted`] naming the
+/// offending component and defect.
 pub fn verify_socket_trusted(path: &Path) -> Result<(), ConnectError> {
-    use std::os::unix::fs::FileTypeExt;
-    let meta = std::fs::metadata(path).map_err(|source| ConnectError::Unreachable {
-        path: path.to_owned(),
-        source,
-    })?;
-    if !meta.file_type().is_socket() {
-        return Err(ConnectError::Untrusted {
+    match crate::peer::walk_socket_trust(path, Path::new("/")) {
+        Ok(()) => Ok(()),
+        Err(crate::peer::SocketTrustError::Io {
+            path: inspected,
+            source,
+        }) if inspected == path && source.kind() == io::ErrorKind::NotFound => {
+            Err(ConnectError::Unreachable {
+                path: path.to_owned(),
+                source,
+            })
+        }
+        Err(e) => Err(ConnectError::Untrusted {
             path: path.to_owned(),
-            reason: "path is not a socket".into(),
-        });
+            reason: e.to_string(),
+        }),
     }
-    if meta.uid() != 0 {
-        return Err(ConnectError::Untrusted {
-            path: path.to_owned(),
-            reason: format!("socket owner UID {} is not root", meta.uid()),
-        });
-    }
-    let parent = path.parent().unwrap_or(Path::new("/"));
-    let parent_meta = std::fs::metadata(parent).map_err(|source| ConnectError::Untrusted {
-        path: path.to_owned(),
-        reason: format!("parent directory {} unreadable: {source}", parent.display()),
-    })?;
-    if parent_meta.uid() != 0 {
-        return Err(ConnectError::Untrusted {
-            path: path.to_owned(),
-            reason: format!(
-                "parent directory {} owner UID {} is not root",
-                parent.display(),
-                parent_meta.uid()
-            ),
-        });
-    }
-    if parent_meta.permissions().mode() & 0o022 != 0 {
-        return Err(ConnectError::Untrusted {
-            path: path.to_owned(),
-            reason: format!(
-                "parent directory {} is writable by group or others",
-                parent.display()
-            ),
-        });
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -789,6 +772,108 @@ mod tests {
         match err {
             ConnectError::Untrusted { reason, .. } => {
                 assert!(reason.contains("root") || reason.contains("writable"));
+            }
+            other => panic!("expected Untrusted, got {other:?}"),
+        }
+    }
+
+    /// S12 item 1 (the walker consolidation): the trust check used
+    /// `metadata`, which FOLLOWS links — a symlink standing where the
+    /// daemon's socket should be was judged by whatever it pointed at, so
+    /// a lookalike link in a root-owned directory laundered the socket
+    /// leaf (and every ancestor above the parent went uninspected). The
+    /// consolidated check walks every component with `lstat`-style
+    /// inspection and NAMES the defect: a symlinked socket path must be
+    /// rejected as a symlink. Pre-fix red (unprivileged): the follow
+    /// reached the target socket, tripped only the owner-UID check, and
+    /// the reason read "socket owner UID ... is not root" — no
+    /// "symbolic link" anywhere.
+    #[test]
+    fn strict_checks_name_a_symlinked_socket_path() {
+        let dir = tempfile::tempdir().unwrap();
+        // A real (stale) socket for the link to resolve to, so the
+        // type check alone cannot reject it.
+        let target = dir.path().join("real.sock");
+        drop(std::os::unix::net::UnixListener::bind(&target).unwrap());
+        let via = dir.path().join("daemon.sock");
+        std::os::unix::fs::symlink(&target, &via).unwrap();
+
+        let err = verify_socket_trusted(&via)
+            .err()
+            .expect("a symlink at the socket path must never be trusted");
+        match err {
+            ConnectError::Untrusted { path, reason } => {
+                assert_eq!(path, via, "the refusal must name the link's path");
+                assert!(
+                    reason.contains("symbolic link"),
+                    "the refusal must name the symlink itself, got: {reason}"
+                );
+            }
+            other => panic!("expected Untrusted, got {other:?}"),
+        }
+    }
+
+    /// S12 item 1: the old check inspected ONE ancestor (the direct
+    /// parent). A group/world-writable directory TWO or more levels above
+    /// the socket — enough for anyone to plant a lookalike socket in it —
+    /// passed unseen. The consolidated walk lstat-checks every ancestor up
+    /// to the trust root; the deep defect must be named. Pre-fix red
+    /// (unprivileged): the owner-UID check on the socket tripped first and
+    /// the reason carried no "writable".
+    #[test]
+    fn strict_checks_reject_a_writable_ancestor_above_the_parent() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        // The writable grandparent is the planting surface: anyone can
+        // create entries in it and shadow the path the deeper components
+        // spell out.
+        let grandparent = dir.path().join("runtime");
+        let parent = grandparent.join("protonwire");
+        std::fs::create_dir_all(&parent).unwrap();
+        std::fs::set_permissions(&grandparent, std::fs::Permissions::from_mode(0o770)).unwrap();
+        let socket = parent.join("protonwire.sock");
+        drop(std::os::unix::net::UnixListener::bind(&socket).unwrap());
+
+        let err = verify_socket_trusted(&socket)
+            .err()
+            .expect("a group/world-writable ancestor must never be trusted");
+        match err {
+            ConnectError::Untrusted { reason, .. } => {
+                assert!(
+                    reason.contains("writable") && reason.contains(grandparent.to_str().unwrap()),
+                    "the refusal must name the writable ancestor, got: {reason}"
+                );
+            }
+            other => panic!("expected Untrusted, got {other:?}"),
+        }
+    }
+
+    /// S12 item 1: the old check never looked at the socket leaf's OWN
+    /// mode. A world-writable socket (0o666-ish) is world-CONNECTABLE —
+    /// connect(2) needs write permission on the socket inode — and the
+    /// leaf's mode is part of the trust surface. Group-write on the leaf
+    /// stays allowed (the R9-1 0o660 group hand-off is the production
+    /// shape); world-write must be named. Pre-fix red (unprivileged): the
+    /// owner-UID check tripped first, no "world" in the reason.
+    #[test]
+    fn strict_checks_reject_a_world_writable_socket_leaf() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("protonwire.sock");
+        drop(std::os::unix::net::UnixListener::bind(&socket).unwrap());
+        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o666)).unwrap();
+
+        let err = verify_socket_trusted(&socket)
+            .err()
+            .expect("a world-writable socket leaf must never be trusted");
+        match err {
+            ConnectError::Untrusted { reason, .. } => {
+                assert!(
+                    reason.contains("world"),
+                    "the refusal must name the world-writable leaf, got: {reason}"
+                );
             }
             other => panic!("expected Untrusted, got {other:?}"),
         }
