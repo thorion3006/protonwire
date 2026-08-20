@@ -261,7 +261,7 @@ pub fn init_tracing_filtered(default_level: &str) {
 /// formats — events from the pinned dependency modules at the levels
 /// where those modules are known to log secrets. It composes over the
 /// [`RedactingMakeWriter`] formatter via
-/// [`suppressed_fmt_layer`]/`init_tracing_filtered`: `EnvFilter` decides
+/// `suppressed_fmt_layer`/`init_tracing_filtered`: `EnvFilter` decides
 /// what the runtime level allows, this filter independently vetoes the
 /// named modules regardless of that level, and only what survives both
 /// reaches the (still scrubbing) writer. A message that is never
@@ -369,7 +369,7 @@ const DEPENDENCY_RELEASE_CAP: Level = Level::DEBUG;
 
 impl SecretSuppressFilter {
     /// The production FR-7P policy: the per-module caps of
-    /// [`MODULE_CAPS`] always, plus the dependency-`trace`-off blanket
+    /// MODULE_CAPS always, plus the dependency-`trace`-off blanket
     /// in release builds.
     #[must_use]
     pub fn fr_7p() -> Self {
@@ -519,14 +519,14 @@ pub fn peer_secret(value: impl Into<String>) -> PeerSecret {
 // ---------------------------------------------------------------------------
 
 /// The T-32 canary harness (m2-plan S1): inject canaries for every secret
-/// class through a dependency-shaped [`CanaryEmitter`] and assert none
+/// class through a dependency-shaped `CanaryEmitter` and assert none
 /// reaches any captured writer at any allowed runtime level.
 ///
 /// Parameterized over the emitter so the stub arm (the pinned upstream
 /// log sites, replayed) lands now while the real-muon arm rides with S4
 /// in the same commit as the first real call sites — that arm drives
 /// real muon with these values as live credentials through
-/// [`assert_no_secrets_reach_logs`] unchanged.
+/// `assert_no_secrets_reach_logs` unchanged.
 pub mod canary {
     use std::io::{self, Write};
     use std::sync::atomic::{AtomicU64, Ordering};
