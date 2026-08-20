@@ -45,7 +45,12 @@
 //! [`FetchFailure::Transport`]. The 429/503 wire-fixture obligation
 //! itself is tracked for S9.
 
+use std::path::Path;
+
 use protonwire_frontend_api::ConfirmationRequirement;
+use protonwire_store::catalog::{
+    CATALOG_CACHE_SCHEMA_VERSION as CACHE_SCHEMA_VERSION, CachedCatalog, CatalogDocument,
+};
 use protonwire_store::config::MetadataCacheSection;
 use protonwire_store::deadlines::IntervalSource;
 
@@ -571,6 +576,21 @@ impl Scheduler {
         persisted: protonwire_store::deadlines::SchedulerDeadlines,
         etag: Option<String>,
     ) -> Self {
+        Self::new_with_cache(config, clock, fetch, store, persisted, etag, None)
+    }
+
+    /// The common construction path: the crash-between-saves
+    /// re-derivation plus an optionally wired catalog cache (production
+    /// wires one; test schedulers usually do not).
+    fn new_with_cache(
+        config: SchedulerConfig,
+        clock: std::sync::Arc<dyn Clock>,
+        fetch: CatalogFetch,
+        store: protonwire_store::deadlines::DeadlineStore,
+        persisted: protonwire_store::deadlines::SchedulerDeadlines,
+        etag: Option<String>,
+        cache: Option<CacheState>,
+    ) -> Self {
         let mut persisted = persisted;
         Self::rederive_crash_pacing(&mut persisted);
         Self {
@@ -586,10 +606,55 @@ impl Scheduler {
                 completed: None,
                 token: None,
                 rollback: RollbackTracker::default(),
-                cache: None,
+                cache,
             }),
             cv: std::sync::Condvar::new(),
         }
+    }
+
+    /// The production constructor (the S9 daemon wiring point): strict
+    /// loads over the `ConfigPaths`-derived cache-directory documents
+    /// with `/` as the fs_trust root, the stored revision seeded for
+    /// conditional requests, the catalog cache wired so successful
+    /// fetches write each new revision through it, and the
+    /// crash-between-saves re-derivation applied to the loaded
+    /// deadlines.
+    pub fn production(
+        config: SchedulerConfig,
+        clock: std::sync::Arc<dyn Clock>,
+        fetch: CatalogFetch,
+        paths: &protonwire_store::paths::ConfigPaths,
+    ) -> Result<Self, SchedulerError> {
+        Self::production_with_trust_root(config, clock, fetch, paths, Path::new("/"))
+    }
+
+    /// The production construction over an explicit fs_trust root.
+    /// Private: the production walk root is `/` (the sshd StrictModes
+    /// rule the fs_trust module documents); the shallower root is the
+    /// hermetic-test opt-in and never leaves the crate.
+    fn production_with_trust_root(
+        config: SchedulerConfig,
+        clock: std::sync::Arc<dyn Clock>,
+        fetch: CatalogFetch,
+        paths: &protonwire_store::paths::ConfigPaths,
+        trust_root: &Path,
+    ) -> Result<Self, SchedulerError> {
+        let store =
+            protonwire_store::deadlines::DeadlineStore::new(paths.cache_dir.join("deadlines.json"));
+        let cache =
+            protonwire_store::catalog::CatalogCache::new(paths.cache_dir.join("servers.json"));
+        let persisted = store.load_strict(trust_root)?.unwrap_or_default();
+        let current = cache.load_strict(trust_root)?;
+        let etag = current.as_ref().and_then(|doc| doc.etag.clone());
+        Ok(Self::new_with_cache(
+            config,
+            clock,
+            fetch,
+            store,
+            persisted,
+            etag,
+            Some(CacheState { cache, current }),
+        ))
     }
 
     /// The crash-between-saves floor re-derivation (rust M1): the
@@ -867,15 +932,36 @@ impl Scheduler {
         });
         let outcome = match &fetched {
             Ok(FetchOutcome::Changed { etag, body }) => {
-                guard.etag = etag.clone();
-                guard.persisted.last_success_unix = Some(effective_now);
-                RefreshOutcome::Changed {
-                    etag: etag.clone(),
-                    body: body.clone(),
+                match adopt_fetched_revision(&mut guard.cache, etag, body, effective_now) {
+                    RevisionVerdict::Adopted => {
+                        // The revision is the server's current one (and,
+                        // when a cache is wired, durably stored or
+                        // test-only un-cached): adopt it for the next
+                        // conditional request and the age anchor.
+                        guard.etag = etag.clone();
+                        guard.persisted.last_success_unix = Some(effective_now);
+                        RefreshOutcome::Changed {
+                            etag: etag.clone(),
+                            body: body.clone(),
+                        }
+                    }
+                    RevisionVerdict::Unusable(reason) => RefreshOutcome::Failed { reason },
                 }
             }
             Ok(FetchOutcome::NotModified) => {
                 guard.persisted.last_success_unix = Some(effective_now);
+                if let Some(state) = &mut guard.cache
+                    && let Some(current) = &state.current
+                {
+                    // FR-13E: freshness only — the stored body bytes are
+                    // carried through verbatim, never rewritten.
+                    match state.cache.refresh_freshness(current, effective_now) {
+                        Ok(updated) => state.current = Some(updated),
+                        Err(error) => {
+                            tracing::warn!(error = %error, "refreshing cached freshness failed")
+                        }
+                    }
+                }
                 RefreshOutcome::NotModified
             }
             Err(FetchFailure::RateLimited {
@@ -923,6 +1009,67 @@ impl Scheduler {
             suppression_until_unix: report.suppression_until_unix,
         }
     }
+}
+
+/// Whether a fetched `Changed` revision may be adopted.
+enum RevisionVerdict {
+    /// The revision is usable (and, with a wired cache, persisted or
+    /// warned-and-skipped on a local I/O failure).
+    Adopted,
+    /// The body failed the live catalog model: nothing adopted, stored,
+    /// or anchored — the refresh reports failure instead.
+    Unusable(String),
+}
+
+/// Writes one fetched revision through the wired catalog cache
+/// (FR-10/FR-13B/FR-13E).
+///
+/// S6's sec discipline, applied on the WRITE side: the body is
+/// validated against the live catalog model BEFORE anything may land
+/// in the root-owned cache location — a drifted or garbage body must
+/// never poison the cache (the loader's strict re-parse would then
+/// fail every future boot until the file is removed by hand). A body
+/// that fails validation is [`RevisionVerdict::Unusable`]: the refresh
+/// reports `Failed` naming the drift, the last good cache survives,
+/// and no etag or age anchor advances. A cache WRITE I/O failure only
+/// warns — the deadline-save precedent: data availability outranks
+/// local bookkeeping, and the fetched data is still adopted and served.
+fn adopt_fetched_revision(
+    cache: &mut Option<CacheState>,
+    etag: &Option<String>,
+    body: &[u8],
+    fetched_unix: u64,
+) -> RevisionVerdict {
+    if let Err(error) = CatalogDocument::from_bytes(body) {
+        return RevisionVerdict::Unusable(format!(
+            "fetched catalog body rejected by the live model (drift fails loudly): {error}"
+        ));
+    }
+    let Some(state) = cache else {
+        return RevisionVerdict::Adopted; // no cache wired (test schedulers)
+    };
+    // JSON is UTF-8 by specification and the model parse above already
+    // consumed these bytes, so the conversion cannot fail for a
+    // validated body; the arm stays a hard refusal anyway — never a
+    // panic, never a lossy rewrite of what gets persisted.
+    let text = match std::str::from_utf8(body) {
+        Ok(text) => text.to_owned(),
+        Err(_) => {
+            return RevisionVerdict::Unusable("fetched catalog body is not valid UTF-8".to_owned());
+        }
+    };
+    let doc = CachedCatalog {
+        schema_version: CACHE_SCHEMA_VERSION,
+        etag: etag.clone(),
+        fetched_unix,
+        body: text,
+    };
+    if let Err(error) = state.cache.store(&doc) {
+        tracing::warn!(error = %error, "persisting the fetched catalog revision failed");
+    } else {
+        state.current = Some(doc);
+    }
+    RevisionVerdict::Adopted
 }
 
 /// Mints one confirmation token: 32 CSPRNG bytes, hex-encoded
@@ -2202,6 +2349,326 @@ mod runtime_tests {
         .join()
         .expect("the scheduler must not be wedged");
         assert!(matches!(second, AutomaticOutcome::NotDue { .. }));
+    }
+
+    // --- The catalog-cache write-through (production wiring) -------------------
+
+    use std::os::unix::fs::PermissionsExt as _;
+
+    use protonwire_store::catalog::{
+        CATALOG_CACHE_SCHEMA_VERSION as CACHE_SCHEMA, CachedCatalog, CatalogCache,
+    };
+    use protonwire_store::paths::ConfigPaths;
+
+    /// A minimal body that parses against the live catalog model.
+    const VALID_BODY: &str = r#"{"Code":1000,"StatusID":"t","LogicalServers":[]}"#;
+
+    /// A scheduler with the production cache wired at `dir/servers.json`
+    /// (the private-field injection point; production constructs this
+    /// through its strict loads).
+    fn wired(clock: &VirtualClock, fetch: &FakeFetch) -> (Arc<Scheduler>, tempfile::TempDir) {
+        let (scheduler, dir) = harness(clock, fetch);
+        scheduler.inner.lock().unwrap().cache = Some(CacheState {
+            cache: CatalogCache::new(dir.path().join("servers.json")),
+            current: None,
+        });
+        (scheduler, dir)
+    }
+
+    fn stored_doc(etag: Option<&str>, fetched_unix: u64, body: &str) -> CachedCatalog {
+        CachedCatalog {
+            schema_version: CACHE_SCHEMA,
+            etag: etag.map(str::to_owned),
+            fetched_unix,
+            body: body.to_owned(),
+        }
+    }
+
+    fn read_stored_cache(dir: &tempfile::TempDir) -> CachedCatalog {
+        let bytes = std::fs::read(dir.path().join("servers.json")).unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[test]
+    fn a_changed_fetch_writes_the_revision_through_the_catalog_cache() {
+        let clock = VirtualClock::new(T0);
+        let fetch = FakeFetch::new(vec![Ok(FetchOutcome::Changed {
+            etag: Some("\"rev-1\"".to_owned()),
+            body: VALID_BODY.as_bytes().to_vec(),
+        })]);
+        let (scheduler, dir) = wired(&clock, &fetch);
+
+        match scheduler.refresh_automatic() {
+            AutomaticOutcome::Due(report) => {
+                assert!(matches!(report.outcome, RefreshOutcome::Changed { .. }))
+            }
+            other => panic!("expected Due, got {other:?}"),
+        }
+        let stored = read_stored_cache(&dir);
+        assert_eq!(stored.schema_version, CACHE_SCHEMA);
+        assert_eq!(stored.etag.as_deref(), Some("\"rev-1\""), "FR-13B revision");
+        assert_eq!(stored.fetched_unix, T0);
+        assert_eq!(stored.body, VALID_BODY, "the raw body, verbatim");
+    }
+
+    #[test]
+    fn a_not_modified_fetch_refreshes_cache_freshness_without_rewriting_the_body() {
+        let clock = VirtualClock::new(T0 + FRESHNESS_FLOOR_SECONDS + 1);
+        let fetch = FakeFetch::new(vec![not_modified()]);
+        let (scheduler, dir) = wired(&clock, &fetch);
+        // Seed the wired cache as if the revision was fetched long ago.
+        let current = stored_doc(Some("\"rev-1\""), T0 - 10_000, VALID_BODY);
+        CatalogCache::new(dir.path().join("servers.json"))
+            .store(&current)
+            .unwrap();
+        scheduler.inner.lock().unwrap().cache = Some(CacheState {
+            cache: CatalogCache::new(dir.path().join("servers.json")),
+            current: Some(current),
+        });
+
+        assert!(matches!(
+            scheduler.refresh_automatic(),
+            AutomaticOutcome::Due(RefreshReport {
+                outcome: RefreshOutcome::NotModified,
+                ..
+            })
+        ));
+        let stored = read_stored_cache(&dir);
+        assert_eq!(stored.etag.as_deref(), Some("\"rev-1\""));
+        assert_eq!(
+            stored.fetched_unix,
+            T0 + FRESHNESS_FLOOR_SECONDS + 1,
+            "FR-13E: freshness advances"
+        );
+        assert_eq!(stored.body, VALID_BODY, "FR-13E: catalog data unchanged");
+    }
+
+    /// S6's sec discipline on the write side: a body that fails the
+    /// live model never lands in the trusted cache location — the
+    /// refresh fails loudly and the last good revision survives.
+    #[test]
+    fn an_unusable_body_fails_the_refresh_and_keeps_the_last_good_cache() {
+        let clock = VirtualClock::new(T0);
+        let fetch = FakeFetch::new(vec![Ok(FetchOutcome::Changed {
+            etag: Some("\"rev-2\"".to_owned()),
+            body: b"{\"Code\":1000,\"Not\":\"a catalog\"}".to_vec(),
+        })]);
+        let (scheduler, dir) = wired(&clock, &fetch);
+        let good = stored_doc(Some("\"rev-1\""), T0 - 500, VALID_BODY);
+        CatalogCache::new(dir.path().join("servers.json"))
+            .store(&good)
+            .unwrap();
+        scheduler.inner.lock().unwrap().cache = Some(CacheState {
+            cache: CatalogCache::new(dir.path().join("servers.json")),
+            current: Some(good),
+        });
+        // Production seeds the in-memory etag from the same loaded
+        // document; mirror that here.
+        scheduler.inner.lock().unwrap().etag = Some("\"rev-1\"".to_owned());
+
+        match scheduler.refresh_automatic() {
+            AutomaticOutcome::Due(report) => match report.outcome {
+                RefreshOutcome::Failed { reason } => assert!(
+                    reason.contains("live model") || reason.contains("drift"),
+                    "the failure must name the validation: {reason}"
+                ),
+                other => panic!("an unusable body must fail, got {other:?}"),
+            },
+            other => panic!("expected Due, got {other:?}"),
+        }
+        // The last good revision is untouched: same etag, same body.
+        let stored = read_stored_cache(&dir);
+        assert_eq!(stored.etag.as_deref(), Some("\"rev-1\""));
+        assert_eq!(stored.body, VALID_BODY);
+        // No adoption happened: the age anchor never moved (there was
+        // no successful fetch this run) and the in-memory etag still
+        // points at the last good revision.
+        assert_eq!(
+            scheduler.diagnostics().last_success_unix,
+            None,
+            "an unusable fetch is not a successful fetch"
+        );
+        assert_eq!(scheduler.diagnostics().last_request_unix, Some(T0));
+        assert_eq!(
+            scheduler.inner.lock().unwrap().etag.as_deref(),
+            Some("\"rev-1\"")
+        );
+        // Pacing still advanced from the attempt: the failure cannot
+        // hammer Proton either.
+        assert!(scheduler.next_due_unix().unwrap() >= T0 + FRESHNESS_FLOOR_SECONDS);
+    }
+
+    /// The production constructor's strict happy path: both documents
+    /// load under the trust root, the stored revision seeds conditional
+    /// requests, and the loaded deadlines govern. Root-gated (the
+    /// fs_trust ownership pass needs a root-owned tree — the store
+    /// suite's compromise); NOTICE-skip otherwise.
+    #[test]
+    fn production_seeds_deadlines_and_the_stored_revision() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let paths = ConfigPaths::rooted(dir.path());
+        std::fs::create_dir_all(&paths.cache_dir).unwrap();
+        DeadlineStore::new(dir.path().join("var/cache/protonwire/deadlines.json"))
+            .save(&SchedulerDeadlines {
+                last_request_unix: Some(T0),
+                last_success_unix: Some(T0),
+                next_eligible_unix: Some(T0 + FRESHNESS_FLOOR_SECONDS),
+                next_eligible_source: Some(IntervalSource::ThreeHourFloor),
+                wall_high_water_unix: T0,
+                ..SchedulerDeadlines::default()
+            })
+            .unwrap();
+        CatalogCache::new(dir.path().join("var/cache/protonwire/servers.json"))
+            .store(&stored_doc(Some("\"rev-9\""), T0, VALID_BODY))
+            .unwrap();
+        let root_owned = std::fs::metadata(dir.path().join("var/cache/protonwire/servers.json"))
+            .map(|m| m.uid() == 0 && m.gid() == 0)
+            .unwrap_or(false);
+        if !root_owned {
+            // NOTICE skip (CONTRIBUTING rule 5, the a368775 idiom): the
+            // fs_trust ownership pass needs a root-owned tree, which an
+            // unprivileged runner cannot construct. The walk's mode and
+            // symlink arms are covered unprivileged below; visible via
+            // `cargo test -- --nocapture`.
+            eprintln!(
+                "NOTICE: skipping production_seeds_deadlines_and_the_stored_revision: the \
+                 cache tree is not root-owned on this runner — the ownership arm of the \
+                 fs_trust walk is unprovable unprivileged"
+            );
+            return;
+        }
+        let clock = VirtualClock::new(T0 + 60);
+        let fetch = FakeFetch::new(vec![not_modified()]);
+        let scheduler = Scheduler::production_with_trust_root(
+            SchedulerConfig::new(FRESHNESS_FLOOR_SECONDS, JITTER, true).unwrap(),
+            Arc::new(clock.clone()),
+            fetch.service(),
+            &paths,
+            dir.path(),
+        )
+        .expect("the strict loads succeed over the root-owned tree");
+        // Deadlines carried (not due until the loaded eligibility) and
+        // the stored revision seeded for the next conditional request.
+        assert_eq!(
+            scheduler.next_due_unix(),
+            Some(T0 + FRESHNESS_FLOOR_SECONDS)
+        );
+        assert_eq!(
+            scheduler.inner.lock().unwrap().etag.as_deref(),
+            Some("\"rev-9\"")
+        );
+        assert!(matches!(
+            scheduler.refresh_automatic(),
+            AutomaticOutcome::NotDue { .. }
+        ));
+    }
+
+    /// The production walk is strict on BOTH documents; the leaf-first
+    /// pass names the tampered leaf before any ancestor (including the
+    /// world-writable `/tmp` the `/` walk would meet), so the refusal
+    /// is deterministic on every runner.
+    #[test]
+    fn production_refuses_a_tampered_deadlines_document() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = ConfigPaths::rooted(dir.path());
+        std::fs::create_dir_all(&paths.cache_dir).unwrap();
+        let deadlines_path = paths.cache_dir.join("deadlines.json");
+        DeadlineStore::new(&deadlines_path)
+            .save(&SchedulerDeadlines {
+                last_request_unix: Some(T0),
+                wall_high_water_unix: T0,
+                ..SchedulerDeadlines::default()
+            })
+            .unwrap();
+        std::fs::set_permissions(&deadlines_path, std::fs::Permissions::from_mode(0o666)).unwrap();
+
+        let err = match Scheduler::production(
+            SchedulerConfig::new(FRESHNESS_FLOOR_SECONDS, JITTER, true).unwrap(),
+            Arc::new(VirtualClock::new(T0)),
+            FakeFetch::new(vec![not_modified()]).service(),
+            &paths,
+        ) {
+            Err(err) => err,
+            Ok(_) => panic!("a world-writable deadlines document must abort construction"),
+        };
+        assert!(
+            matches!(
+                &err,
+                SchedulerError::Deadlines(
+                    protonwire_store::deadlines::DeadlineStoreError::FsTrust(_)
+                )
+            ),
+            "{err}"
+        );
+        assert!(
+            err.to_string().contains("deadlines.json"),
+            "the leaf defect must be named, not an ancestor: {err}"
+        );
+    }
+
+    /// The production walk is strict on BOTH documents (deadlines load
+    /// first, then the cache). Root-gated like the happy-path test —
+    /// an unprivileged runner cannot pass the ownership arm of the
+    /// FIRST (deadlines) walk at all, so reaching the cache walk
+    /// requires a root-owned tree; NOTICE-skip otherwise. The cache's
+    /// own walk arms are pinned unprivileged in the store suite.
+    #[test]
+    fn production_refuses_a_tampered_cache_document() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let paths = ConfigPaths::rooted(dir.path());
+        std::fs::create_dir_all(&paths.cache_dir).unwrap();
+        DeadlineStore::new(paths.cache_dir.join("deadlines.json"))
+            .save(&SchedulerDeadlines {
+                last_request_unix: Some(T0),
+                wall_high_water_unix: T0,
+                ..SchedulerDeadlines::default()
+            })
+            .unwrap();
+        let cache_path = paths.cache_dir.join("servers.json");
+        CatalogCache::new(&cache_path)
+            .store(&stored_doc(None, T0, VALID_BODY))
+            .unwrap();
+        let root_owned = std::fs::metadata(&cache_path)
+            .map(|m| m.uid() == 0 && m.gid() == 0)
+            .unwrap_or(false);
+        if !root_owned {
+            eprintln!(
+                "NOTICE: skipping production_refuses_a_tampered_cache_document: the \
+                 cache tree is not root-owned on this runner — the first (deadlines) \
+                 walk cannot pass the ownership arm unprivileged, so the cache arm is \
+                 unreachable here"
+            );
+            return;
+        }
+        std::fs::set_permissions(&cache_path, std::fs::Permissions::from_mode(0o666)).unwrap();
+
+        let err = match Scheduler::production_with_trust_root(
+            SchedulerConfig::new(FRESHNESS_FLOOR_SECONDS, JITTER, true).unwrap(),
+            Arc::new(VirtualClock::new(T0)),
+            FakeFetch::new(vec![not_modified()]).service(),
+            &paths,
+            dir.path(),
+        ) {
+            Err(err) => err,
+            Ok(_) => panic!("a world-writable cache document must abort construction"),
+        };
+        assert!(
+            matches!(
+                &err,
+                SchedulerError::CatalogCache(
+                    protonwire_store::catalog::CatalogCacheError::FsTrust(_)
+                )
+            ),
+            "{err}"
+        );
+        assert!(
+            err.to_string().contains("servers.json"),
+            "the leaf defect must be named, not an ancestor: {err}"
+        );
     }
 
     // --- E2E-22: the 24-virtual-hours suite -----------------------------------
