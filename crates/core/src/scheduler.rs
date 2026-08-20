@@ -1749,8 +1749,12 @@ mod runtime_tests {
 
     /// A scheduler over a temp deadline store, on the given clock.
     fn harness(clock: &VirtualClock, fetch: &FakeFetch) -> (Arc<Scheduler>, tempfile::TempDir) {
-        harness_with_config(clock, fetch, SchedulerConfig::new(FRESHNESS_FLOOR_SECONDS, JITTER, true)
-            .expect("the standard suite config is valid"))
+        harness_with_config(
+            clock,
+            fetch,
+            SchedulerConfig::new(FRESHNESS_FLOOR_SECONDS, JITTER, true)
+                .expect("the standard suite config is valid"),
+        )
     }
 
     /// [`harness`] over an explicit policy (the conditional-requests
@@ -3428,10 +3432,8 @@ mod runtime_tests {
                                             Some(suppression.map_or(raw, |old: u64| old.max(raw)));
                                     }
                                     let sup = suppression.unwrap_or(0);
-                                    let bounds = (
-                                        raw.max(sup),
-                                        raw.saturating_add(JITTER).max(sup),
-                                    );
+                                    let bounds =
+                                        (raw.max(sup), raw.saturating_add(JITTER).max(sup));
                                     assert!(
                                         report.next_eligible_unix >= bounds.0
                                             && report.next_eligible_unix <= bounds.1,
@@ -3477,7 +3479,8 @@ mod runtime_tests {
                         match scheduler.refresh_manual(token) {
                             ManualOutcome::Suppressed { until_unix } => {
                                 assert_eq!(
-                                    Some(until_unix), suppression,
+                                    Some(until_unix),
+                                    suppression,
                                     "the named suppression is not the derived one \
                                      (seed {seed})"
                                 );
@@ -3506,10 +3509,8 @@ mod runtime_tests {
                                             Some(suppression.map_or(raw, |old: u64| old.max(raw)));
                                     }
                                     let sup = suppression.unwrap_or(0);
-                                    let bounds = (
-                                        raw.max(sup),
-                                        raw.saturating_add(JITTER).max(sup),
-                                    );
+                                    let bounds =
+                                        (raw.max(sup), raw.saturating_add(JITTER).max(sup));
                                     assert!(
                                         report.next_eligible_unix >= bounds.0
                                             && report.next_eligible_unix <= bounds.1,
