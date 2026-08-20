@@ -4746,7 +4746,6 @@ name = "protonwire-store"
 version = "0.1.0"
 dependencies = [
  "nix 0.31.3",
- "protonwire-core",
  "protonwire-frontend-api",
  "serde",
  "serde_json",

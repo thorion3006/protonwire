@@ -34,11 +34,9 @@ zeroize = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
-# Test-only (M2 S5b, the F1 lesson): proves the documented production
-# `SecretBoundary for PeerSecret` one-liner against the REAL boundary
-# type — store cannot link core in production (core depends on store;
-# the reverse edge is a cycle), but cargo permits the dev edge, so the
-# impl and its registry-blindness test compile and run here. Already a
-# workspace member: no new lockfile package (lockfile hunk: one
-# dev-edge on protonwire-store).
-protonwire-core = { workspace = true }
+# (The former test-only `protonwire-core` dev edge is GONE: the seam's
+# production impl landed in core (`redact.rs`) with its proof tests
+# (`boundary_seam_tests`) — under cargo's dev-cycle handling this
+# crate's test build saw two store instances and the impl resolved only
+# against core's dependency instance, E0599 for the local view. The
+# lockfile hunk was removed with it.)

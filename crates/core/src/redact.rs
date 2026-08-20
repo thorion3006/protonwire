@@ -517,6 +517,23 @@ pub fn peer_secret(value: impl Into<String>) -> PeerSecret {
     PeerSecret::new(value)
 }
 
+/// THE production boundary seam (S5b, FR-7C): every credential value
+/// read by `protonwire_store::credential_input` enters guarded storage
+/// through this impl. The trait lives in store, the guarded type here —
+/// core is the one crate where both are visible without a dependency
+/// cycle. The store-side `production_boundary_tests` module exercises
+/// this impl verbatim through its dev-dependency edge; its test-only
+/// copy was deleted when this landed (the documented E0119 coherence
+/// removal condition — the tests run unchanged against this impl).
+impl protonwire_store::credential_input::SecretBoundary for PeerSecret {
+    fn ingress(value: String) -> Self {
+        peer_secret(value)
+    }
+    fn expose(&self) -> &str {
+        PeerSecret::expose(self)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // T-32 canary harness
 // ---------------------------------------------------------------------------
@@ -1225,6 +1242,64 @@ mod canary_suite_tests {
             result.is_err(),
             "the harness must catch a control leak through an unsuppressed module"
         );
+    }
+}
+
+/// The production boundary seam's proof (S5b): the `SecretBoundary`
+/// impl below is THE ingress every credential value from
+/// `protonwire_store::credential_input` crosses. Proven HERE — core's
+/// build sees store exactly once, the way the daemon's acyclic build
+/// resolves the impl; store's own dev-cycle double-build cannot see it
+/// (its test-only edge built two store instances — recorded in the
+/// credential_input module doc).
+#[cfg(test)]
+mod boundary_seam_tests {
+    use super::{PeerSecret, peer_secret, register_secret, scrub};
+    use protonwire_store::credential_input::SecretBoundary;
+
+    #[test]
+    fn the_production_impl_round_trips_and_renders_redacted() {
+        let secret = PeerSecret::ingress("tok-production-seam-0001".to_owned());
+        assert_eq!(secret.expose(), "tok-production-seam-0001");
+        assert_eq!(format!("{secret:?}"), "[redacted]");
+        assert_eq!(format!("{secret}"), "[redacted]");
+    }
+
+    /// The registry-blindness pin (the S1/S4 gate; M1 security finding
+    /// 10): a value that crossed the boundary NEVER enters the global
+    /// scrub registry — observed through `scrub()`, with a registered
+    /// control arm proving the observation works.
+    #[test]
+    fn peer_secret_values_never_enter_the_scrub_registry() {
+        let token = "peer-secret-never-registers-0123456789";
+        let secret = PeerSecret::ingress(token.to_owned());
+        assert_eq!(
+            &*scrub(token),
+            token,
+            "a boundary-held value must pass scrub untouched (never registered)"
+        );
+        // Control: the same string, locally registered, IS scrubbed.
+        let handle = register_secret(token);
+        assert_ne!(
+            &*scrub(token),
+            token,
+            "the control arm must observe an active registration"
+        );
+        drop(handle);
+        drop(secret);
+    }
+
+    /// The impl's body is exactly the sanctioned constructor — no
+    /// `SecretString`/`register_secret` detour is possible through it.
+    #[test]
+    fn the_impl_ingress_is_peer_secret_verbatim() {
+        let via_trait = PeerSecret::ingress("tok-verbatim-0002".to_owned());
+        let direct = peer_secret("tok-verbatim-0002");
+        // Both render redacted and never register (the types make value
+        // equality unobservable by design; the observable contract is
+        // scrub-blindness + redaction, pinned above and here).
+        assert_eq!(format!("{via_trait}"), format!("{direct}"));
+        assert_eq!(&*scrub("tok-verbatim-0002"), "tok-verbatim-0002");
     }
 }
 

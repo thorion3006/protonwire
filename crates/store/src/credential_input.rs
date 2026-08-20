@@ -34,36 +34,19 @@
 //! injected collaborator — the house seam-injection idiom (CONTRIBUTING
 //! "Concurrent lanes" rule 7).
 //!
-//! # The production impl, proven here (S5b)
+//! # The production impl (landed in core)
 //!
-//! The production wiring is one impl in the consumer lane — it still
-//! lands there — but S5b PROVES it here: a test-only
-//! `[dev-dependencies]` edge on core (which cargo permits even across
-//! the cycle) compiles the exact documented one-liner against the real
-//! type, and `production_boundary_tests` pins registry-blindness
-//! through core's public `scrub()` — impl and test in the same commit
-//! (the F1 lesson):
-//!
-//! ```text
-//! // in the daemon lane, once: PeerSecret IS the boundary
-//! impl protonwire_store::credential_input::SecretBoundary
-//!     for protonwire_core::redact::PeerSecret
-//! {
-//!     fn ingress(value: String) -> Self {
-//!         protonwire_core::redact::peer_secret(value)
-//!     }
-//!     fn expose(&self) -> &str {
-//!         protonwire_core::redact::PeerSecret::expose(self)
-//!     }
-//! }
-//! ```
-//!
-//! Coherence note (removal condition): once the daemon lane lands that
-//! production copy in core, the test-only copy in
-//! `production_boundary_tests` must be DELETED — both impls become
-//! visible together in this crate's test build and rustc rejects the
-//! pair (E0119). The tests themselves keep running unchanged against
-//! core's production impl.
+//! The production wiring is one impl in `protonwire-core` (`redact.rs`,
+//! next to `PeerSecret` — the one crate where both the type and this
+//! trait are visible without a cycle). It CANNOT be exercised from this
+//! crate's test build: a test-only dev-dependency edge on core builds
+//! store twice under cargo's dev-cycle handling (local instance vs
+//! core's dependency instance), and the impl resolves only against the
+//! latter — E0599 for the local view. The seam is therefore proven in
+//! CORE's test build (`boundary_seam_tests` in `redact.rs`: round-trip,
+//! redacted renders, and registry-blindness with a registered control
+//! arm), where store appears exactly once and the impl resolves the
+//! way the daemon's acyclic build sees it.
 //!
 //! The interactive provider returns the same secret type: values arriving
 //! over the S9 IPC surface are wrapped at THAT wire boundary (the S4
@@ -1550,72 +1533,7 @@ mod envelope_bridge_tests {
     }
 }
 
-/// The production seam, proven against the REAL boundary type (S5b; the
-/// F1 lesson — the impl and its test land in the same commit).
-///
-/// This crate cannot compile this impl in production code
-/// (`protonwire-core` depends on `protonwire-store`; the reverse edge is
-/// a dependency cycle), but a TEST-ONLY `[dev-dependencies]` edge the
-/// other way is legal, so the exact documented one-liner below compiles
-/// and runs against the real `PeerSecret` and the real scrub registry.
-///
-/// REMOVAL CONDITION (coherence): when the daemon lane lands the
-/// production copy of this impl in `protonwire-core`, the two impls
-/// become visible together in this crate's test build and rustc rejects
-/// the pair (E0119) — delete the impl below then; the tests keep
-/// running unchanged against core's production impl.
-#[cfg(test)]
-mod production_boundary_tests {
-    use super::SecretBoundary;
-    use protonwire_core::redact::PeerSecret;
-    use protonwire_core::redact::peer_secret;
-
-    /// The documented production impl, verbatim (see the module
-    /// documentation). This is the line the daemon lane copies into
-    /// `protonwire-core`.
-    impl SecretBoundary for PeerSecret {
-        fn ingress(value: String) -> Self {
-            peer_secret(value)
-        }
-        fn expose(&self) -> &str {
-            PeerSecret::expose(self)
-        }
-    }
-
-    #[test]
-    fn the_production_impl_round_trips_and_renders_redacted() {
-        let secret = PeerSecret::ingress("tok-production-seam-0001".to_owned());
-        assert_eq!(secret.expose(), "tok-production-seam-0001");
-        assert_eq!(format!("{secret:?}"), "[redacted]");
-        assert_eq!(format!("{secret}"), "[redacted]");
-    }
-
-    /// The registry-blindness pin (the S1/S4 gate; M1 security finding
-    /// 10): a value that crossed the boundary NEVER enters the global
-    /// scrub registry. Observed through core's public `scrub()`: a
-    /// REGISTERED value is rewritten out of any line carrying it, while
-    /// a boundary-held value passes through untouched. The control arm
-    /// proves the observation itself works (a locally-registered value
-    /// IS scrubbed), so the pass-through is blindness, not a broken
-    /// probe.
-    #[test]
-    fn peer_secret_values_never_enter_the_scrub_registry() {
-        let token = "peer-secret-never-registers-0123456789";
-        let secret = PeerSecret::ingress(token.to_owned());
-        assert_eq!(
-            &*protonwire_core::redact::scrub(token),
-            token,
-            "a boundary-held value must pass scrub untouched (never registered)"
-        );
-        // Control: the same string, locally registered, IS scrubbed —
-        // the observation works.
-        let handle = protonwire_core::redact::register_secret(token);
-        assert_ne!(
-            &*protonwire_core::redact::scrub(token),
-            token,
-            "the control arm must observe an active registration"
-        );
-        drop(handle);
-        drop(secret);
-    }
-}
+// (The former `production_boundary_tests` module moved to core:
+// `boundary_seam_tests` in `crates/core/src/redact.rs`. See the module
+// doc — the dev-cycle double-build prevents exercising the production
+// impl from this crate's test build.)
