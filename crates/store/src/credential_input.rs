@@ -511,9 +511,9 @@ impl<S: SecretBoundary> CredentialSource<S> {
 /// # Errors
 /// [`CredentialInputError::Envelope`] wrapping the store's typed
 /// refusals — never a best-effort envelope. The `Parse` refusal is
-/// reduced to serde's error CATEGORY plus line/column (see
-/// [`parse_error_summary`]): serde's Display embeds the offending value
-/// verbatim, and this module never carries value bytes.
+/// reduced to serde's error CATEGORY plus line/column (see the private
+/// `parse_error_summary` helper): serde's Display embeds the offending
+/// value verbatim, and this module never carries value bytes.
 pub fn parse_session_envelope<S: SecretBoundary>(
     secret: &S,
 ) -> Result<SessionEnvelope, CredentialInputError> {

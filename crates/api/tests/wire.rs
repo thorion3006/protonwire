@@ -1215,34 +1215,201 @@ fn tempfile_dir() -> std::path::PathBuf {
 // The peer-secret registry-blindness pin (S1's finding-10 gate)
 // ===========================================================================
 
+/// One mid-call scrub observation taken INSIDE a responder step
+/// closure: (field label, the value checked, whether the global scrub
+/// registry redacted it). Assertions happen on the TEST thread after
+/// the exchange — a panic inside the responder thread would only
+/// surface as an unrelated transport failure.
+type ScrubObservation = (&'static str, String, bool);
+
+/// Records a mid-call scrub check of `value`: scrubbing to anything
+/// other than itself means the value was REGISTERED — exactly what the
+/// peer-secret front door forbids for wire-supplied credentials. The
+/// check runs while the adapter call is blocked on the response, the
+/// one window a mutated registration's handle is provably live (the qa
+/// M2/M4 survivors: post-call asserts run after the registry prunes a
+/// dropped handle, and the fido submission was never driven at all).
+fn observe_midcall_scrub(
+    seen: &Arc<Mutex<Vec<ScrubObservation>>>,
+    label: &'static str,
+    value: &str,
+) {
+    let leaked = protonwire_core::redact::scrub(value).as_ref() != value;
+    seen.lock().unwrap().push((label, value.to_owned(), leaked));
+}
+
+/// The SRP login exchange with mid-call scrub checks at the
+/// `/auth/v4/info` step — the first credential-bearing response, served
+/// WHILE `begin_login` is blocked on it.
+fn srp_login_steps_checked(
+    username: &str,
+    password: &str,
+    scopes: &'static [&'static str],
+    tfa: Value,
+    midcall: &Arc<Mutex<Vec<ScrubObservation>>>,
+) -> Vec<Step> {
+    let server = Arc::new(SrpServer::register(username, password));
+    let server_for_info = Arc::clone(&server);
+    let server_for_auth = Arc::clone(&server);
+    let check_user = (Arc::clone(midcall), username.to_owned());
+    let check_pass = (Arc::clone(midcall), password.to_owned());
+    vec![
+        // The anonymous-session mint muon performs before the first
+        // send on a credential-less session (spike memo Q2).
+        Step::static_json("POST", "/auth/v4/sessions", "200 OK", anon_session()),
+        Step::computed("POST", "/auth/v4/info", move |_| {
+            // MID-CALL: begin_login is blocked on this response, so its
+            // peer-secret handles (or a mutation's registered ones) are
+            // live RIGHT NOW — the window the old post-call-only pin
+            // could not see into.
+            observe_midcall_scrub(&check_user.0, "username", &check_user.1);
+            observe_midcall_scrub(&check_pass.0, "password", &check_pass.1);
+            let ephemeral = server_for_info.challenge();
+            Response::json("200 OK", auth_info("srp-session-1", ephemeral))
+        }),
+        Step::computed("POST", "/auth/v4", move |recorded| {
+            match server_for_auth.verify(recorded) {
+                Some(server_proof) => {
+                    Response::json("200 OK", auth_v4(server_proof, scopes, tfa.clone()))
+                }
+                None => Response::error(
+                    "400 Bad Request",
+                    8002,
+                    "incorrect password (real SRP proof verification failed)",
+                ),
+            }
+        }),
+    ]
+}
+
+/// The 2FA step with mid-call scrub checks — served WHILE
+/// `submit_fido_payload` is blocked on it (the M4 survivor fix: the
+/// old pin never drove this call at all).
+fn two_factor_fido_step_checked(
+    client_data: &str,
+    authenticator_data: &str,
+    signature: &str,
+    midcall: &Arc<Mutex<Vec<ScrubObservation>>>,
+) -> Step {
+    let midcall = Arc::clone(midcall);
+    let cd = client_data.to_owned();
+    let ad = authenticator_data.to_owned();
+    let sig = signature.to_owned();
+    Step::computed("POST", "/auth/v4/2fa", move |_| {
+        // MID-CALL: submit_fido_payload's assertion handles are live
+        // right now.
+        observe_midcall_scrub(&midcall, "fido-client-data", &cd);
+        observe_midcall_scrub(&midcall, "fido-authenticator-data", &ad);
+        observe_midcall_scrub(&midcall, "fido-signature", &sig);
+        Response::json("200 OK", json!({"Scopes": ["loggedin", "full"]}))
+    })
+}
+
 /// The S4 wire path's contract, pinned: every credential-shaped value
 /// that arrives through the trait stays OUT of the global scrub registry
 /// (peer storage only), while the one secret the adapter MINTS (a fork
 /// selector, local provenance) IS registered. A future handler writing
 /// `register_secret(peer.expose())` or `SecretString::new(wire_value)`
-/// breaks the first half of this test.
+/// breaks this test.
+///
+/// Blindness fix (qa P2, mutation-proven M2/M4 survivors): the old pin
+/// asserted only AFTER the calls — a mutated registration whose handle
+/// dropped at call end was pruned from the registry before the assert
+/// ran, and the FIDO submission was never driven at all. Now every
+/// credential-bearing call is observed MID-CALL inside its responder
+/// step closure (the handle-live window), the fido submission is
+/// driven, and the post-call asserts remain for the persistent-guard
+/// mutation shape. The S1 flood + local-asset arms are mirrored at the
+/// wire seam beside the real exchanges.
 #[test]
 fn wire_supplied_credentials_never_enter_the_scrub_registry() {
     let username = "peerpin-username-value";
     let password = "peerpin-password-value";
-    let totp = "424242";
+    let fido_client_data = "peerpin-fido-client-data";
+    let fido_authenticator_data = "peerpin-fido-authenticator-data";
+    let fido_signature = "peerpin-fido-signature";
     let imported_selector = "peerpin-imported-selector";
+    let minted_selector = "peerpin-minted-selector";
+    let midcall: Arc<Mutex<Vec<ScrubObservation>>> = Arc::new(Mutex::new(Vec::new()));
 
-    // A full TOTP login with the distinctive peer values (registered
-    // with the SRP server half under those same values, so the
-    // exchange is real for them too).
+    // One exchange carrying three credential-bearing calls, every one
+    // observed WHILE the adapter is inside the call: begin_login
+    // (checked at /auth/v4/info), submit_fido_payload (checked at
+    // /auth/v4/2fa), and fork — which mints the LOCAL-provenance asset
+    // the flood arm below leans on.
     let (handle, port, _seen) = spawn_scripted(
-        srp_login_steps_as(username, password, &["twofactor"], tfa_totp())
+        srp_login_steps_checked(username, password, &["twofactor"], tfa_fido(), &midcall)
             .into_iter()
-            .chain([two_factor_step()])
+            .chain([two_factor_fido_step_checked(
+                fido_client_data,
+                fido_authenticator_data,
+                fido_signature,
+                &midcall,
+            )])
+            .chain([Step::static_json(
+                "POST",
+                "/auth/v4/sessions/forks",
+                "200 OK",
+                json!({"Selector": minted_selector}),
+            )])
             .collect(),
     );
     let adapter = adapter_on_port(port);
     adapter.begin_login(username, password).expect("login");
-    adapter.submit_two_factor(totp).expect("2fa");
+    adapter
+        .submit_fido_payload(&Fido2Payload {
+            client_data: fido_client_data.into(),
+            authenticator_data: fido_authenticator_data.into(),
+            signature: fido_signature.into(),
+            credential_id: FIDO_CREDENTIAL_ID_BYTES.to_vec(),
+        })
+        .expect("2fa fido");
+    let selector = adapter.fork("localagent").expect("fork");
+    handle.join().expect("responder thread");
+    assert_eq!(selector.as_str(), minted_selector);
+
+    // An imported selector is peer-derived too: a second exchange,
+    // observed mid-call at its GET step as well.
+    let import_midcall = Arc::clone(&midcall);
+    let import_selector_value = imported_selector.to_owned();
+    let (handle, port, _seen) = spawn_scripted(vec![Step::computed(
+        "GET",
+        format!("/auth/v4/sessions/forks/{imported_selector}"),
+        move |_| {
+            // MID-CALL: import_fork is blocked on this response.
+            observe_midcall_scrub(&import_midcall, "imported-selector", &import_selector_value);
+            Response::json("200 OK", fork_get_response("forked-uid-2", "forked-user-2"))
+        },
+    )]);
+    let importer = adapter_on_port(port);
+    importer
+        .import_fork(&ForkSelector::new(imported_selector))
+        .expect("import");
     handle.join().expect("responder thread");
 
-    for value in [username, password, totp] {
+    // MID-CALL verdicts — the M2/M4 fix: every observation ran while a
+    // mutated registration's handle would have been live, so a
+    // peer_secret -> register_secret mutation fails HERE, not after
+    // the registry prunes the dropped handle.
+    for (label, value, leaked) in midcall.lock().unwrap().iter() {
+        assert!(
+            !leaked,
+            "mid-call ({label}): a wire-supplied credential was registered \
+             for scrubbing DURING the call: {value}"
+        );
+    }
+
+    // POST-CALL defense: the values stayed out of the registry after
+    // the calls too (kills the persistent-guard mutation shape, where
+    // the handle is kept alive past the call).
+    for value in [
+        username,
+        password,
+        fido_client_data,
+        fido_authenticator_data,
+        fido_signature,
+        imported_selector,
+    ] {
         assert_eq!(
             protonwire_core::redact::scrub(value),
             value,
@@ -1250,22 +1417,34 @@ fn wire_supplied_credentials_never_enter_the_scrub_registry() {
         );
     }
 
-    // An imported selector is peer-derived too: unregistered.
-    let (handle, port, _seen) = spawn_scripted(vec![Step::static_json(
-        "GET",
-        format!("/auth/v4/sessions/forks/{imported_selector}"),
-        "200 OK",
-        fork_get_response("forked-uid-2", "forked-user-2"),
-    )]);
-    let adapter = adapter_on_port(port);
-    adapter
-        .import_fork(&ForkSelector::new(imported_selector))
-        .expect("import");
-    handle.join().expect("responder thread");
+    // The minted selector IS registered (local provenance — contrast
+    // every peer value above): the adapter's guard keeps it scrubbable
+    // for the adapter's lifetime, which is what the flood arm leans on.
     assert_eq!(
-        protonwire_core::redact::scrub(imported_selector),
-        imported_selector,
-        "a peer-derived selector must never be registered for scrubbing"
+        protonwire_core::redact::scrub(minted_selector),
+        protonwire_core::redact::REDACTED
+    );
+
+    // The S1 flood + local-asset arms (core pins them at the unit;
+    // this mirrors both at the wire seam, beside real exchanges): 4096
+    // junk values flood the exact front door every wire-supplied
+    // credential crosses — none may enter the registry — and the
+    // PRE-REGISTERED local asset must stay exactly as scrubbable after
+    // the flood as before it (weak-ref registry, no cap to poison).
+    let flood: Vec<_> = (0..4096)
+        .map(|i| protonwire_core::redact::peer_secret(format!("peerpin-junk-{i:06}")))
+        .collect();
+    for peer in flood.iter().step_by(256) {
+        assert_eq!(
+            protonwire_core::redact::scrub(peer.expose()),
+            peer.expose(),
+            "a flooded peer value must never be registered"
+        );
+    }
+    assert_eq!(
+        protonwire_core::redact::scrub(minted_selector),
+        protonwire_core::redact::REDACTED,
+        "the pre-registered local asset must stay scrubbable after the flood"
     );
 }
 
