@@ -1187,7 +1187,8 @@ fn observed_credentials_round_trip_through_the_session_envelope() {
     let envelope = protonwire_store::session::SessionEnvelope::new(value).expect("envelope");
 
     let dir = TempDirGuard::new("envelope");
-    let store = protonwire_store::session::SessionEnvelopeStore::new(dir.path().join("session.json"));
+    let store =
+        protonwire_store::session::SessionEnvelopeStore::new(dir.path().join("session.json"));
     store.save(&envelope).expect("persist");
     let loaded = store.load().expect("load").expect("present");
 

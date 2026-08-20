@@ -244,13 +244,13 @@ impl SessionEnvelopeStore {
     /// # Errors
     /// See [`SessionEnvelopeError`].
     pub fn save(&self, envelope: &SessionEnvelope) -> Result<(), SessionEnvelopeError> {
-        if let Some(on_disk) = self.load()? {
-            if envelope.envelope_generation < on_disk.envelope_generation {
-                return Err(SessionEnvelopeError::StaleGeneration {
-                    attempted: envelope.envelope_generation,
-                    on_disk: on_disk.envelope_generation,
-                });
-            }
+        if let Some(on_disk) = self.load()?
+            && envelope.envelope_generation < on_disk.envelope_generation
+        {
+            return Err(SessionEnvelopeError::StaleGeneration {
+                attempted: envelope.envelope_generation,
+                on_disk: on_disk.envelope_generation,
+            });
         }
         let bytes = serde_json::to_vec(envelope)
             .map_err(|e| SessionEnvelopeError::Parse(parse_error_kind_at(e)))?;
