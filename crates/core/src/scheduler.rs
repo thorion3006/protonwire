@@ -3285,6 +3285,24 @@ mod runtime_tests {
     /// (advances, rollbacks, forward jumps) with interleaved automatic
     /// and manual attempts, every performed fetch observes the greatest
     /// deadline computed before it, and suppression is never violated.
+    ///
+    /// sec P3 (mirror-oracle fix): every expectation is DERIVED from the
+    /// virtual clock — which only this walk moves — never echoed from
+    /// the scheduler's own reports. The walk keeps its own high-water
+    /// mark (the highest wall reading any refresh call could have
+    /// observed; the scheduler reads the clock only inside those calls),
+    /// computes each led fetch's un-jittered greatest-of from the call's
+    /// effective time and the rate limit THE WALK queued — with or
+    /// without a `Retry-After` delay (`raw = E + max(floor,
+    /// Retry-After)`, saturating; a delay-less rate limit still mints
+    /// the floor, Q4) — and asserts
+    /// the report lands in `[max(raw, suppression),
+    /// max(raw + jitter ceiling, suppression)]` with the suppression
+    /// EXACTLY the accumulated max of past rate-limited raws. The old
+    /// shape copied `report.next_eligible_unix`/`suppression_until_unix`
+    /// and the persisted high-water into the oracle, so a mis-anchored
+    /// or mis-floored deadline was self-consistent and invisible here —
+    /// exactly the qa P1-1 class, which only the unit tests caught.
     #[test]
     fn property_random_virtual_clock_walks_respect_every_deadline() {
         for seed in [0x5EED_1001u64, 0x5EED_1002, 0x5EED_1003] {
@@ -3318,10 +3336,40 @@ mod runtime_tests {
                 None,
             ));
 
-            let mut next_eligible: Option<u64> = None;
+            // --- the walk's OWN ledger (nothing reads the scheduler's
+            // idea of time or deadlines) ---
+            // Highest wall reading any refresh call has observed. Updated
+            // at call time below — the walk can jump the wall forward and
+            // back between calls without the scheduler ever seeing the
+            // peak, so a per-step max would be WRONG, not just mirrored.
+            let mut walk_high_water: u64 = 0;
+            // [lower, upper] bounds of the current next-eligibility: the
+            // un-jittered greatest-of through the jitter ceiling, never
+            // below the accumulated suppression (the drawn jitter hides
+            // the exact value; the bounds do not). None before the first
+            // fetch — the bootstrap is always due.
+            let mut window: Option<(u64, u64)> = None;
+            // The accumulated suppression: every rate limit mints the
+            // un-jittered greatest-of, and suppression never clears.
             let mut suppression: Option<u64> = None;
+            // The rate limits this walk queued, in order — `Some(delay)`
+            // or `None` (the delay-less Q4 class) — the fetch that leads
+            // next consumes the front, whichever door opened (the
+            // service's script and this queue pop together).
+            let mut queued_retry_afters: VecDeque<Option<u64>> = VecDeque::new();
+            let mut automatic_windows = 0u64;
             let mut manual_windows = 0u64;
             let mut outstanding_token: Option<String> = None;
+
+            // The un-jittered greatest-of for one fetch led at effective
+            // time `effective` (the configured interval IS the floor in
+            // this harness, so span = max(floor, Retry-After)).
+            let raw_deadline = |effective: u64, retry_after: Option<u64>| {
+                let span = retry_after.map_or(FRESHNESS_FLOOR_SECONDS, |delay| {
+                    FRESHNESS_FLOOR_SECONDS.max(delay)
+                });
+                effective.saturating_add(span)
+            };
 
             for _step in 0..400 {
                 let choice = rng.next_u64() % 100;
@@ -3340,41 +3388,86 @@ mod runtime_tests {
                     }
                     60..=79 => {
                         // Occasionally inject rate limiting ahead of the
-                        // next fetch.
+                        // next fetch — with a Retry-After delay or
+                        // delay-less (both Q4 classes suppress).
                         if rng.next_u64().is_multiple_of(4) {
+                            let delay = rng
+                                .next_u64()
+                                .is_multiple_of(4)
+                                .then(|| rng.between(1, 5 * 3600));
+                            queued_retry_afters.push_back(delay);
                             script
                                 .lock()
                                 .unwrap()
                                 .push_back(Err(FetchFailure::RateLimited {
-                                    retry_after_seconds: Some(rng.between(1, 5 * 3600)),
+                                    retry_after_seconds: delay,
                                 }));
                         }
-                        let effective = effective_now(&clock, &scheduler);
-                        let eligible = next_eligible.is_none_or(|d| effective >= d);
+                        walk_high_water = walk_high_water.max(clock.now_unix());
+                        let effective = clock.now_unix().max(walk_high_water);
                         match scheduler.refresh_automatic() {
                             AutomaticOutcome::Due(report) => {
+                                // No fetch before its DERIVED floor, ever
+                                // (the lower bound is jitter-free, so a
+                                // due fetch below it is a real violation).
                                 assert!(
-                                    eligible || report.coalesced,
-                                    "automatic fetch before its deadline at {:?} (seed {seed})",
-                                    report
+                                    window.is_none_or(|(lower, _)| effective >= lower)
+                                        || report.coalesced,
+                                    "automatic fetch before its derived deadline at \
+                                     effective {effective}, window {window:?} (seed {seed})"
                                 );
                                 if !report.coalesced {
-                                    next_eligible = Some(report.next_eligible_unix);
-                                    if let Some(until) = report.suppression_until_unix {
-                                        suppression = Some(
-                                            suppression.map_or(until, |old: u64| old.max(until)),
-                                        );
+                                    automatic_windows += 1;
+                                    let injected = queued_retry_afters.pop_front();
+                                    let raw = raw_deadline(effective, injected.flatten());
+                                    if injected.is_some() {
+                                        // EVERY rate limit — with or
+                                        // without a delay — mints the
+                                        // un-jittered greatest-of (Q4).
+                                        suppression =
+                                            Some(suppression.map_or(raw, |old: u64| old.max(raw)));
                                     }
+                                    let sup = suppression.unwrap_or(0);
+                                    let bounds = (
+                                        raw.max(sup),
+                                        raw.saturating_add(JITTER).max(sup),
+                                    );
+                                    assert!(
+                                        report.next_eligible_unix >= bounds.0
+                                            && report.next_eligible_unix <= bounds.1,
+                                        "automatic reset {} outside the derived window \
+                                          {bounds:?} (seed {seed})",
+                                        report.next_eligible_unix
+                                    );
+                                    assert_eq!(
+                                        report.suppression_until_unix, suppression,
+                                        "suppression drifted from the derived \
+                                         accumulation (seed {seed})"
+                                    );
+                                    window = Some(bounds);
                                 }
                             }
                             AutomaticOutcome::NotDue { next_eligible_unix } => {
-                                assert_eq!(Some(next_eligible_unix), next_eligible);
+                                let (lower, upper) =
+                                    window.expect("the bootstrap fetch is always due");
+                                assert!(
+                                    next_eligible_unix >= lower && next_eligible_unix <= upper,
+                                    "named deadline {next_eligible_unix} outside the \
+                                     derived window ({lower}, {upper}) (seed {seed})"
+                                );
+                                assert!(
+                                    effective < upper,
+                                    "the door stalled past its own derived jittered \
+                                     deadline: effective {effective}, upper {upper} \
+                                     (seed {seed})"
+                                );
                             }
                         }
                     }
                     80..=99 => {
                         // The manual door, with and without a token.
-                        let effective = effective_now(&clock, &scheduler);
+                        walk_high_water = walk_high_water.max(clock.now_unix());
+                        let effective = clock.now_unix().max(walk_high_water);
                         let suppressed = suppression.is_some_and(|until| effective < until);
                         let token = if rng.next_u64().is_multiple_of(2) {
                             outstanding_token.as_deref()
@@ -3382,7 +3475,12 @@ mod runtime_tests {
                             None
                         };
                         match scheduler.refresh_manual(token) {
-                            ManualOutcome::Suppressed { .. } => {
+                            ManualOutcome::Suppressed { until_unix } => {
+                                assert_eq!(
+                                    Some(until_unix), suppression,
+                                    "the named suppression is not the derived one \
+                                     (seed {seed})"
+                                );
                                 assert!(suppressed, "unsuppressed manual refused (seed {seed})");
                             }
                             ManualOutcome::ConfirmationRequired(requirement) => {
@@ -3392,20 +3490,39 @@ mod runtime_tests {
                             ManualOutcome::Refreshed(report) => {
                                 if !report.coalesced {
                                     manual_windows += 1;
-                                }
-                                // A confirmed refresh is legal inside the
-                                // interval but NEVER inside a suppression.
-                                assert!(
-                                    !suppressed,
-                                    "manual refresh escaped suppression (seed {seed})"
-                                );
-                                if !report.coalesced {
-                                    next_eligible = Some(report.next_eligible_unix);
-                                    if let Some(until) = report.suppression_until_unix {
-                                        suppression = Some(
-                                            suppression.map_or(until, |old: u64| old.max(until)),
-                                        );
+                                    // A confirmed refresh is legal inside the
+                                    // interval but NEVER inside a suppression.
+                                    assert!(
+                                        !suppressed,
+                                        "manual refresh escaped suppression (seed {seed})"
+                                    );
+                                    let injected = queued_retry_afters.pop_front();
+                                    let raw = raw_deadline(effective, injected.flatten());
+                                    if injected.is_some() {
+                                        // EVERY rate limit — with or
+                                        // without a delay — mints the
+                                        // un-jittered greatest-of (Q4).
+                                        suppression =
+                                            Some(suppression.map_or(raw, |old: u64| old.max(raw)));
                                     }
+                                    let sup = suppression.unwrap_or(0);
+                                    let bounds = (
+                                        raw.max(sup),
+                                        raw.saturating_add(JITTER).max(sup),
+                                    );
+                                    assert!(
+                                        report.next_eligible_unix >= bounds.0
+                                            && report.next_eligible_unix <= bounds.1,
+                                        "manual reset {} outside the derived window \
+                                          {bounds:?} (seed {seed})",
+                                        report.next_eligible_unix
+                                    );
+                                    assert_eq!(
+                                        report.suppression_until_unix, suppression,
+                                        "suppression drifted from the derived \
+                                         accumulation (seed {seed})"
+                                    );
+                                    window = Some(bounds);
                                     outstanding_token = None; // burned
                                 }
                             }
@@ -3419,11 +3536,21 @@ mod runtime_tests {
                     }
                     _ => unreachable!(),
                 }
-                // The persisted view always agrees with the tracked view.
+                // The persisted view agrees with the DERIVED ledger —
+                // never a mirror: the bounds come from the walk's clock
+                // math and its own queued rate limits alone.
                 let persisted = scheduler.persisted();
-                assert_eq!(persisted.next_eligible_unix, next_eligible);
+                if let Some((lower, upper)) = window {
+                    let persisted_next = persisted.next_eligible_unix;
+                    assert!(
+                        persisted_next.is_some_and(|next| next >= lower && next <= upper),
+                        "persisted eligibility {persisted_next:?} outside \
+                         the derived window ({lower}, {upper}) (seed {seed})"
+                    );
+                }
                 assert_eq!(persisted.suppression_until_unix, suppression);
                 assert_eq!(persisted.manual_refresh_count, manual_windows);
+                assert_eq!(persisted.automatic_refresh_count, automatic_windows);
             }
         }
     }
