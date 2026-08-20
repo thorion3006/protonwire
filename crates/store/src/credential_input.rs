@@ -67,7 +67,9 @@
 //! [`CredentialInputError`]. Error payloads carry names, paths, sizes,
 //! and modes; they never carry the value bytes (a `NotUtf8` refusal
 //! deliberately discards `FromUtf8Error`, whose Display embeds the
-//! offending bytes).
+//! offending bytes, and an envelope parse refusal reduces serde's error
+//! to its category and line/column — serde's Display embeds the
+//! offending value verbatim).
 //!
 //! # Trust root: the credentials directory itself
 //!
@@ -479,13 +481,17 @@ impl<S: SecretBoundary> CredentialSource<S> {
 ///
 /// # Errors
 /// [`CredentialInputError::Envelope`] wrapping the store's typed
-/// refusals — never a best-effort envelope.
+/// refusals — never a best-effort envelope. The `Parse` refusal is
+/// reduced to serde's error CATEGORY plus line/column (see
+/// [`parse_error_summary`]): serde's Display embeds the offending value
+/// verbatim, and this module never carries value bytes.
 pub fn parse_session_envelope<S: SecretBoundary>(
     secret: &S,
 ) -> Result<SessionEnvelope, CredentialInputError> {
     // The deliberate consumer: the one expose() site in this crate.
-    let envelope: SessionEnvelope = serde_json::from_str(secret.expose())
-        .map_err(|e| CredentialInputError::Envelope(SessionEnvelopeError::Parse(e.to_string())))?;
+    let envelope: SessionEnvelope = serde_json::from_str(secret.expose()).map_err(|e| {
+        CredentialInputError::Envelope(SessionEnvelopeError::Parse(parse_error_summary(&e)))
+    })?;
     if envelope.schema_version != SESSION_SCHEMA_VERSION {
         return Err(CredentialInputError::Envelope(
             SessionEnvelopeError::UnsupportedSchema(envelope.schema_version),
@@ -497,6 +503,26 @@ pub fn parse_session_envelope<S: SecretBoundary>(
         ));
     }
     Ok(envelope)
+}
+
+/// serde's error Display embeds the offending VALUE verbatim (an
+/// `invalid type: string "…"` refusal carries the misprovisioned bytes —
+/// for a session slot, that is a password riding daemon error logs).
+/// The parse refusal is therefore reduced to its value-free facts: the
+/// `classify()` category (kind, never the message) plus line/column.
+fn parse_error_summary(error: &serde_json::Error) -> String {
+    let kind = match error.classify() {
+        serde_json::error::Category::Io => "io",
+        serde_json::error::Category::Syntax => "syntax",
+        serde_json::error::Category::Data => "data",
+        serde_json::error::Category::Eof => "eof",
+    };
+    format!(
+        "{} error at line {} column {}",
+        kind,
+        error.line(),
+        error.column()
+    )
 }
 
 /// A credential name must be exactly one plain file name: non-empty, no
@@ -1138,6 +1164,45 @@ mod envelope_bridge_tests {
                 _
             )))
         ));
+    }
+
+    /// Rust-review P1 (S5a FAIL item): serde's Display embeds the
+    /// offending VALUE verbatim — a misprovisioned session slot holding a
+    /// password where the envelope expects a number rides the refusal as
+    /// `... invalid type: string "hunter2-super-secret-password",
+    /// expected u32 ...`, falsifying this module's never-carry-the-value
+    /// promise the moment it reaches daemon error logs. The probe embeds
+    /// a distinctive wrong-typed value and asserts the refusal names the
+    /// error KIND and its line/column position, never the bytes.
+    #[test]
+    fn parse_refusals_carry_kind_and_position_but_never_the_value() {
+        let envelope = SessionEnvelope::new(creds("acc-1")).unwrap();
+        let slot = json!({
+            // A password where the schema expects a `u32`.
+            "schema_version": "hunter2-super-secret-password",
+            "envelope_generation": 1,
+            "source_digest": envelope.source_digest,
+            "credentials": creds("acc-1"),
+        });
+        let secret = TestSecret::ingress(slot.to_string());
+        let err = parse_session_envelope(&secret)
+            .expect_err("a wrong-typed schema_version must not parse");
+        assert!(
+            matches!(
+                err,
+                CredentialInputError::Envelope(SessionEnvelopeError::Parse(_))
+            ),
+            "must be the envelope Parse refusal: {err}"
+        );
+        let message = err.to_string();
+        assert!(
+            !message.contains("hunter2-super-secret-password"),
+            "the refusal Display embeds the credential value: {message}"
+        );
+        assert!(
+            message.contains("data") && message.contains("line") && message.contains("column"),
+            "the refusal must name the error kind and its position: {message}"
+        );
     }
 
     /// End-to-end (root-gated with the tree): the `session` credential
