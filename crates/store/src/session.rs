@@ -24,6 +24,13 @@
 //!   payload it attests (integrity of the pair, not secrecy: the file
 //!   is mode 0600 and its contents are still credentials).
 //!
+//! `Debug` is manual and redacted: the metadata fields render by name,
+//! `credentials` renders `[redacted]` — an envelope is credentials, and
+//! the derived impl printed the access token into every `{:?}` of one
+//! (S5a sec verdict, landed S5b; pinned by
+//! `debug_names_metadata_but_never_the_credentials` and the
+//! loaded-envelope arm beside it).
+//!
 //! Persistence follows the `state.rs` precedent: write a sibling temp
 //! file, fsync, rename over the target — with the one hardening this
 //! document needs over the daemon state file: the temp file is created
@@ -53,7 +60,12 @@ pub const SESSION_SCHEMA_VERSION: u32 = 1;
 static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// The versioned envelope around serialized Muon session credentials.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Debug` is manual and redacted (S5a sec verdict, landed S5b): the
+/// metadata fields render by name, `credentials` renders `[redacted]` —
+/// the derived impl printed the access token into every `{:?}` of an
+/// envelope (panic messages, `unwrap` contexts, debug logs).
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SessionEnvelope {
     /// The envelope format version ([`SESSION_SCHEMA_VERSION`]).
@@ -62,8 +74,25 @@ pub struct SessionEnvelope {
     pub envelope_generation: u64,
     /// SHA-256 (hex) over the canonical serialization of `credentials`.
     pub source_digest: String,
-    /// The serialized Muon `SessionCredentials`, verbatim.
+    /// The serialized Muon `SessionCredentials`, verbatim. Never
+    /// rendered by `Debug` (see the type documentation).
     pub credentials: serde_json::Value,
+}
+
+/// The redaction placeholder — same spelling as the S1/S4 contract's
+/// `[redacted]` (this crate cannot name `protonwire-core`'s constant:
+/// core depends on store).
+const DEBUG_REDACTED: &str = "[redacted]";
+
+impl std::fmt::Debug for SessionEnvelope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionEnvelope")
+            .field("schema_version", &self.schema_version)
+            .field("envelope_generation", &self.envelope_generation)
+            .field("source_digest", &self.source_digest)
+            .field("credentials", &DEBUG_REDACTED)
+            .finish()
+    }
 }
 
 /// Failures of the session envelope store.
@@ -602,6 +631,64 @@ mod tests {
             }
             other => panic!("expected Parse, got {other:?}"),
         }
+    }
+
+    /// S5a sec verdict, final deferred obligation (landed S5b): the
+    /// DERIVED `Debug` rendered the embedded credentials verbatim — the
+    /// access token rode every `{:?}` of an envelope (panic messages,
+    /// `unwrap` contexts, any debug log formatting one). RED (observed
+    /// first against the derived impl): this test failed with the token
+    /// in the rendered string. GREEN: metadata fields stay NAMED
+    /// (`schema_version`, `envelope_generation`, `source_digest`) while
+    /// `credentials` renders `[redacted]` — the redaction is
+    /// field-targeted, not a blank.
+    #[test]
+    fn debug_names_metadata_but_never_the_credentials() {
+        let envelope = SessionEnvelope::new(creds("acc-super-secret-0001")).unwrap();
+        let rendered = format!("{envelope:?}");
+        for fragment in ["acc-super-secret-0001", "refresh-1", "uid-1", "user-1"] {
+            assert!(
+                !rendered.contains(fragment),
+                "Debug must never render credential bytes ({fragment}): {rendered}"
+            );
+        }
+        assert!(
+            rendered.contains("[redacted]"),
+            "the credentials field renders the placeholder: {rendered}"
+        );
+        for field in ["schema_version", "envelope_generation", "source_digest"] {
+            assert!(
+                rendered.contains(field),
+                "the metadata field {field} stays named: {rendered}"
+            );
+        }
+    }
+
+    /// The canary-style arm of the same pin: an envelope LOADED from disk
+    /// (the shape a daemon log line or panic would format) debug-renders
+    /// without the token. The full T-32 canary harness (a real tracing
+    /// writer capture) lives in `protonwire-core`'s redact suite; this is
+    /// the store-side pin that the capture source — the `{:?}` of a
+    /// loaded envelope — is clean by construction.
+    #[test]
+    fn a_loaded_envelope_never_debugs_its_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionEnvelopeStore::new(dir.path().join("session.json"));
+        let envelope = SessionEnvelope::new(creds("acc-loaded-secret-0002")).unwrap();
+        store.save(&envelope).unwrap();
+        let loaded = store.load().unwrap().expect("envelope on disk");
+        let captured = format!("{loaded:?}");
+        assert!(
+            !captured.contains("acc-loaded-secret-0002") && !captured.contains("refresh-1"),
+            "a loaded envelope debug-renders its credentials: {captured}"
+        );
+        assert!(captured.contains("[redacted]"), "placeholder: {captured}");
+        assert!(
+            captured.contains("schema_version")
+                && captured.contains("envelope_generation")
+                && captured.contains("source_digest"),
+            "metadata stays named: {captured}"
+        );
     }
 
     /// The wrap-the-serialized-credentials contract (spike memo Q2): the
