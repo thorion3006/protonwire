@@ -281,6 +281,15 @@ pub enum ApiError {
     /// refusals (S4): the client surfaces orchestrate the order.
     #[error("invalid adapter state: {0}")]
     InvalidState(&'static str),
+    /// The upstream refused the request for pacing reasons (429/503
+    /// class; the S9 wire-fixture obligation tracked since S6).
+    /// `retry_after_seconds` carries the parsed `Retry-After` delay
+    /// when the API supplied a usable one — the SECONDS form only,
+    /// clamped at the adapter's parse seam; `None` (absent, empty, or
+    /// the refused HTTP-date form) still classifies as rate-limited:
+    /// the S7 scheduler suppresses to the greatest-of floor per Q4.
+    #[error("rate limited by the upstream")]
+    RateLimited { retry_after_seconds: Option<u64> },
     /// The Proton API transport failed.
     #[error("transport failure: {0}")]
     Transport(String),

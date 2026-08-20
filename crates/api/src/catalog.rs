@@ -44,6 +44,47 @@ pub const CATALOG_PATH: &str = "/vpn/logicals";
 /// MiB; 30 s is deliberately generous while still bounded).
 pub const CATALOG_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Upper bound applied to a parsed `Retry-After` delay at this seam
+/// (S9 sec-tracked clamp): 30 days.
+///
+/// The availability-vs-PRD trade, recorded: the PRD mandates HONORING
+/// Proton's `Retry-After` (ER-16 — a signalled rate limit outranks even
+/// a confirmed manual refresh), so the clamp never touches an honest
+/// delay; it bounds only the hostile shape. An unclamped
+/// `Retry-After: 1000000000` (~31,700 years) would permanently
+/// suppress the single-flight scheduler — persisted, immune to restart
+/// and confirmation — converting one hostile response into a permanent
+/// denial of the server catalog, which the availability side of the
+/// PRD cannot accept either. Thirty days is far past every honest
+/// Proton delay observed (seconds to days) and short enough that the
+/// floor survives an operator's attention span; the three-hour
+/// greatest-of floor still applies beneath it either way.
+pub const RETRY_AFTER_CEILING_SECONDS: u64 = 30 * 24 * 60 * 60;
+
+/// Parses one `Retry-After` header value (S9, tracked since S6).
+///
+/// Only the SECONDS form (`digits`) is honored. The HTTP-date form is
+/// REFUSED — disclosed: pinned Muon surfaces no date parser, and
+/// deriving "now + delta" from a local wall clock that may be wrong
+/// (the S7 rollback guard exists because it can be) would fabricate a
+/// suppression deadline the upstream never sent. A refusal yields
+/// `None`, which STILL classifies the response as rate-limited: the
+/// scheduler mints the greatest-of floor (Q4 — a delay-less rate limit
+/// is still a rate limit), so refusing the date form is fail-closed,
+/// not a bypass. Every parsed value is clamped at
+/// [`RETRY_AFTER_CEILING_SECONDS`] (see its doc for the trade).
+fn parse_retry_after(value: Option<&str>) -> Option<u64> {
+    // Parsed as u128 so a delay beyond u64's range CLAMPS (it is
+    // certainly past the ceiling) instead of degrading to the floor —
+    // only non-numeric shapes (the refused date form, garbage) refuse.
+    let seconds = value?.trim().parse::<u128>().ok()?;
+    Some(
+        u64::try_from(seconds)
+            .unwrap_or(u64::MAX)
+            .min(RETRY_AFTER_CEILING_SECONDS),
+    )
+}
+
 /// One in-flight catalog request, as presented to the blocking bridge.
 pub type FetchFuture = Pin<Box<dyn Future<Output = muon::Result<muon::ProtonResponse>>>>;
 
@@ -102,6 +143,26 @@ impl CatalogApi for MuonCatalog {
     fn fetch(&self, etag: Option<&str>) -> Result<CatalogFetch, ApiError> {
         let res = (self.send)(Self::catalog_request(etag))
             .map_err(|e| ApiError::Transport(format!("catalog transport failure: {e}")))?;
+        // The pacing classification runs BEFORE `ok()` (which consumes
+        // the response): a 429/503 is a transport-level SUCCESS whose
+        // headers carry the scheduler's suppression input (S9, the
+        // obligation tracked since S6). Both statuses map to
+        // [`ApiError::RateLimited`] — a 503 with no usable
+        // `Retry-After` still rate-limits (Q4: `None` suppresses to
+        // the floor).
+        let status = res.status();
+        if status == muon::http::Status::TOO_MANY_REQUESTS
+            || status == muon::http::Status::SERVICE_UNAVAILABLE
+        {
+            let retry_after = res
+                .headers()
+                .get("retry-after")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| parse_retry_after(Some(value)));
+            return Err(ApiError::RateLimited {
+                retry_after_seconds: retry_after,
+            });
+        }
         // ok() accepts 3xx, so the 304 reaches this layer (spike Q4).
         let res = res.ok().map_err(|err| {
             ApiError::Transport(format!(
@@ -194,10 +255,21 @@ mod wire_tests {
 
         /// The catalog response.
         fn catalog(status: &'static str, etag: Option<&str>, body: Vec<u8>) -> Self {
+            let extra = etag
+                .map(|etag| vec![("ETag", etag.to_owned())])
+                .unwrap_or_default();
+            Self::catalog_with_headers(status, extra, body)
+        }
+
+        /// The catalog response with arbitrary extra headers (the
+        /// rate-limit fixtures' `Retry-After`).
+        fn catalog_with_headers(
+            status: &'static str,
+            extra: Vec<(&'static str, String)>,
+            body: Vec<u8>,
+        ) -> Self {
             let mut headers = vec![("Content-Type", "application/json".into())];
-            if let Some(etag) = etag {
-                headers.push(("ETag", etag.to_owned()));
-            }
+            headers.extend(extra);
             Self {
                 method: "GET",
                 path: CATALOG_PATH,
@@ -587,6 +659,13 @@ mod wire_tests {
         let sdk = test_sdk();
 
         let session = rt.block_on(async {
+            // ER-17, aligned with production (the S4 adapter builds its
+            // client with `RetryPolicy::never()`): without this the
+            // default policy makes muon sleep-and-retry a 429/503 in
+            // place, and the rate-limit fixtures would time out inside
+            // the transport instead of delivering the classified
+            // response. No automatic retries anywhere on this client.
+            let retry = muon::common::RetryPolicy::default().never();
             let client = muon::Client::builder(app, env)
                 .with_operating_system(
                     TestOs {
@@ -599,6 +678,7 @@ mod wire_tests {
                     TestRng(0x5EED),
                 )
                 .with_multi_thread_executor(TokioExecutor)
+                .retry_policy(retry)
                 .without_persistence::<()>()
                 .without_cookie_store()
                 .register_sdk(sdk.clone())
@@ -708,5 +788,110 @@ mod wire_tests {
             }
             other => panic!("expected Transport failure, got {other:?}"),
         }
+    }
+
+    /// S9 obligation (tracked since S6, the 429/503 wire-fixture lane):
+    /// a 429 carrying `Retry-After` in the SECONDS form maps to
+    /// [`ApiError::RateLimited`] with the parsed delay — the S7
+    /// scheduler's suppression input. The loopback seam scripts the
+    /// anonymous-session mint, then the 429.
+    #[test]
+    fn fetch_maps_429_with_retry_after_seconds() {
+        let (handle, port, seen) = spawn_responder(vec![
+            Step::anon_session(),
+            Step::catalog_with_headers(
+                "429 Too Many Requests",
+                vec![("Retry-After", "120".to_owned())],
+                Vec::new(),
+            ),
+        ]);
+        let (adapter, _rt) = adapter_against(port);
+
+        let err = adapter
+            .fetch(None)
+            .expect_err("429 must refuse, never fabricate");
+        handle.join().expect("responder thread");
+
+        match err {
+            ApiError::RateLimited {
+                retry_after_seconds,
+            } => {
+                assert_eq!(retry_after_seconds, Some(120));
+            }
+            other => panic!("expected RateLimited, got {other:?}"),
+        }
+
+        let requests = seen.lock().unwrap();
+        assert_eq!(requests.len(), 2, "mint + refused fetch: {requests:?}");
+        assert_eq!(requests[1].path, CATALOG_PATH);
+    }
+
+    /// S9 obligation (tracked since S6): a 503 with NO `Retry-After`
+    /// still maps to [`ApiError::RateLimited`], with `None` for the
+    /// delay — the scheduler's Q4 rule suppresses to the greatest-of
+    /// floor when the API supplies no usable delay (a delay-less rate
+    /// limit is still a rate limit).
+    #[test]
+    fn fetch_maps_503_without_retry_after() {
+        let (handle, port, _seen) = spawn_responder(vec![
+            Step::anon_session(),
+            Step::catalog("503 Service Unavailable", None, Vec::new()),
+        ]);
+        let (adapter, _rt) = adapter_against(port);
+
+        let err = adapter.fetch(None).expect_err("503 must refuse");
+        handle.join().expect("responder thread");
+
+        match err {
+            ApiError::RateLimited {
+                retry_after_seconds,
+            } => {
+                assert_eq!(retry_after_seconds, None);
+            }
+            other => panic!("expected RateLimited, got {other:?}"),
+        }
+    }
+
+    /// The parse seam's unit pins (no wire needed): the seconds form
+    /// parses; the HTTP-date form is REFUSED (disclosed: pinned Muon
+    /// surfaces no date parser and fabricating one from a wall clock
+    /// that may be wrong is worse than the floor — `None` still
+    /// suppresses per Q4); whitespace tolerates nothing hostile; and
+    /// the sec-tracked CLAMP bounds a hostile `Retry-After` at
+    /// [`RETRY_AFTER_CEILING_SECONDS`].
+    #[test]
+    fn retry_after_parsing_and_the_availability_clamp() {
+        // The seconds form.
+        assert_eq!(parse_retry_after(Some("120")), Some(120));
+        assert_eq!(parse_retry_after(Some("0")), Some(0));
+        // Absent, empty, and the refused HTTP-date form all yield None.
+        assert_eq!(parse_retry_after(None), None);
+        assert_eq!(parse_retry_after(Some("")), None);
+        assert_eq!(
+            parse_retry_after(Some("Wed, 21 Oct 2026 07:28:00 GMT")),
+            None,
+            "the HTTP-date form is refused with a disclosure, never guessed"
+        );
+        assert_eq!(parse_retry_after(Some("soon")), None);
+        // The clamp: a hostile delay must not suppress forever.
+        assert_eq!(
+            parse_retry_after(Some("1000000000")),
+            Some(RETRY_AFTER_CEILING_SECONDS),
+            "a hostile Retry-After is clamped at the ceiling, never honored verbatim"
+        );
+        assert_eq!(
+            parse_retry_after(Some("18446744073709551616")),
+            Some(RETRY_AFTER_CEILING_SECONDS),
+            "a delay beyond u64's range clamps — it is certainly past the ceiling"
+        );
+        // A delay exactly at the ceiling survives; one past it clamps.
+        assert_eq!(
+            parse_retry_after(Some(&RETRY_AFTER_CEILING_SECONDS.to_string())),
+            Some(RETRY_AFTER_CEILING_SECONDS)
+        );
+        assert_eq!(
+            parse_retry_after(Some(&(RETRY_AFTER_CEILING_SECONDS + 1).to_string())),
+            Some(RETRY_AFTER_CEILING_SECONDS)
+        );
     }
 }
