@@ -42,6 +42,45 @@ pub fn resync_marker_reaches(version: u32) -> bool {
     version >= RESYNC_MARKER_INTRODUCED_IN
 }
 
+/// Protocol version that introduced the M2 daemon-emitted event family:
+/// [`Event::CatalogRefreshed`], [`Event::AccountChanged`], and
+/// [`Event::SchedulerNotice`] — the S2 wire shapes, first actually
+/// EMITTED by the S9 daemon wiring. Like the resync marker, the family
+/// landed inside version 1 (nothing has shipped; distribution is
+/// license-blocked), so every in-tree client understands it; the
+/// declared constant exists so the outbound fan-out filters by DECLARED
+/// introduction version (the same registration discipline
+/// [`RESYNC_MARKER_INTRODUCED_IN`] documents) instead of an ad-hoc
+/// comparison, and the next event kind registers beside these.
+pub const M2_EVENTS_INTRODUCED_IN: u32 = 1;
+
+/// Per-version outbound filter for the M2 event family (the S2/S7-sec
+/// tracked obligation): a session negotiated below the family's
+/// introduction version must not receive these events — a peer that
+/// predates them recovers through the ordinary sequence-gap
+/// resynchronization on the next event that does reach it. Withheld
+/// events are dropped, not downgraded: no encoding of an
+/// unknown-variant tagged enum exists that such a peer could parse.
+pub fn m2_events_reach(version: u32) -> bool {
+    version >= M2_EVENTS_INTRODUCED_IN
+}
+
+/// The outbound fan-out's one per-version predicate for a real event:
+/// which sessions (by their hello-negotiated version) may receive it.
+/// Reserved outbound markers (the X4 resync seq) stay on their own
+/// filter — they ride an existing wire shape, not an [`Event`] variant
+/// a peer must name. This is the registration point every future event
+/// kind extends; adding a kind without registering its introduction
+/// version here is the exact drift the S2/S7 gate exists to prevent.
+pub fn event_reaches(version: u32, event: &Event) -> bool {
+    match event {
+        Event::StateChanged { .. } | Event::Notice { .. } => true,
+        Event::CatalogRefreshed { .. } | Event::AccountChanged | Event::SchedulerNotice { .. } => {
+            m2_events_reach(version)
+        }
+    }
+}
+
 /// Envelope for every daemon-pushed event. `seq` is monotonic per daemon
 /// process lifetime; a client that observes a gap must resynchronize with a
 /// [`crate::Request::GetState`] request (PRD FR-127D). The one value a real
@@ -191,6 +230,62 @@ mod tests {
         );
         assert!(resync_marker_reaches(RESYNC_MARKER_INTRODUCED_IN));
         assert!(resync_marker_reaches(crate::PROTOCOL_VERSION));
+    }
+
+    /// S9 (the S2/S7-sec tracked obligation): the M2 event family is
+    /// REGISTERED with a declared introduction version and the outbound
+    /// predicate withholds it below that version — the same discipline
+    /// the resync marker's test above pins. The pre-family peer is
+    /// forced (the handshake refuses real versions below 1, which is
+    /// exactly why the whole family landing inside the unshipped
+    /// version 1 is free); a withheld event is dropped, never
+    /// downgraded, and the M1 shapes always reach everyone.
+    #[test]
+    fn m2_events_are_withheld_below_their_introduction_version() {
+        assert_eq!(
+            M2_EVENTS_INTRODUCED_IN, 1,
+            "the family landed inside protocol version 1 (unshipped)"
+        );
+        let m2_events = [
+            Event::CatalogRefreshed {
+                result: CatalogRefreshResult::Changed,
+            },
+            Event::AccountChanged,
+            Event::SchedulerNotice {
+                level: NoticeLevel::Warning,
+                message: "suppressed".into(),
+            },
+        ];
+        for event in &m2_events {
+            assert!(
+                event_reaches(M2_EVENTS_INTRODUCED_IN, event),
+                "{event:?} must reach its introduction version"
+            );
+            assert!(
+                event_reaches(crate::PROTOCOL_VERSION, event),
+                "{event:?} must reach the current protocol version"
+            );
+            assert!(
+                !event_reaches(M2_EVENTS_INTRODUCED_IN - 1, event),
+                "{event:?} must be withheld below its introduction version"
+            );
+        }
+        // The M1 shapes predate the family machinery: they reach every
+        // negotiable version unconditionally.
+        let m1_events = [
+            Event::StateChanged {
+                from: VpnState::Disconnected,
+                to: VpnState::Connected,
+            },
+            Event::Notice {
+                level: NoticeLevel::Info,
+                message: "m1".into(),
+            },
+        ];
+        for event in &m1_events {
+            assert!(event_reaches(0, event), "{event:?} is version-free");
+            assert!(event_reaches(u32::MAX, event));
+        }
     }
 
     /// M2 S2 additive events: the wire shapes for the catalog-refresh

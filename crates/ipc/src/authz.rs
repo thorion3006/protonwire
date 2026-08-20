@@ -23,7 +23,22 @@ pub fn required_role(request: &Request) -> IpcRole {
         Request::Ping { .. }
         | Request::GetState
         | Request::Connect { .. }
-        | Request::Disconnect => IpcRole::AnyUser,
+        | Request::Disconnect
+        // M2 S9: the servers/account/credential surface is user-level —
+        // the scheduler's pacing and the confirmation ceremony protect
+        // the upstream, the peer-secret boundary protects the values,
+        // and the daemon is the single-account privileged host
+        // (per-UID account namespacing rides the per-UID overlay
+        // milestone).
+        | Request::ServersList
+        | Request::ServersRefresh { .. }
+        | Request::BeginLogin { .. }
+        | Request::SubmitTwoFactor { .. }
+        | Request::SubmitFidoPayload { .. }
+        | Request::RefreshSession
+        | Request::Logout
+        | Request::SubmitCredential { .. }
+        | Request::GetAccount => IpcRole::AnyUser,
         Request::Shutdown => IpcRole::Admin,
     }
 }
@@ -74,6 +89,43 @@ mod tests {
             Request::Disconnect,
         ] {
             assert_eq!(required_role(&req), IpcRole::AnyUser);
+        }
+        assert!(authorize(IpcRole::AnyUser, &peer(1000)).is_ok());
+    }
+
+    /// M2 S9: the servers/account/credential surface is user-level —
+    /// every new method requires only [`IpcRole::AnyUser`]; the
+    /// upstream-protection and secret-handling guarantees live in the
+    /// daemon handler, not the socket role.
+    #[test]
+    fn s9_surface_requests_allow_any_user() {
+        for req in [
+            Request::ServersList,
+            Request::ServersRefresh {
+                confirmation_token: None,
+            },
+            Request::BeginLogin {
+                username: protonwire_frontend_api::SecretParam::new("u"),
+                password: protonwire_frontend_api::SecretParam::new("p"),
+            },
+            Request::SubmitTwoFactor {
+                code: protonwire_frontend_api::SecretParam::new("123456"),
+            },
+            Request::SubmitFidoPayload {
+                client_data: protonwire_frontend_api::SecretParam::new("cd"),
+                authenticator_data: protonwire_frontend_api::SecretParam::new("ad"),
+                signature: protonwire_frontend_api::SecretParam::new("sig"),
+                credential_id: vec![1, 2, 3],
+            },
+            Request::RefreshSession,
+            Request::Logout,
+            Request::SubmitCredential {
+                name: "session".into(),
+                value: protonwire_frontend_api::SecretParam::new("v"),
+            },
+            Request::GetAccount,
+        ] {
+            assert_eq!(required_role(&req), IpcRole::AnyUser, "{req:?}");
         }
         assert!(authorize(IpcRole::AnyUser, &peer(1000)).is_ok());
     }

@@ -169,6 +169,10 @@ pub struct HelloError {
 /// Requests the daemon accepts (PRD FR-127). Milestone 1 implements
 /// `Ping`/`GetState` end to end and returns a typed
 /// [`RpcErrorCode::NotImplemented`] refusal for the connection lifecycle.
+/// Milestone 2 S9 adds the servers/account/credential surface: the
+/// catalog reads and scheduler-paced refresh, the login family over the
+/// Muon adapter, the interactive credential submissions feeding the S5a
+/// input source, and the account snapshot behind `account --json`.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "method", content = "params", rename_all = "kebab-case")]
 pub enum Request {
@@ -185,6 +189,104 @@ pub enum Request {
     Disconnect,
     /// Stop the daemon. Requires administrator (UID 0) peer credentials.
     Shutdown,
+    /// Serve the cached server catalog (FR-9/FR-10) — no upstream
+    /// request; the daemon answers from the strict-loaded cache and
+    /// reports `None` fields when nothing is cached yet.
+    ServersList,
+    /// Refresh the server catalog through the single-flight scheduler
+    /// (FR-11/FR-13C). An early refresh is refused with
+    /// [`RpcErrorCode::ConfirmationRequired`] carrying the typed
+    /// [`ConfirmationRequirement`]; the confirmed retry echoes its
+    /// single-use token here.
+    ServersRefresh {
+        /// The single-use confirmation token from a prior
+        /// [`RpcErrorCode::ConfirmationRequired`] refusal, when
+        /// confirming an early refresh (FR-13I).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        confirmation_token: Option<String>,
+    },
+    /// Begin SRP username/password login (PRD 7.1). Refused with
+    /// `invalid state` semantics (see [`RpcErrorCode::InvalidParams`])
+    /// when a session already exists or a second-factor challenge is
+    /// in progress — the client surfaces orchestrate the order.
+    BeginLogin {
+        /// The account username.
+        username: SecretParam,
+        /// The account password.
+        password: SecretParam,
+    },
+    /// Continue a login paused at the 2FA step with a TOTP code
+    /// (PRD 7.1). Only the 6–8 digit TOTP shape is submittable;
+    /// recovery codes fail closed as
+    /// [`RpcErrorCode::UnsupportedChallenge`].
+    SubmitTwoFactor {
+        /// The TOTP code.
+        code: SecretParam,
+    },
+    /// Continue a login paused at the 2FA step with a WebAuthn/FIDO2
+    /// assertion assembled by the client ceremony (PRD 7.1). Base64
+    /// fields as on the wire.
+    SubmitFidoPayload {
+        /// `PublicKeyCredential.clientDataJSON`, base64.
+        client_data: SecretParam,
+        /// Authenticator data, base64.
+        authenticator_data: SecretParam,
+        /// Assertion signature, base64.
+        signature: SecretParam,
+        /// The credential ID used.
+        credential_id: Vec<u8>,
+    },
+    /// Force a session token refresh (FR-3); invalidates any pending
+    /// second-factor challenge.
+    RefreshSession,
+    /// Log out: best-effort remote teardown, guaranteed local
+    /// credential removal (FR-4).
+    Logout,
+    /// Submit one credential value for the INTERACTIVE input source
+    /// (FR-7F, S5a): the value lands in the daemon's in-memory input
+    /// store keyed by short name (`session`, `username`, `password`)
+    /// and is consumed by the source's read path. Peer-secret
+    /// handling: the value crosses the daemon boundary into
+    /// zeroizing, never-registry storage.
+    SubmitCredential {
+        /// The credential short name.
+        name: String,
+        /// The credential value.
+        value: SecretParam,
+    },
+    /// The account snapshot behind `account --json` (FR-7H): login
+    /// status, credential input source and its startup read, the
+    /// configured writable store, and persistence health when the
+    /// writable-store half reports one.
+    GetAccount,
+}
+
+/// A secret value crossing the request boundary (a password, a TOTP
+/// code, a credential value, a FIDO2 assertion field): serializes as a
+/// plain JSON string — the local socket is the trusted transport — but
+/// its `Debug` renders `[redacted]` so no log line, panic message, or
+/// error formatter derived from a `{:?}` of a request ever carries it
+/// (the S0/S4 `Fido2Payload` precedent, applied at the wire layer).
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(transparent)]
+pub struct SecretParam(String);
+
+impl std::fmt::Debug for SecretParam {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SecretParam([redacted])")
+    }
+}
+
+impl SecretParam {
+    /// Wraps a secret value for a request.
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    /// Read access for the deliberate consumer (the daemon's ingress).
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
 }
 
 /// Successful request outcomes.
@@ -195,8 +297,243 @@ pub enum RequestResult {
     Pong { nonce: String },
     /// Reply to [`Request::GetState`].
     State { state: DaemonState },
-    /// Reply to [`Request::Disconnect`] / [`Request::Shutdown`].
+    /// Reply to [`Request::Disconnect`] / [`Request::Shutdown`] /
+    /// [`Request::Logout`] / [`Request::SubmitCredential`].
     Acknowledged,
+    /// Reply to [`Request::ServersList`]: the cached catalog revision,
+    /// served verbatim (FR-10 — the raw upstream body, never
+    /// rewritten), or all-`None` fields when nothing is cached yet.
+    Servers {
+        /// The cached revision's `ETag`, for diagnostics.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        etag: Option<String>,
+        /// When this revision was fetched (Unix seconds); absent when
+        /// no catalog is cached.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        fetched_unix: Option<u64>,
+        /// The raw catalog JSON body, byte-for-byte as cached.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        body: Option<String>,
+    },
+    /// Reply to [`Request::ServersRefresh`]: the scheduler's report.
+    ServersRefreshed {
+        /// What the refresh did and what follows.
+        report: ServersRefreshReport,
+    },
+    /// Reply to the login family ([`Request::BeginLogin`],
+    /// [`Request::SubmitTwoFactor`], [`Request::SubmitFidoPayload`]):
+    /// the next step of the flow, never a silent retry.
+    LoginStep {
+        /// The step's outcome.
+        step: LoginOutcome,
+    },
+    /// Reply to [`Request::RefreshSession`]: the post-refresh status.
+    LoginStatus {
+        /// The session's login status after the refresh.
+        status: SessionStatus,
+    },
+    /// Reply to [`Request::GetAccount`]: the account snapshot.
+    Account {
+        /// The account facts.
+        account: AccountStatus,
+    },
+}
+
+/// One step of a login-family flow on the wire (the S0/S4 adapter's
+/// `LoginStep`): a completed session, a continuation challenge, or a
+/// fail-closed stop with a stable reason.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "step", content = "data", rename_all = "kebab-case")]
+pub enum LoginOutcome {
+    /// The session is authenticated; login is complete.
+    Session {
+        /// The Proton user ID.
+        user_id: String,
+        /// The auth session ID.
+        session_id: String,
+    },
+    /// A second factor is required before the session is usable.
+    Challenge {
+        /// TOTP is enabled for the account.
+        totp_enabled: bool,
+        /// FIDO2 ceremony parameters when the account has registered
+        /// keys.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        fido2: Option<Fido2ChallengeParams>,
+    },
+    /// The flow has no authorized public continuation; the stable
+    /// reason is carried for the client surfaces (ER-17).
+    Blocked {
+        /// The stable refusal reason.
+        reason: LoginBlockedReason,
+    },
+}
+
+/// The WebAuthn ceremony parameters of a FIDO2 challenge (the wire
+/// mirror of the adapter's reduced challenge).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct Fido2ChallengeParams {
+    /// The ceremony challenge bytes.
+    pub challenge: Vec<u8>,
+    /// Allowed credential IDs (the account's registered FIDO2 keys).
+    pub allow_credentials: Vec<Vec<u8>>,
+}
+
+/// Stable reasons a login flow stops without a session (ER-17; the
+/// strings are recorded in `docs/official-parity.yaml`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum LoginBlockedReason {
+    /// Human verification: no authorized public surface.
+    HumanVerification,
+    /// Organization SSO: no authorized public surface.
+    OrganizationSso,
+    /// Guest login: not exposed by the pinned adapter on Linux.
+    GuestLogin,
+    /// Connection feedback: out of scope for the required flows.
+    Feedback,
+    /// A challenge shape the pinned adapter cannot continue (for
+    /// example recovery codes).
+    UnsupportedChallenge,
+}
+
+/// Login status of the daemon's account session (the wire mirror of
+/// the adapter's status).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum SessionStatus {
+    /// No session exists.
+    LoggedOut,
+    /// A session exists and is usable.
+    LoggedIn,
+    /// A session exists but must be refreshed before use.
+    NeedsRefresh,
+}
+
+/// The scheduler's report for one manual refresh (FR-11/FR-13I): what
+/// the refresh did, whether this caller joined an in-flight refresh,
+/// and the pacing facts that follow.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ServersRefreshReport {
+    /// What the refresh did.
+    pub outcome: ServersRefreshOutcome,
+    /// `true` when this caller joined an already in-flight refresh
+    /// (T-25 single-flight coalescing).
+    pub coalesced: bool,
+    /// The next automatic eligibility the refresh set (Unix seconds).
+    pub next_eligible_unix: u64,
+    /// The active suppression deadline after the refresh, if any
+    /// (ER-16: no path may bypass it).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub suppression_until_unix: Option<u64>,
+}
+
+/// What one catalog refresh did.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "outcome", content = "data", rename_all = "kebab-case")]
+pub enum ServersRefreshOutcome {
+    /// A new catalog revision was fetched and committed.
+    Changed {
+        /// The new revision's `ETag`, when the API sent one.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        etag: Option<String>,
+    },
+    /// The stored revision was still current (an ETag match).
+    NotModified,
+    /// The upstream rate-limited the refresh; the suppression
+    /// deadline in the report governs the next attempt.
+    RateLimited {
+        /// The `Retry-After` delay the API supplied, if any
+        /// (already clamped at the adapter's parse seam).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        retry_after_seconds: Option<u64>,
+    },
+    /// The refresh failed; `reason` is a stable, never-secret
+    /// description.
+    Failed {
+        /// Stable failure description.
+        reason: String,
+    },
+}
+
+/// The account snapshot behind `account --json` (FR-7H): never a
+/// secret, never a fabricated fact — absent fields mean unknown or
+/// not-yet-wired, per the S6 discipline.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct AccountStatus {
+    /// The daemon account session's login status.
+    pub login_status: SessionStatus,
+    /// The resolved credential INPUT source (FR-7F).
+    pub credential_source: CredentialSourceStatus,
+    /// The configured WRITABLE store (the S5b/S5c half).
+    pub writable_store: WritableStoreStatus,
+    /// Persistence health, when the writable-store half reports one
+    /// (ER-18). Absent until S5b/S5c wires the writable store — never
+    /// fabricated.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub persistence_health: Option<PersistenceHealth>,
+}
+
+/// The resolved credential input source (S5a's two arms).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "source", content = "data", rename_all = "kebab-case")]
+pub enum CredentialSourceStatus {
+    /// Values arrive over the IPC surface (the S9 interactive
+    /// provider).
+    Interactive,
+    /// Read-only import from the systemd credentials directory
+    /// (FR-7F/FR-7J).
+    Systemd {
+        /// The resolved `$CREDENTIALS_DIRECTORY`.
+        directory: String,
+        /// What the daemon's startup read of the preferred `session`
+        /// credential found (recorded once, never re-read mid-run).
+        startup_read: CredentialStartupRead,
+    },
+}
+
+/// The recorded outcome of the daemon's startup read of the systemd
+/// `session` credential — facts only, never value bytes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "read", content = "data", rename_all = "kebab-case")]
+pub enum CredentialStartupRead {
+    /// A current, integral FR-7C envelope was readable (the
+    /// transactional import into the writable store is S5b's; this is
+    /// the input-half fact).
+    Read {
+        /// The envelope's schema version.
+        schema_version: u32,
+    },
+    /// The read refused; `reason` is the typed refusal's value-free
+    /// summary (the recorded skip reason).
+    Refused {
+        /// Value-free refusal summary.
+        reason: String,
+    },
+}
+
+/// The configured writable-store facts (S5b/S5c own the resolution).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct WritableStoreStatus {
+    /// The declared `account.writable_session_store` vocabulary value.
+    pub declared: String,
+    /// The configured `account.writable_store_priority` order.
+    pub priority: Vec<String>,
+}
+
+/// Writable-store persistence health (ER-18). Carried only when the
+/// writable-store half is wired and reporting.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum PersistenceHealth {
+    /// Restart persistence is intact.
+    Healthy,
+    /// Restart persistence is at risk; operations requiring durable
+    /// login must fail. The reason is value-free.
+    Unhealthy {
+        /// Value-free failure summary.
+        reason: String,
+    },
 }
 
 /// Reply to a request.
@@ -692,5 +1029,223 @@ mod tests {
             .count(),
             64
         );
+    }
+
+    /// M2 S9: the servers/account/credential surface rides the flat
+    /// request shape — `method` kebab-case, params beside the id, the
+    /// confirmation token absent until a confirmed retry carries it.
+    #[test]
+    fn s9_request_methods_render_kebab_case() {
+        let json = serde_json::to_value(&Request::ServersList).unwrap();
+        assert_eq!(json, serde_json::json!({ "method": "servers-list" }));
+
+        let early = serde_json::to_value(&Request::ServersRefresh {
+            confirmation_token: None,
+        })
+        .unwrap();
+        // Characterization (serde's tag+content shape): a variant WITH
+        // fields always emits its `params` object, even when every
+        // field is skip-serialized — the tokenless refresh is
+        // `params: {}`, while the unit variants (ServersList, Logout,
+        // ...) carry no params at all (pinned above).
+        assert_eq!(
+            early,
+            serde_json::json!({ "method": "servers-refresh", "params": {} })
+        );
+        // And the encoding round-trips (the params-less encoding does
+        // NOT decode — serde's tag+content requires the content key for
+        // a variant with fields — so senders always emit `params`).
+        match serde_json::from_value::<Request>(early).unwrap() {
+            Request::ServersRefresh { confirmation_token } => {
+                assert_eq!(confirmation_token, None)
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        let confirmed = serde_json::to_value(&Request::ServersRefresh {
+            confirmation_token: Some("tok".into()),
+        })
+        .unwrap();
+        assert_eq!(
+            confirmed,
+            serde_json::json!({ "method": "servers-refresh", "params": { "confirmation_token": "tok" } })
+        );
+
+        for (request, method) in [
+            (&Request::RefreshSession, "refresh-session"),
+            (&Request::Logout, "logout"),
+            (&Request::GetAccount, "get-account"),
+        ] {
+            assert_eq!(
+                serde_json::to_value(request).unwrap()["method"],
+                method,
+                "{request:?}"
+            );
+        }
+    }
+
+    /// M2 S9: the secret-carrying request params serialize as plain
+    /// strings (the local socket is the transport) but NEVER render
+    /// through `Debug` — a log line, panic, or error formatter derived
+    /// from `{:?}` of a request must not disclose them (the S4
+    /// `Fido2Payload` precedent at the wire layer).
+    #[test]
+    fn secret_params_never_render_their_values() {
+        let request = Request::BeginLogin {
+            username: SecretParam::new("alice@example.com"),
+            password: SecretParam::new("hunter2-wire-pin"),
+        };
+        let rendered = format!("{request:?}");
+        assert!(!rendered.contains("hunter2-wire-pin"));
+        assert!(!rendered.contains("alice@example.com"));
+        assert!(rendered.contains("[redacted]"));
+
+        // On the wire they are plain strings, and they round-trip.
+        let json = serde_json::to_value(&request).unwrap();
+        assert_eq!(json["params"]["password"], "hunter2-wire-pin");
+        let back: Request = serde_json::from_value(json).unwrap();
+        match back {
+            Request::BeginLogin { username, password } => {
+                assert_eq!(username.expose(), "alice@example.com");
+                assert_eq!(password.expose(), "hunter2-wire-pin");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        let submit = Request::SubmitCredential {
+            name: "session".into(),
+            value: SecretParam::new("envelope-secret-bytes"),
+        };
+        let rendered = format!("{submit:?}");
+        assert!(!rendered.contains("envelope-secret-bytes"));
+        assert!(rendered.contains("[redacted]"));
+    }
+
+    /// M2 S9: the response-side wire shapes — the servers snapshot
+    /// (absent fields stay off the wire when nothing is cached), the
+    /// refresh report, the login steps, and the account snapshot's
+    /// never-fabricated optional facts.
+    #[test]
+    fn s9_result_wire_shapes() {
+        // Nothing cached: all-None fields stay off the wire.
+        let empty = serde_json::to_value(RequestResult::Servers {
+            etag: None,
+            fetched_unix: None,
+            body: None,
+        })
+        .unwrap();
+        assert_eq!(empty["result"], "servers");
+        assert_eq!(empty["data"].as_object().map(|o| o.len()), Some(0));
+
+        let cached = serde_json::to_value(RequestResult::Servers {
+            etag: Some("\"rev-42\"".into()),
+            fetched_unix: Some(1_755_000_000),
+            body: Some("{\"LogicalServers\":[]}".into()),
+        })
+        .unwrap();
+        assert_eq!(cached["data"]["etag"], "\"rev-42\"");
+        assert_eq!(cached["data"]["fetched_unix"], 1_755_000_000);
+
+        // The refresh report mirrors the scheduler's facts.
+        let report = ServersRefreshReport {
+            outcome: ServersRefreshOutcome::RateLimited {
+                retry_after_seconds: Some(120),
+            },
+            coalesced: false,
+            next_eligible_unix: 1_755_010_800,
+            suppression_until_unix: Some(1_755_010_800),
+        };
+        let json = serde_json::to_value(RequestResult::ServersRefreshed { report }).unwrap();
+        assert_eq!(json["result"], "servers-refreshed");
+        // The nested outcome is itself tag+content: the delay rides the
+        // outcome's `data`.
+        assert_eq!(json["data"]["report"]["outcome"]["outcome"], "rate-limited");
+        assert_eq!(
+            json["data"]["report"]["outcome"]["data"]["retry_after_seconds"],
+            120
+        );
+        assert_eq!(json["data"]["report"]["coalesced"], false);
+        assert_eq!(json["data"]["report"]["next_eligible_unix"], 1_755_010_800);
+        let back: RequestResult = serde_json::from_value(json).unwrap();
+        assert!(matches!(
+            back,
+            RequestResult::ServersRefreshed {
+                report: ServersRefreshReport {
+                    outcome: ServersRefreshOutcome::RateLimited {
+                        retry_after_seconds: Some(120)
+                    },
+                    suppression_until_unix: Some(1_755_010_800),
+                    ..
+                }
+            }
+        ));
+
+        // The login steps: session, challenge (fido2 absent off the
+        // wire), and the stable blocked reasons. Each step is itself
+        // tag+content, so its fields ride the step's `data`.
+        let session = serde_json::to_value(RequestResult::LoginStep {
+            step: LoginOutcome::Session {
+                user_id: "uid-1".into(),
+                session_id: "sid-1".into(),
+            },
+        })
+        .unwrap();
+        assert_eq!(session["result"], "login-step");
+        assert_eq!(session["data"]["step"]["step"], "session");
+        assert_eq!(session["data"]["step"]["data"]["user_id"], "uid-1");
+        let challenge = serde_json::to_value(RequestResult::LoginStep {
+            step: LoginOutcome::Challenge {
+                totp_enabled: true,
+                fido2: None,
+            },
+        })
+        .unwrap();
+        assert_eq!(challenge["data"]["step"]["step"], "challenge");
+        assert_eq!(challenge["data"]["step"]["data"]["totp_enabled"], true);
+        assert!(challenge["data"]["step"]["data"].get("fido2").is_none());
+        for (reason, rendered) in [
+            (LoginBlockedReason::HumanVerification, "human-verification"),
+            (
+                LoginBlockedReason::UnsupportedChallenge,
+                "unsupported-challenge",
+            ),
+        ] {
+            assert_eq!(
+                serde_json::to_value(reason).unwrap(),
+                rendered,
+                "blocked reasons render kebab-case"
+            );
+        }
+
+        // The account snapshot: absent persistence health stays off
+        // the wire (never fabricated); the systemd arm carries the
+        // startup-read facts.
+        let account = serde_json::to_value(RequestResult::Account {
+            account: AccountStatus {
+                login_status: SessionStatus::LoggedOut,
+                credential_source: CredentialSourceStatus::Systemd {
+                    directory: "/run/credentials/protonwire.service".into(),
+                    startup_read: CredentialStartupRead::Refused {
+                        reason: "credential `session` is missing".into(),
+                    },
+                },
+                writable_store: WritableStoreStatus {
+                    declared: "auto".into(),
+                    priority: vec!["keyring".into(), "encrypted-local".into()],
+                },
+                persistence_health: None,
+            },
+        })
+        .unwrap();
+        assert_eq!(account["result"], "account");
+        let data = &account["data"]["account"];
+        assert_eq!(data["login_status"], "logged-out");
+        assert_eq!(data["credential_source"]["source"], "systemd");
+        assert_eq!(
+            data["credential_source"]["data"]["startup_read"]["read"],
+            "refused"
+        );
+        assert_eq!(data["writable_store"]["declared"], "auto");
+        assert!(data.get("persistence_health").is_none());
     }
 }

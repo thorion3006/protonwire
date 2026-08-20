@@ -134,6 +134,19 @@ impl DaemonCore {
                 // Intercepted by the daemon (admin-gated) before reaching core.
                 Err(CoreError::Internal("shutdown must be handled by the daemon".into()).into_rpc())
             }
+            // M2 S9: the servers/account/credential surface is owned by
+            // the daemon handler, which intercepts every one of those
+            // methods before delegation — core never sees them. This
+            // arm is the defensive refusal if one ever slips through
+            // (the S9 unit could not add wire variants without breaking
+            // this match; the wildcard trades a compile error for a
+            // typed refusal, and the M4 engine transition — which owns
+            // the next surface growth — is where this dispatch is
+            // revisited).
+            _ => Err(
+                CoreError::Internal("this request surface is handled by the daemon".into())
+                    .into_rpc(),
+            ),
         }
     }
 

@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use protonwire_frontend_api::{
     ClientMessage, EVENT_SEQ_RESYNC_NOW, Event, EventEnvelope, HelloAck, HelloError, NoticeLevel,
-    PROTOCOL_VERSION, Request, RequestResult, Response, RpcError, ServerMessage,
+    PROTOCOL_VERSION, Request, RequestResult, Response, RpcError, ServerMessage, event_reaches,
     resync_marker_reaches,
 };
 use tracing::{debug, info, warn};
@@ -73,6 +73,25 @@ fn forward_events(
         return; // session ended before hello; nothing to forward
     };
     for message in event_rx {
+        // S9 (the S2/S7-sec tracked obligation): the per-version
+        // outbound filter for real events. A session negotiated below
+        // an event family's DECLARED introduction version must not
+        // receive it — a peer that predates the shape recovers through
+        // the ordinary sequence-gap resynchronization on the next event
+        // that does reach it (the withheld event is dropped, never
+        // downgraded: there is no encoding of an unknown-variant tagged
+        // enum such a peer could parse). The M1 shapes and everything
+        // introduced at the session's version pass untouched, so today
+        // (every family introduced inside the unshipped version 1) no
+        // negotiable session is filtered — the gate is the registration
+        // discipline that keeps the NEXT family honest.
+        let deliverable = match &message {
+            ServerMessage::Event(envelope) => event_reaches(negotiated_version, &envelope.event),
+            _ => true,
+        };
+        if !deliverable {
+            continue;
+        }
         if forward_window.send_through(&forward_tx, message).is_err() {
             break;
         }
@@ -528,6 +547,14 @@ impl WriteWindow {
     /// A failed send leaks the reservation deliberately — a failed send
     /// means the writer channel's receiver is gone, so the session is
     /// ending and the window will never be consulted again.
+    ///
+    /// `result_large_err` allow: the M2 S9 wire growth pushed
+    /// `ServerMessage` past the lint's Err-size threshold. The error
+    /// value exists only on the writer-death path (never constructed in
+    /// steady state), boxing the wire enum would ripple through every
+    /// Clone and match, and the SendError payload is never inspected —
+    /// every caller matches `is_err()`.
+    #[allow(clippy::result_large_err)]
     fn send_through(
         &self,
         tx: &mpsc::SyncSender<ServerMessage>,
@@ -1211,6 +1238,70 @@ mod tests {
             "a forced pre-marker version must NOT receive the reserved seq — it \
              recovers through the ordinary sequence-gap resynchronization instead"
         );
+    }
+
+    /// S9 (the S2/S7-sec tracked obligation), forwarder-level pin: the
+    /// per-version outbound filter runs where production carries the
+    /// decision — the hello gate hands the forwarder the negotiated
+    /// version and the forwarder drops events below their DECLARED
+    /// introduction version. Same forced-version shape as the marker
+    /// test above (the handshake refuses real versions below 1, which
+    /// is why the whole M2 family landing inside the unshipped
+    /// version 1 is free). Red (behavioral, recorded): with the
+    /// `event_reaches` filter removed from the forwarder, the
+    /// forced-zero episode delivers the M2 event and this fails.
+    #[test]
+    fn m2_events_are_withheld_below_their_introduction_version_by_the_forwarder() {
+        /// One forwarded episode at `negotiated` over `event`: whether
+        /// the event crossed the writer channel.
+        fn delivers_at(negotiated: u32, event: Event) -> bool {
+            let (event_tx, event_rx) = mpsc::channel::<ServerMessage>();
+            let (writer_tx, writer_rx) = mpsc::sync_channel::<ServerMessage>(16);
+            let (gate_tx, gate_rx) = mpsc::sync_channel::<u32>(1);
+            let overflowed = Arc::new(AtomicBool::new(false));
+            let forwarder = {
+                let writer_tx = writer_tx.clone();
+                let window = Arc::new(WriteWindow::new());
+                std::thread::spawn(move || {
+                    forward_events(gate_rx, event_rx, writer_tx, window, overflowed)
+                })
+            };
+            event_tx
+                .send(ServerMessage::Event(EventEnvelope { seq: 3, event }))
+                .unwrap();
+            gate_tx.send(negotiated).unwrap();
+            let seen = match writer_rx.recv_timeout(Duration::from_millis(300)) {
+                Ok(ServerMessage::Event(_)) => true,
+                Ok(other) => panic!("unexpected frame: {other:?}"),
+                Err(mpsc::RecvTimeoutError::Timeout) => false,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    panic!("the forwarder died mid-episode")
+                }
+            };
+            drop(event_tx);
+            drop(writer_tx);
+            let _ = forwarder.join();
+            seen
+        }
+
+        let m2_event = Event::AccountChanged;
+        assert!(
+            delivers_at(1, m2_event.clone()),
+            "the introduction version receives the M2 event"
+        );
+        assert!(
+            !delivers_at(0, m2_event),
+            "a forced pre-family version must NOT receive the M2 event — it \
+             recovers through the ordinary sequence-gap resynchronization instead"
+        );
+        // The M1 shapes are version-free: every negotiable (and the
+        // forced pre-family) version receives them.
+        let m1_event = Event::Notice {
+            level: NoticeLevel::Info,
+            message: "m1 shape".into(),
+        };
+        assert!(delivers_at(0, m1_event.clone()));
+        assert!(delivers_at(1, m1_event));
     }
 
     /// Codex round 5 (P1): the writer thread exiting on a write timeout
