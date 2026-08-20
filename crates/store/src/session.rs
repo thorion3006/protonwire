@@ -139,10 +139,25 @@ impl SessionEnvelope {
     }
 }
 
+/// Reduces a serde error to its KIND and POSITION: `json data error at
+/// line 1 column 50`. The message text is dropped because serde's
+/// `invalid type` Display prints the offending VALUE — a password in a
+/// misprovisioned slot would land verbatim in the error string (S5a
+/// rust-review FAIL P1, identical arm probed there; this file's twin
+/// is fixed by the S5a lane).
+fn parse_error_kind_at(e: serde_json::Error) -> String {
+    format!(
+        "json {:?} error at line {} column {}",
+        e.classify(),
+        e.line(),
+        e.column()
+    )
+}
+
 /// Hex SHA-256 over the canonical (compact) serialization of `value`.
 fn canonical_digest(value: &serde_json::Value) -> Result<String, SessionEnvelopeError> {
-    let bytes =
-        serde_json::to_vec(value).map_err(|e| SessionEnvelopeError::Parse(e.to_string()))?;
+    let bytes = serde_json::to_vec(value)
+        .map_err(|e| SessionEnvelopeError::Parse(parse_error_kind_at(e)))?;
     use sha2::Digest as _;
     let digest = sha2::Sha256::digest(&bytes);
     Ok(digest.iter().map(|b| format!("{b:02x}")).collect())
@@ -186,7 +201,7 @@ impl SessionEnvelopeStore {
             ));
         }
         let envelope: SessionEnvelope = serde_json::from_slice(&bytes)
-            .map_err(|e| SessionEnvelopeError::Parse(e.to_string()))?;
+            .map_err(|e| SessionEnvelopeError::Parse(parse_error_kind_at(e)))?;
         if envelope.schema_version != SESSION_SCHEMA_VERSION {
             return Err(SessionEnvelopeError::UnsupportedSchema(
                 envelope.schema_version,
@@ -223,8 +238,8 @@ impl SessionEnvelopeStore {
                 });
             }
         }
-        let bytes =
-            serde_json::to_vec(envelope).map_err(|e| SessionEnvelopeError::Parse(e.to_string()))?;
+        let bytes = serde_json::to_vec(envelope)
+            .map_err(|e| SessionEnvelopeError::Parse(parse_error_kind_at(e)))?;
         if bytes.len() > MAX_SESSION_BYTES {
             return Err(SessionEnvelopeError::Parse(
                 "session document exceeds size cap".into(),
@@ -518,6 +533,41 @@ mod tests {
             SessionEnvelopeStore::new(&path).load(),
             Err(SessionEnvelopeError::Parse(_))
         ));
+    }
+
+    /// S5a rust-review FAIL P1 (identical arm, probed there): serde's
+    /// `invalid type` Display prints the offending VALUE — a password
+    /// in a misprovisioned slot landed verbatim in the error string.
+    /// The Parse refusal must carry kind and position only, never the
+    /// value. Pre-fix red: the message was `invalid type: string
+    /// "hunter2-super-secret-password", expected u32 ...`.
+    #[test]
+    fn parse_refusals_never_embed_the_offending_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.json");
+        // Misprovisioned: `schema_version` (a u32) carrying a
+        // password-shaped probe string, first in the document so the
+        // type error is the parse failure.
+        let doc = concat!(
+            r#"{"schema_version": "hunter2-super-secret-password","#,
+            r#""envelope_generation": 1,"#,
+            r#""source_digest": "00","#,
+            r#""credentials": {}}"#
+        );
+        std::fs::write(&path, doc).unwrap();
+        match SessionEnvelopeStore::new(&path).load() {
+            Err(SessionEnvelopeError::Parse(message)) => {
+                assert!(
+                    !message.contains("hunter2-super-secret-password"),
+                    "the offending value leaked into the parse refusal: {message}"
+                );
+                assert!(
+                    message.contains("line 1 column"),
+                    "the refusal must still name the position: {message}"
+                );
+            }
+            other => panic!("expected Parse, got {other:?}"),
+        }
     }
 
     /// The wrap-the-serialized-credentials contract (spike memo Q2): the
