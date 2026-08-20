@@ -571,6 +571,8 @@ impl Scheduler {
         persisted: protonwire_store::deadlines::SchedulerDeadlines,
         etag: Option<String>,
     ) -> Self {
+        let mut persisted = persisted;
+        Self::rederive_crash_pacing(&mut persisted);
         Self {
             config,
             clock,
@@ -587,6 +589,26 @@ impl Scheduler {
                 cache: None,
             }),
             cv: std::sync::Condvar::new(),
+        }
+    }
+
+    /// The crash-between-saves floor re-derivation (rust M1): the
+    /// pre-fetch save persists `last_request` but the floor-bumped
+    /// `next_eligible` only lands post-fetch, so a daemon crash-looping
+    /// inside that window loads a stale — or absent, on the first fetch
+    /// — eligibility that reads as "due" and refetches on every start.
+    /// The floor from the persisted request time is the minimum
+    /// survivable window: re-deriving it at construction can only push
+    /// eligibility further out, never shorten a greater surviving
+    /// deadline.
+    fn rederive_crash_pacing(persisted: &mut protonwire_store::deadlines::SchedulerDeadlines) {
+        let Some(last_request) = persisted.last_request_unix else {
+            return; // never fetched: the FR-13F bootstrap stays due
+        };
+        let floor = last_request.saturating_add(FRESHNESS_FLOOR_SECONDS);
+        if persisted.next_eligible_unix.is_none_or(|next| next < floor) {
+            persisted.next_eligible_unix = Some(floor);
+            persisted.next_eligible_source = Some(IntervalSource::ThreeHourFloor);
         }
     }
 
@@ -1761,6 +1783,63 @@ mod runtime_tests {
         );
     }
 
+    /// rust M1: the pre-fetch save persists `last_request` but the
+    /// floor-bumped `next_eligible` only lands post-fetch — a daemon
+    /// crash-looping inside that window must not refetch on every
+    /// start. Construction re-derives the minimum survivable window.
+    #[test]
+    fn restart_after_a_crash_between_saves_is_not_immediately_due() {
+        let dir = tempfile::tempdir().unwrap();
+        // The exact document the pre-fetch save leaves behind when the
+        // FIRST fetch crashes mid-flight: request recorded, eligibility
+        // still absent (`None` reads as "immediately due").
+        DeadlineStore::new(dir.path().join("deadlines.json"))
+            .save(&SchedulerDeadlines {
+                last_request_unix: Some(T0),
+                wall_high_water_unix: T0,
+                ..SchedulerDeadlines::default()
+            })
+            .unwrap();
+        let clock = VirtualClock::new(T0 + 60);
+        let fetch = FakeFetch::new(vec![not_modified()]);
+        let restarted = restart(&clock, &fetch, &dir);
+
+        assert_eq!(
+            restarted.refresh_automatic(),
+            AutomaticOutcome::NotDue {
+                next_eligible_unix: T0 + FRESHNESS_FLOOR_SECONDS
+            },
+            "a crash between the saves must not make every restart due"
+        );
+        assert_eq!(
+            fetch.calls(),
+            0,
+            "the crash-looping daemon refetches zero times"
+        );
+
+        // The re-derivation only ever pushes the window OUT: an
+        // eligibility already at or above the floor survives untouched
+        // (a longer suppression or configured window is not shortened).
+        let dir = tempfile::tempdir().unwrap();
+        DeadlineStore::new(dir.path().join("deadlines.json"))
+            .save(&SchedulerDeadlines {
+                last_request_unix: Some(T0),
+                next_eligible_unix: Some(T0 + 6 * 3600),
+                next_eligible_source: Some(IntervalSource::RetryAfter),
+                wall_high_water_unix: T0,
+                suppression_until_unix: Some(T0 + 6 * 3600),
+                ..SchedulerDeadlines::default()
+            })
+            .unwrap();
+        let restarted = restart(&clock, &fetch, &dir);
+        assert_eq!(restarted.next_due_unix(), Some(T0 + 6 * 3600));
+        assert_eq!(
+            restarted.persisted().next_eligible_source,
+            Some(IntervalSource::RetryAfter),
+            "a surviving greater deadline keeps its own source label"
+        );
+    }
+
     // --- Q4 / ER-16 / E2E-22: suppression --------------------------------------
 
     #[test]
@@ -1857,17 +1936,20 @@ mod runtime_tests {
     /// (mirroring the manual door's suppression check).
     #[test]
     fn the_automatic_door_refuses_directly_while_suppressed() {
-        let clock = VirtualClock::new(T0 + 60);
+        let clock = VirtualClock::new(T0 + 2 * 3600);
         let fetch = FakeFetch::new(vec![not_modified()]);
         let dir = tempfile::tempdir().unwrap();
         // The inconsistent shape the defense exists for: an eligibility
-        // that has already passed while a suppression is still active.
+        // consistent with its own floor (it survives construction's
+        // crash re-derivation) that has already passed, while a
+        // suppression beyond it is still active — the writer's
+        // next_eligible >= suppression derivation has been violated.
         let persisted = SchedulerDeadlines {
-            last_request_unix: Some(T0),
-            last_success_unix: Some(T0),
-            next_eligible_unix: Some(T0), // stale/passed — below suppression
+            last_request_unix: Some(T0 - 2 * 3600),
+            last_success_unix: Some(T0 - 2 * 3600),
+            next_eligible_unix: Some(T0 + 3600), // passed, below suppression
             next_eligible_source: Some(IntervalSource::ThreeHourFloor),
-            wall_high_water_unix: T0,
+            wall_high_water_unix: T0 + 2 * 3600,
             suppression_until_unix: Some(T0 + 4 * 3600),
             ..SchedulerDeadlines::default()
         };
