@@ -319,7 +319,7 @@ impl MemorySessionStore {
 /// The `encrypted-local` writable session store: the FR-7C envelope
 /// file under `/var/lib/protonwire`, beside the daemon state file.
 ///
-/// Construction is ConfigPaths-derived ONLY ([`from_paths`]) —
+/// Construction is ConfigPaths-derived ONLY ([`EncryptedLocalStore::from_paths`]) —
 /// production gets `/var/lib/protonwire/session.json`, tests get
 /// `ConfigPaths::rooted` — so there is exactly one way to address the
 /// store and no caller can aim it at an arbitrary file.
