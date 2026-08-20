@@ -151,7 +151,14 @@ pub struct DeadlineInputs {
     pub configured_interval_seconds: u64,
     /// A Proton-provided cache lifetime, when the API supplies one.
     pub proton_lifetime_seconds: Option<u64>,
-    /// A `Retry-After` delay observed at `now_unix` (seconds).
+    /// Whether the request was rate-limited at all (429/503 class),
+    /// independent of whether the API supplied a usable
+    /// `Retry-After` delay: a rate limit WITHOUT a delay still mints
+    /// the suppression floor (Q4: `None` suppresses to the
+    /// greatest-of floor).
+    pub rate_limited: bool,
+    /// A `Retry-After` delay observed at `now_unix` (seconds); only
+    /// meaningful together with [`Self::rate_limited`].
     pub retry_after_seconds: Option<u64>,
     /// The already-drawn non-negative jitter (0..=ceiling).
     pub jitter_seconds: u64,
@@ -210,7 +217,10 @@ pub fn next_deadline(inputs: &DeadlineInputs) -> Deadline {
     Deadline {
         next_eligible_unix: raw.saturating_add(inputs.jitter_seconds),
         source,
-        suppression_until_unix: inputs.retry_after_seconds.map(|_| raw),
+        // Q4: EVERY rate limit mints the suppression floor — the
+        // un-jittered greatest-of — including one that carried no
+        // Retry-After delay (None suppresses to the floor; qa P1-1).
+        suppression_until_unix: inputs.rate_limited.then_some(raw),
     }
 }
 
@@ -509,6 +519,17 @@ struct Inner {
     completed: Option<(u64, std::sync::Arc<RefreshReport>)>,
     token: Option<PendingToken>,
     rollback: RollbackTracker,
+    /// The production catalog cache (ConfigPaths-derived), when wired:
+    /// successful fetches write the new revision through it (FR-10/
+    /// FR-13B/FR-13E). `None` for test-only schedulers.
+    cache: Option<CacheState>,
+}
+
+/// The wired catalog cache and its current document.
+#[derive(Debug, Clone)]
+struct CacheState {
+    cache: protonwire_store::catalog::CatalogCache,
+    current: Option<protonwire_store::catalog::CachedCatalog>,
 }
 
 /// Which door a refresh came through (separate counters, FR-13I).
@@ -563,6 +584,7 @@ impl Scheduler {
                 completed: None,
                 token: None,
                 rollback: RollbackTracker::default(),
+                cache: None,
             }),
             cv: std::sync::Condvar::new(),
         }
@@ -646,6 +668,17 @@ impl Scheduler {
         {
             return AutomaticOutcome::NotDue {
                 next_eligible_unix: deadline,
+            };
+        }
+        // Defense-in-depth (sec P3, invariant-trust): the writer derives
+        // next_eligible >= suppression, but the automatic door must not
+        // bet on that derivation surviving every writer — an active
+        // suppression refuses directly, mirroring the manual door below.
+        if let Some(until) = guard.persisted.suppression_until_unix
+            && now.effective < until
+        {
+            return AutomaticOutcome::NotDue {
+                next_eligible_unix: until,
             };
         }
         AutomaticOutcome::Due(self.lead_refresh(guard, RefreshKind::Automatic))
@@ -806,6 +839,7 @@ impl Scheduler {
             // The adapter supplies no Proton cache lifetime today (spike
             // memo Q4/Q8); the input stays wired so S8 can feed it.
             proton_lifetime_seconds: None,
+            rate_limited: matches!(&fetched, Err(FetchFailure::RateLimited { .. })),
             retry_after_seconds: retry_after,
             jitter_seconds: jitter,
         });
@@ -959,6 +993,7 @@ mod tests {
             now_unix: 1_771_000_010,
             configured_interval_seconds: FRESHNESS_FLOOR_SECONDS,
             proton_lifetime_seconds: None,
+            rate_limited: false,
             retry_after_seconds: None,
             jitter_seconds: 0,
         }
@@ -1024,6 +1059,7 @@ mod tests {
     #[test]
     fn retry_after_wins_the_greatest_of_against_the_floor() {
         let inputs = DeadlineInputs {
+            rate_limited: true,
             retry_after_seconds: Some(FRESHNESS_FLOOR_SECONDS * 2),
             ..base_inputs()
         };
@@ -1042,6 +1078,7 @@ mod tests {
         // suppression floor still pins to the floor: a 429 never
         // *shortens* the suppression below the greatest-of.
         let inputs = DeadlineInputs {
+            rate_limited: true,
             retry_after_seconds: Some(60),
             ..base_inputs()
         };
@@ -1053,6 +1090,42 @@ mod tests {
         );
         // Without any Retry-After there is no suppression floor at all.
         assert_eq!(next_deadline(&base_inputs()).suppression_until_unix, None);
+    }
+
+    /// qa P1-1 (the documented Q4 contract): a rate limit WITHOUT a
+    /// `Retry-After` delay — `RateLimited { retry_after_seconds: None }`
+    /// — still suppresses to the un-jittered greatest-of floor. The
+    /// delay is optional; the rate limit itself is not.
+    #[test]
+    fn a_rate_limit_without_retry_after_still_pins_the_floor_suppression() {
+        let inputs = DeadlineInputs {
+            rate_limited: true,
+            retry_after_seconds: None,
+            ..base_inputs()
+        };
+        let deadline = next_deadline(&inputs);
+        assert_eq!(
+            deadline.suppression_until_unix,
+            Some(inputs.last_request_unix.unwrap() + FRESHNESS_FLOOR_SECONDS),
+            "None must suppress to the un-jittered greatest-of floor"
+        );
+        assert_eq!(deadline.source, IntervalSource::ThreeHourFloor);
+        // The suppression is the floor WITHOUT jitter: eligibility may
+        // sit above it by the drawn jitter, never below.
+        assert!(deadline.next_eligible_unix >= deadline.suppression_until_unix.unwrap());
+
+        // A configured interval above the floor raises the None-case
+        // suppression with it (still the greatest-of).
+        let inputs = DeadlineInputs {
+            rate_limited: true,
+            retry_after_seconds: None,
+            configured_interval_seconds: FRESHNESS_FLOOR_SECONDS * 2,
+            ..base_inputs()
+        };
+        assert_eq!(
+            next_deadline(&inputs).suppression_until_unix,
+            Some(inputs.last_request_unix.unwrap() + FRESHNESS_FLOOR_SECONDS * 2)
+        );
     }
 
     #[test]
@@ -1071,6 +1144,7 @@ mod tests {
     #[test]
     fn hostile_values_saturate_instead_of_overflowing_into_the_past() {
         let inputs = DeadlineInputs {
+            rate_limited: true,
             retry_after_seconds: Some(u64::MAX),
             proton_lifetime_seconds: Some(u64::MAX),
             jitter_seconds: u64::MAX,
@@ -1131,14 +1205,19 @@ mod tests {
             let interval = rng.between(0, FRESHNESS_FLOOR_SECONDS * 4);
             let lifetime = (rng.next_u64().is_multiple_of(4))
                 .then(|| rng.between(0, FRESHNESS_FLOOR_SECONDS * 4));
-            let retry_after = (rng.next_u64().is_multiple_of(3))
-                .then(|| rng.between(1, FRESHNESS_FLOOR_SECONDS * 6));
+            // A rate limit arrives with or without a Retry-After delay
+            // (Q4); a delay never arrives without a rate limit.
+            let rate_limited = rng.next_u64().is_multiple_of(3);
+            let retry_after = rate_limited
+                .then(|| rng.between(1, FRESHNESS_FLOOR_SECONDS * 6))
+                .filter(|_| rng.next_u64().is_multiple_of(2));
             let jitter = rng.between(0, 600);
             let inputs = DeadlineInputs {
                 last_request_unix: Some(last_request),
                 now_unix: now,
                 configured_interval_seconds: interval,
                 proton_lifetime_seconds: lifetime,
+                rate_limited,
                 retry_after_seconds: retry_after,
                 jitter_seconds: jitter,
             };
@@ -1165,17 +1244,23 @@ mod tests {
                     deadline.next_eligible_unix >= now + retry_after,
                     "retry-after dropped for {inputs:?}"
                 );
+            }
+            if rate_limited {
+                // Q4: EVERY rate limit pins a suppression floor — with a
+                // delay it is at least now+Retry-After, without one it is
+                // still the greatest-of floor; never below either.
                 let suppression = deadline
                     .suppression_until_unix
-                    .expect("a Retry-After always pins a suppression floor");
+                    .expect("a rate limit always pins a suppression floor");
+                let delay_floor = retry_after.map_or(0, |delay| now + delay);
                 assert!(
-                    suppression >= (now + retry_after).max(last_request + FRESHNESS_FLOOR_SECONDS),
+                    suppression >= delay_floor.max(last_request + FRESHNESS_FLOOR_SECONDS),
                     "suppression floor below the greatest-of for {inputs:?}"
                 );
             } else {
                 assert_eq!(
                     deadline.suppression_until_unix, None,
-                    "no Retry-After must not mint a suppression for {inputs:?}"
+                    "no rate limit must not mint a suppression for {inputs:?}"
                 );
             }
             // Jitter is additive-only (FR-13D non-negative).
@@ -1204,13 +1289,16 @@ mod tests {
             let interval = rng.between(FRESHNESS_FLOOR_SECONDS, FRESHNESS_FLOOR_SECONDS * 2);
             let lifetime = (rng.next_u64().is_multiple_of(3))
                 .then(|| rng.between(0, FRESHNESS_FLOOR_SECONDS * 3));
-            let retry_after = (rng.next_u64().is_multiple_of(3))
-                .then(|| rng.between(1, FRESHNESS_FLOOR_SECONDS * 3));
+            let rate_limited = rng.next_u64().is_multiple_of(3);
+            let retry_after = rate_limited
+                .then(|| rng.between(1, FRESHNESS_FLOOR_SECONDS * 3))
+                .filter(|_| rng.next_u64().is_multiple_of(2));
             let inputs = DeadlineInputs {
                 last_request_unix: Some(last_request),
                 now_unix: now,
                 configured_interval_seconds: interval,
                 proton_lifetime_seconds: lifetime,
+                rate_limited,
                 retry_after_seconds: retry_after,
                 jitter_seconds: 0,
             };
@@ -1717,6 +1805,88 @@ mod runtime_tests {
             scheduler.persisted().next_eligible_source,
             Some(IntervalSource::RetryAfter)
         );
+    }
+
+    /// qa P1-1, behavioral red: inject `RateLimited { None }` at T0;
+    /// the manual door at T0+60 must be Suppressed with the floor-pinned
+    /// deadline — not ConfirmationRequired.
+    #[test]
+    fn a_rate_limit_without_retry_after_suppresses_the_manual_door() {
+        let clock = VirtualClock::new(T0);
+        let fetch = FakeFetch::new(vec![rate_limited(None), not_modified()]);
+        let (scheduler, _dir) = harness(&clock, &fetch);
+
+        match scheduler.refresh_automatic() {
+            AutomaticOutcome::Due(report) => assert!(matches!(
+                report.outcome,
+                RefreshOutcome::RateLimited {
+                    retry_after_seconds: None
+                }
+            )),
+            other => panic!("expected Due, got {other:?}"),
+        }
+        // The suppression is the un-jittered 3h floor from the request.
+        assert_eq!(
+            scheduler.persisted().suppression_until_unix,
+            Some(T0 + FRESHNESS_FLOOR_SECONDS)
+        );
+
+        // The manual door: floor-pinned Suppressed, never a ceremony.
+        clock.set_wall(T0 + 60);
+        assert_eq!(
+            scheduler.refresh_manual(None),
+            ManualOutcome::Suppressed {
+                until_unix: T0 + FRESHNESS_FLOOR_SECONDS
+            }
+        );
+        assert_eq!(
+            scheduler.refresh_manual(Some("confirmed-anyway")),
+            ManualOutcome::Suppressed {
+                until_unix: T0 + FRESHNESS_FLOOR_SECONDS
+            },
+            "even a confirmed shape cannot escape a delay-less rate limit"
+        );
+        assert_eq!(fetch.calls(), 1, "no request may escape the suppression");
+    }
+
+    /// sec P3 (invariant-trust defense-in-depth): the automatic door
+    /// must refuse inside an active suppression EVEN IF the persisted
+    /// next eligibility somehow sits below it — the writer derives
+    /// next_eligible >= suppression, but no reader may bet on that
+    /// derivation surviving every hand-built or future writer
+    /// (mirroring the manual door's suppression check).
+    #[test]
+    fn the_automatic_door_refuses_directly_while_suppressed() {
+        let clock = VirtualClock::new(T0 + 60);
+        let fetch = FakeFetch::new(vec![not_modified()]);
+        let dir = tempfile::tempdir().unwrap();
+        // The inconsistent shape the defense exists for: an eligibility
+        // that has already passed while a suppression is still active.
+        let persisted = SchedulerDeadlines {
+            last_request_unix: Some(T0),
+            last_success_unix: Some(T0),
+            next_eligible_unix: Some(T0), // stale/passed — below suppression
+            next_eligible_source: Some(IntervalSource::ThreeHourFloor),
+            wall_high_water_unix: T0,
+            suppression_until_unix: Some(T0 + 4 * 3600),
+            ..SchedulerDeadlines::default()
+        };
+        let scheduler = Scheduler::new(
+            SchedulerConfig::new(FRESHNESS_FLOOR_SECONDS, JITTER, true).unwrap(),
+            Arc::new(clock.clone()),
+            fetch.service(),
+            DeadlineStore::new(dir.path().join("deadlines.json")),
+            persisted,
+            None,
+        );
+        assert_eq!(
+            scheduler.refresh_automatic(),
+            AutomaticOutcome::NotDue {
+                next_eligible_unix: T0 + 4 * 3600
+            },
+            "the suppression itself must gate the automatic door"
+        );
+        assert_eq!(fetch.calls(), 0);
     }
 
     /// E2E-22: even a confirmed manual request and every restart honor
