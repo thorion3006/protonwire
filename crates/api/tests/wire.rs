@@ -1186,8 +1186,8 @@ fn observed_credentials_round_trip_through_the_session_envelope() {
     let value = serde_json::to_value(&credentials).expect("muon serialization");
     let envelope = protonwire_store::session::SessionEnvelope::new(value).expect("envelope");
 
-    let dir = tempfile_dir();
-    let store = protonwire_store::session::SessionEnvelopeStore::new(dir.join("session.json"));
+    let dir = TempDirGuard::new("envelope");
+    let store = protonwire_store::session::SessionEnvelopeStore::new(dir.path().join("session.json"));
     store.save(&envelope).expect("persist");
     let loaded = store.load().expect("load").expect("present");
 
@@ -1199,19 +1199,34 @@ fn observed_credentials_round_trip_through_the_session_envelope() {
     assert_eq!(restored.user_id(), Some(USER_ID));
 }
 
-fn tempfile_dir() -> std::path::PathBuf {
-    // The api crate has no tempfile dev-dependency; the std fallback is
-    // a per-test directory under the target dir.
-    let dir = std::env::temp_dir().join(format!(
-        "pw-s4-envelope-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+/// A per-test temp directory removed on drop (rust Low, S4 round: the
+/// plain std fallback leaked a `pw-s4-envelope-*` directory per run —
+/// panic-safe now too, which a trailing `remove_dir_all` call was not).
+struct TempDirGuard(std::path::PathBuf);
+
+impl TempDirGuard {
+    fn new(tag: &str) -> Self {
+        let dir = std::env::temp_dir().join(format!(
+            "pw-s4-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        Self(dir)
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl Drop for TempDirGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 // ===========================================================================

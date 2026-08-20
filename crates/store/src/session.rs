@@ -190,6 +190,20 @@ impl SessionEnvelopeStore {
     /// # Errors
     /// See [`SessionEnvelopeError`].
     pub fn load(&self) -> Result<Option<SessionEnvelope>, SessionEnvelopeError> {
+        // Stat first (rust Low, S4 review round): a hostile multi-
+        // gigabyte file is refused on SIZE before `fs::read` allocates
+        // for it. The post-read cap below stays — the file may grow
+        // between the two calls.
+        match std::fs::metadata(&self.path) {
+            Ok(meta) if meta.len() > MAX_SESSION_BYTES as u64 => {
+                return Err(SessionEnvelopeError::Parse(
+                    "session document exceeds size cap".into(),
+                ));
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.into()),
+        }
         let bytes = match std::fs::read(&self.path) {
             Ok(bytes) => bytes,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -256,12 +270,32 @@ impl SessionEnvelopeStore {
             std::process::id(),
             TEMP_SEQ.fetch_add(1, Ordering::Relaxed)
         ));
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp)?;
+        let mut file = {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt as _;
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    // Mode AT CREATION (rust Low, S4 review round): an
+                    // empty world-readable temp file used to exist
+                    // between create and the set_permissions below;
+                    // 0600-from-the-first-instant closes that window (a
+                    // umask can only narrow it further).
+                    .mode(0o600)
+                    .open(&tmp)?
+            }
+            #[cfg(not(unix))]
+            {
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&tmp)?
+            }
+        };
         // A partially-written credentials file is still a credentials
-        // file: owner-only from the first byte.
+        // file: owner-only regardless of umask (the explicit set can
+        // only normalize toward 0600, never widen it).
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

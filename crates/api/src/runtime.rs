@@ -212,10 +212,14 @@ impl muon::rt::SystemTimeFactory for TokioTime {
 
     fn now(&self) -> Self::SystemTime {
         use muon::rt::SinceUnixEpoch as _;
+        // Pre-epoch clock (dead RTC, rust Low S4 round): zero (the
+        // Unix epoch) rather than panicking inside the transport —
+        // expiry arithmetic degrades, the daemon does not take a
+        // panic path over a wrong wall clock.
         muon::rt::MuonSystemTime::since_unix_epoch(
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .expect("system clock after the Unix epoch"),
+                .unwrap_or_default(),
         )
     }
 }
