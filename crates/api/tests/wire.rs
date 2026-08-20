@@ -13,8 +13,9 @@
 //! be loopback-faked, so alternative-routing coverage exercises the
 //! direct-class multi-server partition (`find_available_sender`'s
 //! ordering across a dead and a live direct server) — the same code
-//! path AR uses — while full DoH resolution rides only the real-muon
-//! canary arm's disclosure below.
+//! path AR uses. DoH/indirect resolution and TLS pinning have no
+//! automated offline coverage; tracked for a pre-release networked arm
+//! (the canary arm below is direct-only too).
 //!
 //! The canary arm at the bottom is the S1 harness's real-muon emitter
 //! (m2-plan S1/S4): muon's REAL auth code paths driven offline with the
@@ -1108,7 +1109,9 @@ fn transport_failures_map_to_transport_errors() {
 /// spike memo Q3): TWO direct-class servers, the first dead — the
 /// client's `find_available_sender` must exhaust the dead direct server
 /// and proceed on the live one (the same direct/indirect partition path
-/// AR rides; full DoH resolution is disclosed below, not faked here).
+/// AR rides). DoH resolution itself has no automated offline coverage —
+/// see the recorded limit in this file's header (tracked: pre-release
+/// networked arm).
 #[test]
 fn direct_class_servers_are_exhausted_in_order() {
     let (handle, live_port, seen) =
