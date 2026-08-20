@@ -8,7 +8,7 @@
 //! * an anchor/alias policy: `&anchor`/`*alias` tokens are refused
 //!   BEFORE parsing (see [`YamlError::AnchorsForbidden`]);
 //! * a structural depth cap and a total-node cap on the materialized
-//!   document (see [`enforce_structure`]);
+//!   document (see `enforce_structure`);
 //! * duplicate-key rejection (inherited from the serde_yaml lineage —
 //!   asserted by test, including nested mappings);
 //! * typed documents with `deny_unknown_fields` reject unexpected keys.
@@ -123,14 +123,36 @@ pub fn from_slice<T: DeserializeOwned>(input: &[u8]) -> Result<T, YamlError> {
 /// the mid-plain `:` in `{k:'v'}` is CONTENT and the entry is one
 /// plain scalar), after `-`/`?` acting as entry indicators (followed by space or EOL AND
 /// themselves sitting at a node start — mid-scalar `a - 'x` and
-/// `a ? 'x` are plain content, for the same reason), and after a flow
+/// `a ? 'x` are plain content, for the same reason), after a flow
 /// separator (`,`/`[`/`{` — but only inside an open flow collection or
 /// opening one: in block context, `a,b`, `a[b`, `a{b` are plain
-/// scalars). Spaces and tabs neither arm nor clear the tracker; any
-/// other consumed character clears it. Closing quotes stay
-/// unconditional — a closing quote always closes, except `\"`, which
-/// YAML double-quoted scalars escape (with `\\` escaping the
-/// backslash), so the close counts the preceding backslash run.
+/// scalars), and after a `---` document-start marker (column 0,
+/// blank-terminated: the marker opens the root node on the same line
+/// after blanks, or at the next line head — a glued `---&x`, an
+/// indented `---` and a mid-line `---` are plain content to the
+/// parser, and markers never occur inside flow). Spaces and tabs
+/// neither arm nor clear the tracker; any other consumed character
+/// clears it. Closing quotes stay unconditional — a closing quote
+/// always closes, except `\"`, which YAML double-quoted scalars
+/// escape (with `\\` escaping the backslash), so the close counts the
+/// preceding backslash run.
+///
+/// A `!` at a node start is a TAG token annotating the NEXT node
+/// (round 5): the scan consumes handle and suffix and STAYS at a node
+/// start, so the tagged node's quote opens (its `#` is content), an
+/// `&`/`*` after the tag is a real anchor/alias position, and a
+/// `|`/`>` after it is a real block header — the parser opens the node
+/// after the tag's blanks (or a comment, across a line break; a bare
+/// tag with no node is an empty-scalar node). The suffix runs to a
+/// blank, `#` or a flow indicator: quotes, `&`, `*` and `:` are tag
+/// URI characters to the parser (`[!!str'a, &x 1]` is the tag
+/// `!!str'a` plus a LIVE anchor; `[!!str&x 1]` is the tag `!!str&x`
+/// with no anchor at all), so stopping the tag at a quote or `&`
+/// would re-open the quote/comment bypass one construct over.
+/// Consuming the tag as plain content was the round-5 P1: it spent
+/// the node start on the tag characters, the tagged node's quote
+/// never opened, and a `#` inside the parser's quoted scalar read as
+/// a comment hiding same-line anchors.
 ///
 /// The scan runs on a line-break-normalized COPY of the input (see
 /// [`normalize_line_breaks`]): the parser also breaks lines on lone
@@ -274,6 +296,36 @@ fn find_anchor_or_alias_token(input: &str) -> Option<usize> {
                         plain_pending = flow_depth == 0;
                         flow_plain = flow_depth > 0;
                     }
+                    // Round 5: tag-token awareness. A `!` at a node
+                    // start is a TAG token (`!`, `!!suffix`, `!local`,
+                    // `!e!suffix`, `!<!verbatim>`) — an indicator can
+                    // never start a plain scalar — and it ANNOTATES the
+                    // next node, so the scan consumes it and STAYS at a
+                    // node start for whatever follows (the tagged
+                    // node's quote, an `&`/`*` position, a block
+                    // header). The suffix runs to a blank, `#` or a
+                    // flow indicator: quotes, `&`, `*` and `:` are URI
+                    // characters to the parser (probe: `[!!str'a,
+                    // &x 1]` is tag `!!str'a` + a live anchor;
+                    // `[!!str&x 1]` is tag `!!str&x` with no anchor),
+                    // so stopping at a quote or `&` would re-open the
+                    // quote/comment bypass one construct over. In a
+                    // parse-Ok document only a blank, a line break or
+                    // a flow separator may follow a tag, and each of
+                    // those re-arms or preserves the node start — the
+                    // armed hand-off mirrors the parser exactly.
+                    '!' if at_node_start => {
+                        let mut end = index + 1;
+                        while end < chars.len()
+                            && !matches!(chars[end], ' ' | '\t' | '#' | ',' | '[' | ']' | '{' | '}')
+                        {
+                            end += 1;
+                        }
+                        index = end - 1; // the loop's `+= 1` lands ON the terminator
+                        at_node_start = true;
+                        plain_pending = false;
+                        flow_plain = false;
+                    }
                     // A block-scalar header starts only a node, and only
                     // in block context (flow has no block scalars), and
                     // only when the rest of the line is indentation
@@ -322,6 +374,30 @@ fn find_anchor_or_alias_token(input: &str) -> Option<usize> {
                         if flow_depth == 0 {
                             ctx_indent = indent;
                         }
+                    }
+                    // A `---` document-start marker at column 0,
+                    // blank-terminated, hands a node start to what
+                    // follows: the parser opens the ROOT node after
+                    // the marker (same line after blanks, or the next
+                    // line head). Consuming the dashes as plain content
+                    // spent the line head's armedness, so `--- [!!str
+                    // 'a # b', &x 1]` never opened a flow collection
+                    // and the tag window hid the anchor (round 5).
+                    // Only a true marker arms: glued dashes (`---&x 1`)
+                    // parse as one plain scalar, an indented `---` is
+                    // plain continuation content, a mid-line `---` is
+                    // content, and markers never occur inside flow.
+                    '-' if index == 0
+                        && at_node_start
+                        && flow_depth == 0
+                        && chars.get(1) == Some(&'-')
+                        && chars.get(2) == Some(&'-')
+                        && chars.get(3).is_none_or(|next| matches!(next, ' ' | '\t')) =>
+                    {
+                        index += 2; // with the loop's `+= 1`, past the marker
+                        at_node_start = true;
+                        plain_pending = false;
+                        flow_plain = false;
                     }
                     // `-`/`?` act as entry indicators only where they
                     // THEMSELVES start a node (line head, after `: `)
@@ -1493,6 +1569,264 @@ mod tests {
             find_anchor_or_alias_token("a: &x 1\nm: {'k':*x}"),
             Some(1),
             "both the declaration and the live adjacency are flagged"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Round 5 (fifth scoped re-review, P1 — a pre-existing bypass
+    // disclosed by round 4's fix agent while probing, out of their
+    // scope): TAG-prefixed scalars. The scanner had no tag-token
+    // awareness: a `!` at a node start was consumed as plain-scalar
+    // content, which SPENT the node-start armedness on the tag
+    // characters, so the tagged node's quote never opened — a `#`
+    // inside the parser's quoted scalar then read as a comment to the
+    // scan and blinded the rest of the line, exactly the phantom-quote
+    // class of rounds 2-4. `[!!str 'a # b', &x 1]` parsed to a tagged
+    // `a # b` plus a LIVE anchor while the scan returned `None`. The
+    // same blindness sat one construct earlier behind `---`
+    // document-start markers (`--- [!!str 'a # b', &x 1]`): the
+    // marker's dashes were plain content to the scan, so the `[` never
+    // opened a flow collection and everything after it stayed
+    // un-armed. Fix: `!` at a node start is a tag token annotating the
+    // NEXT node (the scan consumes handle+suffix and stays at a node
+    // start), and a column-0 blank-terminated `---` hands a node start
+    // to what follows. All reds below observed on the pre-fix scanner.
+    // ------------------------------------------------------------------
+
+    /// The named bypass, live (red pre-fix: scan `None`, hardened loader
+    /// `Ok`): the tagged scalar's quote is REAL to the parser, the `#`
+    /// inside it is content, and the same-line anchor and alias after
+    /// the separator are live — the alias RESOLVES, materializing
+    /// `["a # b", 1, 1]`.
+    #[test]
+    fn tag_prefixed_quoted_scalar_comment_hides_contraband() {
+        let doc = "[!!str 'a # b', &x 1, *x]";
+        let value: serde_norway::Value = serde_norway::from_str(doc)
+            .unwrap_or_else(|e| panic!("must parse un-hardened: {doc:?}: {e}"));
+        let expanded: serde_norway::Value =
+            serde_norway::from_str("[\"a # b\", 1, 1]").expect("static fixture");
+        assert_eq!(
+            value, expanded,
+            "the alias must RESOLVE under the un-hardened parser: {doc:?}"
+        );
+        assert_eq!(
+            find_anchor_or_alias_token(doc),
+            Some(1),
+            "policy scan must flag the anchored entry: {doc:?}"
+        );
+        assert!(matches!(
+            from_str::<serde_norway::Value>(doc).unwrap_err(),
+            YamlError::AnchorsForbidden(_)
+        ));
+    }
+
+    /// The family (red pre-fix on every shape: scan `None`, parse `Ok`
+    /// with a live anchor): every tag handle form (`!` local, `!!suffix`
+    /// secondary incl. `!!python/none`, `!<!verbatim>`, `!e!suffix`
+    /// behind a `%TAG` directive), both quote styles, a tab separator,
+    /// a comma glued to the closing quote, tagged QUOTED KEYS, the
+    /// `&` inside the tag URI, a line break after the tag, and the
+    /// `---` document-marker openings (same line and across a break).
+    #[test]
+    fn tag_quote_comment_phantom_family_flagged() {
+        for doc in [
+            "{a: !!str 'v # w', &x 1}",
+            "[! 'a # b', &x 1]",
+            "[!!python/none 'a # b', &x 1]",
+            "[!<!foo> 'a # b', &x 1]",
+            "[!<tag:x> 'a # b', &x 1]",
+            "[!!str \"a # b\", &x 1]",
+            "[!!str\t'a # b', &x 1]",
+            "[!!str 'a # b',&x 1]",
+            "[b, !!str 'a # b',&x 1]",
+            "m: {k: !!str 'a # b', j: &x 1}",
+            "{!!str 'k # 1': v, &x 2}",
+            "[!!str 'a # b', !!str 'c # d', &x 1]",
+            // `&` inside the tag URI: the tag is `!!str&a` and the
+            // QUOTED node after it is real — the contraband is the
+            // second entry's anchor.
+            "[!!str&a 'v # w', &x 1]",
+            // Document-marker openings: `---` hands a node start to
+            // the flow collection that follows.
+            "--- [!!str 'a # b', &x 1]",
+            "--- [!!str 'a # b',&x 1]",
+            "--- {k: !!str 'a # b', &x 1}",
+        ] {
+            assert_policy_rejects(doc, 1);
+        }
+        // A line break after the tag (the tagged node opens at the
+        // next line head): anchor live on line 2.
+        assert_policy_rejects("[!!str\n'a # b', &x 1]", 2);
+        assert_policy_rejects("---\n[!!str 'a # b', &x 1]", 2);
+        // Named handle behind a %TAG directive: `!e!v` is a real tag
+        // token to the parser (the directive line is not YAML content).
+        assert_policy_rejects("%TAG !e! tag:x\n--- [!e!v 'a # b', &x 1]", 2);
+    }
+
+    /// The capstone (red pre-fix: scan `None`, hardened loader `Ok` —
+    /// the wide fan-out was ACCEPTED): the committed round-3/4 capstone
+    /// payload routed through the TAG window instead of the phantom
+    /// colon. The expansion materializes ~90.6k nodes — UNDER
+    /// `MAX_YAML_NODES`, so the structural caps alone accept it
+    /// (pinned below); the anchor/alias policy must refuse it before
+    /// any construction work starts. The `,\r` twin (anchor at a
+    /// parser-fresh line head after the window) was already flagged
+    /// on the pre-fix scanner via the comment-break state clear and
+    /// stays flagged — both routes refuse.
+    #[test]
+    fn tag_window_wide_fanout_capstone_refused_by_policy() {
+        let mut doc = String::from("m: [!!str 'a # b', &f [");
+        doc.push_str(&"1,".repeat(300));
+        doc.push(']');
+        for _ in 0..300 {
+            doc.push_str(", *f");
+        }
+        doc.push(']');
+        let raw: serde_norway::Value = serde_norway::from_str(&doc)
+            .unwrap_or_else(|e| panic!("toggle-red: the un-hardened path accepts: {e}"));
+        assert!(
+            enforce_structure(&raw).is_ok(),
+            "the ~90.6k-node expansion sits UNDER the node cap: only the \
+             anchor/alias policy can refuse it"
+        );
+        assert_eq!(
+            find_anchor_or_alias_token(&doc),
+            Some(1),
+            "the &f anchor sits inside the former tag window; the scan must see it"
+        );
+        assert!(matches!(
+            from_str::<serde_norway::Value>(&doc).unwrap_err(),
+            YamlError::AnchorsForbidden(_)
+        ));
+
+        // CR-routed twin: the anchor lands at a parser line head the
+        // round-3 normalization already exposed.
+        let mut twin = String::from("m: [!!str 'a # b',\r&f [");
+        twin.push_str(&"1,".repeat(300));
+        twin.push(']');
+        for _ in 0..300 {
+            twin.push_str(",\r*f");
+        }
+        twin.push(']');
+        assert_eq!(
+            find_anchor_or_alias_token(&twin),
+            Some(2),
+            "the &f anchor sits at a parser-fresh line head: {twin:?}"
+        );
+        assert!(matches!(
+            from_str::<serde_norway::Value>(&twin).unwrap_err(),
+            YamlError::AnchorsForbidden(_)
+        ));
+    }
+
+    /// Clean arms of the tag awareness (no over-regression): tag-bearing
+    /// documents WITHOUT anchors must stay accepted — including
+    /// `#`-carrying quoted scalars whose hash is now (correctly) quote
+    /// content, bare tags as nodes (`[!!str, 'a']` — probe-verified a
+    /// tag with no node is an empty-scalar node), tagged block scalars,
+    /// and the two URI-charset truths that keep the tag arm honest:
+    /// a quote GLUED to the tag (`[!!str'a b']`) and an `&` GLUED to
+    /// the tag (`[!!str&x 1]`) are tag-URI characters to the parser —
+    /// the first has no quote to open, the second NO anchor at all. If
+    /// the tag arm stopped at `'` or `&`, the first would phantom-open
+    /// quote state and the second would drop the scanner's node-start
+    /// model mid-token.
+    #[test]
+    fn tag_arm_clean_arms_stay_clean() {
+        assert_accepts("[!!str 'plain value', 1]");
+        assert_accepts("a: !!str v");
+        assert_accepts("!!str 'a # b'");
+        assert_accepts("k: !!str 'a # b'");
+        assert_accepts("a: [!!str 'a # b']");
+        assert_accepts("[! 'a # b']");
+        assert_accepts("[!<!foo> 'a # b']");
+        assert_accepts("[!!str, 'a']");
+        assert_accepts("[!, 'a']");
+        assert_accepts("!!str");
+        assert_accepts("--- [!!str 'a # b']");
+        assert_accepts("--- !!str 'a # b'");
+        // Tagged block scalar: the `|` header opens after the tag and
+        // swallows its content (the `#` inside is literal).
+        assert_accepts("k: !!str |\n  a # b\nnext: 1\n");
+        // URI-charset truths (probe-verified parser truth, pinned):
+        // `[!!str'a b']` parses as tag `!!str'a` + plain `b'`; and
+        // `[!!str&x 1]` parses as tag `!!str&x` + plain `1` — the `&x`
+        // is URI content, there is NO anchor token to flag.
+        assert_accepts("[!!str'a b']");
+        assert_accepts("[!!str&x 1]");
+        // Over-arm guard: a `!` INSIDE a plain scalar is content —
+        // arming there would phantom-open the quote, carry it across
+        // the line break, and hide the real anchor on line 2.
+        assert_policy_rejects("k: a !!str 'c\nd: &x 1\n", 2);
+    }
+
+    /// Tag/marker adjacency pins (green on every round — these pin
+    /// PARSER truth and the model's answer to the order question):
+    /// the parser accepts tag-before-anchor AND anchor-before-tag; at
+    /// tag-then-anchor the `&` sits at an armed node start (a real
+    /// anchor position — flagged, correctly); at anchor-then-tag the
+    /// anchor token itself is flagged BEFORE any tag window could
+    /// open, so the order cannot launder it. Also pinned: a comment
+    /// may intervene between tag and node (across the break), the
+    /// comma directly after a tag is a separator, `---&x 1` glued is
+    /// NOT a marker (one plain string — over-reject via the loose
+    /// arm), an INDENTED `---` is plain continuation content, and a
+    /// `---` line head inside flow is refused by the parser (the
+    /// marker model arms only at column 0 outside flow).
+    #[test]
+    fn tag_and_marker_adjacency_pins() {
+        // Order: tag-then-anchor and anchor-then-tag, flow and block.
+        assert_policy_rejects("[!!str &x 'a # b']", 1);
+        assert_policy_rejects("[&x !!str 'a # b']", 1);
+        assert_policy_rejects("k: !!str &x v", 1);
+        assert_policy_rejects("k: &x !!str v", 1);
+        assert_policy_rejects("!!str &x 'a # b'", 1);
+        // A quote glued INSIDE the tag URI: the tag is `!!str'a`, the
+        // `,` after it is a separator, and the anchor is live.
+        assert_policy_rejects("[!!str'a, &x 1]", 1);
+        // A comma directly after the tag: bare-tag node, then the
+        // anchored entry.
+        assert_policy_rejects("[!!str,'a',&x 1]", 1);
+        assert_policy_rejects("[!!str,'a # b', &x 1]", 1);
+        // A comment may intervene between tag and node (the node
+        // opens at the post-comment line head); the anchor is on
+        // line 2.
+        assert_policy_rejects("[!!str # c\n'a # b', &x 1]", 2);
+        assert_policy_rejects("a: [!!str 'a # b' # c\n, &x 1]", 2);
+        // Tag + block scalar: the header opens after the tag, the
+        // `#` line is swallowed content, the anchor is on line 3.
+        assert_policy_rejects("k: !!str |\n  a # b\nc: &x 1\n", 3);
+        // Marker truth: glued `---&x 1` parses as ONE plain string
+        // (premise enforced) and over-rejects via the loose arm; an
+        // indented `---` is plain continuation content (premise
+        // enforced); a marker + blank + anchor is a real anchored
+        // root; and a `---` line head inside flow is parser-refused.
+        let glued = "---&x 1";
+        let value: serde_norway::Value = serde_norway::from_str(glued).unwrap();
+        assert_eq!(
+            value,
+            serde_norway::Value::String("---&x 1".into()),
+            "glued dashes are a plain scalar, not a marker: {value:?}"
+        );
+        assert_eq!(find_anchor_or_alias_token(glued), Some(1));
+        let indented = "k: v\n  --- 'x # y'\nc: &z 1\n";
+        let value: serde_norway::Value = serde_norway::from_str(indented).unwrap();
+        assert_eq!(
+            value["k"],
+            serde_norway::Value::String("v --- 'x".into()),
+            "an indented `---` is plain continuation content: {value:?}"
+        );
+        assert_eq!(find_anchor_or_alias_token(indented), Some(3));
+        assert_policy_rejects("--- &x 1", 1);
+        let in_flow = "a: [\n--- 'y', &w 1]";
+        assert!(
+            serde_norway::from_str::<serde_norway::Value>(in_flow).is_err(),
+            "a `---` line head inside flow is not a marker: {in_flow:?}"
+        );
+        assert_eq!(
+            find_anchor_or_alias_token(in_flow),
+            Some(2),
+            "the scan still sees the anchor through the parser refusal: {in_flow:?}"
         );
     }
 }
