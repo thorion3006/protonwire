@@ -81,6 +81,11 @@ pub enum SessionEnvelopeError {
     /// The digest does not match the embedded credentials.
     #[error("session envelope integrity failure")]
     Integrity,
+    /// The write would regress `envelope_generation` below the valid
+    /// envelope already on disk — a stale writer must not silently
+    /// overwrite fresher credentials (rust P2, S4 review round).
+    #[error("stale envelope generation: attempted {attempted}, on disk {on_disk}")]
+    StaleGeneration { attempted: u64, on_disk: u64 },
 }
 
 impl SessionEnvelope {
@@ -196,9 +201,28 @@ impl SessionEnvelopeStore {
     /// Persists the envelope atomically: sibling temp file (mode 0600),
     /// fsync, rename over the target.
     ///
+    /// Monotonicity (rust P2, S4 review round): a write whose
+    /// `envelope_generation` is below the valid on-disk envelope's is
+    /// REFUSED before anything is written — a stale writer regenerating
+    /// from superseded state must not silently overwrite fresher
+    /// credentials. The floor is only the readable, integral
+    /// predecessor: a missing file imposes none, and an unreadable one
+    /// fails the save rather than laundering a blind overwrite.
+    /// Residual: the compare-then-rename sequence is not atomic across
+    /// concurrent writers (equal generations race; single-writer
+    /// pinning is the S5 facade's to add on top).
+    ///
     /// # Errors
     /// See [`SessionEnvelopeError`].
     pub fn save(&self, envelope: &SessionEnvelope) -> Result<(), SessionEnvelopeError> {
+        if let Some(on_disk) = self.load()? {
+            if envelope.envelope_generation < on_disk.envelope_generation {
+                return Err(SessionEnvelopeError::StaleGeneration {
+                    attempted: envelope.envelope_generation,
+                    on_disk: on_disk.envelope_generation,
+                });
+            }
+        }
         let bytes =
             serde_json::to_vec(envelope).map_err(|e| SessionEnvelopeError::Parse(e.to_string()))?;
         if bytes.len() > MAX_SESSION_BYTES {
@@ -316,6 +340,104 @@ mod tests {
             let mode = std::fs::metadata(&path).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o600, "credentials file mode {mode:o}");
         }
+    }
+
+    #[test]
+    fn regressed_generation_is_refused_against_the_on_disk_envelope() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionEnvelopeStore::new(dir.path().join("session.json"));
+
+        let base = SessionEnvelope::new(creds("acc-1")).unwrap();
+        store.save(&base).unwrap();
+
+        // Chain A pulls ahead: generations 2 and 3 land on disk.
+        let a2 = base.regenerate(creds("acc-a2")).unwrap();
+        let a3 = a2.regenerate(creds("acc-a3")).unwrap();
+        store.save(&a2).unwrap();
+        store.save(&a3).unwrap();
+
+        // Chain B — a stale writer regenerating from the same base —
+        // now writes generation 2 against on-disk 3: refused, and the
+        // fresher envelope survives untouched.
+        let b2 = base.regenerate(creds("acc-b2")).unwrap();
+        match store.save(&b2) {
+            Err(SessionEnvelopeError::StaleGeneration { attempted, on_disk }) => {
+                assert_eq!((attempted, on_disk), (2, 3));
+            }
+            other => panic!("expected StaleGeneration, got {other:?}"),
+        }
+        let loaded = store.load().unwrap().expect("envelope present");
+        assert_eq!(loaded.envelope_generation, 3);
+        assert_eq!(loaded.credentials(), &creds("acc-a3"));
+    }
+
+    /// The racing arm of the monotonicity pin: two threads regenerate
+    /// independent chains from one shared base and save concurrently.
+    /// In lockstep rounds the generations are EQUAL (not below) — both
+    /// writers' atomic renames must succeed — and once one chain is
+    /// ahead, the lagging chain's next write is refused as a
+    /// regression. (Single-writer pinning is the S5 facade's to add;
+    /// until then the compare-before-rename refusal is the guard, and
+    /// its residual compare/rename race is exactly what the facade
+    /// closes.)
+    #[test]
+    fn racing_regenerate_chains_refuse_the_regressed_writer() {
+        const ROUNDS: u64 = 8;
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionEnvelopeStore::new(dir.path().join("session.json"));
+
+        let base = SessionEnvelope::new(creds("acc-base")).unwrap();
+        store.save(&base).unwrap();
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let mut chains = Vec::new();
+        for t in 0..2 {
+            let store = store.clone();
+            let barrier = std::sync::Arc::clone(&barrier);
+            let mut chain = base.clone();
+            chains.push(std::thread::spawn(move || {
+                for r in 1..=ROUNDS {
+                    chain = chain
+                        .regenerate(json!({
+                            "UID": format!("uid-r{r}-{t}"),
+                            "UserID": "user",
+                            "AccessToken": format!("acc-r{r}-{t}"),
+                            "RefreshToken": "refresh",
+                            "Scopes": ["loggedin"],
+                        }))
+                        .unwrap();
+                    // Lockstep: both threads hold generation r+1 before
+                    // either saves — equal generations race the rename,
+                    // and BOTH saves must succeed (not-below passes).
+                    barrier.wait();
+                    store.save(&chain).expect("equal-generation save");
+                }
+                chain
+            }));
+        }
+        let finished: Vec<_> = chains.into_iter().map(|h| h.join().unwrap()).collect();
+        assert_eq!(
+            store.load().unwrap().unwrap().envelope_generation,
+            ROUNDS + 1
+        );
+
+        // One chain pulls ahead by two generations; the other's next
+        // write is below on-disk and must be refused.
+        let ahead = finished[0]
+            .regenerate(creds("acc-ahead-1"))
+            .and_then(|e| e.regenerate(creds("acc-ahead-2")))
+            .unwrap();
+        store.save(&ahead).unwrap();
+        let lagging = finished[1].regenerate(creds("acc-lagging")).unwrap();
+        match store.save(&lagging) {
+            Err(SessionEnvelopeError::StaleGeneration { attempted, on_disk }) => {
+                assert_eq!((attempted, on_disk), (ROUNDS + 2, ROUNDS + 3));
+            }
+            other => panic!("expected StaleGeneration, got {other:?}"),
+        }
+        let loaded = store.load().unwrap().expect("envelope present");
+        assert_eq!(loaded.envelope_generation, ROUNDS + 3);
+        assert_eq!(loaded.credentials(), &creds("acc-ahead-2"));
     }
 
     #[test]
