@@ -623,10 +623,7 @@ impl Scheduler {
         let mut guard = self.inner.lock().expect("scheduler lock");
         // T-25 single-flight: join an already-running refresh instead of
         // piling a second request onto Proton.
-        loop {
-            let Some(running) = guard.in_flight else {
-                break;
-            };
+        while let Some(running) = guard.in_flight {
             let seen = running;
             while guard.in_flight == Some(seen) {
                 guard = self.cv.wait(guard).expect("scheduler lock");
@@ -659,10 +656,7 @@ impl Scheduler {
     /// active suppression refuses even a confirmed request (E2E-22).
     pub fn refresh_manual(&self, token: Option<&str>) -> ManualOutcome {
         let mut guard = self.inner.lock().expect("scheduler lock");
-        loop {
-            let Some(running) = guard.in_flight else {
-                break;
-            };
+        while let Some(running) = guard.in_flight {
             let seen = running;
             while guard.in_flight == Some(seen) {
                 guard = self.cv.wait(guard).expect("scheduler lock");
@@ -1528,7 +1522,7 @@ mod runtime_tests {
         // FR-12/FR-13D: the next window is [floor, floor + jitter].
         let next = scheduler.next_due_unix().unwrap();
         assert!(
-            next >= T0 + FRESHNESS_FLOOR_SECONDS && next <= T0 + FRESHNESS_FLOOR_SECONDS + JITTER,
+            (T0 + FRESHNESS_FLOOR_SECONDS..=T0 + FRESHNESS_FLOOR_SECONDS + JITTER).contains(&next),
             "next {next} outside the floor+jitter window"
         );
         assert_eq!(
@@ -2071,7 +2065,7 @@ mod runtime_tests {
                         .lock()
                         .unwrap()
                         .pop_front()
-                        .unwrap_or_else(|| Ok(FetchOutcome::NotModified))
+                        .unwrap_or(Ok(FetchOutcome::NotModified))
                 })
             };
             let dir = tempfile::tempdir().unwrap();
