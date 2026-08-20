@@ -1649,13 +1649,15 @@ mod runtime_tests {
     // --- fixtures -----------------------------------------------------------
 
     /// Scripted fetch service: responses pop in order, the LAST repeats
-    /// forever. Counts every invocation; can gate its first invocation
-    /// until released (the single-flight race pin).
+    /// forever. Counts every invocation and RECORDS the ETag each one
+    /// received (the FR-13E pass-through pin); can gate its first
+    /// invocation until released (the single-flight race pin).
     #[derive(Clone)]
     struct FakeFetch(Arc<FetchInner>);
 
     struct FetchInner {
         calls: AtomicU64,
+        seen: StdMutex<Vec<Option<String>>>,
         script: StdMutex<VecDeque<Result<FetchOutcome, FetchFailure>>>,
         repeat: Result<FetchOutcome, FetchFailure>,
         started: Option<mpsc::Sender<()>>,
@@ -1669,6 +1671,7 @@ mod runtime_tests {
             let repeat = script.pop_back().expect("at least one scripted response");
             Self(Arc::new(FetchInner {
                 calls: AtomicU64::new(0),
+                seen: StdMutex::new(Vec::new()),
                 script: StdMutex::new(script),
                 repeat,
                 started: None,
@@ -1693,6 +1696,12 @@ mod runtime_tests {
             self.0.calls.load(Ordering::SeqCst)
         }
 
+        /// The ETag each invocation received, in order (None = the
+        /// request went out unconditional).
+        fn seen_etags(&self) -> Vec<Option<String>> {
+            self.0.seen.lock().unwrap().clone()
+        }
+
         fn service(&self) -> CatalogFetch {
             let inner = Arc::clone(&self.0);
             Arc::new(move |etag| inner.invoke(etag))
@@ -1711,8 +1720,9 @@ mod runtime_tests {
     }
 
     impl FetchInner {
-        fn invoke(&self, _etag: Option<&str>) -> Result<FetchOutcome, FetchFailure> {
+        fn invoke(&self, etag: Option<&str>) -> Result<FetchOutcome, FetchFailure> {
             self.calls.fetch_add(1, Ordering::SeqCst);
+            self.seen.lock().unwrap().push(etag.map(str::to_owned));
             if let Some(started) = &self.started
                 && let Some(release) = self.release.lock().unwrap().take()
             {
@@ -1739,9 +1749,20 @@ mod runtime_tests {
 
     /// A scheduler over a temp deadline store, on the given clock.
     fn harness(clock: &VirtualClock, fetch: &FakeFetch) -> (Arc<Scheduler>, tempfile::TempDir) {
+        harness_with_config(clock, fetch, SchedulerConfig::new(FRESHNESS_FLOOR_SECONDS, JITTER, true)
+            .expect("the standard suite config is valid"))
+    }
+
+    /// [`harness`] over an explicit policy (the conditional-requests
+    /// arms).
+    fn harness_with_config(
+        clock: &VirtualClock,
+        fetch: &FakeFetch,
+        config: SchedulerConfig,
+    ) -> (Arc<Scheduler>, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let scheduler = Scheduler::new(
-            SchedulerConfig::new(FRESHNESS_FLOOR_SECONDS, JITTER, true).unwrap(),
+            config,
             Arc::new(clock.clone()),
             fetch.service(),
             DeadlineStore::new(dir.path().join("deadlines.json")),
@@ -2164,6 +2185,67 @@ mod runtime_tests {
             AutomaticOutcome::Due(_)
         ));
         assert_eq!(fetch.calls(), 2);
+    }
+
+    /// qa P2-1: the rollback guard's deterministic pin, through the one
+    /// path that legitimately runs while the effective time says "early"
+    /// — a CONFIRMED manual override. A fetch completes at wall W, the
+    /// wall rolls back, the confirmed refresh runs anyway (it is only
+    /// early, not suppressed); its reset window must anchor at the
+    /// rollback-clamped effective time (W, the persisted high-water
+    /// mark), never at the rolled-back reading: rolling the clock back
+    /// two hours must not buy a two-hour-earlier next refresh.
+    #[test]
+    fn a_confirmed_manual_refresh_after_a_rollback_anchors_at_the_high_water_mark() {
+        let clock = VirtualClock::new(T0);
+        let fetch = FakeFetch::new(vec![not_modified(), not_modified()]);
+        let (scheduler, _dir) = harness(&clock, &fetch);
+
+        // The fetch completes at wall W; W becomes the high-water mark.
+        assert!(matches!(
+            scheduler.refresh_automatic(),
+            AutomaticOutcome::Due(_)
+        ));
+        let w = T0;
+
+        // Roll the wall back two hours while the monotonic counter keeps
+        // running (the only shape that cannot be ordinary time passing).
+        clock.set_wall(w - 2 * 3600);
+        clock.set_monotonic_ms(clock.monotonic_ms() + 1000);
+        assert!(matches!(
+            scheduler.refresh_automatic(),
+            AutomaticOutcome::NotDue { .. }
+        ));
+
+        // The effective time is still W, so the manual door is early but
+        // NOT suppressed: the ceremony mints, the token redeems.
+        let requirement = match scheduler.refresh_manual(None) {
+            ManualOutcome::ConfirmationRequired(requirement) => requirement,
+            other => panic!("the rolled-back wall must not reopen the window: {other:?}"),
+        };
+        let report = match scheduler.refresh_manual(Some(&requirement.confirmation_token)) {
+            ManualOutcome::Refreshed(report) => report,
+            other => panic!("a confirmed refresh must run while merely early: {other:?}"),
+        };
+        // THE pin: the reset window anchors at the high-water mark. The
+        // exact upper bound is the drawn jitter (0..=JITTER); the floor
+        // side is the deterministic fact under test.
+        assert!(
+            report.next_eligible_unix >= w + FRESHNESS_FLOOR_SECONDS,
+            "next eligibility {} must anchor at the high-water mark {w} \
+             (+{FRESHNESS_FLOOR_SECONDS}s floor), not the rolled-back wall",
+            report.next_eligible_unix
+        );
+        assert!(report.next_eligible_unix <= w + FRESHNESS_FLOOR_SECONDS + JITTER);
+        assert!(scheduler.next_due_unix().unwrap() >= w + FRESHNESS_FLOOR_SECONDS);
+        assert_eq!(fetch.calls(), 2);
+
+        // The persisted document carries the clamped window: a restart
+        // inherits the same protection (the re-derivation and the saved
+        // deadline agree on the W-anchored floor).
+        let persisted = scheduler.persisted();
+        assert!(persisted.wall_high_water_unix >= w);
+        assert!(persisted.next_eligible_unix.unwrap() >= w + FRESHNESS_FLOOR_SECONDS);
     }
 
     /// T-26: deadlines, suppression, and the diagnostic counters survive
@@ -3017,6 +3099,96 @@ mod runtime_tests {
         assert!(
             err.to_string().contains("servers.json"),
             "the leaf defect must be named, not an ancestor: {err}"
+        );
+    }
+
+    // --- FR-13E: conditional-request pass-through -------------------------------
+
+    /// qa P2-2: the stored ETag flows to the next conditional request.
+    /// The seam records the ETag every invocation receives; the bootstrap
+    /// fetch goes out unconditional (no stored revision), and the adopted
+    /// revision's ETag must ride the next request.
+    #[test]
+    fn the_adopted_etag_flows_to_the_next_conditional_request() {
+        let clock = VirtualClock::new(T0);
+        let fetch = FakeFetch::new(vec![
+            Ok(FetchOutcome::Changed {
+                etag: Some("\"rev-1\"".to_owned()),
+                body: VALID_BODY.as_bytes().to_vec(),
+            }),
+            not_modified(),
+        ]);
+        let (scheduler, _dir) = harness(&clock, &fetch);
+
+        // Bootstrap: nothing stored, so the request is unconditional.
+        assert!(matches!(
+            scheduler.refresh_automatic(),
+            AutomaticOutcome::Due(RefreshReport {
+                outcome: RefreshOutcome::Changed { .. },
+                ..
+            })
+        ));
+        assert_eq!(
+            fetch.seen_etags(),
+            [None],
+            "the bootstrap request carries no ETag"
+        );
+
+        // The adopted revision's ETag must be presented on the next one.
+        let next = scheduler.next_due_unix().unwrap();
+        clock.set_wall(next);
+        assert!(matches!(
+            scheduler.refresh_automatic(),
+            AutomaticOutcome::Due(_)
+        ));
+        assert_eq!(
+            fetch.seen_etags(),
+            [None, Some("\"rev-1\"".to_owned())],
+            "the stored revision must be presented conditionally (FR-13E)"
+        );
+        assert_eq!(fetch.calls(), 2);
+    }
+
+    /// qa P2-2, the disabled arm: `conditional_requests: false` must
+    /// strip the ETag from every request — the policy is the product
+    /// gate on the pass-through, not a hint — while the revision itself
+    /// is still adopted (a Changed outcome is a Changed outcome; only
+    /// the wire shape changes).
+    #[test]
+    fn a_disabled_conditional_policy_never_sends_the_etag() {
+        let clock = VirtualClock::new(T0);
+        let fetch = FakeFetch::new(vec![
+            Ok(FetchOutcome::Changed {
+                etag: Some("\"rev-1\"".to_owned()),
+                body: VALID_BODY.as_bytes().to_vec(),
+            }),
+            not_modified(),
+        ]);
+        let (scheduler, _dir) = harness_with_config(
+            &clock,
+            &fetch,
+            SchedulerConfig::new(FRESHNESS_FLOOR_SECONDS, JITTER, false).unwrap(),
+        );
+
+        assert!(matches!(
+            scheduler.refresh_automatic(),
+            AutomaticOutcome::Due(_)
+        ));
+        let next = scheduler.next_due_unix().unwrap();
+        clock.set_wall(next);
+        assert!(matches!(
+            scheduler.refresh_automatic(),
+            AutomaticOutcome::Due(_)
+        ));
+        assert_eq!(
+            fetch.seen_etags(),
+            [None, None],
+            "a disabled conditional policy must never present the stored ETag"
+        );
+        assert_eq!(
+            scheduler.inner.lock().unwrap().etag.as_deref(),
+            Some("\"rev-1\""),
+            "the revision is still adopted; only the request shape changed"
         );
     }
 
