@@ -1485,6 +1485,21 @@ impl muon::ProvideInformation for CanaryFingerprint {
 /// 6. `AuthFlow::from_fork().with_selector(canary)` — the real
 ///    `muon::auth::from_fork` selector sites (twice at info per the S0
 ///    memo), as the FR-7L import path.
+/// 7. A scripted `Set-Cookie` response header carrying the cookie
+///    canary (sec rider, S4 round). PREMISE CORRECTED during landing:
+///    at pinned muon 2.6.1 the retry handler's DEBUG site formats the
+///    response through `Display` (`received http::Response { status,
+///    error_code }` — no headers), so no Set-Cookie value reaches any
+///    writer even with the `muon::common::retry` cap removed; the step
+///    is therefore an engine-upgrade TRAP, not a currently
+///    load-bearing pin — every canary run now pushes a secret-shaped
+///    response header through the real transport and the real retry
+///    handler, so a future muon that logs response headers (e.g. by
+///    switching to `{res:?}`, whose Debug DOES carry the full
+///    HeaderMap — res.rs:59-67) turns this arm red at exactly the
+///    levels the cap guards. Mutation-verified while landing: with the
+///    cap entry neutralized to TRACE the arm stayed green and the
+///    captured writer showed the Display shape verbatim.
 ///
 /// Disclosure — the one site NOT driven: pvpnclient's
 /// `supervisor::localagent` trace (fork selector + cookies). pvpnclient
@@ -1553,17 +1568,36 @@ impl protonwire_core::redact::canary::CanaryEmitter for RealMuonCanaryEmitter {
         let auth_token = token.clone();
         let auth_token_refresh = format!("{token}-r");
 
+        let cookie_header = c.cookie.clone();
+        let anon_uid = uid.clone();
+        let anon_token = token.clone();
+        let anon_refresh = format!("{token}-r");
+
         let mut script = vec![
-            Step::static_json(
-                "POST",
-                "/auth/v4/sessions",
-                "200 OK",
-                json!({
-                    "UID": uid, "UserID": null,
-                    "AccessToken": token, "RefreshToken": format!("{token}-r"),
+            // The scripted Set-Cookie step (item 7 above): a real
+            // response header carrying the cookie canary through the
+            // real transport and the real retry handler on every
+            // canary run (see the premise correction — a trap for
+            // engines that start logging response headers).
+            Step::computed("POST", "/auth/v4/sessions", move |_| {
+                let body = serde_json::to_vec(&json!({
+                    "UID": anon_uid, "UserID": null,
+                    "AccessToken": anon_token, "RefreshToken": anon_refresh,
                     "Scopes": ["unauth"],
-                }),
-            ),
+                }))
+                .expect("serialize scripted body");
+                Response {
+                    status: "200 OK",
+                    headers: vec![
+                        ("Content-Type".into(), "application/json".into()),
+                        (
+                            "Set-Cookie".into(),
+                            format!("Session-Id={cookie_header}; Path=/; Secure; HttpOnly"),
+                        ),
+                    ],
+                    body,
+                }
+            }),
             Step::computed("POST", "/auth/v4/info", move |_| {
                 Response::json(
                     "200 OK",
