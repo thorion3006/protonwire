@@ -333,12 +333,15 @@ const MODULE_CAPS: [(&str, Level); 8] = [
     ("muon::store", Level::WARN),
     ("muon::client", Level::WARN),
     ("muon::transport", Level::ERROR),
-    // S4 sec review round 1: RetryHandler logs the whole response —
-    // full HeaderMap, `Set-Cookie` un-stripped (it sits BELOW
-    // CookieSender in the sender stack) — at DEBUG on EVERY send;
-    // `RetryPolicy::never()` only kills the retry loop, not this
-    // `inspect` (retry.rs:42 via res.rs:59-67). Its WARN sites carry
-    // only status/delay strings, so WARN keeps the diagnostics.
+    // S4 sec review round 1, premise CORRECTED by the S4 fix round's
+    // captured output: at pinned muon 2.6.1, retry.rs:42 logs
+    // `debug!("received {res}")` via DISPLAY — status + error_code
+    // only, NO headers. The header-carrying Debug (res.rs:59-67, the
+    // full HeaderMap with `Set-Cookie` un-stripped below CookieSender)
+    // is logged nowhere upstream today. The cap is an ENGINE-UPGRADE
+    // TRAP GUARD: if a future muon logs the Debug (or any richer
+    // response render), it is already suppressed. WARN keeps retry's
+    // status/delay diagnostics.
     ("muon::common::retry", Level::WARN),
     // S4 sec review round 1: doh logs resolved IP sets at DEBUG/TRACE
     // (`?res` / `RData {rd:?}`, doh.rs:142/:158) and full DNS responses
@@ -721,10 +724,12 @@ pub mod canary {
                 "http1 send req=Request {{ .., body: Some(b\"{{\\\"RefreshToken\\\":\\\"{}\\\"}}\") }}",
                 c.token
             );
-            // muon::common::retry at DEBUG — the whole response with the
-            // full HeaderMap on EVERY send; Set-Cookie rides it un-stripped
-            // (RetryHandler sits below CookieSender in the stack) (S4 sec
-            // review round 1; retry.rs:42 via res.rs:59-67).
+            // muon::common::retry at DEBUG — emitted shape is the
+            // header-bearing WORST CASE (muon 2.6.1's actual line is
+            // Display: status/error_code only — the header-carrying
+            // Debug is unlogged upstream; see the MODULE_CAPS entry's
+            // engine-upgrade-trap-guard rationale). The stub pins the
+            // cap against the worst future render.
             tracing::event!(
                 target: "muon::common::retry",
                 tracing::Level::DEBUG,
@@ -1007,17 +1012,16 @@ mod suppression_policy_tests {
         }
     }
 
-    /// S4 sec review (round 1): `muon::common::retry` logs the whole
-    /// response — full HeaderMap, `Set-Cookie` un-stripped (it sits BELOW
-    /// CookieSender in the stack) — at DEBUG on EVERY send, and
-    /// `RetryPolicy::never()` does not kill this `inspect`. Cookies are a
-    /// named FR-121 class, so the module caps at WARN (its own WARN sites
-    /// carry only status/delay strings).
+    /// S4 sec review (round 1; premise corrected by the S4 fix round's
+    /// captured output — see MODULE_CAPS): `muon::common::retry`'s
+    /// actual 2.6.1 line is Display (status only), but its header-bearing
+    /// Debug is one render away from live; the cap holds the class.
     #[test]
     fn muon_common_retry_is_capped_at_warn_in_every_build() {
         let f = SecretSuppressFilter::for_build(false);
-        // The leaking site: `debug!("received {res}")` with the full
-        // HeaderMap including Set-Cookie (retry.rs:42 via res.rs:59-67).
+        // The trap-guarded site: `debug!("received {res}")` — Display
+        // today, the full-HeaderMap Debug (retry.rs:42 via res.rs:59-67)
+        // in any future render.
         assert!(!f.allows("muon::common::retry", &Level::DEBUG));
         assert!(!f.allows("muon::common::retry", &Level::INFO));
         // Safe diagnostics survive.
@@ -1086,7 +1090,9 @@ mod suppression_policy_tests {
     /// sites the S0 memo's Q9 table missed (see MODULE_CAPS): the fork
     /// selector rides the request PATH at WARN, and full request objects
     /// INCLUDING bodies are logged at DEBUG/trace. Paths and bodies carry
-    /// credentials at every level below ERROR.
+    /// credentials at every level below ERROR. (The retry-site premise
+    /// was later corrected — see the MODULE_CAPS entry — but the
+    /// transport P1s were live and empirically reproduced.)
     #[test]
     fn muon_transport_subtree_is_capped_at_error_in_every_build() {
         let f = SecretSuppressFilter::for_build(false);
