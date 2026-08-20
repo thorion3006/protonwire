@@ -4745,6 +4745,7 @@ dependencies = [
 name = "protonwire-store"
 version = "0.1.0"
 dependencies = [
+ "nix 0.31.3",
  "protonwire-frontend-api",
  "serde",
  "serde_json",
@@ -4753,6 +4754,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.20",
  "tracing",
+ "zeroize",
 ]
 
 [[package]]

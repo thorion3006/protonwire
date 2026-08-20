@@ -75,7 +75,8 @@
 //! deliberately discards `FromUtf8Error`, whose Display embeds the
 //! offending bytes, and an envelope parse refusal reduces serde's error
 //! to its category and line/column — serde's Display embeds the
-//! offending value verbatim).
+//! offending value verbatim), and the value bytes themselves live in
+//! zeroizing storage from the read to the ingress seam.
 //!
 //! # Trust root: the credentials directory itself
 //!
@@ -96,23 +97,40 @@
 //! traversal").
 //!
 //! Check order inside [`SystemdCredentialDirectory::read`]: name
-//! validation, then leaf-shape and content gates, then the full trust
-//! walk, then ingress. Content is inspected before the walk so the
-//! fail-closed matrix is provable on non-root development runners (the
-//! walker's ownership pass would otherwise shadow every content defect
-//! on a user-owned tree). This does not weaken the guarantee: nothing
-//! leaves `read` before the walk passes — a refusal discards the bytes
-//! read — and the walk was already happens-before-use, not atomic
-//! (`fs_trust.rs`).
+//! validation, then ONE pinned `open(2)` (`O_NOFOLLOW` — a symlinked
+//! leaf fails at open with `ELOOP`, mapped to the typed symlink
+//! refusal), then the `fstat` gates on THAT descriptor (regular-file
+//! type, owner-only mode, size — all before a single byte is read),
+//! then the size-bounded read FROM the descriptor, then content gates,
+//! then the ancestor trust walk, then ingress (S5a sec P3, landed S5b:
+//! the descriptor is the inode every gate approved, so a path swap
+//! between gate and read changes nothing the gates saw). Content is
+//! inspected before the walk so the fail-closed matrix is provable on
+//! non-root development runners (the walker's ownership pass would
+//! otherwise shadow every content defect on a user-owned tree). This
+//! does not weaken the guarantee: nothing leaves `read` before the
+//! walk passes — and the walk was already happens-before-use, not
+//! atomic (`fs_trust.rs`).
+//!
+//! Value transit is ZEROIZING end to end (S5a sec P2, landed S5b): the
+//! bytes read live in `Zeroizing<Vec<u8>>`, the UTF-8 string in
+//! `Zeroizing<String>`, and the ingress seam MOVES the allocation out
+//! of transit (`mem::take`) — no refusal path, and no intermediate
+//! copy, ever drops plain credential bytes (the `FromUtf8Error` owns
+//! its offending bytes, so that arm re-captures them into zeroizing
+//! storage before discarding them).
 
 use std::collections::BTreeMap;
 use std::io;
 use std::io::Read as _;
 use std::marker::PhantomData;
+use std::mem;
 use std::os::unix::fs::MetadataExt as _;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
+
+use zeroize::Zeroizing;
 
 use crate::config::AccountSection;
 use crate::config::CredentialInputSource as ConfiguredCredentialSource;
@@ -153,6 +171,42 @@ pub const MAX_CREDENTIAL_BYTES: usize = 64 * 1024;
 /// credentials mode `0400` inside a `0700` directory, and group/world
 /// READ on a credential file is disclosure, not just tampering surface.
 const LEAF_BEYOND_OWNER: u32 = 0o077;
+
+/// `open(2)` flags for the pinned credential read (S5a sec P3, landed
+/// S5b), from nix's typed `OFlag` (std's `custom_flags` takes raw bits
+/// and names none; hand-rolled syscall constants are exactly what this
+/// repo's stdlib-first policy prefers a dependency over).
+///
+/// `O_NOFOLLOW` makes a symlinked leaf fail AT OPEN (`ELOOP`) — the
+/// link itself is the defect (SEC-16B), never a target to follow.
+/// `O_NONBLOCK` keeps a hostile FIFO planted where a credential file
+/// should be from hanging the open; on the regular files the fstat gate
+/// below requires it has no effect on `read(2)`.
+fn pinned_open_flags() -> i32 {
+    (nix::fcntl::OFlag::O_NOFOLLOW | nix::fcntl::OFlag::O_NONBLOCK).bits()
+}
+
+/// Opens `path` once, pinned: read-only with [`pinned_open_flags`]. The
+/// returned descriptor is the inode every later gate and read uses —
+/// see [`SystemdCredentialDirectory::read`].
+fn open_pinned(path: &Path) -> io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(pinned_open_flags())
+        .open(path)
+}
+
+/// Size-bounded read FROM THE PINNED DESCRIPTOR into zeroizing storage
+/// (S5a sec P2): credential bytes are secret material from the moment
+/// they exist, refusal paths included — every discard below drops a
+/// `Zeroizing`, never a plain buffer. Reads at most `cap + 1` bytes so
+/// an over-cap file is detected without reading it whole.
+fn read_bounded(file: &std::fs::File, cap: usize) -> io::Result<Zeroizing<Vec<u8>>> {
+    let mut bytes = Zeroizing::new(Vec::new());
+    file.take(cap as u64 + 1).read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
 
 /// The peer-secret boundary the input half is generic over.
 ///
@@ -297,21 +351,35 @@ impl<S: SecretBoundary> SystemdCredentialDirectory<S> {
     /// through the peer-secret ingress. Fully fail-closed — see the
     /// module documentation for the refusal matrix and check order.
     ///
+    /// The read is FD-PINNED (S5a sec P3, landed S5b): the file is
+    /// opened ONCE with `O_NOFOLLOW` (a symlinked leaf fails at open —
+    /// `ELOOP`, mapped to the typed symlink refusal), every gate that
+    /// matters for the bytes (regular-file type, owner-only mode, size)
+    /// runs on the `fstat` OF THAT DESCRIPTOR, and the bytes are read
+    /// from the same descriptor — a path swap between the gates and the
+    /// read changes nothing the gates approved.
+    ///
     /// # Errors
     /// Every refusal is typed: see [`CredentialInputError`]. Never a
     /// partial or blank value.
     pub fn read(&self, short_name: &str) -> Result<S, CredentialInputError> {
         let (name, path) = self.resolve(short_name)?;
-        // 1. Leaf shape (lstat — never followed): a credential is a
-        //    regular file. A symlink is the laundering path (SEC-16B),
-        //    a subdirectory is not a credential.
-        let leaf = match std::fs::symlink_metadata(&path) {
-            Ok(meta) => meta,
+        // 1. Open once, pinned: `O_NOFOLLOW` refuses a symlinked leaf AT
+        //    OPEN (ELOOP → the typed symlink refusal — the link is the
+        //    defect, its target never consulted); absent is the typed
+        //    Missing; anything else is Unreadable.
+        let file = match open_pinned(&path) {
+            Ok(file) => file,
             Err(source) if source.kind() == io::ErrorKind::NotFound => {
                 return Err(CredentialInputError::Missing {
                     name: name.to_owned(),
                     path: path.clone(),
                 });
+            }
+            Err(source) if source.raw_os_error() == Some(nix::errno::Errno::ELOOP as i32) => {
+                return Err(CredentialInputError::Untrusted(FsTrustError::Symlink {
+                    path: path.clone(),
+                }));
             }
             Err(source) => {
                 return Err(CredentialInputError::Unreadable {
@@ -321,32 +389,50 @@ impl<S: SecretBoundary> SystemdCredentialDirectory<S> {
                 });
             }
         };
-        if leaf.file_type().is_symlink() {
-            return Err(CredentialInputError::Untrusted(FsTrustError::Symlink {
-                path: path.clone(),
-            }));
-        }
-        if !leaf.is_file() {
-            return Err(CredentialInputError::Untrusted(
-                FsTrustError::NotARegularFile { path: path.clone() },
-            ));
-        }
-        // 2. Content, size-bounded (SEC-16B): read at most cap+1 bytes
-        //    so an over-cap file is detected without reading it whole.
-        let file =
-            std::fs::File::open(&path).map_err(|source| CredentialInputError::Unreadable {
-                name: name.to_owned(),
-                path: path.clone(),
-                source,
-            })?;
-        let mut bytes = Vec::new();
-        file.take(MAX_CREDENTIAL_BYTES as u64 + 1)
-            .read_to_end(&mut bytes)
+        // 2. fstat THE DESCRIPTOR — the inode the read below will come
+        //    from. Type (a subdirectory or FIFO where a credential file
+        //    should be), owner-only mode (disclosure-class: beats any
+        //    content defect), then size (stat-first: a hostile file is
+        //    refused on size before a single byte is read).
+        let leaf = file
+            .metadata()
             .map_err(|source| CredentialInputError::Unreadable {
                 name: name.to_owned(),
                 path: path.clone(),
                 source,
             })?;
+        if !leaf.is_file() {
+            return Err(CredentialInputError::Untrusted(
+                FsTrustError::NotARegularFile { path: path.clone() },
+            ));
+        }
+        let mode = leaf.mode() & 0o777;
+        if mode & LEAF_BEYOND_OWNER != 0 {
+            return Err(CredentialInputError::ExcessivePermission {
+                name: name.to_owned(),
+                path: path.clone(),
+                mode,
+            });
+        }
+        if leaf.len() > MAX_CREDENTIAL_BYTES as u64 {
+            return Err(CredentialInputError::Oversized {
+                name: name.to_owned(),
+                path: path.clone(),
+                size: leaf.len(),
+                cap: MAX_CREDENTIAL_BYTES,
+            });
+        }
+        // 3. Read from the pinned descriptor into ZEROIZING storage
+        //    (S5a sec P2): the bytes are credential material from the
+        //    first byte, on refusal paths included. Belt-and-braces
+        //    post-read cap: the file may have grown since the fstat.
+        let mut bytes = read_bounded(&file, MAX_CREDENTIAL_BYTES).map_err(|source| {
+            CredentialInputError::Unreadable {
+                name: name.to_owned(),
+                path: path.clone(),
+                source,
+            }
+        })?;
         if bytes.len() > MAX_CREDENTIAL_BYTES {
             return Err(CredentialInputError::Oversized {
                 name: name.to_owned(),
@@ -361,29 +447,27 @@ impl<S: SecretBoundary> SystemdCredentialDirectory<S> {
                 path: path.clone(),
             });
         }
-        // 3. Owner-only leaf (the lstat'd inode from step 1 — the same
-        //    one the walker will re-verify): systemd provisions
-        //    credentials 0400 in a 0700 directory; any group/world bit
-        //    on a credential is disclosure or tampering surface.
-        let mode = leaf.mode() & 0o777;
-        if mode & LEAF_BEYOND_OWNER != 0 {
-            return Err(CredentialInputError::ExcessivePermission {
-                name: name.to_owned(),
-                path: path.clone(),
-                mode,
-            });
-        }
         // 4. Credentials are text (envelopes are JSON, usernames and
-        //    passwords are strings); the FromUtf8Error is dropped
-        //    because its Display embeds the offending value bytes.
-        let value = String::from_utf8(bytes).map_err(|_| CredentialInputError::NotUtf8 {
-            name: name.to_owned(),
-            path: path.clone(),
-        })?;
+        //    passwords are strings). `FromUtf8Error` OWNS the offending
+        //    bytes, so on the refusal path they are re-captured into
+        //    zeroizing storage before being dropped (its Display also
+        //    embeds them — that arm predates this one).
+        let mut value = match String::from_utf8(mem::take(&mut *bytes)) {
+            Ok(value) => Zeroizing::new(value),
+            Err(error) => {
+                let _recovered = Zeroizing::new(error.into_bytes());
+                return Err(CredentialInputError::NotUtf8 {
+                    name: name.to_owned(),
+                    path: path.clone(),
+                });
+            }
+        };
         // 5. The authoritative trust walk: the credentials directory is
-        //    the trust root; leaf and root must both be clean (no
-        //    group/world write, root-owned). Nothing has left this
-        //    function yet — a refusal here discards the bytes read.
+        //    the trust root. The fd pins the LEAF (gates 2-4 all ran on
+        //    its inode); this walk covers the leaf's PATH and every
+        //    ancestor to the root — no group/world write, root-owned.
+        //    Nothing has left this function yet — a refusal here
+        //    discards the zeroizing transit bytes.
         match verify_trusted_path(&path, &self.directory, MissingLeaf::Reject) {
             Ok(()) => {}
             // Only reachable through a delete race with step 1; report
@@ -397,8 +481,11 @@ impl<S: SecretBoundary> SystemdCredentialDirectory<S> {
             }
             Err(error) => return Err(error.into()),
         }
-        // 6. Ingress: the ONLY way a value crosses the source boundary.
-        Ok(S::ingress(value))
+        // 6. Ingress at the seam: the value MOVES out of zeroizing
+        //    transit into the guarded boundary type (`mem::take` leaves
+        //    an empty string behind, zeroized on drop — no unzeroized
+        //    copy is ever made).
+        Ok(S::ingress(mem::take(&mut *value)))
     }
 }
 
@@ -949,9 +1036,12 @@ mod systemd_read_tests {
         }
     }
 
-    /// SEC-16B / walker semantics: a symlinked credential is refused as
-    /// a symlink even when its target is perfectly clean — the link
-    /// itself is the defect (lstat, never followed).
+    /// SEC-16B / fd-pinning semantics: a symlinked credential is
+    /// refused AT OPEN (`O_NOFOLLOW` → `ELOOP` → the typed symlink
+    /// refusal) even when its target is perfectly clean — the link
+    /// itself is the defect; its target is never consulted, so there is
+    /// no follow to race. Before S5b this refusal came from a separate
+    /// `lstat` pass ahead of the open; the outcome is pinned unchanged.
     #[test]
     fn symlinked_credential_is_refused() {
         let root = tempfile::tempdir().unwrap();
@@ -1063,6 +1153,61 @@ mod systemd_read_tests {
             Err(CredentialInputError::NameNotConfigured { name }) => assert_eq!(name, "totp"),
             other => panic!("expected NameNotConfigured, got {other:?}"),
         }
+    }
+
+    /// S5a sec P3 (fd-pinning), order pin: the owner-only MODE gate runs
+    /// on the fstat of the PINNED descriptor, BEFORE any byte is read —
+    /// the disclosure-class defect beats content-class defects even when
+    /// both are present. RED (observed first): the pre-fix tree checked
+    /// content before mode, so this empty-and-world-readable leaf was
+    /// refused as `Empty`.
+    #[test]
+    fn a_world_readable_leaf_refuses_on_mode_before_content_gates() {
+        let root = tempfile::tempdir().unwrap();
+        let source = credentials_tree(root.path(), &[("protonwire-session", "")]);
+        let path = source.directory().join("protonwire-session");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        match assert_no_ingress(|| source.read("session")) {
+            Err(CredentialInputError::ExcessivePermission { mode, .. }) => assert_eq!(mode, 0o644),
+            other => panic!("expected ExcessivePermission before the empty check, got {other:?}"),
+        }
+    }
+
+    /// Same order pin against the size gate: the fstat SIZE is checked
+    /// before the read, so an oversized-and-world-readable leaf refuses
+    /// on mode too. RED (observed first): pre-fix the content read ran
+    /// first and this was refused as `Oversized`.
+    #[test]
+    fn a_world_readable_leaf_refuses_on_mode_before_the_size_gate() {
+        let root = tempfile::tempdir().unwrap();
+        let source = credentials_tree(root.path(), &[("protonwire-session", "x")]);
+        let path = source.directory().join("protonwire-session");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o664)).unwrap();
+        std::fs::write(&path, vec![b'x'; MAX_CREDENTIAL_BYTES + 1]).unwrap();
+        match assert_no_ingress(|| source.read("session")) {
+            Err(CredentialInputError::ExcessivePermission { mode, .. }) => assert_eq!(mode, 0o664),
+            other => panic!("expected ExcessivePermission before the size check, got {other:?}"),
+        }
+    }
+
+    /// Sec obligation A (S5a sec P2), the storage-type pin: the read
+    /// path's value transit is zeroizing from the first byte to the
+    /// ingress seam, and the seam MOVES the allocation out of transit
+    /// (`mem::take`) rather than copying it. Class: compile-red —
+    /// observed pre-fix as `read_bounded`/`open_pinned` absent (the
+    /// path held plain `Vec<u8>`/`String`); the drop-zeroizes behavior
+    /// itself is the `zeroize` crate's own, upstream-tested, and is not
+    /// observable from this workspace's `unsafe_code = deny` tests.
+    #[test]
+    fn value_transit_is_zeroizing_until_the_ingress_seam() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("credential");
+        std::fs::write(&path, "tok-transit").unwrap();
+        let file = open_pinned(&path).expect("a plain file opens pinned");
+        let mut bytes: zeroize::Zeroizing<Vec<u8>> =
+            read_bounded(&file, MAX_CREDENTIAL_BYTES).unwrap();
+        let moved = String::from_utf8(std::mem::take(&mut *bytes)).expect("fixture is UTF-8");
+        assert_eq!(moved, "tok-transit");
     }
 }
 

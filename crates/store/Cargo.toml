@@ -11,6 +11,11 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
+# Typed open(2) flags / errno for the fd-pinned credential read (M2 S5b,
+# S5a sec P3): O_NOFOLLOW/O_NONBLOCK and ELOOP, which std's custom_flags
+# API takes only as raw bits. Already the workspace pin (ipc, tui), so
+# no new lockfile package (lockfile hunk: one edge on protonwire-store).
+nix = { workspace = true }
 protonwire-frontend-api = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -21,6 +26,11 @@ serde_norway = { workspace = true }
 sha2 = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+# Credential-read value transit (M2 S5b, S5a sec P2): zeroizing storage
+# for credential bytes from the read to the peer-secret ingress seam —
+# the same workspace pin core/api already use, so no new lockfile
+# package (lockfile hunk: one edge on protonwire-store).
+zeroize = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
