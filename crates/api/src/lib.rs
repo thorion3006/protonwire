@@ -28,6 +28,7 @@ pub use muon;
 
 pub mod auth;
 pub mod catalog;
+pub mod entitlements;
 pub mod runtime;
 
 /// Authentication capabilities the adapter must expose.

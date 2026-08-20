@@ -1,0 +1,26 @@
+{
+  "Code": 1000,
+  "Error": null,
+  "Details": null,
+  "Subscribed": 1,
+  "Services": 4,
+  "Delinquent": 0,
+  "Credit": 0,
+  "HasPaymentMethod": 1,
+  "VPN": {
+    "Status": 1,
+    "ExpirationTime": 1820000000,
+    "PlanName": "visionary2028",
+    "PlanTitle": "Visionary (synthetic)",
+    "MaxTier": 3,
+    "MaxConnect": 10,
+    "Name": "synthetic-vpn-user",
+    "GroupID": null,
+    "IsBusiness": false,
+    "NetShield": {
+      "Malware": true,
+      "AdsAndTrackers": true,
+      "AdultContent": false
+    }
+  }
+}
