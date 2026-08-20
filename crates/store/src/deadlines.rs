@@ -352,7 +352,17 @@ mod tests {
             .map(|m| m.uid() == 0 && m.gid() == 0)
             .unwrap_or(false);
         if !root_owned {
-            return; // ownership arm unprovable for this runner
+            // NOTICE skip (CONTRIBUTING rule 5, the a368775 idiom): the
+            // fs_trust ownership arm needs a root-owned tree, which an
+            // unprivileged runner cannot construct. The walk's symlink
+            // and mode arms are covered unprivileged by the tests below;
+            // visible via `cargo test -- --nocapture`.
+            eprintln!(
+                "NOTICE: skipping strict_load_walks_then_loads_for_root_runners: the \
+                 tempdir tree is not root-owned on this runner — the ownership arm of \
+                 the fs_trust walk is unprovable unprivileged"
+            );
+            return;
         }
         let loaded = store
             .load_strict(dir.path())
