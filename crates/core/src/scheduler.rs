@@ -461,6 +461,11 @@ pub enum ManualOutcome {
         /// When suppression ends.
         until_unix: u64,
     },
+    /// Fail-closed (rust M4/sec F1): the confirmation-token CSPRNG is
+    /// unavailable, so no ceremony can be held and no early manual
+    /// refresh is possible — a broken RNG must not become a bypass.
+    /// The caller may retry once the RNG recovers; nothing was burned.
+    Unavailable,
 }
 
 /// Scheduler facts for FR-123 status and FR-13I diagnostics.
@@ -524,10 +529,33 @@ struct Inner {
     completed: Option<(u64, std::sync::Arc<RefreshReport>)>,
     token: Option<PendingToken>,
     rollback: RollbackTracker,
+    /// Confirmation-token mint source — the OS CSPRNG in production,
+    /// injectable through this private field for the in-crate
+    /// forced-failure fail-closed test (the seam-injection idiom the
+    /// fetch seam uses).
+    minter: MintSource,
     /// The production catalog cache (ConfigPaths-derived), when wired:
     /// successful fetches write the new revision through it (FR-10/
     /// FR-13B/FR-13E). `None` for test-only schedulers.
     cache: Option<CacheState>,
+}
+
+/// The confirmation-token mint source (see
+/// [`mint_confirmation_token`]). A newtype so [`Inner`] keeps its
+/// derived `Debug`/`Default` while holding an injectable closure.
+#[derive(Clone)]
+struct MintSource(std::sync::Arc<dyn Fn() -> Option<String> + Send + Sync>);
+
+impl std::fmt::Debug for MintSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("MintSource(<closure>)")
+    }
+}
+
+impl Default for MintSource {
+    fn default() -> Self {
+        Self(std::sync::Arc::new(mint_confirmation_token))
+    }
 }
 
 /// The wired catalog cache and its current document.
@@ -606,6 +634,7 @@ impl Scheduler {
                 completed: None,
                 token: None,
                 rollback: RollbackTracker::default(),
+                minter: MintSource::default(),
                 cache,
             }),
             cv: std::sync::Condvar::new(),
@@ -774,6 +803,16 @@ impl Scheduler {
     /// The manual path (FR-11/FR-13I): eligible refreshes proceed
     /// outright; early ones require a fresh warned confirmation; an
     /// active suppression refuses even a confirmed request (E2E-22).
+    ///
+    /// Single-flight joins (T-25): a manual caller that arrives while a
+    /// refresh is already in flight receives its result — the joiner
+    /// caused no upstream request, so it is counted by the LEADER's
+    /// door (FR-13I) and any token it presents is NOT burned: a join
+    /// consumes an already-running window, not the ceremony. (A live
+    /// outstanding token can only predate the lead — ceremonies cannot
+    /// be minted while a refresh is in flight, and a manual LEAD burns
+    /// its token at redeem — so an unburned token has never authorized
+    /// anything and still buys exactly its one later early refresh.)
     pub fn refresh_manual(&self, token: Option<&str>) -> ManualOutcome {
         let mut guard = self.inner.lock().expect("scheduler lock");
         while let Some(running) = guard.in_flight {
@@ -806,7 +845,12 @@ impl Scheduler {
             return ManualOutcome::Refreshed(self.lead_refresh(guard, RefreshKind::Manual));
         }
         match token {
-            Some(value) => {
+            // An empty echo is foreign by construction and is rejected
+            // BEFORE the pending-token comparison (rust M4/sec F1,
+            // redeem side): tokens are 64 hex characters, and a failed
+            // mint mints NOTHING (`Unavailable`), so "" can never be
+            // the live pending value — it must never redeem.
+            Some(value) if !value.is_empty() => {
                 let redeemable = guard.token.as_ref().is_some_and(|pending| {
                     pending.value == value && now.effective <= pending.expires_unix
                 });
@@ -818,14 +862,22 @@ impl Scheduler {
                 } else {
                     // Expired, already-burned, or foreign token: a fresh
                     // ceremony, never a silent acceptance.
-                    ManualOutcome::ConfirmationRequired(
-                        self.mint_requirement(&mut guard, now.effective),
-                    )
+                    self.ceremony(&mut guard, now.effective)
                 }
             }
-            None => ManualOutcome::ConfirmationRequired(
-                self.mint_requirement(&mut guard, now.effective),
-            ),
+            Some(_) | None => self.ceremony(&mut guard, now.effective),
+        }
+    }
+
+    /// Mints one fresh ceremony, fail-closed: when the token CSPRNG is
+    /// unavailable no requirement can be minted, no token is stored,
+    /// and the early manual refresh is simply impossible (rust M4/
+    /// sec F1 — the old shape returned an empty token, matchable by
+    /// echoing "" back).
+    fn ceremony(&self, guard: &mut Inner, effective_now: u64) -> ManualOutcome {
+        match self.mint_requirement(guard, effective_now) {
+            Some(requirement) => ManualOutcome::ConfirmationRequired(requirement),
+            None => ManualOutcome::Unavailable,
         }
     }
 
@@ -839,14 +891,20 @@ impl Scheduler {
     /// Mints one fresh confirmation requirement (and replaces any
     /// outstanding token: confirmation is per-request, FR-13I). The
     /// warning is the compile-time constant — no peer-derived value
-    /// enters it (see [`MANUAL_REFRESH_WARNING`]).
-    fn mint_requirement(&self, guard: &mut Inner, effective_now: u64) -> ConfirmationRequirement {
-        let token = mint_confirmation_token();
+    /// enters it (see [`MANUAL_REFRESH_WARNING`]). `None` = the CSPRNG
+    /// failed: nothing is stored and no ceremony is possible
+    /// (fail-closed).
+    fn mint_requirement(
+        &self,
+        guard: &mut Inner,
+        effective_now: u64,
+    ) -> Option<ConfirmationRequirement> {
+        let token = (guard.minter.0)()?;
         guard.token = Some(PendingToken {
             value: token.clone(),
             expires_unix: effective_now.saturating_add(CONFIRMATION_TOKEN_TTL_SECONDS),
         });
-        ConfirmationRequirement {
+        Some(ConfirmationRequirement {
             catalog_age_seconds: guard
                 .persisted
                 .last_success_unix
@@ -860,7 +918,7 @@ impl Scheduler {
                 .max(guard.persisted.suppression_until_unix.unwrap_or(0)),
             warning: MANUAL_REFRESH_WARNING.to_owned(),
             confirmation_token: token,
-        }
+        })
     }
 
     /// Runs one fetch as the single-flight leader. `guard` is held on
@@ -1074,15 +1132,24 @@ fn adopt_fetched_revision(
 
 /// Mints one confirmation token: 32 CSPRNG bytes, hex-encoded
 /// (single-use, expiring; see [`PendingToken`]). Never derived from
-/// anything caller-controlled or hash-seeded.
-fn mint_confirmation_token() -> String {
+/// anything caller-controlled or hash-seeded. `None` when the CSPRNG
+/// fails — fail-closed (rust M4/sec F1): no token means no ceremony
+/// means no early manual refresh; the pre-fix shape returned an EMPTY
+/// string, which a caller could "redeem" by echoing `""` back,
+/// converting a broken RNG into a confirmation bypass.
+fn mint_confirmation_token() -> Option<String> {
+    mint_confirmation_token_from(|bytes| getrandom::getrandom(bytes).is_ok())
+}
+
+/// The mint over an injectable fill (`true` = the bytes were filled).
+/// The seam exists for the forced-failure arm the OS CSPRNG cannot
+/// produce on demand in a test.
+fn mint_confirmation_token_from(fill: impl FnOnce(&mut [u8; 32]) -> bool) -> Option<String> {
     let mut bytes = [0u8; 32];
-    if getrandom::getrandom(&mut bytes).is_err() {
-        // A broken CSPRNG must not become a bypass: refuse to mint by
-        // returning an unmatchable value — no confirmation can proceed.
-        return String::new();
+    if !fill(&mut bytes) {
+        return None;
     }
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+    Some(bytes.iter().map(|b| format!("{b:02x}")).collect())
 }
 
 /// Test-support: a deterministic scenario generator for the property
@@ -1322,6 +1389,21 @@ mod tests {
         let deadline = next_deadline(&inputs);
         assert_eq!(deadline.next_eligible_unix, u64::MAX);
         assert_eq!(deadline.suppression_until_unix, Some(u64::MAX));
+    }
+
+    /// rust M4/sec F1, mint side: a failed CSPRNG mints NOTHING — not
+    /// the empty string the fail-open shape returned, which was
+    /// matchable by echoing "" back into the redeem arm.
+    #[test]
+    fn a_failed_csprng_mint_mints_nothing() {
+        assert_eq!(mint_confirmation_token_from(|_| false), None);
+        let token = mint_confirmation_token_from(|_| true).expect("a healthy fill mints");
+        assert_eq!(token.len(), 64);
+        assert!(token.chars().all(|c| c.is_ascii_hexdigit()));
+        assert!(!token.is_empty());
+        // The production mint delegates to the OS CSPRNG.
+        let minted = mint_confirmation_token().expect("the OS CSPRNG is available");
+        assert_eq!(minted.len(), 64);
     }
 
     // --- FR-13D: jitter is additive-only ------------------------------------
@@ -2287,6 +2369,79 @@ mod runtime_tests {
         assert_eq!(fetch.calls(), 1);
     }
 
+    /// rust M4/sec F1, scheduler side: a forced CSPRNG failure makes
+    /// the manual door fail CLOSED — no ceremony, no token stored, no
+    /// early fetch — and the door recovers once the RNG does.
+    #[test]
+    fn a_forced_csprng_failure_makes_the_manual_door_fail_closed() {
+        let clock = VirtualClock::new(T0);
+        let fetch = FakeFetch::new(vec![not_modified()]);
+        let (scheduler, _dir) = harness(&clock, &fetch);
+        assert!(matches!(
+            scheduler.refresh_automatic(),
+            AutomaticOutcome::Due(_)
+        ));
+
+        // Force the mint source to fail THROUGH the real mint helper
+        // (production = the OS CSPRNG via getrandom, which cannot be
+        // made to fail on demand; routing the force through the helper
+        // keeps the mint's own fail-closed shape under test).
+        scheduler.inner.lock().unwrap().minter = MintSource(std::sync::Arc::new(|| {
+            mint_confirmation_token_from(|_| false)
+        }));
+        clock.set_wall(T0 + 60);
+        assert_eq!(
+            scheduler.refresh_manual(None),
+            ManualOutcome::Unavailable,
+            "a broken RNG must not become a confirmation bypass"
+        );
+        // The empty echo of the old fail-open sentinel redeems nothing
+        // either — there is no pending token at all.
+        assert_eq!(
+            scheduler.refresh_manual(Some("")),
+            ManualOutcome::Unavailable
+        );
+        assert_eq!(fetch.calls(), 1, "no early fetch may escape");
+        // Nothing was stored: a healthy mint still mints a real token.
+        scheduler.inner.lock().unwrap().minter = MintSource::default();
+        match scheduler.refresh_manual(None) {
+            ManualOutcome::ConfirmationRequired(requirement) => {
+                assert_eq!(requirement.confirmation_token.len(), 64);
+            }
+            other => panic!("a recovered mint must hold a ceremony: {other:?}"),
+        }
+        assert_eq!(fetch.calls(), 1);
+    }
+
+    /// rust M4/sec F1, redeem side: an empty echo never redeems — even
+    /// against a live pending token, the empty string is foreign by
+    /// construction (tokens are 64 hex chars) and must never match.
+    #[test]
+    fn an_empty_echo_never_redeems() {
+        let clock = VirtualClock::new(T0);
+        let fetch = FakeFetch::new(vec![not_modified()]);
+        let (scheduler, _dir) = harness(&clock, &fetch);
+        assert!(matches!(
+            scheduler.refresh_automatic(),
+            AutomaticOutcome::Due(_)
+        ));
+        clock.set_wall(T0 + 60);
+        let requirement = match scheduler.refresh_manual(None) {
+            ManualOutcome::ConfirmationRequired(requirement) => requirement,
+            other => panic!("expected a requirement, got {other:?}"),
+        };
+        // The empty echo against the live ceremony: refused, and the
+        // refusal mints a FRESH ceremony (per-request confirmation).
+        match scheduler.refresh_manual(Some("")) {
+            ManualOutcome::ConfirmationRequired(fresh) => {
+                assert_ne!(fresh.confirmation_token, requirement.confirmation_token);
+                assert!(!fresh.confirmation_token.is_empty());
+            }
+            other => panic!("an empty echo must never redeem: {other:?}"),
+        }
+        assert_eq!(fetch.calls(), 1, "no refresh ran");
+    }
+
     /// The minted token never reaches the persisted document (FR-13I)
     /// even while it is live in memory.
     #[test]
@@ -2716,9 +2871,13 @@ mod runtime_tests {
         let suppression = scheduler.persisted().suppression_until_unix.unwrap();
         assert_eq!(suppression, next_window + 1 + 4 * 3600);
 
-        // A fresh confirmation is minted but STILL refused — suppression
-        // outranks confirmation (E2E-22).
-        let requirement = match scheduler.refresh_manual(None) {
+        // A manual request while the suppression is active is refused
+        // outright — suppression outranks confirmation (E2E-22). The
+        // clock sits just past the injected window with a 4 h
+        // suppression ahead, so every other arm is a failure of that
+        // ordering (the old dead arm that merely discarded the
+        // requirement is gone).
+        match scheduler.refresh_manual(None) {
             ManualOutcome::Suppressed { until_unix } => {
                 assert_eq!(until_unix, suppression);
                 // While suppressed the ceremony itself is refused; use a
@@ -2727,16 +2886,12 @@ mod runtime_tests {
                     scheduler.refresh_manual(Some("confirmed-anyway")),
                     ManualOutcome::Suppressed { until_unix }
                 );
-                None
             }
-            ManualOutcome::ConfirmationRequired(requirement) => Some(requirement),
-            other => panic!("unexpected manual outcome: {other:?}"),
-        };
-        if let Some(requirement) = requirement {
-            // If the window had reopened past suppression, a confirmed
-            // request must still be single-flight and counted separately;
-            // here we only reach this arm when suppression already lapsed.
-            let _ = requirement;
+            other => panic!(
+                "suppression must outrank the ceremony at this point (suppression \
+                 {suppression}, wall {}): {other:?}",
+                clock.now_unix()
+            ),
         }
 
         // Every restart honors the persisted suppression deadline.
@@ -2887,6 +3042,12 @@ mod runtime_tests {
                                     }
                                     outstanding_token = None; // burned
                                 }
+                            }
+                            // The healthy-minter walk never fails the
+                            // CSPRNG; the fail-closed arm is driven
+                            // deterministically in its own test.
+                            ManualOutcome::Unavailable => {
+                                panic!("healthy minter reported unavailable (seed {seed})")
                             }
                         }
                     }
