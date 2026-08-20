@@ -18,6 +18,7 @@ pub mod fs_trust;
 pub mod paths;
 pub mod session;
 pub mod state;
+pub mod writable_store;
 pub mod yaml;
 
 pub use config::{

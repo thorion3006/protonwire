@@ -189,7 +189,7 @@ fn pinned_open_flags() -> i32 {
 /// Opens `path` once, pinned: read-only with [`pinned_open_flags`]. The
 /// returned descriptor is the inode every later gate and read uses —
 /// see [`SystemdCredentialDirectory::read`].
-fn open_pinned(path: &Path) -> io::Result<std::fs::File> {
+pub(crate) fn open_pinned(path: &Path) -> io::Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt as _;
     std::fs::OpenOptions::new()
         .read(true)
@@ -202,7 +202,7 @@ fn open_pinned(path: &Path) -> io::Result<std::fs::File> {
 /// they exist, refusal paths included — every discard below drops a
 /// `Zeroizing`, never a plain buffer. Reads at most `cap + 1` bytes so
 /// an over-cap file is detected without reading it whole.
-fn read_bounded(file: &std::fs::File, cap: usize) -> io::Result<Zeroizing<Vec<u8>>> {
+pub(crate) fn read_bounded(file: &std::fs::File, cap: usize) -> io::Result<Zeroizing<Vec<u8>>> {
     let mut bytes = Zeroizing::new(Vec::new());
     file.take(cap as u64 + 1).read_to_end(&mut bytes)?;
     Ok(bytes)
@@ -640,7 +640,7 @@ fn resolve_systemd_directory(directory: Option<&Path>) -> Result<PathBuf, Creden
 /// for a session slot, that is a password riding daemon error logs).
 /// The parse refusal is therefore reduced to its value-free facts: the
 /// `classify()` category (kind, never the message) plus line/column.
-fn parse_error_summary(error: &serde_json::Error) -> String {
+pub(crate) fn parse_error_summary(error: &serde_json::Error) -> String {
     let kind = match error.classify() {
         serde_json::error::Category::Io => "io",
         serde_json::error::Category::Syntax => "syntax",
