@@ -53,13 +53,19 @@
 //! The interactive provider returns the same secret type: values arriving
 //! over the S9 IPC surface are wrapped at THAT wire boundary (the S4
 //! adapter's contract), so the provider hands over already-guarded
-//! values. `expose()` is called at exactly ONE deliberate consumer site:
-//! [`parse_session_envelope`], the FR-7C envelope bridge whose eventual
-//! caller is the S4 MuonAuth adapter's persistence facade.
+//! values. `expose()` is called at exactly TWO deliberate consumer
+//! sites, both gates rather than uses of the value as data: the
+//! interactive arm's blankness check in [`CredentialSource::read`]
+//! (fail-closed symmetry with the systemd arm's empty-file refusal —
+//! a blank is not a credential), and [`parse_session_envelope`], the
+//! FR-7C envelope bridge whose eventual caller is the S4 MuonAuth
+//! adapter's persistence facade.
 //!
 //! # Fail-closed (every refusal is typed, never a blank/partial value)
 //!
-//! A missing credential file, an unreadable file, an empty value, an
+//! A missing credential file, an unreadable file, an empty value (a
+//! zero-byte credential file, or a blank handed back by the interactive
+//! surface — both arms refuse blanks), an
 //! oversized value, a non-UTF-8 value, a traversal-shaped credential
 //! name, a symlink or subdirectory where a credential file should be, a
 //! leaf with group/world permission bits, an untrusted (writable or
@@ -163,9 +169,10 @@ pub trait SecretBoundary: Sized {
     /// global scrub registry).
     fn ingress(value: String) -> Self;
 
-    /// Read access for the deliberate consumer. Within this crate that
-    /// is exactly [`parse_session_envelope`]; anywhere else it belongs
-    /// to the caller that owns the secret.
+    /// Read access for the deliberate consumer. Within this crate that is
+    /// exactly two gate sites: the interactive arm's blankness check in
+    /// [`CredentialSource::read`] and [`parse_session_envelope`];
+    /// anywhere else it belongs to the caller that owns the secret.
     fn expose(&self) -> &str;
 }
 
@@ -232,11 +239,15 @@ impl<S> SystemdCredentialDirectory<S> {
     /// [`CredentialInputError::NoCredentialsDirectory`] when the
     /// variable is absent — a configured systemd source with no
     /// systemd behind it is a misdeployment, refused rather than
-    /// silently blank (FR-7J).
+    /// silently blank (FR-7J) — and
+    /// [`CredentialInputError::EmptyCredentialsDirectory`] when it is
+    /// set but empty (a broken deployment, distinct from absent).
     pub fn from_env(account: &AccountSection) -> Result<Self, CredentialInputError> {
-        let directory = std::env::var_os(CREDENTIALS_DIRECTORY_VAR)
-            .map(PathBuf::from)
-            .ok_or(CredentialInputError::NoCredentialsDirectory)?;
+        let directory = resolve_systemd_directory(
+            std::env::var_os(CREDENTIALS_DIRECTORY_VAR)
+                .as_deref()
+                .map(Path::new),
+        )?;
         Ok(Self::new(
             directory,
             account.systemd_credential_names.clone(),
@@ -398,7 +409,9 @@ impl<S: SecretBoundary> CredentialSource<S> {
     ///
     /// # Errors
     /// [`CredentialInputError::NoCredentialsDirectory`] when the
-    /// vocabulary names the systemd source and the variable is absent.
+    /// vocabulary names the systemd source and the variable is absent;
+    /// [`CredentialInputError::EmptyCredentialsDirectory`] when it is
+    /// set but empty.
     pub fn resolve(
         vocabulary: ConfiguredCredentialSource,
         account: &AccountSection,
@@ -420,7 +433,9 @@ impl<S: SecretBoundary> CredentialSource<S> {
     ///
     /// # Errors
     /// [`CredentialInputError::NoCredentialsDirectory`] when the
-    /// vocabulary names the systemd source and `directory` is `None`.
+    /// vocabulary names the systemd source and `directory` is `None`;
+    /// [`CredentialInputError::EmptyCredentialsDirectory`] when it is
+    /// `Some` but empty.
     pub fn resolve_in(
         vocabulary: ConfiguredCredentialSource,
         account: &AccountSection,
@@ -430,9 +445,7 @@ impl<S: SecretBoundary> CredentialSource<S> {
         match vocabulary {
             ConfiguredCredentialSource::Interactive => Ok(Self::Interactive { provider }),
             ConfiguredCredentialSource::Systemd => {
-                let directory = directory
-                    .ok_or(CredentialInputError::NoCredentialsDirectory)?
-                    .to_path_buf();
+                let directory = resolve_systemd_directory(directory)?;
                 Ok(Self::Systemd(SystemdCredentialDirectory::new(
                     directory,
                     account.systemd_credential_names.clone(),
@@ -443,14 +456,30 @@ impl<S: SecretBoundary> CredentialSource<S> {
 
     /// Reads one credential by short name through the active source.
     ///
+    /// The interactive arm refuses blank values: a provider yielding
+    /// `Some("")` gets the [`CredentialInputError::ProvidedEmpty`]
+    /// refusal, symmetric with the systemd arm's empty-file refusal —
+    /// a blank is never a credential on either arm.
+    ///
     /// # Errors
     /// The active arm's typed refusals — see [`CredentialInputError`].
     pub fn read(&self, short_name: &str) -> Result<S, CredentialInputError> {
         match self {
             Self::Interactive { provider } => {
-                provider(short_name).ok_or_else(|| CredentialInputError::NotProvided {
-                    name: short_name.to_owned(),
-                })
+                let secret =
+                    provider(short_name).ok_or_else(|| CredentialInputError::NotProvided {
+                        name: short_name.to_owned(),
+                    })?;
+                // Fail-closed symmetry with the systemd arm's `Empty`
+                // refusal. The second deliberate expose() consumer site
+                // (see the module docs) — a blankness check, nothing
+                // else may branch on the value here.
+                if secret.expose().is_empty() {
+                    return Err(CredentialInputError::ProvidedEmpty {
+                        name: short_name.to_owned(),
+                    });
+                }
+                Ok(secret)
             }
             Self::Systemd(directory) => directory.read(short_name),
         }
@@ -505,6 +534,20 @@ pub fn parse_session_envelope<S: SecretBoundary>(
     Ok(envelope)
 }
 
+/// The systemd arm's directory resolution, shared by the env-backed and
+/// injected entry points: absent fails as [`CredentialInputError::
+/// NoCredentialsDirectory`] (FR-7J) and a set-but-empty value fails as
+/// [`CredentialInputError::EmptyCredentialsDirectory`] — an empty path
+/// would otherwise resolve credential names against the process working
+/// directory and misreport every read as a bare relative `Missing`.
+fn resolve_systemd_directory(directory: Option<&Path>) -> Result<PathBuf, CredentialInputError> {
+    let directory = directory.ok_or(CredentialInputError::NoCredentialsDirectory)?;
+    if directory.as_os_str().is_empty() {
+        return Err(CredentialInputError::EmptyCredentialsDirectory);
+    }
+    Ok(directory.to_path_buf())
+}
+
 /// serde's error Display embeds the offending VALUE verbatim (an
 /// `invalid type: string "…"` refusal carries the misprovisioned bytes —
 /// for a session slot, that is a password riding daemon error logs).
@@ -544,6 +587,16 @@ pub enum CredentialInputError {
          not provisioned)"
     )]
     NoCredentialsDirectory,
+    /// `$CREDENTIALS_DIRECTORY` is set but empty. Distinct from absent:
+    /// systemd always provisions an absolute per-unit path, so an empty
+    /// value is a broken deployment — left unchecked it would resolve
+    /// credential names against the process working directory and
+    /// misreport every read as a bare relative `Missing`.
+    #[error(
+        "the CREDENTIALS_DIRECTORY environment variable is set but empty \
+         (systemd always provisions an absolute per-unit path)"
+    )]
+    EmptyCredentialsDirectory,
     /// The short name has no entry in `account.systemd_credential_names`.
     #[error(
         "no systemd credential name configured for `{name}` \
@@ -634,6 +687,19 @@ pub enum CredentialInputError {
         /// The requested short name.
         name: String,
     },
+    /// The interactive surface provided an EMPTY value — never a blank
+    /// credential. The interactive twin of the systemd arm's
+    /// [`CredentialInputError::Empty`] refusal: a misbehaving S9 client
+    /// handing back an empty string is treated exactly like an empty
+    /// credential file (fail-closed symmetry — qa round decision).
+    #[error(
+        "the interactive credential surface provided an empty value for `{name}` \
+         (a blank is not a credential)"
+    )]
+    ProvidedEmpty {
+        /// The requested short name.
+        name: String,
+    },
     /// The credentials tree failed the fs_trust walk (symlink,
     /// wrong type, group/world write, or non-root ownership) — the
     /// directory is not the systemd-provisioned tree it must be.
@@ -690,6 +756,25 @@ mod test_support {
     pub(super) fn exposes() -> usize {
         EXPOSE_CALLS.with(Cell::get)
     }
+
+    /// The zero-ingress pin on every systemd refusal arm: no value may
+    /// cross the source boundary when the read refuses. Kills the
+    /// mutation class qa's round survived ("ingress moved to
+    /// immediately-after-read, before all gates" passed the pre-fix
+    /// suite 24/24 because no refusal arm asserted the boundary count);
+    /// the success arm's exactly-once pin lives in
+    /// `provisioned_credential_crosses_exactly_one_ingress_unchanged`.
+    pub(super) fn assert_no_ingress<R>(body: impl FnOnce() -> R) -> R {
+        let before = ingresses();
+        let result = body();
+        assert_eq!(
+            ingresses(),
+            before,
+            "a refusal must not cross the ingress boundary — values enter \
+             only after every gate passes"
+        );
+        result
+    }
 }
 
 /// The systemd fail-closed matrix. Positive arms need a root-owned tree
@@ -701,6 +786,7 @@ mod systemd_read_tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
     use test_support::TestSecret;
+    use test_support::assert_no_ingress;
 
     /// A systemd-shaped tree: 0700 credentials directory, one 0400 leaf
     /// per (credential-name, value), the default name mappings.
@@ -771,7 +857,7 @@ mod systemd_read_tests {
     fn missing_credential_file_is_a_typed_missing_error() {
         let root = tempfile::tempdir().unwrap();
         let source = credentials_tree(root.path(), &[]);
-        let err = source.read("session").unwrap_err();
+        let err = assert_no_ingress(|| source.read("session")).unwrap_err();
         assert!(
             matches!(err, CredentialInputError::Missing { ref name, ref path }
                 if name == "protonwire-session" && path.ends_with("protonwire-session")),
@@ -785,7 +871,7 @@ mod systemd_read_tests {
         let root = tempfile::tempdir().unwrap();
         let source = credentials_tree(root.path(), &[("protonwire-session", "")]);
         assert!(matches!(
-            source.read("session"),
+            assert_no_ingress(|| source.read("session")),
             Err(CredentialInputError::Empty { .. })
         ));
     }
@@ -794,6 +880,7 @@ mod systemd_read_tests {
     /// without being read whole; exactly-at-cap is not over it.
     #[test]
     fn oversized_credential_is_refused() {
+        use test_support::ingresses;
         let root = tempfile::tempdir().unwrap();
         let source = credentials_tree(root.path(), &[("protonwire-session", "x")]);
         let path = source.directory().join("protonwire-session");
@@ -801,7 +888,7 @@ mod systemd_read_tests {
         // test's own staged content.
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
         std::fs::write(&path, vec![b'x'; MAX_CREDENTIAL_BYTES + 1]).unwrap();
-        match source.read("session") {
+        match assert_no_ingress(|| source.read("session")) {
             Err(CredentialInputError::Oversized { size, cap, .. }) => {
                 assert_eq!(cap, MAX_CREDENTIAL_BYTES);
                 assert_eq!(size, MAX_CREDENTIAL_BYTES as u64 + 1);
@@ -810,14 +897,20 @@ mod systemd_read_tests {
         }
         // Boundary: exactly at the cap is not over it (on unprivileged
         // runners the trust walk's ownership arm refuses instead —
-        // either way, not Oversized).
+        // either way, not Oversized). Both runner shapes keep the
+        // boundary count honest: a refusal crosses nothing, a success
+        // crosses exactly once.
         std::fs::write(&path, vec![b'x'; MAX_CREDENTIAL_BYTES]).unwrap();
+        let before = ingresses();
         match source.read("session") {
-            Ok(secret) => assert_eq!(secret.expose().len(), MAX_CREDENTIAL_BYTES),
+            Ok(secret) => {
+                assert_eq!(secret.expose().len(), MAX_CREDENTIAL_BYTES);
+                assert_eq!(ingresses() - before, 1, "success crosses exactly once");
+            }
             Err(CredentialInputError::Oversized { .. }) => {
                 panic!("at-cap must not be Oversized")
             }
-            Err(_) => {}
+            Err(_) => assert_eq!(ingresses() - before, 0, "a refusal crosses nothing"),
         }
     }
 
@@ -831,7 +924,7 @@ mod systemd_read_tests {
         let path = source.directory().join("protonwire-session");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
         std::fs::write(&path, [0x80u8, 0xff, 0xfe, 0x7f]).unwrap();
-        match source.read("session") {
+        match assert_no_ingress(|| source.read("session")) {
             Err(err @ CredentialInputError::NotUtf8 { .. }) => {
                 assert!(!err.to_string().contains("0x"), "no bytes in: {err}");
             }
@@ -848,8 +941,10 @@ mod systemd_read_tests {
         let source = credentials_tree(root.path(), &[("protonwire-session", "tok-1")]);
         let path = source.directory().join("protonwire-session");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-        match source.read("session") {
-            Err(CredentialInputError::ExcessivePermission { mode, .. }) => assert_eq!(mode, 0o644),
+        match assert_no_ingress(|| source.read("session")) {
+            Err(CredentialInputError::ExcessivePermission { mode, .. }) => {
+                assert_eq!(mode, 0o644)
+            }
             other => panic!("expected ExcessivePermission, got {other:?}"),
         }
     }
@@ -865,7 +960,7 @@ mod systemd_read_tests {
         let real = root.path().join("real-secret");
         std::fs::write(&real, "tok-laundered").unwrap();
         std::os::unix::fs::symlink(&real, dir.join("protonwire-session")).unwrap();
-        let err = source.read("session").unwrap_err();
+        let err = assert_no_ingress(|| source.read("session")).unwrap_err();
         assert!(
             matches!(
                 err,
@@ -882,7 +977,7 @@ mod systemd_read_tests {
         let root = tempfile::tempdir().unwrap();
         let source = credentials_tree(root.path(), &[]);
         std::fs::create_dir(source.directory().join("protonwire-session")).unwrap();
-        let err = source.read("session").unwrap_err();
+        let err = assert_no_ingress(|| source.read("session")).unwrap_err();
         assert!(
             matches!(
                 err,
@@ -907,7 +1002,7 @@ mod systemd_read_tests {
             let mut names = BTreeMap::new();
             names.insert("session".to_owned(), bad.to_owned());
             let source = SystemdCredentialDirectory::<TestSecret>::new(&dir, names);
-            match source.read("session") {
+            match assert_no_ingress(|| source.read("session")) {
                 Err(CredentialInputError::BadCredentialName { name }) => assert_eq!(name, bad),
                 other => panic!("`{bad}` must be BadCredentialName, got {other:?}"),
             }
@@ -923,7 +1018,7 @@ mod systemd_read_tests {
         let source = credentials_tree(root.path(), &[("protonwire-session", "tok-1")]);
         std::fs::set_permissions(source.directory(), std::fs::Permissions::from_mode(0o777))
             .unwrap();
-        let err = source.read("session").unwrap_err();
+        let err = assert_no_ingress(|| source.read("session")).unwrap_err();
         assert!(
             matches!(
                 err,
@@ -948,7 +1043,7 @@ mod systemd_read_tests {
         if std::fs::metadata(dir).unwrap().uid() == 0 {
             return; // cannot construct a non-root-owned tree here
         }
-        let err = source.read("session").unwrap_err();
+        let err = assert_no_ingress(|| source.read("session")).unwrap_err();
         assert!(
             matches!(
                 err,
@@ -964,7 +1059,7 @@ mod systemd_read_tests {
     fn unconfigured_short_name_is_refused() {
         let root = tempfile::tempdir().unwrap();
         let source = credentials_tree(root.path(), &[]);
-        match source.read("totp") {
+        match assert_no_ingress(|| source.read("totp")) {
             Err(CredentialInputError::NameNotConfigured { name }) => assert_eq!(name, "totp"),
             other => panic!("expected NameNotConfigured, got {other:?}"),
         }
@@ -998,6 +1093,22 @@ mod interactive_tests {
         match source.read("session") {
             Err(CredentialInputError::NotProvided { name }) => assert_eq!(name, "session"),
             other => panic!("expected NotProvided, got {other:?}"),
+        }
+    }
+
+    /// qa gap (decision: REFUSE — fail-closed symmetry with the systemd
+    /// arm's `Empty`): the interactive arm used to accept `Some("")` as
+    /// a blank credential while the systemd arm refused empty files.
+    /// Red observed first in the behavioral is_err form against the
+    /// pre-fix tree: `Ok([redacted-test])`.
+    #[test]
+    fn a_provider_handing_back_an_empty_value_is_a_typed_refusal() {
+        let provider: InteractiveProvider<TestSecret> =
+            Arc::new(|_| Some(TestSecret::ingress(String::new())));
+        let source = CredentialSource::Interactive { provider };
+        match source.read("session") {
+            Err(CredentialInputError::ProvidedEmpty { name }) => assert_eq!(name, "session"),
+            other => panic!("expected ProvidedEmpty, got {other:?}"),
         }
     }
 }
@@ -1047,6 +1158,48 @@ mod resolution_tests {
         }
     }
 
+    /// qa gap: a SET-but-empty `$CREDENTIALS_DIRECTORY` used to resolve
+    /// to a bare relative path, misreporting every subsequent read as
+    /// `Missing { name, path: "protonwire-session" }` — the wrong error
+    /// class for a broken deployment. Pins BOTH directions: absent is
+    /// the FR-7J `NoCredentialsDirectory` refusal, empty is its own
+    /// distinct defect (red observed first in the behavioral is_err
+    /// form against the pre-fix tree: `Ok(Systemd)`).
+    #[test]
+    fn empty_and_absent_credentials_directory_are_distinct_refusals() {
+        let empty = CredentialSource::<TestSecret>::resolve_in(
+            ConfiguredCredentialSource::Systemd,
+            &account(),
+            Some(Path::new("")),
+            any_provider(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(empty, CredentialInputError::EmptyCredentialsDirectory),
+            "a set-but-empty directory must be EmptyCredentialsDirectory: {empty}"
+        );
+        assert!(
+            empty.to_string().contains("empty"),
+            "the message must name the defect: {empty}"
+        );
+        let absent = CredentialSource::<TestSecret>::resolve_in(
+            ConfiguredCredentialSource::Systemd,
+            &account(),
+            None,
+            any_provider(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(absent, CredentialInputError::NoCredentialsDirectory),
+            "absent stays the FR-7J refusal: {absent}"
+        );
+        assert_ne!(
+            empty.to_string(),
+            absent.to_string(),
+            "the two directions are distinct classes, not one message"
+        );
+    }
+
     /// FR-7J: a configured source that is unavailable fails closed.
     #[test]
     fn systemd_vocabulary_without_a_directory_fails_closed() {
@@ -1081,6 +1234,10 @@ mod resolution_tests {
             None => assert!(matches!(
                 outcome,
                 Err(CredentialInputError::NoCredentialsDirectory)
+            )),
+            Some(value) if value.is_empty() => assert!(matches!(
+                outcome,
+                Err(CredentialInputError::EmptyCredentialsDirectory)
             )),
             Some(_) => assert!(outcome.is_ok()),
         }
