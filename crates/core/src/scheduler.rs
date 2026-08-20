@@ -129,10 +129,11 @@ impl SchedulerConfig {
         // draw runs while the leader holds the lock, so the panic
         // would poison the mutex and wedge every joiner.
         if max_positive_jitter_seconds == u64::MAX {
-            return Err(SchedulerError::Config(format!(
+            return Err(SchedulerError::Config(
                 "jitter ceiling u64::MAX overflows draw_jitter's inclusive range \
                  (max_seconds + 1 wraps); use any value below u64::MAX"
-            )));
+                    .to_owned(),
+            ));
         }
         Ok(Self {
             refresh_interval_seconds,
@@ -1244,7 +1245,7 @@ mod tests {
         let config = SchedulerConfig::new(FRESHNESS_FLOOR_SECONDS, u64::MAX - 1, true)
             .expect("u64::MAX - 1 does not overflow the range");
         assert_eq!(config.max_positive_jitter_seconds, u64::MAX - 1);
-        assert!(draw_jitter(u64::MAX - 1) <= u64::MAX - 1);
+        assert!(draw_jitter(u64::MAX - 1) < u64::MAX);
     }
 
     #[test]
