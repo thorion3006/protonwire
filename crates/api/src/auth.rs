@@ -577,7 +577,16 @@ where
     }
 
     fn refresh(&self) -> Result<LoginStatus, ApiError> {
-        let state = self.state.lock().expect("adapter state lock");
+        let mut state = self.state.lock().expect("adapter state lock");
+        // A forced refresh invalidates any pending 2FA challenge (qa
+        // P2, S4 round): the challenge was minted against pre-refresh
+        // session material, and submitting it afterwards would drive
+        // the wire with stale challenge state — transport-class
+        // nonsense. Fail closed: the stale submit becomes an
+        // `InvalidState` refusal before any wire action (the rust/qa
+        // convergent decision; the client surfaces orchestrate the
+        // login → submit ordering).
+        state.pending = None;
         let session = self.session(&state);
         self.bridge
             .block_on(Box::pin(async move { session.refresh_auth().await }))

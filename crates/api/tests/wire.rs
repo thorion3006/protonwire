@@ -928,6 +928,45 @@ fn forced_refresh_swaps_the_tokens() {
     assert_eq!(body["RefreshToken"], REFRESH_TOKEN);
 }
 
+/// qa P2 (S4 review round): a 2FA submission after a forced refresh
+/// must fail closed. `refresh()` used to leave `state.pending` in
+/// place, so the STALE challenge — minted against pre-refresh session
+/// material — drove the wire through `from_totp` as transport-class
+/// nonsense. The decision (rust/qa converge): refresh invalidates the
+/// pending challenge; the stale submit is an `InvalidState` refusal
+/// with ZERO wire actions.
+#[test]
+fn submit_two_factor_after_refresh_is_a_state_refusal() {
+    let (handle, port, seen) = spawn_scripted(
+        srp_login_steps(&["twofactor"], tfa_totp())
+            .into_iter()
+            .chain([Step::static_json(
+                "POST",
+                "/auth/v4/refresh",
+                "200 OK",
+                refresh_response("access-token-NEW", "refresh-token-NEW"),
+            )])
+            .collect(),
+    );
+    let adapter = adapter_on_port(port);
+    adapter.begin_login(USERNAME, PASSWORD).expect("login");
+    adapter.refresh().expect("refresh");
+    let before = seen.lock().unwrap().len();
+
+    match adapter.submit_two_factor("123456") {
+        Err(protonwire_api::ApiError::InvalidState(code)) => {
+            assert_eq!(code, "no 2FA challenge in progress");
+        }
+        other => panic!("expected InvalidState, got {other:?}"),
+    }
+    handle.join().expect("responder thread");
+    assert_eq!(
+        seen.lock().unwrap().len(),
+        before,
+        "the stale submit must not touch the wire"
+    );
+}
+
 /// Logout: the remote `DELETE /auth/v4` happens, local state always
 /// clears, and the reported status is `LoggedOut` even though the
 /// scripted DELETE response is empty.
