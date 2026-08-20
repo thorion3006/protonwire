@@ -152,16 +152,25 @@ impl Drop for Fido2Payload {
 /// An opaque, single-use child-session fork selector minted by
 /// `AuthenticationApi::fork` (Muon's `POST /auth/v4/sessions/forks`).
 /// A session-bearing secret: never logged (its `Debug` renders
-/// `[redacted]`, landed with S4), never persisted beside the
-/// parent envelope, and never shared with ProTUN's `ApiSession` cache
-/// (PRD 6.5, FR-7C). Spike memo Q9: Muon logs selectors at `info`, so
-/// S1's suppression must cover the fork modules.
+/// `[redacted]`, landed with S4), zeroized on drop (the
+/// [`Fido2Payload`] hardening family, S4 review round), never persisted
+/// beside the parent envelope, and never shared with ProTUN's
+/// `ApiSession` cache (PRD 6.5, FR-7C). Spike memo Q9: Muon logs
+/// selectors at `info`, so S1's suppression must cover the fork
+/// modules.
 #[derive(Clone, PartialEq, Eq)]
 pub struct ForkSelector(String);
 
 impl std::fmt::Debug for ForkSelector {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("ForkSelector([redacted])")
+    }
+}
+
+impl Drop for ForkSelector {
+    fn drop(&mut self) {
+        use zeroize::Zeroize as _;
+        self.0.zeroize();
     }
 }
 
