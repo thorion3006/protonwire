@@ -565,7 +565,11 @@ struct CacheState {
     current: Option<protonwire_store::catalog::CachedCatalog>,
 }
 
-/// Which door a refresh came through (separate counters, FR-13I).
+/// Which door a refresh came through (separate counters, FR-13I). The
+/// LEADER's kind owns the diagnostic counter: one fetch increments
+/// exactly one counter, by the door that initiated it — a manual
+/// joiner of an automatic lead is counted as automatic (it caused no
+/// upstream request and overrode nothing), and vice versa.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RefreshKind {
     Automatic,
@@ -1792,6 +1796,14 @@ mod runtime_tests {
         started
             .recv_timeout(std::time::Duration::from_secs(5))
             .expect("the leader must reach the fetch");
+        // Race-settle note (the F5 discipline): this 200 ms sleep is
+        // NOT the correctness anchor — the `started` signal above is.
+        // While the gate holds, no additional fetch can begin, so
+        // `calls() == 1` holds at any sleep length including zero; the
+        // sleep only gives the losing racers time to REACH the condvar
+        // so the joiner arm below is exercised (without it they could
+        // straggle past completion and the joiner-count assert would
+        // flake on scheduling, not on behavior).
         std::thread::sleep(std::time::Duration::from_millis(200));
         assert_eq!(fetch.calls(), 1, "the leader must be the only fetcher");
         gate.release();
@@ -1839,6 +1851,151 @@ mod runtime_tests {
             "at least one racer must have joined the in-flight refresh \
              ({stragglers} arrived after completion)"
         );
+    }
+
+    /// qa P1-2 (the prescribed shape): the MANUAL door's single-flight
+    /// join. A manual caller presenting a token while an AUTOMATIC
+    /// refresh is in flight joins it — exactly ONE fetch,
+    /// `coalesced: true` — never a second request. Deleting the manual
+    /// door's join block left 57/57 tests green; this pin kills that
+    /// deletion (verified by running it).
+    ///
+    /// Counter semantics DECIDED and pinned (FR-13I): the LEADER's kind
+    /// owns the counter — the manual joiner added no upstream request
+    /// and overrode no interval, so `manual_refresh_count` does not
+    /// move for a join.
+    #[test]
+    fn a_manual_caller_joins_an_in_flight_automatic_refresh() {
+        let clock = VirtualClock::new(T0);
+        let (fetch, started, gate) = FakeFetch::new(vec![not_modified()]).gated();
+        let (scheduler, _dir) = seeded(&clock, &fetch, T0);
+
+        // Mint a ceremony while the window is shut, so the joiner has
+        // an outstanding token to present.
+        clock.set_wall(T0 + 60);
+        let requirement = match scheduler.refresh_manual(None) {
+            ManualOutcome::ConfirmationRequired(requirement) => requirement,
+            other => panic!("the early manual request must mint a ceremony: {other:?}"),
+        };
+        assert_eq!(fetch.calls(), 0);
+
+        // Open the window; the automatic leader parks inside the gate.
+        clock.set_wall(T0 + FRESHNESS_FLOOR_SECONDS + JITTER + 1);
+        let leader = std::thread::spawn({
+            let scheduler = Arc::clone(&scheduler);
+            move || scheduler.refresh_automatic()
+        });
+        started
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the leader must reach the fetch");
+        assert_eq!(fetch.calls(), 1);
+
+        // The manual caller presents the token and must JOIN the
+        // in-flight refresh (the token is not what opens this window —
+        // the automatic leader's eligibility did).
+        let joiner = std::thread::spawn({
+            let scheduler = Arc::clone(&scheduler);
+            let token = requirement.confirmation_token.clone();
+            move || scheduler.refresh_manual(Some(&token))
+        });
+        // Park-settle (the racing test's idiom): give the joiner time
+        // to reach the condvar BEFORE the release — the correctness
+        // anchor is the gate (no second fetch can start while it
+        // holds); this only ensures the join arm is the one exercised.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        gate.release();
+
+        match leader.join().unwrap() {
+            AutomaticOutcome::Due(report) => assert!(!report.coalesced, "the automatic led"),
+            other => panic!("the open window must be due for the automatic door: {other:?}"),
+        }
+        match joiner.join().unwrap() {
+            ManualOutcome::Refreshed(report) => {
+                assert!(report.coalesced, "the manual caller must join, not lead");
+                assert!(matches!(report.outcome, RefreshOutcome::NotModified));
+            }
+            other => panic!("the manual caller must join the in-flight refresh: {other:?}"),
+        }
+        assert_eq!(fetch.calls(), 1, "single-flight spans BOTH doors");
+
+        // The leader's kind owns the counter (the decision, pinned).
+        let diagnostics = scheduler.diagnostics();
+        assert_eq!(diagnostics.automatic_refresh_count, 1);
+        assert_eq!(
+            diagnostics.manual_refresh_count, 0,
+            "a join overrode nothing and caused no request"
+        );
+    }
+
+    /// rust L1 (DECIDED + pinned): a JOIN does not burn the presented
+    /// token. The join consumed an already-running window, not the
+    /// ceremony — and a live outstanding token can only PREDATE the
+    /// lead (ceremonies cannot be minted while a refresh is in flight,
+    /// and a manual LEAD burns its token at redeem), so the surviving
+    /// token has authorized nothing yet and still buys exactly its one
+    /// later early refresh. Burning on join would charge the user a
+    /// confirmation for a refresh that was already happening. (Times
+    /// stay inside the 300 s token TTL: mint just before the window
+    /// opens, join just after, replay while still live.)
+    #[test]
+    fn a_join_does_not_burn_the_outstanding_token() {
+        let clock = VirtualClock::new(T0);
+        let (fetch, started, gate) = FakeFetch::new(vec![not_modified(), not_modified()]).gated();
+        let (scheduler, _dir) = seeded(&clock, &fetch, T0);
+        let open = T0 + FRESHNESS_FLOOR_SECONDS; // the seeded window
+
+        // Mint inside the TTL horizon of everything that follows.
+        clock.set_wall(open - 60);
+        let requirement = match scheduler.refresh_manual(None) {
+            ManualOutcome::ConfirmationRequired(requirement) => requirement,
+            other => panic!("expected a ceremony, got {other:?}"),
+        };
+        // The automatic leader opens the window; the token is still
+        // live (minted 61 s ago, TTL 300 s).
+        clock.set_wall(open + 1);
+        let leader = std::thread::spawn({
+            let scheduler = Arc::clone(&scheduler);
+            move || scheduler.refresh_automatic()
+        });
+        started
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the leader must reach the fetch");
+        let joiner = std::thread::spawn({
+            let scheduler = Arc::clone(&scheduler);
+            let token = requirement.confirmation_token.clone();
+            move || scheduler.refresh_manual(Some(&token))
+        });
+        // Park-settle before the release (the racing test's idiom).
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        gate.release();
+        assert!(matches!(leader.join().unwrap(), AutomaticOutcome::Due(_)));
+        assert!(matches!(
+            joiner.join().unwrap(),
+            ManualOutcome::Refreshed(RefreshReport {
+                coalesced: true,
+                ..
+            })
+        ));
+        assert_eq!(fetch.calls(), 1);
+
+        // The window is future again; the SAME token still authorizes
+        // exactly one early refresh (the ceremony was never consumed,
+        // and it has not expired: minted at open-60, redeemed at
+        // open+120, TTL 300).
+        clock.set_wall(open + 120);
+        match scheduler.refresh_manual(Some(&requirement.confirmation_token)) {
+            ManualOutcome::Refreshed(report) => assert!(!report.coalesced),
+            other => panic!("the token around a join must still redeem once: {other:?}"),
+        }
+        assert_eq!(fetch.calls(), 2);
+        assert_eq!(scheduler.diagnostics().manual_refresh_count, 1);
+
+        // And is then dead for good — one ceremony, one redemption.
+        match scheduler.refresh_manual(Some(&requirement.confirmation_token)) {
+            ManualOutcome::ConfirmationRequired(_) => {}
+            other => panic!("after its one redemption the token is dead: {other:?}"),
+        }
+        assert_eq!(fetch.calls(), 2);
     }
 
     // --- T-26: floor, jitter window, rollback, restart ------------------------
