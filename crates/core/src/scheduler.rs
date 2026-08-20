@@ -98,7 +98,9 @@ pub struct SchedulerConfig {
     /// [`FRESHNESS_FLOOR_SECONDS`].
     pub refresh_interval_seconds: u64,
     /// The inclusive ceiling for the non-negative additive jitter, in
-    /// seconds (FR-13D: 0..=ceiling, never negative).
+    /// seconds (FR-13D: 0..=ceiling, never negative). Never
+    /// [`u64::MAX`] — [`SchedulerConfig::new`] rejects it (the range
+    /// computation would overflow; see [`draw_jitter`]).
     pub max_positive_jitter_seconds: u64,
     /// Whether conditional (ETag) requests are used (FR-13E).
     pub conditional_requests: bool,
@@ -119,6 +121,17 @@ impl SchedulerConfig {
             return Err(SchedulerError::Config(format!(
                 "refresh interval {refresh_interval_seconds}s is below the three-hour floor \
                  ({FRESHNESS_FLOOR_SECONDS}s)"
+            )));
+        }
+        // The same never-constructible defense for the ceiling (rust
+        // M2): draw_jitter's `max_seconds + 1` wraps at exactly
+        // u64::MAX (the subsequent modulo divides by zero) — and the
+        // draw runs while the leader holds the lock, so the panic
+        // would poison the mutex and wedge every joiner.
+        if max_positive_jitter_seconds == u64::MAX {
+            return Err(SchedulerError::Config(format!(
+                "jitter ceiling u64::MAX overflows draw_jitter's inclusive range \
+                 (max_seconds + 1 wraps); use any value below u64::MAX"
             )));
         }
         Ok(Self {
@@ -1209,6 +1222,29 @@ mod tests {
         // The exact floor is accepted; so is everything above it.
         assert!(SchedulerConfig::new(FRESHNESS_FLOOR_SECONDS, 0, true).is_ok());
         assert!(SchedulerConfig::new(FRESHNESS_FLOOR_SECONDS + 1, 600, false).is_ok());
+    }
+
+    /// rust M2: draw_jitter(u64::MAX) overflows (`max_seconds + 1`
+    /// wraps to 0, then `% range` divides by zero) and it runs while
+    /// the leader HOLDS the lock — the panic would poison the mutex and
+    /// wedge every joiner. The floor's "never constructible below the
+    /// floor" defense applies to the ceiling too: the config must never
+    /// be constructible with the overflow value.
+    #[test]
+    fn jitter_ceiling_is_validated_like_the_floor() {
+        let err = SchedulerConfig::new(FRESHNESS_FLOOR_SECONDS, u64::MAX, true)
+            .expect_err("the overflow ceiling must be rejected like a sub-floor interval");
+        assert!(
+            err.to_string().contains("jitter ceiling"),
+            "the error must name the ceiling: {err}"
+        );
+        // Everything strictly below the overflow point stays
+        // constructible, and the largest safe ceiling draws safely
+        // (range = u64::MAX, limit = u64::MAX — every draw accepted).
+        let config = SchedulerConfig::new(FRESHNESS_FLOOR_SECONDS, u64::MAX - 1, true)
+            .expect("u64::MAX - 1 does not overflow the range");
+        assert_eq!(config.max_positive_jitter_seconds, u64::MAX - 1);
+        assert!(draw_jitter(u64::MAX - 1) <= u64::MAX - 1);
     }
 
     #[test]
