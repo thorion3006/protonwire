@@ -117,9 +117,11 @@ pub fn from_slice<T: DeserializeOwned>(input: &[u8]) -> Result<T, YamlError> {
 /// arm, whose misfires over-reject (safe), a mis-opened quote blinds
 /// (unsafe). A node starts at the head of a fresh line (NOT a plain
 /// scalar's more-indented continuation line), immediately after `:`
-/// acting as a value indicator (followed by space or EOL — or anywhere
-/// inside a flow collection: `{k:*x}` is a live alias position), after
-/// `-`/`?` acting as entry indicators (followed by space or EOL AND
+/// acting as a value indicator (followed by space or EOL — or in flow
+/// where no plain token is in flight: after a completed key such as
+/// the quoted `{'k':'v'}` even a non-spaced `:` is an indicator, while
+/// the mid-plain `:` in `{k:'v'}` is CONTENT and the entry is one
+/// plain scalar), after `-`/`?` acting as entry indicators (followed by space or EOL AND
 /// themselves sitting at a node start — mid-scalar `a - 'x` and
 /// `a ? 'x` are plain content, for the same reason), and after a flow
 /// separator (`,`/`[`/`{` — but only inside an open flow collection or
@@ -138,14 +140,16 @@ pub fn from_slice<T: DeserializeOwned>(input: &[u8]) -> Result<T, YamlError> {
 /// original bytes.
 ///
 /// `*`/`&` detection deliberately keeps the looser round-1 boundary rule
-/// (any spacing/indicator character). This is no longer forced by a
-/// known bypass: the flow `:` arm below arms `at_node_start`
-/// unconditionally inside flow collections, so an `at_node_start`-tight
-/// arm would also catch `{k:*x}`. Loose stays as pure policy — it is
-/// strictly the safe direction: a misfire (a `*`/`&` in plain-scalar
-/// prose such as `k: a *b`) only over-rejects a document, while any
-/// miss would be a bypass; over-reject-only is the standing rule for
-/// untrusted input.
+/// (any spacing/indicator character). Probe-verified parser truth
+/// (round 4): `{k:*x}` is NOT a live alias — it parses as ONE plain
+/// scalar key `"k:*x"`, even with `&x` in scope — but the quoted-key
+/// twin `{'k':*x}` IS a live, resolving alias at exactly the same
+/// adjacency. The two differ only in the parser's mid-token state,
+/// which a pre-parse character scan cannot observe, so adjacency is
+/// inherently ambiguous and loose errs safe: a misfire (a `*`/`&` in
+/// plain-scalar prose such as `k: a *b`) only over-rejects a document,
+/// while any miss would be a bypass; over-reject-only is the standing
+/// rule for untrusted input.
 fn find_anchor_or_alias_token(input: &str) -> Option<usize> {
     // Line-keyed state must key on PARSER lines: normalize the YAML 1.1
     // break set into `\n` for the scan only (the parser in `from_str`
@@ -297,7 +301,21 @@ fn find_anchor_or_alias_token(input: &str) -> Option<usize> {
                         index += 1;
                         continue;
                     }
-                    ':' if flow_depth > 0 || spaced_or_eol => {
+                    // The parser's own two-position rule (libyaml,
+                    // round 4): `:` is an indicator iff followed by
+                    // blank/EOL, or in flow where NO plain token is in
+                    // flight. A mid-plain `:` (`[b:'c`, `{k:'v'`) is
+                    // CONTENT — the plain scalar runs straight through
+                    // it — so arming there opened phantom quote state
+                    // on the next quote and blinded the scan (the
+                    // round-4 P1). After a COMPLETED key token
+                    // (`{'k':'v'}` — a real pair, probe-verified) even
+                    // a non-spaced `:` is a value indicator: not arming
+                    // there would leave the value quote unopened and a
+                    // `#` inside it would read as a comment, hiding
+                    // same-line anchors. `flow_plain` is exactly the
+                    // "plain token in flight" tracker.
+                    ':' if spaced_or_eol || (flow_depth > 0 && !flow_plain) => {
                         at_node_start = true;
                         plain_pending = false;
                         flow_plain = false;
@@ -807,7 +825,9 @@ mod tests {
         assert_accepts("k:\n  - 'a'\n  - 'b'\n");
         // Round-1 Low-track conservative false-flags, deliberately left
         // (over-reject is the safe direction; `*`/`&` keep the loose
-        // boundary because `{k:*x}` is a live alias site — pinned above):
+        // boundary because the same adjacency is a live alias site when
+        // the preceding key token is complete — `{'k':*x}` resolves —
+        // see `flow_colon_adjacency_parses_as_plain_scalar_keys`):
         // plain-scalar `*` after spacing / after `-` still flags.
         assert_eq!(find_anchor_or_alias_token("k: a *b\n"), Some(1));
         assert_eq!(find_anchor_or_alias_token("k: e-*x\n"), Some(1));
@@ -982,24 +1002,59 @@ mod tests {
         }
     }
 
-    /// Pin (green on round-1 HEAD): a `:` immediately followed by the
-    /// value inside flow collections (`{k:*x}`) IS a live alias
-    /// position — serde_norway resolves it. The `*`/`&` arm would catch
-    /// it even tightened to `at_node_start` (the flow `:` arm arms
-    /// unconditionally in flow), so loose is pure over-reject-only
-    /// policy here — see the scanner doc comment.
+    /// Pin (green on every round since 1; premise corrected round 4): a
+    /// `:` immediately followed by `*name` inside flow collections
+    /// stays FLAGGED. The corrected premise: `{k:*x}` is NOT a live
+    /// alias — it parses as ONE plain scalar key `"k:*x"` (asserted
+    /// below; even with `&x` in scope the alias does not resolve) —
+    /// but the quoted-key twin `{'k':*x}` IS a live, resolving alias
+    /// at the same adjacency, and a pre-parse scan cannot distinguish
+    /// the two parser token states. The flag is therefore conservative
+    /// over-reject in the `{k:*x}` case and a true positive in the
+    /// `{'k':*x}` case; loose errs safe — see the scanner doc comment
+    /// and `flow_colon_adjacency_parses_as_plain_scalar_keys`.
     #[test]
     fn flow_colon_alias_adjacency_still_flagged() {
         assert_policy_rejects("a: &x 1\ntop: {k:*x}\n", 1);
+        // Premise enforced: the flagged adjacency parses as one plain
+        // scalar key — the alias does NOT resolve.
+        let value: serde_norway::Value = serde_norway::from_str("a: &x 1\ntop: {k:*x}\n").unwrap();
+        let serde_norway::Value::Mapping(inner) = &value["top"] else {
+            panic!("{{k:*x}} must parse as a mapping: {value:?}")
+        };
+        assert_eq!(
+            inner.get(serde_norway::Value::String("k:*x".into())),
+            Some(&serde_norway::Value::Null),
+            "`k:*x` is one plain scalar key, not a resolving alias: {inner:?}"
+        );
     }
 
-    /// Pin (green on round-1 HEAD): the flow `:` adjacency must also
-    /// keep OPENING quotes (`{k:'v'}` is a quoted value) while the block
-    /// `:` without space (`it:'s`) does not.
+    /// Pin (green on every round since 1; premise corrected round 4):
+    /// `{k:'v'}` is NOT a quoted value — the mid-plain `:` is content
+    /// and the entry parses as ONE plain scalar key `"k:'v'"` with a
+    /// null value (asserted below). Since round 4 the scan treats the
+    /// quote there as content (no phantom opens); the QUOTED-KEY twin
+    /// `{'k':'v'}` is a real pair — its non-spaced `:` is a true
+    /// indicator and the value quote opens (pinned by
+    /// `quoted_key_nonspace_flow_colon_is_a_true_indicator`) — while
+    /// the block `:` without space (`it:'s`) stays content.
     #[test]
     fn flow_colon_quoted_value_opens() {
         assert_accepts("m: {k:'v'}\n");
+        // Premise enforced: one plain scalar key, not a quoted value.
+        let value: serde_norway::Value = serde_norway::from_str("m: {k:'v'}\n").unwrap();
+        let serde_norway::Value::Mapping(inner) = &value["m"] else {
+            panic!("{{k:'v'}} must parse as a mapping: {value:?}")
+        };
+        assert_eq!(
+            inner.get(serde_norway::Value::String("k:'v'".into())),
+            Some(&serde_norway::Value::Null),
+            "`k:'v'` is one plain scalar key with a null value: {inner:?}"
+        );
         assert_policy_rejects("m: {k:'v'}\nn: &z 1\n", 2);
+        // The real pair twin: the value quote after the quoted key's
+        // non-spaced `:` must stay synchronized too.
+        assert_accepts("m: {'k':'v'}\n");
     }
 
     /// Pins (green on round-1 HEAD): explicit-key quotes (`? 'k'`) and
@@ -1212,6 +1267,232 @@ mod tests {
             Some(3),
             "the quote opens at the post-comment line head, `*b` is content, \
              and the real anchor is flagged on line 3: {doc:?}"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Round 4 (fourth scoped re-review, P1): the in-flow `:` arm armed
+    // `at_node_start` where the parser sees plain-scalar CONTENT.
+    // libyaml's plain-scalar scanner treats a colon followed by a
+    // non-blank, non-flow-indicator character as CONTENT (`[b:'c` is
+    // the plain scalar `b:'c`, NOT key `b` plus a quoted value), so the
+    // armed position opened PHANTOM quote state on the quote that
+    // follows — and everything up to the next same-quote character
+    // (often the rest of the document) was invisible to the policy
+    // scan while the parser happily resolved anchors and aliases
+    // there. Fix: the arm mirrors the parser's own two-position rule —
+    // `:` is an indicator iff followed by blank/EOL, or in flow where
+    // NO plain token is in flight (`!flow_plain`: after a completed
+    // key such as the quoted `{'k':'v'}`, probe-verified a real pair).
+    // Strictly less arming than round 3; the loose `*`/`&` boundary
+    // still catches every live token the disarmed positions could
+    // hide. All reds below observed on the pre-fix scanner.
+    // ------------------------------------------------------------------
+
+    /// The named bypass, live (red pre-fix: scan `None`, hardened loader
+    /// `Ok`): the mid-plain `:` in `b:'c` is content, the phantom quote
+    /// swallowed the anchor AND its alias, and the alias RESOLVES under
+    /// the un-hardened parser — `[b:'c, &x 1, *x]` materializes
+    /// `["b:'c", 1, 1]`.
+    #[test]
+    fn mid_plain_flow_colon_quote_is_content_not_a_node_start() {
+        let doc = "a: [b:'c, &x 1, *x]";
+        let value: serde_norway::Value = serde_norway::from_str(doc)
+            .unwrap_or_else(|e| panic!("must parse un-hardened: {doc:?}: {e}"));
+        let expanded: serde_norway::Value =
+            serde_norway::from_str("[\"b:'c\", 1, 1]").expect("static fixture");
+        assert_eq!(
+            value["a"], expanded,
+            "the alias must RESOLVE under the un-hardened parser: {doc:?}"
+        );
+        assert_eq!(
+            find_anchor_or_alias_token(doc),
+            Some(1),
+            "policy scan must flag the anchored entry: {doc:?}"
+        );
+        assert!(matches!(
+            from_str::<serde_norway::Value>(doc).unwrap_err(),
+            YamlError::AnchorsForbidden(_)
+        ));
+    }
+
+    /// The family (red pre-fix on every shape: scan `None`, parse `Ok`
+    /// with a live anchor or resolving alias): nested sequences, the
+    /// anchor as a flow-mapping key, a mid-plain colon in a mapping
+    /// VALUE position, a tag-prefixed anchored entry, the alias
+    /// consumed by a later block entry, the double-quote twin, the
+    /// multi-line plain-continuation twin (the phantom swallows the
+    /// line break), and the CR-separator twin.
+    #[test]
+    fn mid_plain_flow_colon_phantom_family_flagged() {
+        for doc in [
+            "a: [[b:'c, &x 1]]",
+            "m: {b:'c, &x 1: 2}",
+            "m: {a: b:'c, d: &x 1}",
+            "a: [b:'c, !!str &x 1]",
+            "a: [b:'c, &x 1]\nc: *x",
+            "a: [b:\"c, &x 1]",
+        ] {
+            assert_policy_rejects(doc, 1);
+        }
+        // Multi-line plain continuation: `[b\n:'c, &x 1]` parses as
+        // `["b :'c", 1]` — the plain token runs across the break, the
+        // `:` on the next line is still mid-plain, and the anchor is
+        // live on line 2.
+        assert_policy_rejects("a: [b\n:'c, &x 1]", 2);
+        // CR-separator twin: the anchor sits at a parser-fresh line
+        // head inside the phantom window (round-3 normalization makes
+        // the scan see it — once the phantom no longer opens).
+        assert_policy_rejects("a: [b:'c,\r&x 1]", 2);
+    }
+
+    /// The capstone (red pre-fix: scan `None`, hardened loader `Ok` —
+    /// the wide fan-out was ACCEPTED): the committed round-3 capstone
+    /// payload opened with the phantom window `b:'c,`. The expanded
+    /// document materializes ~90.6k nodes — UNDER `MAX_YAML_NODES`, so
+    /// the structural caps alone would accept it (pinned below); the
+    /// anchor/alias policy must refuse it before any construction.
+    #[test]
+    fn phantom_window_wide_fanout_capstone_refused_by_policy() {
+        let mut doc = String::from("m: [b:'c,\r&f [");
+        doc.push_str(&"1,".repeat(300));
+        doc.push(']');
+        for _ in 0..300 {
+            doc.push_str(",\r*f");
+        }
+        doc.push(']');
+        let raw: serde_norway::Value = serde_norway::from_str(&doc)
+            .unwrap_or_else(|e| panic!("toggle-red: the un-hardened path accepts: {e}"));
+        assert!(
+            enforce_structure(&raw).is_ok(),
+            "the ~90.6k-node expansion sits UNDER the node cap: only the \
+             anchor/alias policy can refuse it"
+        );
+        assert_eq!(
+            find_anchor_or_alias_token(&doc),
+            Some(2),
+            "the &f anchor sits inside the former phantom window; the scan must see it"
+        );
+        assert!(matches!(
+            from_str::<serde_norway::Value>(&doc).unwrap_err(),
+            YamlError::AnchorsForbidden(_)
+        ));
+    }
+
+    /// No-regression pins for the REDUCED arming (green on round-3 HEAD
+    /// by definition; the red was demonstrated against the named
+    /// mutation in the probe crate — see the commit message): a
+    /// non-spaced in-flow `:` IS a true value indicator where the
+    /// parser has a COMPLETED key token — `{'k':'v # w'}` is a real
+    /// pair with a quoted value, so the value quote must OPEN and the
+    /// `#` inside it must not read as a comment hiding the same-line
+    /// anchor. Under the literal arm reduction (`':' if spaced_or_eol`
+    /// alone) every shape here regresses to scan `None` with parse
+    /// `Ok`. The `:`+EOL indicator (H6) and the clean quoted-key
+    /// documents stay correct too.
+    #[test]
+    fn quoted_key_nonspace_flow_colon_is_a_true_indicator() {
+        assert_policy_rejects("{'k':'v # w', &x 1}", 1);
+        assert_policy_rejects("{\"k\":\"v # w\", &x 1}", 1);
+        assert_policy_rejects("m: {'k': {'j':'v # w', &x 1}}", 1);
+        assert_accepts("{'k':'v # w'}");
+        // H6 (round-4 probe): `:` before a line break is a true
+        // indicator (spaced_or_eol covers EOL); the quote at the next
+        // parser line head opens, and the anchor after it is flagged.
+        assert_policy_rejects("a: [b:\r'c', &x 1]", 2);
+    }
+
+    /// Clean arms of the reduced arming (no over-regression) plus the
+    /// honest over-reject disclosures: shapes whose `&x`/`*x` the
+    /// PARSER sees as plain-scalar content still flag via the loose
+    /// `*`/`&` boundary — the standing over-reject-only policy.
+    #[test]
+    fn reduced_colon_arming_clean_arms_stay_clean() {
+        // Mid-plain colon without contraband: accepted (the phantom
+        // used to open AND close inside `b:'c'` — now it never opens).
+        assert_accepts("a: [b'c]");
+        assert_accepts("a: [b:'c']");
+        // Contraband after the phantom's former window: still flagged
+        // (loose arm after `, `).
+        assert_policy_rejects("a: [b:'c', &x 1]", 1);
+        // Over-reject, pinned as truth (red on round-3 HEAD as a MISS:
+        // scan `None`): no comma ends the plain token, so `&x 1` is
+        // parser CONTENT (`["b:'c &x 1"]`) — the loose boundary flags
+        // it anyway. Over-reject is the safe direction; pinned so a
+        // future pass must make a conscious choice to change it.
+        assert_eq!(find_anchor_or_alias_token("a: [b:'c &x 1]"), Some(1));
+        // BLOCK context, probe-verified truth: `k: a:'b, &x 1` parses
+        // as ONE plain string (block `:` without space is content),
+        // and the scan flags it via the loose arm — conservative
+        // over-reject, unchanged from round 3.
+        let block = "k: a:'b, &x 1";
+        let value: serde_norway::Value = serde_norway::from_str(block).unwrap();
+        assert_eq!(
+            value["k"],
+            serde_norway::Value::String("a:'b, &x 1".into()),
+            "block-context mid-plain colon: the whole value is one plain string"
+        );
+        assert_eq!(find_anchor_or_alias_token(block), Some(1));
+    }
+
+    /// Premise enforcement for the round-4 corrections (green on every
+    /// round — these pin PARSER truth): `{k:'v'}` and `{k:*x}` each
+    /// parse as ONE plain scalar key, NOT as a quoted value or a
+    /// resolving alias — even with `&x` in scope. The quoted-key twin
+    /// `{'k':*x}` IS a live, resolving alias at exactly the same
+    /// adjacency: a pre-parse scan cannot distinguish the two token
+    /// states, which is the honest reason the `*`/`&` boundary stays
+    /// loose (over-reject-only). See the scanner doc comment.
+    #[test]
+    fn flow_colon_adjacency_parses_as_plain_scalar_keys() {
+        for doc in ["m: {k:'v'}", "a: &x 1\nm: {k:'v'}"] {
+            let value: serde_norway::Value = serde_norway::from_str(doc).unwrap();
+            let serde_norway::Value::Mapping(inner) = &value["m"] else {
+                panic!(
+                    "{{k:'v'}} must parse as a mapping: {doc:?} -> {:?}",
+                    value["m"]
+                )
+            };
+            assert_eq!(
+                inner.len(),
+                1,
+                "one plain key, not a quoted pair: {inner:?}"
+            );
+            assert_eq!(
+                inner.get(serde_norway::Value::String("k:'v'".into())),
+                Some(&serde_norway::Value::Null),
+                "`k:'v'` is one plain scalar key with a null value: {inner:?}"
+            );
+        }
+        for doc in ["m: {k:*x}", "a: &x 1\nm: {k:*x}"] {
+            let value: serde_norway::Value = serde_norway::from_str(doc).unwrap();
+            let serde_norway::Value::Mapping(inner) = &value["m"] else {
+                panic!(
+                    "{{k:*x}} must parse as a mapping: {doc:?} -> {:?}",
+                    value["m"]
+                )
+            };
+            assert_eq!(inner.len(), 1, "one plain key, not an alias use: {inner:?}");
+            assert_eq!(
+                inner.get(serde_norway::Value::String("k:*x".into())),
+                Some(&serde_norway::Value::Null),
+                "`k:*x` is one plain scalar key — the alias does NOT resolve, \
+                 even with `&x` in scope: {inner:?}"
+            );
+        }
+        // The live twin: quoted key + non-spaced `:` + `*x` — the alias
+        // RESOLVES. Same adjacency as `{k:*x}`, different parser token
+        // state; the loose boundary catches both.
+        let live: serde_norway::Value = serde_norway::from_str("a: &x 1\nm: {'k':*x}").unwrap();
+        let one: serde_norway::Value = serde_norway::from_str("1").expect("static fixture");
+        assert_eq!(
+            live["m"]["k"], one,
+            "the alias RESOLVES at quoted-key adjacency: {live:?}"
+        );
+        assert_eq!(
+            find_anchor_or_alias_token("a: &x 1\nm: {'k':*x}"),
+            Some(1),
+            "both the declaration and the live adjacency are flagged"
         );
     }
 }
