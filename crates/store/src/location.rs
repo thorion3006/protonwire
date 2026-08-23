@@ -343,8 +343,11 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(
-            mode, LOCATION_CACHE_MODE,
-            "the IP-bearing payload must be owner-only at rest (the SEC-16 rationale)"
+            mode, 0o600,
+            "the IP-bearing payload must be owner-only at rest (the SEC-16 \
+             rationale) — pinned as the LITERAL, not the write constant: \
+             weakening LOCATION_CACHE_MODE must fail here, not flip both \
+             sides of the comparison (the S10 review's constant-anchor gap)"
         );
     }
 

@@ -269,14 +269,40 @@ pub struct CredentialStore {
     values: RwLock<std::collections::HashMap<String, PeerSecret>>,
 }
 
+/// The interactive credential vocabulary — the proto's documented short
+/// names (frontend-api `SubmitCredential`): the store is bounded to
+/// exactly these keys. Unbounded peer-supplied names × frame-sized
+/// values × no eviction was a memory-exhaustion lever against the root
+/// daemon from any socket-group peer (the S9 sec review's P2 — the
+/// M1 finding-10 class); the bound lives at the STORE (the asset), not
+/// only the handler.
+pub const INTERACTIVE_CREDENTIAL_NAMES: [&str; 3] = ["session", "username", "password"];
+
 impl CredentialStore {
     /// Records one credential value under its short name (replacing any
-    /// previous value — the newest submission wins).
-    pub fn submit(&self, name: &str, value: PeerSecret) {
+    /// previous value — the newest submission wins). Refuses names
+    /// outside [`INTERACTIVE_CREDENTIAL_NAMES`] with the vocabulary's
+    /// message for the wire; the value is the caller's to drop.
+    pub fn submit(&self, name: &str, value: PeerSecret) -> Result<(), &'static str> {
+        if !INTERACTIVE_CREDENTIAL_NAMES.contains(&name) {
+            return Err(
+                "unknown credential short name (the vocabulary is: session, username, password)",
+            );
+        }
         self.values
             .write()
             .expect("credential store lock")
             .insert(name.to_owned(), value);
+        Ok(())
+    }
+
+    /// True when no credential has landed — the bound's observable:
+    /// refused submissions never occupy entries.
+    pub fn is_empty(&self) -> bool {
+        self.values
+            .read()
+            .expect("credential store lock")
+            .is_empty()
     }
 
     /// Reads one credential value by short name (the provider half).
@@ -872,13 +898,13 @@ mod tests {
             other => panic!("nothing submitted must refuse NotProvided: {other:?}"),
         }
         // A submitted value serves through the boundary, newest wins.
-        store.submit("session", peer_secret("first"));
-        store.submit("session", peer_secret("second"));
+        store.submit("session", peer_secret("first")).unwrap();
+        store.submit("session", peer_secret("second")).unwrap();
         let served = source.read("session").expect("the submitted value serves");
         assert_eq!(served.expose(), "second");
         assert_eq!(format!("{served:?}"), "[redacted]");
         // A blank is never a credential (the source's own gate).
-        store.submit("username", peer_secret(""));
+        store.submit("username", peer_secret("")).unwrap();
         match source.read("username") {
             Err(CredentialInputError::ProvidedEmpty { name }) => assert_eq!(name, "username"),
             other => panic!("a blank must refuse ProvidedEmpty: {other:?}"),

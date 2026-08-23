@@ -521,10 +521,14 @@ pub fn peer_secret(value: impl Into<String>) -> PeerSecret {
 /// read by `protonwire_store::credential_input` enters guarded storage
 /// through this impl. The trait lives in store, the guarded type here —
 /// core is the one crate where both are visible without a dependency
-/// cycle. The store-side `production_boundary_tests` module exercises
-/// this impl verbatim through its dev-dependency edge; its test-only
-/// copy was deleted when this landed (the documented E0119 coherence
-/// removal condition — the tests run unchanged against this impl).
+/// cycle. Proven by `boundary_seam_tests` in THIS crate's test build
+/// (core sees store exactly once, the way every acyclic consumer — the
+/// daemon — resolves the impl): round-trip and redaction,
+/// registry-blindness with a registered control arm, and a
+/// verbatim-constructor pin. (The original store-side proof rode a
+/// test-only dev edge, which cargo's dev-cycle handling made unable to
+/// see this impl — two store instances; the lesson is recorded in the
+/// credential_input module doc.)
 impl protonwire_store::credential_input::SecretBoundary for PeerSecret {
     fn ingress(value: String) -> Self {
         peer_secret(value)

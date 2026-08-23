@@ -97,11 +97,13 @@ impl RequestHandler for DaemonHandler {
             // (d) The interactive credential source's IPC feed: the
             // value crosses the daemon boundary straight into guarded
             // peer-secret storage (zeroizing, never the scrub
-            // registry) keyed by its short name.
+            // registry) keyed by its short name — bounded to the
+            // documented vocabulary at the store (the S9 sec P2).
             Request::SubmitCredential { name, value } => {
                 self.services
                     .credentials
-                    .submit(&name, protonwire_core::redact::peer_secret(value.expose()));
+                    .submit(&name, protonwire_core::redact::peer_secret(value.expose()))
+                    .map_err(|detail| RpcError::new(RpcErrorCode::InvalidParams, detail))?;
                 Ok(RequestResult::Acknowledged)
             }
             // FR-7H's snapshot behind `account --json`: facts only,
@@ -609,6 +611,57 @@ mod tests {
             handler.handle(&admin_ctx(), Request::GetState).unwrap(),
             RequestResult::State { .. }
         ));
+    }
+
+    /// S9 sec P2: the credential store is BOUNDED to the proto's
+    /// documented short-name vocabulary — unbounded names × frame-sized
+    /// values × no eviction was a memory-exhaustion lever against the
+    /// root daemon from any socket-group peer (the M1 finding-10
+    /// class). An out-of-vocabulary name is a typed InvalidParams, the
+    /// store never sees it.
+    #[test]
+    fn submit_credential_rejects_names_outside_the_vocabulary() {
+        use protonwire_frontend_api::{RequestResult, SecretParam};
+
+        let (handler, _) = handler();
+        for junk in ["arbitrary-junk", "session ", "", "x".repeat(512).as_str()] {
+            let err = handler
+                .handle(
+                    &admin_ctx(),
+                    Request::SubmitCredential {
+                        name: junk.into(),
+                        value: SecretParam::new("v"),
+                    },
+                )
+                .expect_err("an out-of-vocabulary name must be refused");
+            assert_eq!(
+                err.code,
+                protonwire_frontend_api::RpcErrorCode::InvalidParams,
+                "name {junk:?}"
+            );
+        }
+        // The store itself stayed empty — the bound holds at the
+        // asset, not just the handler.
+        assert!(
+            handler.services.credentials.is_empty(),
+            "refused submissions must not occupy store entries"
+        );
+        // The three documented names still land.
+        for good in ["session", "username", "password"] {
+            match handler
+                .handle(
+                    &admin_ctx(),
+                    Request::SubmitCredential {
+                        name: good.into(),
+                        value: SecretParam::new("v"),
+                    },
+                )
+                .unwrap()
+            {
+                RequestResult::Acknowledged => {}
+                other => panic!("unexpected result for {good:?}: {other:?}"),
+            }
+        }
     }
 }
 
