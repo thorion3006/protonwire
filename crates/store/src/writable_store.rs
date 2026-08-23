@@ -609,7 +609,7 @@ enum SecretServiceSource {
 /// single-account daemon's one session; the same identity the file
 /// store gives `/var/lib/protonwire/session.json`). The envelope
 /// discipline is unchanged from the file store: the strict parse
-/// ([`parse_strict`]) and the generation-monotonicity refusal apply to
+/// (`parse_strict`) and the generation-monotonicity refusal apply to
 /// the Secret Service bytes exactly as to file bytes.
 ///
 /// # Lazy bind — resolution never opens a D-Bus session
@@ -628,7 +628,7 @@ enum SecretServiceSource {
 ///
 /// `get_secret` bytes move into [`Zeroizing`] transit on arrival and a
 /// credential VALUE leaves this module only across the peer-secret
-/// boundary ([`load_credentials`]). Residual, recorded in the S5c
+/// boundary (`load_credentials`). Residual, recorded in the S5c
 /// spike: the Secret Service protocol decrypts the secret inside zbus
 /// buffers this crate cannot zeroize — inherent to the dependency
 /// (the file store's equivalent transit is fully zeroized).
