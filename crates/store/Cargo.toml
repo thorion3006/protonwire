@@ -13,7 +13,7 @@ workspace = true
 [dependencies]
 # The freedesktop Secret Service backend of the `keyring` writable
 # session store (M2 S5c): keyring-core entries over the pure-Rust zbus
-# store (RustCrypto session crypto). Audit, lockfile delta (33 new
+# store (RustCrypto session crypto). Audit, lockfile delta (36 new
 # packages, all pure Rust, no C, no tokio), and the no-facade decision:
 # docs/spike-2026-08.md §S5c. The mock store for the D-Bus-free tests
 # ships in keyring-core itself (no extra dev-dependency).
