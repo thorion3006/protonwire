@@ -11,6 +11,14 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
+# The freedesktop Secret Service backend of the `keyring` writable
+# session store (M2 S5c): keyring-core entries over the pure-Rust zbus
+# store (RustCrypto session crypto). Audit, lockfile delta (33 new
+# packages, all pure Rust, no C, no tokio), and the no-facade decision:
+# docs/spike-2026-08.md §S5c. The mock store for the D-Bus-free tests
+# ships in keyring-core itself (no extra dev-dependency).
+keyring-core = { workspace = true }
+zbus-secret-service-keyring-store = { workspace = true }
 # Typed open(2) flags / errno for the fd-pinned credential read (M2 S5b,
 # S5a sec P3): O_NOFOLLOW/O_NONBLOCK and ELOOP, which std's custom_flags
 # API takes only as raw bits. Already the workspace pin (ipc, tui), so
