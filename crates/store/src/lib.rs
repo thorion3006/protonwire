@@ -15,6 +15,7 @@ pub mod config;
 pub mod credential_input;
 pub mod deadlines;
 pub mod fs_trust;
+pub mod location;
 pub mod paths;
 pub mod session;
 pub mod state;
