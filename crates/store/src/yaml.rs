@@ -162,6 +162,20 @@ pub fn from_slice<T: DeserializeOwned>(input: &[u8]) -> Result<T, YamlError> {
 /// never opened, and a `#` inside the parser's quoted scalar read as
 /// a comment hiding same-line anchors.
 ///
+/// One U+FEFF at the head of a TOKEN-BOUNDARY line is transparent
+/// (round 7): the parser's token hunt skips exactly one column-0 BOM
+/// at every between-tokens line head (unsafe-libyaml-norway 0.2.15
+/// scanner.rs:929-931 — `mark.column == 0 && IS_BOM`), so the scan
+/// skips it too — arming and clearing nothing, with
+/// `prev_is_spacing` keeping its line-start `true` (a glued `&`/`*`
+/// after the BOM stays on the loose arm) and `at_node_start` keeping
+/// its line-head value (a quote at that head still opens). The skip
+/// is bounded by the line-head token-boundary computation itself: on
+/// a plain scalar's continuation line (block or flow) and from the
+/// SECOND column-0 BOM on, the parser is mid-token (or past its only
+/// skip) and the BOM is CONTENT — skipping it there would hand plain
+/// prose a false token boundary and over-reject parse-Ok documents.
+///
 /// The scan runs on a line-break-normalized COPY of the input (see
 /// [`normalize_line_breaks`]): the parser also breaks lines on lone
 /// `\r`, U+0085, U+2028 and U+2029, which a line-keyed scan over
@@ -227,6 +241,25 @@ fn find_anchor_or_alias_token(input: &str) -> Option<usize> {
         };
         let mut prev_is_spacing = true; // start of line is a token boundary
         let mut index = 0;
+        // Round 7: the parser's token hunt (`scan_to_next_token`) skips
+        // EXACTLY ONE column-0 U+FEFF at every between-tokens line head
+        // (unsafe-libyaml-norway 0.2.15 scanner.rs:929-931), so the scan
+        // skips it too — transparently: no state is armed or cleared,
+        // `prev_is_spacing` keeps its line-start `true` (a glued `&`/`*`
+        // after the BOM still hits the loose arm) and `at_node_start`
+        // keeps its line-head value (a quote at that head still opens).
+        // The guard is the line-head token-boundary computation itself:
+        // where the parser is mid-token instead — a plain scalar's
+        // continuation line (block: `plain_pending && indent >
+        // ctx_indent`; flow: `flow_plain`), or from the SECOND column-0
+        // BOM on (the parser's single skip leaves it at column 1) — the
+        // BOM is CONTENT, and skipping it there would hand plain prose
+        // a false token boundary (the round-7 clean guards). Where a
+        // quote is already open the skip is a no-op either way: a BOM
+        // is never a quote close.
+        if at_node_start && chars.first() == Some(&'\u{FEFF}') {
+            index = 1;
+        }
         while index < chars.len() {
             let c = chars[index];
             if in_double_quote {
@@ -2070,6 +2103,216 @@ mod tests {
             find_anchor_or_alias_token(in_flow),
             Some(2),
             "the scan still sees the anchor through the parser refusal: {in_flow:?}"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Round 7 (seventh scoped re-review, one bounded P1): the column-0
+    // UTF-8 BOM. The parser's token hunt `yaml_parser_scan_to_next_token`
+    // skips EXACTLY ONE leading U+FEFF at column 0 whenever it hunts a
+    // token (unsafe-libyaml-norway 0.2.15 scanner.rs:929-931:
+    // `mark.column == 0 && IS_BOM`), so the parser sees THROUGH a BOM at
+    // every between-tokens line head — but the scan's `_` catch-all
+    // consumed it as plain content (spending `at_node_start`, clearing
+    // `prev_is_spacing`), so a glued `&`/`*` after the BOM missed the
+    // loose arm and a quote at that head never opened (a later `#` then
+    // read as a comment hiding the line). Fix: the per-line walk skips
+    // exactly one leading U+FEFF TRANSPARENTLY — neither arming nor
+    // clearing state; `prev_is_spacing` keeps its line-start `true` —
+    // IFF the line head is a token boundary under the existing
+    // computation (flow `!flow_plain`; block
+    // `!(plain_pending && indent > ctx_indent)`, mirroring the parser's
+    // between-tokens condition): there — and only there — the parser is
+    // between tokens and skips the BOM itself; on a plain scalar's
+    // continuation line and mid-line the BOM is CONTENT. All reds
+    // observed pre-fix via the probe crate (parse `Ok`, scan `None`).
+    // ------------------------------------------------------------------
+
+    /// The named bypass family, live (red pre-fix on all nine shapes:
+    /// scan `None`, parse `Ok`): every shape hides GLUED contraband
+    /// behind a column-0 BOM the parser skips — an anchor at the
+    /// document head, the phantom-comment quote arms (single- and
+    /// double-quoted keys, behind a `?` and behind secondary and
+    /// verbatim tags: the BOM spent the node start, the key's quote
+    /// never opened, `#` read as a comment hiding the anchored value),
+    /// and a flow-entry line head after `[`. (A BOM followed by BLANKS
+    /// before the anchor already flagged pre-fix — spacing re-arms the
+    /// loose boundary — pinned below as unchanged.)
+    #[test]
+    fn column0_bom_glued_contraband_is_a_live_bypass() {
+        assert_policy_rejects("\u{FEFF}&x 1", 1);
+        assert_policy_rejects("\u{FEFF}'k # w': &x 1", 1);
+        assert_policy_rejects("\u{FEFF}\"k # w\": &x 1", 1);
+        assert_policy_rejects("k: [\n\u{FEFF}&x 1]", 2);
+        assert_policy_rejects("---\n\u{FEFF}&x 1", 2);
+        assert_policy_rejects("\u{FEFF}? 'k # w': &x 1", 1);
+        assert_policy_rejects("\u{FEFF}!<a> 'v # w': &x 1", 1);
+        assert_policy_rejects("\u{FEFF}!!str 'k # w': &x 1", 1);
+        // Unchanged by the fix (already flagged pre-fix): blanks after
+        // the BOM re-arm the loose `*`/`&` boundary on their own.
+        assert_policy_rejects("k: [\n\u{FEFF}  &x 1]", 2);
+    }
+
+    /// The alias twin resolves (red pre-fix: scan `None` while raw
+    /// serde_norway materializes `{k: [1, 1]}`): the anchor AND its
+    /// alias each sit behind their own column-0 BOM at flow line heads
+    /// — the parser skips both BOMs and expands the alias.
+    #[test]
+    fn column0_bom_anchor_and_alias_both_resolve() {
+        let doc = "k: [\n\u{FEFF}&x 1,\n\u{FEFF}*x]";
+        let value: serde_norway::Value = serde_norway::from_str(doc)
+            .unwrap_or_else(|e| panic!("must parse un-hardened: {doc:?}: {e}"));
+        let expanded: serde_norway::Value =
+            serde_norway::from_str("{k: [1, 1]}").expect("static fixture");
+        assert_eq!(
+            value, expanded,
+            "the alias must RESOLVE behind the column-0 BOMs: {doc:?}"
+        );
+        assert_eq!(
+            find_anchor_or_alias_token(doc),
+            Some(2),
+            "policy scan must flag the &x line: {doc:?}"
+        );
+        assert!(matches!(
+            from_str::<serde_norway::Value>(doc).unwrap_err(),
+            YamlError::AnchorsForbidden(_)
+        ));
+    }
+
+    /// The capstone (red pre-fix: scan `None`, hardened loader `Ok` —
+    /// the wide fan-out was ACCEPTED): an anchored flow entry and 300
+    /// alias references, each behind its own column-0 BOM at a flow
+    /// line head. The un-hardened parser skips every BOM and resolves
+    /// every reference (~90.6k nodes, UNDER the node cap, pinned
+    /// below) — only the anchor/alias policy can refuse it.
+    #[test]
+    fn column0_bom_wide_fanout_capstone_refused_by_policy() {
+        let mut doc = String::from("m: [\n\u{FEFF}&f [");
+        doc.push_str(&"1,".repeat(300));
+        doc.push(']');
+        for _ in 0..300 {
+            doc.push_str(",\n\u{FEFF}*f");
+        }
+        doc.push(']');
+        let raw: serde_norway::Value = serde_norway::from_str(&doc)
+            .unwrap_or_else(|e| panic!("toggle-red: the un-hardened path accepts: {e}"));
+        assert!(
+            enforce_structure(&raw).is_ok(),
+            "the ~90.6k-node expansion sits UNDER the node cap: only the \
+             anchor/alias policy can refuse it"
+        );
+        assert_eq!(
+            find_anchor_or_alias_token(&doc),
+            Some(2),
+            "the &f anchor sits behind a column-0 BOM; the scan must see it"
+        );
+        assert!(matches!(
+            from_str::<serde_norway::Value>(&doc).unwrap_err(),
+            YamlError::AnchorsForbidden(_)
+        ));
+    }
+
+    /// Clean guards (the over-reject pins): shapes where the parser
+    /// keeps the BOM as CONTENT — parse `Ok`, no live token — must stay
+    /// unflagged. A naive skip-everywhere fix over-rejects the first
+    /// four (the third needs the exactly-ONE bound), which is why the
+    /// skip is gated on the line-head token-boundary computation.
+    #[test]
+    fn bom_content_positions_stay_content() {
+        // Plain-scalar continuation line (block): the BOM folds into
+        // the scalar (premise enforced below).
+        assert_accepts("k: v\n  \u{FEFF}&x 1");
+        // After a `--- ` marker the BOM sits at column 4, not column 0,
+        // and starts one plain scalar.
+        assert_accepts("--- \u{FEFF}&x 1");
+        // Only ONE column-0 BOM is transparent: the parser's skip leaves
+        // the second at column 1, where it starts a plain scalar.
+        assert_accepts("\u{FEFF}\u{FEFF}&x 1");
+        // Mid-line: content of the running plain scalar.
+        assert_accepts("k: a\u{FEFF}&x 1");
+        // Inside quoted scalars and block-scalar bodies: content in both
+        // models (the `#` stays inside the quote; the body is swallowed).
+        assert_accepts("k: 'a\u{FEFF}b # c'");
+        assert_accepts("text: |\n  \u{FEFF}x &y\nnext: 1\n");
+        // Flow plain-continuation twin: the BOM folds into the running
+        // flow plain token (no skip mid-token), and the anchor after the
+        // `,` is still flagged.
+        assert_policy_rejects("k: [a\n\u{FEFF}b, &x 1]", 2);
+        // Premises: the continuation folds into ONE plain scalar that
+        // carries the BOM and the `&x 1` as content; so does the second
+        // BOM of the doubled shape.
+        let folded: serde_norway::Value = serde_norway::from_str("k: v\n  \u{FEFF}&x 1").unwrap();
+        assert_eq!(
+            folded["k"],
+            serde_norway::Value::String("v \u{feff}&x 1".into()),
+            "the continuation line folds into the plain scalar: {folded:?}"
+        );
+        let doubled: serde_norway::Value = serde_norway::from_str("\u{FEFF}\u{FEFF}&x 1").unwrap();
+        assert_eq!(
+            doubled,
+            serde_norway::Value::String("\u{feff}&x 1".into()),
+            "only the FIRST column-0 BOM is skipped; the second is content: {doubled:?}"
+        );
+    }
+
+    /// Supplementary pins: every BOM'd shape tracks its BOM-less twin.
+    /// (1) A BOM'd line inside a multi-line quoted scalar is content
+    /// (a BOM is never a quote close); the real anchor after the close
+    /// stays flagged. (2) The root-plain-scalar column-0 pair: the
+    /// BOM-less twin was already a pinned conservative over-reject
+    /// (the parser folds `first\n&x 1` into one plain scalar — premise
+    /// enforced), and the BOM'd twin flags identically — the skip can
+    /// only move a shape TOWARD its BOM-less verdict, never past it.
+    /// (3) A BOM before `---` disarms the marker (the fetch table
+    /// requires column 0): both twins parse as one plain string and
+    /// over-reject through the loose arm, unchanged. (4) A block
+    /// scalar's terminator line is a token boundary: the parser skips
+    /// the BOM there too; the shape is parser-refused, and the scan
+    /// sees the anchor through the refusal (the errs-safe pattern).
+    #[test]
+    fn bom_shapes_track_their_bomless_twins() {
+        assert_policy_rejects("k: 'a\n\u{FEFF}b *x'\nc: &y 1", 3);
+        // Root-scalar pair (pre-existing over-reject class).
+        let folded: serde_norway::Value = serde_norway::from_str("first\n&x 1").unwrap();
+        assert_eq!(
+            folded,
+            serde_norway::Value::String("first &x 1".into()),
+            "the BOM-less twin folds to one plain scalar (no live anchor): {folded:?}"
+        );
+        assert_eq!(find_anchor_or_alias_token("first\n&x 1"), Some(2));
+        assert_eq!(
+            serde_norway::from_str::<serde_norway::Value>("first\n\u{FEFF}&x 1").unwrap(),
+            serde_norway::Value::String("first \u{feff}&x 1".into()),
+            "the BOM'd twin folds the same way (the BOM is mid-token content)"
+        );
+        assert_eq!(
+            find_anchor_or_alias_token("first\n\u{FEFF}&x 1"),
+            Some(2),
+            "the BOM'd twin flags exactly like its BOM-less twin (same class)"
+        );
+        // Marker twins: the BOM skip moves `---` to column 1 — not a
+        // marker to the parser either; both stay one plain string and
+        // over-reject via the loose arm (the round-6 glued-dashes class).
+        for doc in ["\u{FEFF}--- &x 1", "\u{FEFF}---\n&x 1"] {
+            let value: serde_norway::Value = serde_norway::from_str(doc).unwrap();
+            assert_eq!(
+                value,
+                serde_norway::Value::String("--- &x 1".into()),
+                "a `---` after a skipped BOM is not a marker: {doc:?}"
+            );
+        }
+        assert_eq!(find_anchor_or_alias_token("\u{FEFF}--- &x 1"), Some(1));
+        assert_eq!(find_anchor_or_alias_token("\u{FEFF}---\n&x 1"), Some(2));
+        // Block-scalar terminator line: token boundary, parser refusal.
+        let refused = "text: |\n  a\n\u{FEFF}&x 1";
+        assert!(
+            serde_norway::from_str::<serde_norway::Value>(refused).is_err(),
+            "the anchored-scalar-after-block shape must not parse: {refused:?}"
+        );
+        assert_eq!(
+            find_anchor_or_alias_token(refused),
+            Some(3),
+            "the scan sees the anchor through the parser refusal: {refused:?}"
         );
     }
 }
