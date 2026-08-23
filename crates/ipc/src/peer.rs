@@ -28,8 +28,8 @@
 //! runners can still observe pass-1 defects); when the two ever diverge,
 //! that is a defect in this copy. Socket-leaf deltas from the fs_trust
 //! rule, both forced by the R9-1 group hand-off (`bind.rs`: the socket
-//! is deliberately 0o660 `root:<client-group>`, and connect(2) needs write
-//! permission on the socket inode):
+//! is deliberately `0o660 root:<client-group>`, and connect(2) needs
+//! write permission on the socket inode):
 //!
 //! * the leaf must be a SOCKET (not a regular file);
 //! * the leaf may grant GROUP write (the production shape 0o660) —
