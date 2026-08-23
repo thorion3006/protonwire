@@ -121,9 +121,13 @@ pub fn from_slice<T: DeserializeOwned>(input: &[u8]) -> Result<T, YamlError> {
 /// where no plain token is in flight: after a completed key such as
 /// the quoted `{'k':'v'}` even a non-spaced `:` is an indicator, while
 /// the mid-plain `:` in `{k:'v'}` is CONTENT and the entry is one
-/// plain scalar), after `-`/`?` acting as entry indicators (followed by space or EOL AND
-/// themselves sitting at a node start — mid-scalar `a - 'x` and
-/// `a ? 'x` are plain content, for the same reason), after a flow
+/// plain scalar), after `-`/`?` acting as entry indicators (`-`
+/// followed by space or EOL AND itself sitting at a node start —
+/// mid-scalar `a - 'x` is plain content, for the same reason; `?`
+/// likewise in BLOCK, but a GLUED `?` in flow is a KEY token to
+/// libyaml whenever flow_level != 0, no adjacency requirement, so in
+/// flow `?` arms at a node start regardless of what follows), after a
+/// flow
 /// separator (`,`/`[`/`{` — but only inside an open flow collection or
 /// opening one: in block context, `a,b`, `a[b`, `a{b` are plain
 /// scalars), and after a `---` document-start marker (column 0,
@@ -148,7 +152,11 @@ pub fn from_slice<T: DeserializeOwned>(input: &[u8]) -> Result<T, YamlError> {
 /// URI characters to the parser (`[!!str'a, &x 1]` is the tag
 /// `!!str'a` plus a LIVE anchor; `[!!str&x 1]` is the tag `!!str&x`
 /// with no anchor at all), so stopping the tag at a quote or `&`
-/// would re-open the quote/comment bypass one construct over.
+/// would re-open the quote/comment bypass one construct over. A
+/// VERBATIM tag `!<...>` instead consumes through its closing `>`:
+/// libyaml scans that URI with uri_char=true, so `,`, `[` and `]` are
+/// tag content there (not terminators), and a tag missing its `>` is
+/// parser-refused outright.
 /// Consuming the tag as plain content was the round-5 P1: it spent
 /// the node start on the tag characters, the tagged node's quote
 /// never opened, and a `#` inside the parser's quoted scalar read as
@@ -316,10 +324,39 @@ fn find_anchor_or_alias_token(input: &str) -> Option<usize> {
                     // armed hand-off mirrors the parser exactly.
                     '!' if at_node_start => {
                         let mut end = index + 1;
-                        while end < chars.len()
-                            && !matches!(chars[end], ' ' | '\t' | '#' | ',' | '[' | ']' | '{' | '}')
-                        {
-                            end += 1;
+                        if chars.get(index + 1) == Some(&'<') {
+                            // VERBATIM tag (round 6): libyaml scans the
+                            // `!<...>` URI with uri_char=true, so `,`,
+                            // `[` and `]` are tag CONTENT up to the
+                            // closing `>` (unsafe-libyaml
+                            // scanner.rs:1428, 1667-1670) — the
+                            // non-verbatim terminator set below stops
+                            // INSIDE the tag, and the leftover `[`/`,`
+                            // desyncs the entry model until a quoted
+                            // scalar's `#` reads as a comment hiding
+                            // same-line anchors. `#`, blanks and `>` are
+                            // NOT URI characters, so in a parse-Ok
+                            // document the tag ends at the FIRST `>` —
+                            // consume exactly through it. A missing `>`
+                            // is parser-refused ("did not find the
+                            // expected '>'"), so running to EOL errs
+                            // safe.
+                            while end < chars.len() {
+                                let is_close = chars[end] == '>';
+                                end += 1;
+                                if is_close {
+                                    break;
+                                }
+                            }
+                        } else {
+                            while end < chars.len()
+                                && !matches!(
+                                    chars[end],
+                                    ' ' | '\t' | '#' | ',' | '[' | ']' | '{' | '}'
+                                )
+                            {
+                                end += 1;
+                            }
                         }
                         index = end - 1; // the loop's `+= 1` lands ON the terminator
                         at_node_start = true;
@@ -405,7 +442,25 @@ fn find_anchor_or_alias_token(input: &str) -> Option<usize> {
                     // and `a ? 'x` are plain content (only `: ` and ` #`
                     // terminate a plain scalar), and arming after them
                     // would re-open the quote-bypass one construct over.
-                    '-' | '?' if at_node_start && spaced_or_eol => {
+                    // EXCEPT a glued `?` in FLOW (round 6): the libyaml
+                    // fetch table runs `fetch_key` for `?` whenever
+                    // flow_level != 0 — NO adjacency requirement
+                    // (unsafe-libyaml scanner.rs:271-275; in BLOCK the
+                    // blank/EOL requirement stands, a glued block `?`
+                    // is plain) — so `{'k # w'}` after a glued flow `?`
+                    // is a QUOTED KEY whose `#` is content, and not
+                    // arming there spent the node start on the `?` and
+                    // read the key's `#` as a comment hiding same-line
+                    // anchors (the phantom-quote class of rounds 2-5).
+                    '-' if at_node_start && spaced_or_eol => {
+                        at_node_start = true;
+                        plain_pending = false;
+                        flow_plain = false;
+                        if flow_depth == 0 {
+                            ctx_indent = indent;
+                        }
+                    }
+                    '?' if at_node_start && (spaced_or_eol || flow_depth > 0) => {
                         at_node_start = true;
                         plain_pending = false;
                         flow_plain = false;
@@ -1758,6 +1813,194 @@ mod tests {
         // arming there would phantom-open the quote, carry it across
         // the line break, and hide the real anchor on line 2.
         assert_policy_rejects("k: a !!str 'c\nd: &x 1\n", 2);
+    }
+
+    // ------------------------------------------------------------------
+    // Round 6 (sixth scoped re-review, two P1s — event-level libyaml
+    // dumps from the probe crate prescribed both): (a) a GLUED `?` in
+    // flow is a KEY token to libyaml — the fetch table runs
+    // `fetch_key` for `?` whenever flow_level != 0, with NO adjacency
+    // requirement (unsafe-libyaml scanner.rs:271-275; a glued `?` in
+    // BLOCK is plain) — so `{'k # w'}` after a glued `?` is a QUOTED
+    // KEY whose `#` is content; the scan's shared `-`/`?` entry arm
+    // required `spaced_or_eol`, spent the node start on the `?`, never
+    // opened the key's quote, and the `#` read as a comment hiding the
+    // same-line anchor (the phantom-quote blindness class of rounds
+    // 2-5). (b) A verbatim tag `!<...>` scans its URI with
+    // uri_char=true, so `,`, `[` and `]` are tag CONTENT up to the
+    // closing `>` (scanner.rs:1428, 1667-1670) — the scan's
+    // non-verbatim terminator stopped INSIDE the tag, and the leftover
+    // `[`/`,` desynced the entry model until a later `#` hid the
+    // anchor. Fix (a): `?` arms at a node start when spaced OR in
+    // flow. Fix (b): `!` + `<` consumes through the closing `>`. All
+    // reds below observed on the pre-fix scanner (probe-verified parse
+    // truth alongside).
+    // ------------------------------------------------------------------
+
+    /// The named bypass (a), live (red pre-fix: scan `None`, hardened
+    /// loader `Ok`): the glued `?` is a KEY token, `'k # w'` a quoted
+    /// key whose `#` is content, the non-spaced `:` after the closing
+    /// quote a true value indicator — so `&x 1` is a LIVE anchored
+    /// value hidden behind the phantom comment window. The alias twin
+    /// RESOLVES: `[?'k # w':&x 1, *x]` materializes the single-pair
+    /// mapping then the aliased `1`.
+    #[test]
+    fn glued_flow_question_mark_is_a_key_indicator() {
+        let doc = "{?'k # w':&x 1}";
+        assert_policy_rejects(doc, 1);
+        // The sequence twin: the alias RESOLVES under the un-hardened
+        // parser.
+        let seq = "[?'k # w':&x 1, *x]";
+        let value: serde_norway::Value = serde_norway::from_str(seq)
+            .unwrap_or_else(|e| panic!("must parse un-hardened: {seq:?}: {e}"));
+        let expanded: serde_norway::Value =
+            serde_norway::from_str("[{'k # w': 1}, 1]").expect("static fixture");
+        assert_eq!(
+            value, expanded,
+            "the alias must RESOLVE under the un-hardened parser: {seq:?}"
+        );
+        assert_policy_rejects(seq, 1);
+        // The family: double-quoted key, line-head (the `?` at the head
+        // of a flow continuation line), nested, and after-comma twins.
+        assert_policy_rejects("{?\"k # w\":&x 1}", 1);
+        assert_policy_rejects("m: {\n?'k # w':&x 1}", 2);
+        assert_policy_rejects("m: {o: {?'k # w':&x 1}}", 1);
+        assert_policy_rejects("{a: 1, ?'k # w':&x 1}", 1);
+    }
+
+    /// Clean arms of fix (a): the SPACED explicit-key forms and the
+    /// block `?` stay unchanged, and the two glued-`?` shapes the
+    /// PARSER reads without contraband stay accepted — `{?x: 1}` (the
+    /// glued `?` is a KEY token, the plain `x` its key: probe-pinned)
+    /// and `{a?b: 1}` (a mid-plain `?` is content — one plain key).
+    #[test]
+    fn glued_flow_question_mark_clean_arms_stay_clean() {
+        assert_accepts("{?x: 1}");
+        assert_accepts("{a?b: 1}");
+        assert_accepts("{ ? 'k # w' : v}");
+        assert_accepts("? 'k'\n: v\n");
+        // Premise: the glued `?` in `{?x: 1}` is a KEY token — the
+        // mapping has the plain key `x`, not the key `?x`.
+        let value: serde_norway::Value = serde_norway::from_str("{?x: 1}").unwrap();
+        let serde_norway::Value::Mapping(inner) = &value else {
+            panic!("{{?x: 1}} must parse as a mapping: {value:?}")
+        };
+        assert_eq!(
+            inner.get(serde_norway::Value::String("x".into())),
+            Some(&serde_norway::Value::Number(1.into())),
+            "the glued `?` is a KEY indicator, `x` the key: {inner:?}"
+        );
+    }
+
+    /// Capstone (a) (red pre-fix: scan `None`, hardened loader `Ok`):
+    /// the round-4/5 wide-fan-out payload opened through the glued-`?`
+    /// window — 301 entries materialize (~90.6k nodes, UNDER the node
+    /// cap, pinned below), so only the anchor/alias policy can refuse
+    /// it.
+    #[test]
+    fn glued_question_mark_wide_fanout_capstone_refused_by_policy() {
+        let mut doc = String::from("m: [?'k # w':&f [");
+        doc.push_str(&"1,".repeat(300));
+        doc.push(']');
+        for _ in 0..300 {
+            doc.push_str(", *f");
+        }
+        doc.push(']');
+        let raw: serde_norway::Value = serde_norway::from_str(&doc)
+            .unwrap_or_else(|e| panic!("toggle-red: the un-hardened path accepts: {e}"));
+        assert!(
+            enforce_structure(&raw).is_ok(),
+            "the ~90.6k-node expansion sits UNDER the node cap: only the \
+             anchor/alias policy can refuse it"
+        );
+        let serde_norway::Value::Sequence(entries) = &raw["m"] else {
+            panic!("the fan-out must materialize a sequence: {raw:?}")
+        };
+        assert_eq!(
+            entries.len(),
+            301,
+            "the single-pair mapping entry plus 300 alias references"
+        );
+        assert_eq!(
+            find_anchor_or_alias_token(&doc),
+            Some(1),
+            "the &f anchor sits inside the former glued-? window; the scan must see it"
+        );
+        assert!(matches!(
+            from_str::<serde_norway::Value>(&doc).unwrap_err(),
+            YamlError::AnchorsForbidden(_)
+        ));
+    }
+
+    /// The named bypass (b), live (red pre-fix: scan `None`, hardened
+    /// loader `Ok` on all four): the verbatim URI's `[`/`]`/`,` are tag
+    /// content up to `>`, so the scan's premature stop left the
+    /// leftover indicator to desync the entry model until the quoted
+    /// scalar's `#` read as a comment hiding the same-line anchor —
+    /// including the empty `!<>` and the verbatim-KEYED mapping twin.
+    #[test]
+    fn verbatim_tag_uri_flow_indicators_are_content() {
+        for doc in [
+            "[!<[a]> 'v # w', &x 1]",
+            "[!<a,b> 'v # w', &x 1]",
+            "[!<]> 'v # w', &x 1]",
+            "{!<a,b> 'k # w': v, &x 1}",
+        ] {
+            assert_policy_rejects(doc, 1);
+        }
+        // An unclosed verbatim tag is parser-refused ("did not find
+        // the expected '>'"), so consuming to the `>` or EOL errs safe
+        // — pinned so the fix stays honest about the refusal.
+        let unclosed = "[!<a 'v # w', &x 1]";
+        assert!(
+            serde_norway::from_str::<serde_norway::Value>(unclosed).is_err(),
+            "an unclosed verbatim tag must not parse: {unclosed:?}"
+        );
+    }
+
+    /// Clean arms of fix (b): verbatim tags WITHOUT flow indicators in
+    /// the URI keep their contraband flagged (the tagged scalar's
+    /// quote opens after the tag, its `#` is content, the separator
+    /// re-arms, the anchor flags) — both the round-5-known `!<!foo>`
+    /// and the plain `!<*>`.
+    #[test]
+    fn verbatim_tag_clean_arms_stay_flagged() {
+        assert_policy_rejects("[!<*> 'v # w', &x 1]", 1);
+        assert_policy_rejects("[!<!foo> 'v # w', &x 1]", 1);
+        assert_accepts("[!<*> 'v # w', 1]");
+        assert_accepts("[!<!foo> 'v # w', 1]");
+    }
+
+    /// Capstone (b) (red pre-fix: scan `None`, hardened loader `Ok`):
+    /// the wide-fan-out payload routed through a verbatim tag carrying
+    /// a `,` in its URI — ~90.6k nodes materialize UNDER the node cap
+    /// (pinned below); the anchor/alias policy must refuse it before
+    /// any construction work starts.
+    #[test]
+    fn verbatim_tag_uri_wide_fanout_capstone_refused_by_policy() {
+        let mut doc = String::from("m: [!<a,b> 'v # w', &f [");
+        doc.push_str(&"1,".repeat(300));
+        doc.push(']');
+        for _ in 0..300 {
+            doc.push_str(", *f");
+        }
+        doc.push(']');
+        let raw: serde_norway::Value = serde_norway::from_str(&doc)
+            .unwrap_or_else(|e| panic!("toggle-red: the un-hardened path accepts: {e}"));
+        assert!(
+            enforce_structure(&raw).is_ok(),
+            "the ~90.6k-node expansion sits UNDER the node cap: only the \
+             anchor/alias policy can refuse it"
+        );
+        assert_eq!(
+            find_anchor_or_alias_token(&doc),
+            Some(1),
+            "the &f anchor sits behind the former verbatim-tag desync; the scan must see it"
+        );
+        assert!(matches!(
+            from_str::<serde_norway::Value>(&doc).unwrap_err(),
+            YamlError::AnchorsForbidden(_)
+        ));
     }
 
     /// Tag/marker adjacency pins (green on every round — these pin
