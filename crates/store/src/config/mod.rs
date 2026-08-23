@@ -25,7 +25,10 @@ use crate::yaml;
 mod overlay;
 mod sections;
 
-pub use overlay::{OutputFormat, UserOverlay, UserPresentation};
+pub use overlay::{
+    OverlayFeatures, OverlayProfileDefault, OverlayProfileSelection, OverlayProfiles, OutputFormat,
+    UserOverlay, UserPresentation,
+};
 pub use sections::{
     AccountSection, AutoConnectRetry, AutoConnectSection, BalancedWeights, ConnectionGroupsSection,
     ConnectionSection, ConnectionType, CredentialInputSource, DaemonSection, DnsLeakProtection,
