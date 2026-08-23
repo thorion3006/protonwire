@@ -5,10 +5,15 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use protonwire_core::DaemonCore;
-use protonwire_frontend_api::{Request, RequestResult, RpcError};
+use protonwire_core::scheduler::ManualOutcome;
+use protonwire_frontend_api::{Request, RequestResult, RpcError, RpcErrorCode};
 use protonwire_ipc::{EventBus, RequestHandler, SessionContext};
 
 use std::path::{Path, PathBuf};
+
+pub mod services;
+
+pub use services::DaemonServices;
 
 /// Resolves where the IPC server binds (Codex PR review finding 4):
 /// the `--socket-dir` CLI override wins, then the config document's
@@ -58,6 +63,10 @@ pub struct DaemonHandler {
     pub stop: Arc<AtomicBool>,
     /// Event fan-out shared with sessions.
     pub bus: Arc<EventBus>,
+    /// The S9 service surface (scheduler, catalog bridge) — constructed
+    /// strictly at startup; fail-closed, so every handler can rely on
+    /// it existing.
+    pub services: Arc<DaemonServices>,
 }
 
 impl RequestHandler for DaemonHandler {
@@ -77,6 +86,59 @@ impl RequestHandler for DaemonHandler {
                 self.stop.store(true, Ordering::SeqCst);
                 Ok(RequestResult::Acknowledged)
             }
+            // FR-10: serve the cached revision verbatim — no upstream
+            // request. An absent cache is the legitimate nothing-yet
+            // state (all-None fields); a PRESENT cache that fails the
+            // strict load fails closed.
+            Request::ServersList => match self.services.cached_catalog() {
+                Ok(Some(cached)) => Ok(RequestResult::Servers {
+                    etag: cached.etag,
+                    fetched_unix: Some(cached.fetched_unix),
+                    body: Some(cached.body),
+                }),
+                Ok(None) => Ok(RequestResult::Servers {
+                    etag: None,
+                    fetched_unix: None,
+                    body: None,
+                }),
+                Err(error) => Err(RpcError::new(
+                    RpcErrorCode::ConfigInvalid,
+                    format!("cached catalog failed the strict load: {error}"),
+                )),
+            },
+            // FR-11/FR-13I through the single-flight scheduler: eligible
+            // refreshes run, early ones demand the warned confirmation,
+            // and an active suppression outranks even a confirmed retry
+            // (ER-16 — the refusal code carries the pacing facts).
+            Request::ServersRefresh { confirmation_token } => {
+                match self
+                    .services
+                    .scheduler
+                    .refresh_manual(confirmation_token.as_deref())
+                {
+                    ManualOutcome::Refreshed(report) => Ok(RequestResult::ServersRefreshed {
+                        report: services::refresh_report_to_wire(report),
+                    }),
+                    ManualOutcome::ConfirmationRequired(requirement) => {
+                        Err(RpcError::confirmation_required(
+                            "the server list is still fresh; confirm to refresh now anyway",
+                            requirement,
+                        ))
+                    }
+                    ManualOutcome::Suppressed { until_unix } => Err(RpcError::new(
+                        RpcErrorCode::RateLimited,
+                        format!(
+                            "a rate-limit suppression is active until Unix time {until_unix}; \
+                             no path may bypass it (ER-16)"
+                        ),
+                    )),
+                    ManualOutcome::Unavailable => Err(RpcError::new(
+                        RpcErrorCode::Internal,
+                        "the confirmation ceremony is unavailable (CSPRNG failure); \
+                         no early manual refresh is possible",
+                    )),
+                }
+            }
             other => self.core.handle_request(ctx.peer.uid, other),
         }
     }
@@ -90,9 +152,22 @@ impl RequestHandler for DaemonHandler {
 mod tests {
     use super::*;
     use protonwire_frontend_api::RpcErrorCode;
+    use protonwire_frontend_api::ServersRefreshOutcome;
     use protonwire_store::config::SystemConfig;
+    use protonwire_store::paths::ConfigPaths;
 
+    /// A handler over a first-boot services instance: an all-absent
+    /// temp cache tree (the FR-13F bootstrap scheduler, no cached
+    /// catalog) over the hermetic trust root — passes on every runner.
     fn handler() -> (DaemonHandler, Arc<AtomicBool>) {
+        let dir =
+            std::env::temp_dir().join(format!("protonwire-daemon-handler-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let paths = ConfigPaths::rooted(&dir);
+        let services = Arc::new(
+            DaemonServices::build_with_trust_root(&SystemConfig::default(), &paths, &dir)
+                .expect("first-boot services construct"),
+        );
         let stop = Arc::new(AtomicBool::new(false));
         let core = Arc::new(DaemonCore::new(
             "0.1.0-test",
@@ -103,6 +178,7 @@ mod tests {
             core,
             stop: Arc::clone(&stop),
             bus: Arc::new(EventBus::new()),
+            services,
         };
         (handler, stop)
     }
@@ -149,6 +225,59 @@ mod tests {
             .handle(&admin_ctx(), Request::Disconnect)
             .unwrap_err();
         assert_eq!(err.code, RpcErrorCode::NotImplemented);
+    }
+
+    /// FR-10: `ServersList` on the first boot is the all-None reply — no
+    /// upstream request, no fabricated facts.
+    #[test]
+    fn servers_list_with_no_cache_answers_all_none() {
+        let (handler, _) = handler();
+        match handler.handle(&admin_ctx(), Request::ServersList).unwrap() {
+            RequestResult::Servers {
+                etag,
+                fetched_unix,
+                body,
+            } => {
+                assert_eq!(etag, None);
+                assert_eq!(fetched_unix, None);
+                assert_eq!(body, None);
+            }
+            other => panic!("unexpected result: {other:?}"),
+        }
+    }
+
+    /// The manual refresh door through the handler: the bootstrap window
+    /// is due, so the refresh runs; with an empty provider cell the
+    /// bridge reports the typed no-adapter transport failure (never a
+    /// fabricated success), and the refusal-shaped outcome rides the
+    /// wire report.
+    #[test]
+    fn servers_refresh_runs_the_bootstrap_window_and_reports_the_bridge_failure() {
+        let (handler, _) = handler();
+        match handler
+            .handle(
+                &admin_ctx(),
+                Request::ServersRefresh {
+                    confirmation_token: None,
+                },
+            )
+            .unwrap()
+        {
+            RequestResult::ServersRefreshed { report } => {
+                assert!(!report.coalesced);
+                match &report.outcome {
+                    ServersRefreshOutcome::Failed { reason } => assert!(
+                        reason.contains("no catalog adapter installed"),
+                        "the empty-cell refusal must be reported verbatim: {reason}"
+                    ),
+                    other => panic!("the empty cell must fail the refresh: {other:?}"),
+                }
+                // The failed attempt still paces: eligibility moved out
+                // by at least the three-hour floor.
+                assert!(report.suppression_until_unix.is_none());
+            }
+            other => panic!("unexpected result: {other:?}"),
+        }
     }
 }
 

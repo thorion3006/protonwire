@@ -41,7 +41,7 @@ struct Args {
 
 fn main() {
     let args = Args::parse();
-    let code = run(args, &init_tracing_filtered, Some(Path::new("/")));
+    let code = run(args, &init_tracing_filtered, Some(Path::new("/")), None);
     if code != 0 {
         std::process::exit(code);
     }
@@ -135,11 +135,28 @@ fn watch_for_termination(stop: Arc<AtomicBool>) -> std::thread::JoinHandle<()> {
 /// runner cannot make root-owned (parameterized, not blanket-applied —
 /// the per-UID overlay and ordinary test paths are unchanged).
 ///
+/// `cache_dir` is the S9 (a) seam, same shape: production passes `None`
+/// (the `ConfigPaths` cache location stands and the scheduler's strict
+/// loads walk to `/`); tests pass a directory to plant the scheduler's
+/// persisted documents under, which ALSO narrows the scheduler's walk
+/// root to that directory — the hermetic-test opt-in (an unprivileged
+/// runner cannot construct a root-owned tree anywhere, and the default
+/// tree's existing ancestors — e.g. a world-writable /tmp — would
+/// otherwise refuse every hermetic construction before the arm under
+/// test). The seam moves WHERE the documents live and how deep the
+/// walk goes; it never relaxes HOW existing components are judged, and
+/// production (main) never takes it.
+///
 /// Configuration is loaded before tracing initializes so that
 /// `daemon.log_level` from the config applies (rust-review finding 7);
 /// a `--log-level` flag wins over the config, and RUST_LOG wins over
 /// both. Load failures predate the logger and go to stderr.
-fn run(args: Args, init_tracing: &dyn Fn(&str), trust_root: Option<&Path>) -> i32 {
+fn run(
+    args: Args,
+    init_tracing: &dyn Fn(&str),
+    trust_root: Option<&Path>,
+    cache_dir: Option<&Path>,
+) -> i32 {
     // M2 S12: the terminating-signal handler goes in FIRST — a signal
     // arriving during config load or bind is recorded in the flag, and
     // the serve-loop watcher (spawned before serve) converts it into
@@ -156,6 +173,9 @@ fn run(args: Args, init_tracing: &dyn Fn(&str), trust_root: Option<&Path>) -> i3
     }
     if let Some(socket_dir) = &args.socket_dir {
         paths.socket_dir = socket_dir.clone();
+    }
+    if let Some(cache_dir) = cache_dir {
+        paths.cache_dir = cache_dir.to_path_buf();
     }
 
     // Round-8 X5 [ZkI1F]: the system document is root-daemon policy, so
@@ -206,6 +226,9 @@ fn run(args: Args, init_tracing: &dyn Fn(&str), trust_root: Option<&Path>) -> i3
     let config_socket_path = config.daemon.socket_path.clone();
     let config_socket_group = config.daemon.socket_group.clone();
     let bus = Arc::new(protonwire_ipc::EventBus::new());
+    // The S9 service construction below needs the validated policy too;
+    // both holders share one Arc.
+    let config_for_services = Arc::clone(&config);
     let core = Arc::new(protonwire_core::DaemonCore::new(
         env!("CARGO_PKG_VERSION"),
         config,
@@ -217,6 +240,31 @@ fn run(args: Args, init_tracing: &dyn Fn(&str), trust_root: Option<&Path>) -> i3
         &paths.socket_dir,
         &paths.socket_name,
     );
+    // M2 S9 (a): the scheduler constructs STRICTLY, and any refusal —
+    // a malformed, oversized, or fs-trust-refused persisted deadlines
+    // or cache document — ABORTS startup (exit 15, the PRD 9.8
+    // config-class code). Never a default-fallback scheduler: silently
+    // re-deriving deadlines from defaults would forget the persisted
+    // high-water mark and re-arm the FR-13H restart refetch storm the
+    // strict load exists to prevent. Production walks to `/`; the
+    // `cache_dir` seam (tests) additionally narrows the walk root to
+    // the injected directory — the hermetic-test opt-in, since an
+    // unprivileged runner cannot construct a root-owned tree anywhere.
+    let services = match &cache_dir {
+        None => protonwire_daemon::DaemonServices::build(&config_for_services, &paths),
+        Some(dir) => protonwire_daemon::DaemonServices::build_with_trust_root(
+            &config_for_services,
+            &paths,
+            dir,
+        ),
+    };
+    let services = match services {
+        Ok(services) => Arc::new(services),
+        Err(e) => {
+            eprintln!("protonwire-daemon: {e}");
+            return 15;
+        }
+    };
     let server = match protonwire_ipc::server::IpcServer::bind_with_group(
         &socket_dir,
         &socket_name,
@@ -241,6 +289,7 @@ fn run(args: Args, init_tracing: &dyn Fn(&str), trust_root: Option<&Path>) -> i3
         core: Arc::clone(&core),
         stop: Arc::clone(&stop),
         bus,
+        services,
     });
 
     info!(
@@ -345,6 +394,9 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let blocker = dir.join("not-a-directory");
         std::fs::write(&blocker, b"").unwrap();
+        // Hermetic scheduler cache (S9 a): all-absent, so the strict
+        // construction is the clean first boot on every runner.
+        let cache_dir = dir.join("var/cache/protonwire");
 
         let args = Args {
             config: Some(dir.join("missing-config.yaml")),
@@ -364,7 +416,7 @@ mod tests {
             }
         };
 
-        let code = run(args, &init, None);
+        let code = run(args, &init, None, Some(&cache_dir));
         assert_eq!(code, 1, "the blocked socket directory must fail the bind");
 
         let entries = log.snapshot();
@@ -422,6 +474,9 @@ mod tests {
             std::env::temp_dir().join(format!("protonwire-daemon-sigterm-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
+        // Hermetic scheduler cache (S9 a): all-absent, so the strict
+        // construction is the clean first boot on every runner.
+        let cache_dir = dir.join("var/cache/protonwire");
         let args = Args {
             config: Some(dir.join("missing-config.yaml")),
             socket_dir: Some(dir.clone()),
@@ -433,7 +488,7 @@ mod tests {
             // No subscriber install (the FU-A test owns the process's
             // single global install); trust_root None keeps the loader
             // on its plain semantics for the scratch-tree path.
-            let _ = exit_tx.send(run(args, &|_level: &str| {}, None));
+            let _ = exit_tx.send(run(args, &|_level: &str| {}, None, Some(&cache_dir)));
         });
 
         // Wait for the socket, then handshake a live session through it.
@@ -502,6 +557,87 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// S9 (a): the scheduler constructs through the STRICT production
+    /// path, and a corrupted persisted-deadlines document REFUSES
+    /// STARTUP — exit 15, before the bind — never a default-fallback
+    /// scheduler. Silently re-deriving deadlines from defaults would
+    /// re-arm exactly the FR-13H refetch storm the persisted high-water
+    /// mark exists to prevent (a rollback-forgetting daemon hammering
+    /// Proton on every restart). Pre-fix red: `run` had no scheduler
+    /// construction at all — this test drove straight past the planted
+    /// deadlines document and died at the blocked socket directory with
+    /// exit 1, not 15.
+    ///
+    /// Arm disclosure (the honest red-evidence nuance): on an
+    /// unprivileged runner the walk's ownership pass refuses the
+    /// test-planted (necessarily non-root-owned) document before the
+    /// parse arm is reached — the refusal class is FsTrust; a
+    /// root-owned tree reaches the Malformed arm (each store-arm class
+    /// is pinned by the deadlines/catalog suites). Both are the
+    /// prescribed abort classes (Malformed/TooLarge/FsTrust), and both
+    /// exit 15 here — the pinned contract is the REFUSAL.
+    #[test]
+    fn corrupted_deadlines_document_refuses_startup_before_bind() {
+        let dir =
+            std::env::temp_dir().join(format!("protonwire-daemon-s9a-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cache_dir = dir.join("var/cache/protonwire");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        // Corrupted persisted deadlines: unparseable bytes.
+        std::fs::write(cache_dir.join("deadlines.json"), b"{not json").unwrap();
+        // The bind blocker makes the PRE-fix outcome deterministic: with
+        // no scheduler construction, `run` reaches the bind and exits 1.
+        let blocker = dir.join("not-a-directory");
+        std::fs::write(&blocker, b"").unwrap();
+
+        let args = Args {
+            config: Some(dir.join("missing-config.yaml")),
+            socket_dir: Some(blocker),
+            log_level: None,
+        };
+        let code = run(args, &|_level: &str| {}, None, Some(&cache_dir));
+        assert_eq!(
+            code, 15,
+            "a corrupted deadlines document must refuse startup with the \
+             config-class exit code, never serve (and never fall back to \
+             default deadlines)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// S9 (a), no-fallback control arm: an all-ABSENT cache tree is the
+    /// legitimate first boot (the FR-13F bootstrap) and must not abort
+    /// anything — the daemon proceeds to the bind (exit 1 here, only
+    /// because of the blocker). This kills the inverse mutation ("abort
+    /// whenever the scheduler looks at the cache directory"). The cache
+    /// directory is deliberately NOT created: absent components are
+    /// soft (MissingLeaf::Allow), so the walk passes on every runner.
+    #[test]
+    fn absent_deadlines_document_is_a_normal_first_boot() {
+        let dir =
+            std::env::temp_dir().join(format!("protonwire-daemon-s9a-ctrl-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // The cache tree itself is deliberately NOT created: absent
+        // components are soft, so the strict construction passes.
+        let cache_dir = dir.join("var/cache/protonwire");
+        let blocker = dir.join("not-a-directory");
+        std::fs::write(&blocker, b"").unwrap();
+
+        let args = Args {
+            config: Some(dir.join("missing-config.yaml")),
+            socket_dir: Some(blocker),
+            log_level: None,
+        };
+        let code = run(args, &|_level: &str| {}, None, Some(&cache_dir));
+        assert_eq!(
+            code, 1,
+            "first boot with no persisted deadlines must reach the bind \
+             (exit 1 is the blocker, not a scheduler refusal)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Round-8 X5 [ZkI1F]: the daemon applies the system configuration as
     /// root, so the document's path is a privilege-escalation surface —
     /// pre-fix, a group-writable config.yaml was read and applied without
@@ -540,7 +676,7 @@ mod tests {
         // single global install; this test pins only the exit code (the
         // defect naming is pinned by the store suite).
         let init = |_level: &str| {};
-        let code = run(args, &init, Some(Path::new("/")));
+        let code = run(args, &init, Some(Path::new("/")), None);
         assert_eq!(
             code, 15,
             "a group-writable system configuration must fail the strict load with \

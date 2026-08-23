@@ -676,10 +676,18 @@ impl Scheduler {
     }
 
     /// The production construction over an explicit fs_trust root.
-    /// Private: the production walk root is `/` (the sshd StrictModes
-    /// rule the fs_trust module documents); the shallower root is the
-    /// hermetic-test opt-in and never leaves the crate.
-    fn production_with_trust_root(
+    ///
+    /// Public since S9 (the daemon wiring lane): the daemon's
+    /// fail-closed startup constructs through [`Scheduler::production`]
+    /// (root `/`), and its hermetic tests need the same construction
+    /// over a shallower root — a root-owned tree is unprovable on
+    /// unprivileged runners, and the ownership pass would otherwise
+    /// refuse every test-planted document before the arm under test
+    /// (the same opt-in this crate's own tests use). The production
+    /// walk root stays `/` (the sshd StrictModes rule the fs_trust
+    /// module documents); the shallower root is the hermetic-test
+    /// opt-in.
+    pub fn production_with_trust_root(
         config: SchedulerConfig,
         clock: std::sync::Arc<dyn Clock>,
         fetch: CatalogFetch,
