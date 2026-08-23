@@ -1,5 +1,7 @@
-//! Daemon-side plumbing shared by `main` and tests: the event-sink bridge
-//! and the request handler that couples core to the admin stop flag.
+//! Daemon-side plumbing shared by `main` and tests: the event-sink bridge,
+//! the request handler that couples core to the admin stop flag, and the
+//! M2 S11 per-UID configuration consult
+//! ([`DaemonHandler::effective_config_for`]).
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -322,6 +324,50 @@ pub fn redact_state_for_peer(state: &mut protonwire_frontend_api::DaemonState, p
     }
 }
 
+/// The M2 S11 / T-37 consult surface, implemented on the handler so
+/// every config-derived answer for a peer goes through one door. The
+/// plan's granularity: S11 lands the loader and this daemon-side seam;
+/// the request-handler integration rides with the overlay IPC wire
+/// surface (the S2 lane's `Request` family — the client's typed-overlay
+/// submission per PRD section 10), whose handlers call this method.
+impl DaemonHandler {
+    /// The effective configuration for the REQUESTING peer: the system
+    /// document with the peer's per-UID overlay merged over it per the
+    /// authority classes (system fields untouched by construction;
+    /// present per-user fields applied; the permanent kill-switch floor
+    /// enforced; cross-field rules re-validated on the merged document).
+    ///
+    /// UID provenance (SEC-27): the overlay is keyed by
+    /// `ctx.peer.uid` — the kernel-provided Unix peer credential read at
+    /// connection time. There is NO client-supplied uid in the consult
+    /// (none exists on this wire), and the store derives the document
+    /// path from the raw integer
+    /// (`protonwire_store::config::overlay_path`), so a peer cannot name
+    /// another UID's document — it can only be answered by its own.
+    ///
+    /// `overlay_base` is the daemon-owned overlay tree (production:
+    /// `protonwire_store::config::PRODUCTION_OVERLAY_BASE`); a missing
+    /// document for the peer is the no-overlay state and yields the
+    /// system document unchanged. A PRESENT document that fails any
+    /// check — a system-authority key, the anchor policy, schema drift,
+    /// or a cross-field violation against the system values — is the
+    /// typed [`RpcErrorCode::ConfigInvalid`] refusal: the caller answers
+    /// fail-closed, never from a silently half-applied policy and never
+    /// from an unnotified system-only fallback.
+    pub fn effective_config_for(
+        &self,
+        ctx: &SessionContext,
+        overlay_base: &Path,
+    ) -> Result<protonwire_store::config::SystemConfig, RpcError> {
+        protonwire_store::config::effective_config(
+            self.services.config.as_ref(),
+            overlay_base,
+            ctx.peer.uid,
+        )
+        .map_err(|error| RpcError::new(RpcErrorCode::ConfigInvalid, error.to_string()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -337,7 +383,7 @@ mod tests {
     /// makes the scheduler save (creating the tree), and a later call
     /// re-constructing over an existing non-root-owned tree would fail
     /// the walk's ownership pass by design.
-    fn handler() -> (DaemonHandler, Arc<AtomicBool>) {
+    fn handler_with_config(config: SystemConfig) -> (DaemonHandler, Arc<AtomicBool>) {
         static CALL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
             "protonwire-daemon-handler-{}-{}",
@@ -347,7 +393,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let paths = ConfigPaths::rooted(&dir);
         let services = Arc::new(
-            DaemonServices::build_with_trust_root(Arc::new(SystemConfig::default()), &paths, &dir)
+            DaemonServices::build_with_trust_root(Arc::new(config), &paths, &dir)
                 .expect("first-boot services construct"),
         );
         let stop = Arc::new(AtomicBool::new(false));
@@ -363,6 +409,11 @@ mod tests {
             services,
         };
         (handler, stop)
+    }
+
+    /// The default handler: default system configuration.
+    fn handler() -> (DaemonHandler, Arc<AtomicBool>) {
+        handler_with_config(SystemConfig::default())
     }
 
     fn admin_ctx() -> SessionContext {
@@ -662,6 +713,186 @@ mod tests {
                 other => panic!("unexpected result for {good:?}: {other:?}"),
             }
         }
+    }
+
+    // ------------------------------------------------------------------
+    // M2 S11 / T-37: the daemon-side consult seam. Red-evidence class:
+    // COMPILE-RED (disclosed) — `DaemonHandler::effective_config_for`
+    // did not exist on this commit's parent. The store-side behaviors
+    // (authority refusal, anchors, merge semantics, the permanent
+    // kill-switch floor) carry the behavioral reds in the store suite;
+    // these tests pin the DAEMON's half: the consult is keyed by the
+    // requesting peer's credential, per-UID isolation at the handler,
+    // the typed ConfigInvalid mapping, and the floor through the seam.
+    // ------------------------------------------------------------------
+
+    /// A session context for an arbitrary peer uid (the admin fixture
+    /// above is just uid 0).
+    fn peer_ctx(uid: u32) -> SessionContext {
+        SessionContext {
+            peer: protonwire_ipc::PeerCredentials {
+                uid,
+                gid: 1000,
+                pid: None,
+            },
+            client: protonwire_frontend_api::ClientInfo {
+                name: "test".into(),
+                version: "0".into(),
+                surface: protonwire_frontend_api::ClientSurface::Other,
+            },
+        }
+    }
+
+    /// A unique scratch directory for one test's overlay base (the
+    /// crate's `main.rs` test idiom — the daemon keeps `tempfile` out of
+    /// its dev-dependencies).
+    fn temp_base(tag: &str) -> std::path::PathBuf {
+        static CALL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "protonwire-daemon-s11-{tag}-{}-{}",
+            std::process::id(),
+            CALL.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Plants one overlay document for `uid` under `base`.
+    fn plant_overlay(base: &Path, uid: u32, document: &str) {
+        let dir = base.join(uid.to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config.yaml"), document).unwrap();
+    }
+
+    /// The no-overlay default at the seam: with no document for the
+    /// requesting peer, the effective config IS the system document the
+    /// services were built over — nothing fabricated, nothing dropped.
+    #[test]
+    fn effective_config_without_an_overlay_is_the_system_document() {
+        let (handler, _) = handler();
+        let base = temp_base("none");
+        let effective = handler
+            .effective_config_for(&peer_ctx(4242), &base.join("absent"))
+            .expect("no overlay must consult cleanly");
+        assert_eq!(
+            serde_json::to_value(&effective).unwrap(),
+            serde_json::to_value(SystemConfig::default()).unwrap(),
+            "the effective config must be the system document, value for value"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// UID provenance + isolation at the consult point: the same handler
+    /// and overlay base answer DIFFERENT effective documents for
+    /// different peer credentials — each peer's overlay is keyed by the
+    /// kernel-provided `ctx.peer.uid` (the consult signature carries no
+    /// client-supplied uid; none exists on this wire). One peer's
+    /// overlay is invisible to the other.
+    #[test]
+    fn effective_config_applies_the_requesting_peers_overlay_and_isolates_uids() {
+        let (handler, _) = handler();
+        let base = temp_base("iso");
+        // uid 1000 lowers the kill switch; uid 1001 raises netshield's
+        // level. Each document is only visible to its own credential.
+        plant_overlay(
+            &base,
+            1000,
+            "schema_version: 2\nfeatures:\n  kill_switch: off\n",
+        );
+        plant_overlay(
+            &base,
+            1001,
+            "schema_version: 2\nfeatures:\n  netshield: malware\n",
+        );
+
+        let for_1000 = handler
+            .effective_config_for(&peer_ctx(1000), &base)
+            .unwrap();
+        assert_eq!(
+            for_1000.features.kill_switch,
+            protonwire_store::config::KillSwitchMode::Off,
+            "uid 1000's overlay must apply"
+        );
+        assert_eq!(
+            for_1000.features.netshield,
+            protonwire_store::config::NetShieldLevel::AdsTrackersMalware,
+            "uid 1001's overlay must NOT leak into uid 1000's answer"
+        );
+
+        let for_1001 = handler
+            .effective_config_for(&peer_ctx(1001), &base)
+            .unwrap();
+        assert_eq!(
+            for_1001.features.netshield,
+            protonwire_store::config::NetShieldLevel::Malware,
+            "uid 1001's overlay must apply"
+        );
+        assert_eq!(
+            for_1001.features.kill_switch,
+            protonwire_store::config::KillSwitchMode::On,
+            "uid 1000's overlay must NOT leak into uid 1001's answer"
+        );
+
+        // A peer with no document gets the system defaults.
+        let for_4242 = handler
+            .effective_config_for(&peer_ctx(4242), &base)
+            .unwrap();
+        assert_eq!(
+            for_4242.features.kill_switch,
+            protonwire_store::config::KillSwitchMode::On
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The daemon-side revalidation surface (T-37): a hostile overlay —
+    /// one attempting a system-authority key — is answered with the
+    /// typed ConfigInvalid refusal naming the key, never a silent
+    /// system-only fallback the requesting user did not author.
+    #[test]
+    fn effective_config_refuses_a_system_authority_overlay_with_config_invalid() {
+        let (handler, _) = handler();
+        let base = temp_base("refuse");
+        plant_overlay(
+            &base,
+            1000,
+            "schema_version: 2\ndaemon:\n  log_level: debug\n",
+        );
+        let err = handler
+            .effective_config_for(&peer_ctx(1000), &base)
+            .expect_err("a system-authority key must be refused at the consult");
+        assert_eq!(err.code, RpcErrorCode::ConfigInvalid);
+        assert!(
+            err.message.contains("daemon"),
+            "the refusal must name the refused key: {}",
+            err.message
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The administrator floor through the seam: a daemon whose system
+    /// document pins `kill_switch: permanent` hands EVERY peer a
+    /// permanent kill switch, whatever the peer's overlay requests.
+    #[test]
+    fn effective_config_enforces_the_permanent_kill_switch_floor() {
+        let mut config = SystemConfig::default();
+        config.features.kill_switch = protonwire_store::config::KillSwitchMode::Permanent;
+        let (handler, _) = handler_with_config(config);
+        let base = temp_base("floor");
+        plant_overlay(
+            &base,
+            1000,
+            "schema_version: 2\nfeatures:\n  kill_switch: off\n",
+        );
+        let effective = handler
+            .effective_config_for(&peer_ctx(1000), &base)
+            .unwrap();
+        assert_eq!(
+            effective.features.kill_switch,
+            protonwire_store::config::KillSwitchMode::Permanent,
+            "the admin's permanent floor must outrank the peer's request"
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
 
