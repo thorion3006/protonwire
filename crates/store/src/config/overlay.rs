@@ -874,13 +874,13 @@ mod tests {
         .unwrap();
         let merged = overlay.merged_over(&system).unwrap();
 
-        assert_eq!(merged.features.secure_core, true);
+        assert!(merged.features.secure_core);
         assert_eq!(merged.features.kill_switch, KillSwitchMode::Permanent);
         assert_eq!(merged.features.split_tunnel, SplitTunnelMode::Include);
         assert_eq!(merged.features.netshield, NetShieldLevel::Off);
-        assert_eq!(merged.features.port_forwarding, true);
+        assert!(merged.features.port_forwarding);
         assert_eq!(merged.features.nat, NatMode::Strict);
-        assert_eq!(merged.features.vpn_accelerator, false);
+        assert!(!merged.features.vpn_accelerator);
         assert_eq!(merged.profiles.default.connection_type, ConnectionType::Tor);
         assert_eq!(merged.profiles.default.protocol, ProtocolMode::Stealth);
         assert_eq!(merged.profiles.default.selection.mode, "random");
