@@ -23,7 +23,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::RwLock;
 
-use protonwire_api::{ApiError, CatalogApi, CatalogFetch};
+use protonwire_api::{ApiError, AuthenticationApi, CatalogApi, CatalogFetch, LoginStatus};
 use protonwire_core::scheduler::CatalogFetch as SchedulerFetch;
 use protonwire_core::scheduler::{
     FetchFailure, FetchOutcome, Scheduler, SchedulerConfig, SchedulerError, SystemClock,
@@ -70,6 +70,146 @@ impl CatalogService {
     }
 }
 
+/// The authentication-adapter provider cell (the login family's twin of
+/// [`CatalogService`]): the session lane INSTALLS the live
+/// `&dyn AuthenticationApi` once the engine wiring lands. An empty cell
+/// is answered by the handler with a typed NotImplemented — never a
+/// fabricated login state.
+#[derive(Default)]
+pub struct AuthProvider {
+    auth: RwLock<Option<Arc<dyn AuthenticationApi>>>,
+}
+
+impl AuthProvider {
+    /// Installs (or replaces) the authentication adapter.
+    pub fn install(&self, api: Arc<dyn AuthenticationApi>) {
+        *self.auth.write().expect("auth provider lock") = Some(api);
+    }
+
+    /// The current adapter, if the session lane has installed one.
+    pub fn current(&self) -> Option<Arc<dyn AuthenticationApi>> {
+        self.auth.read().expect("auth provider lock").clone()
+    }
+}
+
+/// S9 obligation (c): the begin_login InvalidState guard, implemented as
+/// the daemon-side precondition CALL SEQUENCE (the work order's
+/// mandated shape — `auth.rs` belongs to the api lane): before any
+/// credentials reach the wire, the daemon consults the adapter's login
+/// status and refuses every non-logged-out state with
+/// [`ApiError::InvalidState`] — an existing session (LoggedIn) and a
+/// session-needing-refresh OR a store-visible pending second-factor
+/// challenge (NeedsRefresh; MuonAuth parks the partial auth in its
+/// store at the 2FA step, which is what makes the pending challenge
+/// observable here at all).
+///
+/// API-LANE FINDING (recorded for that lane, not fixed here): the guard
+/// ultimately belongs INSIDE `MuonAuth::begin_login` — the adapter owns
+/// its `pending` field directly and could refuse the store-invisible
+/// window precisely, whereas this sequence can only observe what
+/// `login_status()` reports. Until the adapter-side guard lands, this
+/// sequence is the fail-closed front door the BeginLogin handler calls.
+pub fn begin_login_guarded(
+    auth: &dyn AuthenticationApi,
+    username: &str,
+    password: &str,
+) -> Result<protonwire_api::LoginStep, ApiError> {
+    // The precondition call sequence: refuse every non-logged-out
+    // status BEFORE the credentials cross the wire (the client
+    // surfaces orchestrate the order — logout or complete the flow
+    // first).
+    match auth.login_status()? {
+        LoginStatus::LoggedOut => auth.begin_login(username, password),
+        LoginStatus::LoggedIn => Err(ApiError::InvalidState(
+            "a session already exists; log out before beginning a new login",
+        )),
+        LoginStatus::NeedsRefresh => Err(ApiError::InvalidState(
+            "a session or pending second-factor challenge already exists; \
+             refresh it, complete the challenge, or log out first",
+        )),
+    }
+}
+
+/// Maps an adapter error onto the wire taxonomy. `InvalidState` maps
+/// onto `RpcErrorCode::InvalidParams` — the wire decision the
+/// `BeginLogin` doc records ("invalid state semantics"); the login
+/// family's other adapter refusals map onto their S2 codes, transport
+/// onto NetworkUnavailable (PRD 9.8 (6)).
+pub fn api_error_to_rpc(error: ApiError) -> protonwire_frontend_api::RpcError {
+    use protonwire_frontend_api::RpcError;
+    use protonwire_frontend_api::RpcErrorCode;
+    match error {
+        ApiError::BlockedUpstream(reason) => RpcError::new(
+            RpcErrorCode::UpstreamCapabilityBlocked,
+            format!("blocked upstream: {reason}"),
+        ),
+        ApiError::UnsupportedChallenge(reason) => RpcError::new(
+            RpcErrorCode::UnsupportedChallenge,
+            format!("unsupported challenge: {reason}"),
+        ),
+        ApiError::InvalidState(reason) => RpcError::new(
+            RpcErrorCode::InvalidParams,
+            format!("invalid state: {reason}"),
+        ),
+        ApiError::RateLimited { .. } => {
+            RpcError::new(RpcErrorCode::RateLimited, "rate limited by the upstream")
+        }
+        ApiError::Transport(detail) => RpcError::new(RpcErrorCode::NetworkUnavailable, detail),
+    }
+}
+
+/// Maps one adapter login step onto the wire outcome (the shapes are
+/// parallel by design; the wire carries no secrets).
+pub fn login_step_to_wire(
+    step: protonwire_api::LoginStep,
+) -> protonwire_frontend_api::LoginOutcome {
+    use protonwire_frontend_api::LoginOutcome;
+    match step {
+        protonwire_api::LoginStep::Session(info) => LoginOutcome::Session {
+            user_id: info.user_id,
+            session_id: info.session_id,
+        },
+        protonwire_api::LoginStep::Challenge(challenge) => LoginOutcome::Challenge {
+            totp_enabled: challenge.totp_enabled,
+            fido2: challenge
+                .fido2
+                .map(|fido2| protonwire_frontend_api::Fido2ChallengeParams {
+                    challenge: fido2.challenge,
+                    allow_credentials: fido2.allow_credentials,
+                }),
+        },
+        protonwire_api::LoginStep::Blocked(reason) => LoginOutcome::Blocked {
+            reason: match reason {
+                protonwire_api::BlockedReason::HumanVerification => {
+                    protonwire_frontend_api::LoginBlockedReason::HumanVerification
+                }
+                protonwire_api::BlockedReason::OrganizationSso => {
+                    protonwire_frontend_api::LoginBlockedReason::OrganizationSso
+                }
+                protonwire_api::BlockedReason::GuestLogin => {
+                    protonwire_frontend_api::LoginBlockedReason::GuestLogin
+                }
+                protonwire_api::BlockedReason::Feedback => {
+                    protonwire_frontend_api::LoginBlockedReason::Feedback
+                }
+                protonwire_api::BlockedReason::UnsupportedChallenge => {
+                    protonwire_frontend_api::LoginBlockedReason::UnsupportedChallenge
+                }
+            },
+        },
+    }
+}
+
+/// Maps the adapter login status onto the wire status (parallel
+/// vocabularies).
+pub fn login_status_to_wire(status: LoginStatus) -> protonwire_frontend_api::SessionStatus {
+    match status {
+        LoginStatus::LoggedOut => protonwire_frontend_api::SessionStatus::LoggedOut,
+        LoginStatus::LoggedIn => protonwire_frontend_api::SessionStatus::LoggedIn,
+        LoginStatus::NeedsRefresh => protonwire_frontend_api::SessionStatus::NeedsRefresh,
+    }
+}
+
 /// S9 obligation (b): maps one adapter fetch result onto the scheduler's
 /// fetch seam. [`ApiError::RateLimited`] carries its (already-clamped at
 /// the ef0074f parse seam — [`protonwire_api::catalog::
@@ -111,6 +251,8 @@ pub struct DaemonServices {
     pub scheduler: Arc<Scheduler>,
     /// The catalog adapter cell + the scheduler's fetch bridge.
     pub catalog: Arc<CatalogService>,
+    /// The authentication adapter cell (the login family's provider).
+    pub auth: AuthProvider,
     /// The strict-loaded catalog cache document location (the
     /// `ServersList` read side; the scheduler is the only writer).
     pub cache_file: std::path::PathBuf,
@@ -159,6 +301,7 @@ impl DaemonServices {
         Ok(Self {
             scheduler,
             catalog,
+            auth: AuthProvider::default(),
             cache_file: paths.cache_dir.join("servers.json"),
             trust_root: trust_root.to_path_buf(),
         })
@@ -212,9 +355,122 @@ pub fn refresh_report_to_wire(
     }
 }
 
+/// Test-support: a fake authentication adapter shared by the services
+/// and handler test suites (a scripted status plus a begin_login
+/// call-record — the guard's observable contract).
+#[cfg(test)]
+pub(crate) mod testkit {
+    use super::*;
+
+    /// A fake authentication adapter with a scripted status that
+    /// records whether `begin_login` was reached (the guard's
+    /// observable contract: the precondition must refuse BEFORE any
+    /// credentials reach the wire).
+    pub(crate) struct FakeAuth {
+        status: LoginStatus,
+        begin_login_called: std::sync::atomic::AtomicBool,
+    }
+
+    impl FakeAuth {
+        /// A fake reporting `status`.
+        pub(crate) fn new(status: LoginStatus) -> Self {
+            Self {
+                status,
+                begin_login_called: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+
+        /// Whether `begin_login` was reached.
+        pub(crate) fn begin_login_was_called(&self) -> bool {
+            self.begin_login_called
+                .load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl AuthenticationApi for FakeAuth {
+        fn login_status(&self) -> Result<LoginStatus, ApiError> {
+            Ok(self.status)
+        }
+
+        fn begin_login(
+            &self,
+            _username: &str,
+            _password: &str,
+        ) -> Result<protonwire_api::LoginStep, ApiError> {
+            self.begin_login_called
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(protonwire_api::LoginStep::Session(
+                protonwire_api::SessionInfo {
+                    user_id: "u".to_owned(),
+                    session_id: "s".to_owned(),
+                },
+            ))
+        }
+
+        fn submit_two_factor(&self, _code: &str) -> Result<protonwire_api::LoginStep, ApiError> {
+            Err(ApiError::InvalidState("no 2FA challenge in progress"))
+        }
+
+        fn submit_fido_payload(
+            &self,
+            _payload: &protonwire_api::Fido2Payload,
+        ) -> Result<protonwire_api::LoginStep, ApiError> {
+            Err(ApiError::InvalidState("no 2FA challenge in progress"))
+        }
+
+        fn refresh(&self) -> Result<LoginStatus, ApiError> {
+            Ok(self.status)
+        }
+
+        fn logout(&self) -> Result<(), ApiError> {
+            Ok(())
+        }
+
+        fn fork(&self, _child_id: &str) -> Result<protonwire_api::ForkSelector, ApiError> {
+            Err(ApiError::InvalidState("logged out"))
+        }
+
+        fn import_fork(
+            &self,
+            _selector: &protonwire_api::ForkSelector,
+        ) -> Result<protonwire_api::LoginStep, ApiError> {
+            Err(ApiError::InvalidState("an active session exists"))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::services::testkit::FakeAuth;
+
+    /// S9 (c), the named obligation: begin_login at a NON-logged-out
+    /// status refuses with `ApiError::InvalidState` and NEVER reaches
+    /// the adapter's `begin_login` — the credentials must not cross the
+    /// wire when the flow is already occupied. Red observed against the
+    /// delegate-only plumbing (the guard removed): every shape returned
+    /// the fake's Ok(Session) with `begin_login_was_called()` true.
+    #[test]
+    fn begin_login_refuses_an_existing_session_or_pending_challenge() {
+        for status in [LoginStatus::LoggedIn, LoginStatus::NeedsRefresh] {
+            let fake = FakeAuth::new(status);
+            let err = begin_login_guarded(&fake, "user", "pass")
+                .err()
+                .unwrap_or_else(|| panic!("status {status:?} must refuse"));
+            assert!(
+                matches!(err, ApiError::InvalidState(_)),
+                "the refusal must be InvalidState for {status:?}: {err}"
+            );
+            assert!(
+                !fake.begin_login_was_called(),
+                "the precondition must refuse before any credentials reach the wire ({status:?})"
+            );
+        }
+        // The LoggedOut control: the login proceeds through the adapter.
+        let fake = FakeAuth::new(LoginStatus::LoggedOut);
+        assert!(begin_login_guarded(&fake, "user", "pass").is_ok());
+        assert!(fake.begin_login_was_called());
+    }
 
     /// A fake adapter scripting one result per call. `ApiError` is not
     /// `Clone` (it owns its detail strings), so the fake produces a

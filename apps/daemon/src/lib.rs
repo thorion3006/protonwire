@@ -139,6 +139,76 @@ impl RequestHandler for DaemonHandler {
                     )),
                 }
             }
+            // The login family: through the auth provider cell. An
+            // empty cell (the engine wiring is the session lane's) is
+            // a typed NotImplemented — never a fabricated login state.
+            Request::BeginLogin { username, password } => match self.services.auth.current() {
+                Some(auth) => {
+                    let step = services::begin_login_guarded(
+                        auth.as_ref(),
+                        username.expose(),
+                        password.expose(),
+                    )
+                    .map_err(services::api_error_to_rpc)?;
+                    Ok(RequestResult::LoginStep {
+                        step: services::login_step_to_wire(step),
+                    })
+                }
+                None => Err(no_engine_installed()),
+            },
+            Request::SubmitTwoFactor { code } => match self.services.auth.current() {
+                Some(auth) => {
+                    let step = auth
+                        .submit_two_factor(code.expose())
+                        .map_err(services::api_error_to_rpc)?;
+                    Ok(RequestResult::LoginStep {
+                        step: services::login_step_to_wire(step),
+                    })
+                }
+                None => Err(no_engine_installed()),
+            },
+            Request::SubmitFidoPayload {
+                client_data,
+                authenticator_data,
+                signature,
+                credential_id,
+            } => match self.services.auth.current() {
+                Some(auth) => {
+                    let payload = protonwire_api::Fido2Payload {
+                        client_data: client_data.expose().to_owned(),
+                        authenticator_data: authenticator_data.expose().to_owned(),
+                        signature: signature.expose().to_owned(),
+                        credential_id,
+                    };
+                    let step = auth
+                        .submit_fido_payload(&payload)
+                        .map_err(services::api_error_to_rpc)?;
+                    Ok(RequestResult::LoginStep {
+                        step: services::login_step_to_wire(step),
+                    })
+                }
+                None => Err(no_engine_installed()),
+            },
+            Request::RefreshSession => match self.services.auth.current() {
+                Some(auth) => {
+                    let status = auth.refresh().map_err(services::api_error_to_rpc)?;
+                    Ok(RequestResult::LoginStatus {
+                        status: services::login_status_to_wire(status),
+                    })
+                }
+                None => Err(no_engine_installed()),
+            },
+            Request::Logout => match self.services.auth.current() {
+                Some(auth) => {
+                    // FR-4: best-effort remote teardown, guaranteed
+                    // local credential removal (Muon's logout is
+                    // infallible by design; a transport failure is
+                    // reported but the local state is the adapter's).
+                    auth.logout().map_err(services::api_error_to_rpc)?;
+                    Ok(RequestResult::Acknowledged)
+                }
+                None => Err(no_engine_installed()),
+            },
             other => self.core.handle_request(ctx.peer.uid, other),
         }
     }
@@ -146,6 +216,18 @@ impl RequestHandler for DaemonHandler {
     fn event_bus(&self) -> &EventBus {
         &self.bus
     }
+}
+
+/// The login family's empty-cell refusal: the session engine (the
+/// MuonAuth construction and runtime wiring) is the api lane's
+/// deliverable; until it installs its adapter, the family answers with
+/// a typed refusal instead of a fabricated state.
+fn no_engine_installed() -> RpcError {
+    RpcError::new(
+        RpcErrorCode::NotImplemented,
+        "the account session engine is not wired yet (the session lane \
+         installs it into the daemon's auth provider)",
+    )
 }
 
 #[cfg(test)]
@@ -278,6 +360,53 @@ mod tests {
             }
             other => panic!("unexpected result: {other:?}"),
         }
+    }
+
+    /// S9 (c) at the handler: BeginLogin runs the daemon-side
+    /// precondition sequence against the installed adapter — a
+    /// logged-in session refuses with the invalid-state semantics
+    /// (wire: InvalidParams) and the credentials never reach the
+    /// adapter; the empty cell is the typed NotImplemented.
+    #[test]
+    fn begin_login_refuses_an_occupied_flow_through_the_handler() {
+        use crate::services::testkit::FakeAuth;
+        use protonwire_api::LoginStatus;
+        use protonwire_frontend_api::{RpcErrorCode, SecretParam};
+
+        let (handler, _) = handler();
+        // Empty cell: typed refusal, never a fabricated state.
+        let err = handler
+            .handle(
+                &admin_ctx(),
+                Request::BeginLogin {
+                    username: SecretParam::new("u"),
+                    password: SecretParam::new("p"),
+                },
+            )
+            .unwrap_err();
+        assert_eq!(err.code, RpcErrorCode::NotImplemented);
+
+        // Installed adapter with a live session: the guard refuses
+        // before the adapter's begin_login.
+        handler
+            .services
+            .auth
+            .install(std::sync::Arc::new(FakeAuth::new(LoginStatus::LoggedIn)));
+        let err = handler
+            .handle(
+                &admin_ctx(),
+                Request::BeginLogin {
+                    username: SecretParam::new("u"),
+                    password: SecretParam::new("p"),
+                },
+            )
+            .unwrap_err();
+        assert_eq!(
+            err.code,
+            RpcErrorCode::InvalidParams,
+            "the invalid-state refusal maps onto the wire code the \
+             BeginLogin doc records: {err}"
+        );
     }
 }
 
