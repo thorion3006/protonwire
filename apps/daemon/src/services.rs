@@ -20,19 +20,26 @@
 //!   storm the persisted high-water mark exists to prevent.
 
 use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::RwLock;
 
 use protonwire_api::{ApiError, AuthenticationApi, CatalogApi, CatalogFetch, LoginStatus};
+use protonwire_core::redact::PeerSecret;
 use protonwire_core::scheduler::CatalogFetch as SchedulerFetch;
 use protonwire_core::scheduler::{
     FetchFailure, FetchOutcome, Scheduler, SchedulerConfig, SchedulerError, SystemClock,
 };
+use protonwire_frontend_api::CredentialStartupRead;
 use protonwire_frontend_api::ServersRefreshOutcome;
 use protonwire_frontend_api::ServersRefreshReport;
 use protonwire_store::catalog::CatalogCache;
 use protonwire_store::catalog::CatalogCacheError;
 use protonwire_store::config::SystemConfig;
+use protonwire_store::credential_input::CREDENTIALS_DIRECTORY_VAR;
+use protonwire_store::credential_input::CredentialInputError;
+use protonwire_store::credential_input::CredentialSource;
+use protonwire_store::credential_input::InteractiveProvider;
 use protonwire_store::paths::ConfigPaths;
 
 /// The catalog-adapter provider cell: the session lane INSTALLS the
@@ -243,6 +250,115 @@ pub enum ServiceStartupError {
     /// fs-trust-refused).
     #[error("scheduler construction failed: {0}")]
     Scheduler(#[from] SchedulerError),
+    /// The configured credential INPUT source could not be resolved
+    /// (FR-7J: a systemd source with no systemd credentials directory
+    /// behind it is a misdeployment, refused at startup rather than
+    /// silently blank).
+    #[error("credential input source resolution failed: {0}")]
+    Credentials(#[from] CredentialInputError),
+}
+
+/// The interactive credential store: the backer of S5a's
+/// [`InteractiveProvider`] (the S9 IPC seam). Values arrive through
+/// `SubmitCredential` and cross the daemon boundary straight into
+/// `peer_secret` guarded storage — zeroizing, never in the global
+/// scrub registry (the M1 finding-10 rule; the S5a module docs record
+/// the boundary contract and its landed core impl).
+#[derive(Default)]
+pub struct CredentialStore {
+    values: RwLock<std::collections::HashMap<String, PeerSecret>>,
+}
+
+impl CredentialStore {
+    /// Records one credential value under its short name (replacing any
+    /// previous value — the newest submission wins).
+    pub fn submit(&self, name: &str, value: PeerSecret) {
+        self.values
+            .write()
+            .expect("credential store lock")
+            .insert(name.to_owned(), value);
+    }
+
+    /// Reads one credential value by short name (the provider half).
+    pub fn get(&self, name: &str) -> Option<PeerSecret> {
+        self.values
+            .read()
+            .expect("credential store lock")
+            .get(name)
+            .cloned()
+    }
+
+    /// The S5a [`InteractiveProvider`] closure over a shared store —
+    /// the seam `CredentialSource::read` consults.
+    pub fn provider(self: &Arc<Self>) -> InteractiveProvider<PeerSecret> {
+        let store = Arc::clone(self);
+        Arc::new(move |name| store.get(name))
+    }
+}
+
+/// The resolved credential input (S9 obligation d) plus the facts the
+/// `GetAccount` snapshot reports.
+pub struct CredentialInput {
+    /// The live source (interactive provider or systemd directory).
+    pub source: CredentialSource<PeerSecret>,
+    /// The systemd arm's recorded startup read of the preferred
+    /// `session` credential (facts only, never value bytes; `None` for
+    /// the interactive arm, which carries no startup read on the wire).
+    pub startup_read: Option<CredentialStartupRead>,
+    /// The systemd arm's resolved credentials directory (reporting
+    /// only); `None` for the interactive arm.
+    pub directory: Option<PathBuf>,
+}
+
+/// Resolves the configured credential input source over an injected
+/// credentials directory (`None` = the systemd arm's hard FR-7J
+/// refusal — the production caller passes the `$CREDENTIALS_DIRECTORY`
+/// value it read from the environment; the injection seam exists
+/// because edition-2024 `set_var` is `unsafe` and the workspace denies
+/// `unsafe_code`).
+///
+/// The systemd arm's startup read of the preferred `session`
+/// credential happens HERE, once: a `Read` fact records the envelope's
+/// schema version, a refusal records the typed error's value-free
+/// summary (the transactional import is S5b's; this is the input-half
+/// fact the wire model carries).
+///
+/// # Errors
+/// [`CredentialInputError`] — see the S5a module docs for the
+/// fail-closed matrix (the resolution arms: no/empty credentials
+/// directory).
+pub fn resolve_credential_input_in(
+    config: &SystemConfig,
+    directory: Option<&Path>,
+    store: Arc<CredentialStore>,
+) -> Result<CredentialInput, CredentialInputError> {
+    let source = CredentialSource::resolve_in(
+        config.account.credential_input_source,
+        &config.account,
+        directory,
+        store.provider(),
+    )?;
+    // The systemd arm's startup read: recorded ONCE here, never
+    // re-read mid-run (the interactive arm carries no startup read).
+    let (startup_read, systemd_dir) = match &source {
+        CredentialSource::Interactive { .. } => (None, None),
+        CredentialSource::Systemd(dir) => (
+            Some(match source.read_session_envelope() {
+                Ok(envelope) => CredentialStartupRead::Read {
+                    schema_version: envelope.schema_version,
+                },
+                Err(error) => CredentialStartupRead::Refused {
+                    reason: error.to_string(),
+                },
+            }),
+            Some(dir.directory().to_path_buf()),
+        ),
+    };
+    Ok(CredentialInput {
+        source,
+        startup_read,
+        directory: systemd_dir,
+    })
 }
 
 /// The live daemon services the request handler dispatches into.
@@ -253,6 +369,14 @@ pub struct DaemonServices {
     pub catalog: Arc<CatalogService>,
     /// The authentication adapter cell (the login family's provider).
     pub auth: AuthProvider,
+    /// The interactive credential store (`SubmitCredential`'s landing;
+    /// the interactive source's provider backer).
+    pub credentials: Arc<CredentialStore>,
+    /// The resolved credential input source + its startup-read facts.
+    pub credential_input: CredentialInput,
+    /// The validated system configuration (the `GetAccount`
+    /// snapshot's writable-store facts).
+    pub config: Arc<SystemConfig>,
     /// The strict-loaded catalog cache document location (the
     /// `ServersList` read side; the scheduler is the only writer).
     pub cache_file: std::path::PathBuf,
@@ -264,30 +388,59 @@ pub struct DaemonServices {
 
 impl DaemonServices {
     /// The production construction: derives the scheduler policy from
-    /// the validated system configuration and constructs the scheduler
-    /// STRICTLY over the `ConfigPaths` cache directory with `/` as the
-    /// fs_trust root.
+    /// the validated system configuration, resolves the credential
+    /// input source (`$CREDENTIALS_DIRECTORY` read from the
+    /// environment), and constructs the scheduler STRICTLY over the
+    /// `ConfigPaths` cache directory with `/` as the fs_trust root.
     ///
     /// # Errors
-    /// [`ServiceStartupError::Scheduler`] — see its doc for the
-    /// fail-closed contract (abort startup; never default deadlines).
-    pub fn build(config: &SystemConfig, paths: &ConfigPaths) -> Result<Self, ServiceStartupError> {
-        Self::build_with_trust_root(config, paths, Path::new("/"))
+    /// [`ServiceStartupError`] — see its variants' docs for the
+    /// fail-closed contract (abort startup; never default deadlines,
+    /// never a silently-blank credential source).
+    pub fn build(
+        config: Arc<SystemConfig>,
+        paths: &ConfigPaths,
+    ) -> Result<Self, ServiceStartupError> {
+        Self::build_in(
+            config,
+            paths,
+            Path::new("/"),
+            std::env::var_os(CREDENTIALS_DIRECTORY_VAR),
+        )
     }
 
-    /// The same construction over an explicit fs_trust root — the
-    /// hermetic-test opt-in (see the core-side doc on
-    /// [`Scheduler::production_with_trust_root`]): an unprivileged
-    /// runner cannot make a tree root-owned, so the ownership pass
-    /// would refuse every test-planted document before the arm under
-    /// test. Production callers use [`Self::build`] (root `/`).
+    /// The hermetic-test construction over an explicit fs_trust root
+    /// (the same opt-in the core-side
+    /// `Scheduler::production_with_trust_root` documents): an
+    /// unprivileged runner cannot make a tree root-owned, so the
+    /// ownership pass would refuse every test-planted document before
+    /// the arm under test. The credentials directory stays the
+    /// environment's (the interactive default needs none; a systemd
+    /// misdeployment test plants its config and relies on the variable
+    /// being absent).
     ///
     /// # Errors
     /// As [`Self::build`].
     pub fn build_with_trust_root(
-        config: &SystemConfig,
+        config: Arc<SystemConfig>,
         paths: &ConfigPaths,
         trust_root: &Path,
+    ) -> Result<Self, ServiceStartupError> {
+        Self::build_in(
+            config,
+            paths,
+            trust_root,
+            std::env::var_os(CREDENTIALS_DIRECTORY_VAR),
+        )
+    }
+
+    /// The common construction: both seams injectable (trust root,
+    /// credentials directory).
+    fn build_in(
+        config: Arc<SystemConfig>,
+        paths: &ConfigPaths,
+        trust_root: &Path,
+        credentials_directory: Option<std::ffi::OsString>,
     ) -> Result<Self, ServiceStartupError> {
         let policy = SchedulerConfig::from_metadata_cache(&config.server_selection.metadata_cache)?;
         let catalog = Arc::new(CatalogService::default());
@@ -298,10 +451,19 @@ impl DaemonServices {
             paths,
             trust_root,
         )?);
+        let credentials = Arc::new(CredentialStore::default());
+        let credential_input = resolve_credential_input_in(
+            &config,
+            credentials_directory.as_deref().map(Path::new),
+            Arc::clone(&credentials),
+        )?;
         Ok(Self {
             scheduler,
             catalog,
             auth: AuthProvider::default(),
+            credentials,
+            credential_input,
+            config,
             cache_file: paths.cache_dir.join("servers.json"),
             trust_root: trust_root.to_path_buf(),
         })
@@ -599,9 +761,10 @@ mod tests {
         std::fs::create_dir_all(&paths.cache_dir).unwrap();
         std::fs::write(paths.cache_dir.join("deadlines.json"), b"{not json").unwrap();
 
-        let err = DaemonServices::build_with_trust_root(&SystemConfig::default(), &paths, &dir)
-            .err()
-            .expect("a corrupted deadlines document must refuse construction");
+        let err =
+            DaemonServices::build_with_trust_root(Arc::new(SystemConfig::default()), &paths, &dir)
+                .err()
+                .expect("a corrupted deadlines document must refuse construction");
         assert!(
             matches!(err, ServiceStartupError::Scheduler(_)),
             "the refusal must surface the scheduler's strict-load failure: {err}"
@@ -623,7 +786,7 @@ mod tests {
         let paths = ConfigPaths::rooted(&dir);
 
         let services =
-            DaemonServices::build_with_trust_root(&SystemConfig::default(), &paths, &dir)
+            DaemonServices::build_with_trust_root(Arc::new(SystemConfig::default()), &paths, &dir)
                 .expect("first boot constructs the scheduler");
         // The FR-13F bootstrap: never fetched, so everything is due.
         assert_eq!(services.scheduler.next_due_unix(), None);
@@ -647,7 +810,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let paths = ConfigPaths::rooted(&dir);
         let services =
-            DaemonServices::build_with_trust_root(&SystemConfig::default(), &paths, &dir)
+            DaemonServices::build_with_trust_root(Arc::new(SystemConfig::default()), &paths, &dir)
                 .expect("first boot");
         services.catalog.install(Arc::new(FakeCatalog::always(|| {
             Err(ApiError::RateLimited {
@@ -675,6 +838,145 @@ mod tests {
         match services.scheduler.refresh_manual(None) {
             ManualOutcome::Suppressed { .. } => {}
             other => panic!("the suppression must refuse the next manual refresh: {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- S9 (d): the credential input wiring ------------------------------
+
+    use protonwire_core::redact::peer_secret;
+    use protonwire_store::config::CredentialInputSource as Vocabulary;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    /// (d) The IPC-driven interactive loop: `SubmitCredential`'s landing
+    /// (the store) feeds S5a's `InteractiveProvider`, and the source's
+    /// own `read` serves the submitted value through the boundary —
+    /// the guarded type never renders its value (Debug is `[redacted]`)
+    /// and a blank submission is refused by the source's blankness
+    /// gate (S5a's fail-closed symmetry, exercised through the real
+    /// `CredentialSource::read`).
+    #[test]
+    fn submit_credential_feeds_the_interactive_provider() {
+        let store = Arc::new(CredentialStore::default());
+        let source = CredentialSource::resolve_in(
+            Vocabulary::Interactive,
+            &SystemConfig::default().account,
+            None,
+            store.provider(),
+        )
+        .expect("the interactive source needs no directory");
+
+        // Nothing submitted: the typed NotProvided refusal.
+        match source.read("session") {
+            Err(CredentialInputError::NotProvided { name }) => assert_eq!(name, "session"),
+            other => panic!("nothing submitted must refuse NotProvided: {other:?}"),
+        }
+        // A submitted value serves through the boundary, newest wins.
+        store.submit("session", peer_secret("first"));
+        store.submit("session", peer_secret("second"));
+        let served = source.read("session").expect("the submitted value serves");
+        assert_eq!(served.expose(), "second");
+        assert_eq!(format!("{served:?}"), "[redacted]");
+        // A blank is never a credential (the source's own gate).
+        store.submit("username", peer_secret(""));
+        match source.read("username") {
+            Err(CredentialInputError::ProvidedEmpty { name }) => assert_eq!(name, "username"),
+            other => panic!("a blank must refuse ProvidedEmpty: {other:?}"),
+        }
+    }
+
+    /// (d) The interactive arm records NO startup read (the wire model
+    /// carries the fact only for the systemd arm).
+    #[test]
+    fn interactive_resolution_records_no_startup_read() {
+        let input = resolve_credential_input_in(
+            &SystemConfig::default(),
+            None,
+            Arc::new(CredentialStore::default()),
+        )
+        .expect("the interactive default resolves without a directory");
+        assert!(input.startup_read.is_none());
+        assert!(input.directory.is_none());
+    }
+
+    /// (d) FR-7J, resolution arm: a configured systemd source with NO
+    /// credentials directory is a misdeployment — the typed refusal the
+    /// daemon's startup aborts on.
+    #[test]
+    fn systemd_source_without_a_directory_refuses_resolution() {
+        let mut config = SystemConfig::default();
+        config.account.credential_input_source = Vocabulary::Systemd;
+        let err = resolve_credential_input_in(&config, None, Arc::new(CredentialStore::default()))
+            .err()
+            .expect("the misdeployment must refuse");
+        assert!(
+            matches!(err, CredentialInputError::NoCredentialsDirectory),
+            "the FR-7J refusal: {err}"
+        );
+    }
+
+    /// (d) The systemd arm's startup read is recorded ONCE at
+    /// resolution: a `Refused` fact for a directory missing the
+    /// preferred `session` credential (the username/password bootstrap
+    /// pair may legitimately be what was provisioned — a refused
+    /// startup read is a FACT, not an abort), and a `Read` fact with
+    /// the envelope's schema version when a current envelope is
+    /// readable. Arm disclosure: the `Read` arm's fs_trust walk needs
+    /// a root-owned tree (NOTICE-skip unprivileged — the a368775
+    /// idiom); the refusal matrix itself is pinned by the store suite.
+    #[test]
+    fn systemd_startup_read_records_the_typed_fact() {
+        use std::os::unix::fs::MetadataExt;
+
+        let mut config = SystemConfig::default();
+        config.account.credential_input_source = Vocabulary::Systemd;
+        let dir =
+            std::env::temp_dir().join(format!("protonwire-daemon-s9-cred-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Missing credential: the Refused fact names the typed error.
+        let input =
+            resolve_credential_input_in(&config, Some(&dir), Arc::new(CredentialStore::default()))
+                .expect("the directory itself resolves");
+        assert_eq!(input.directory.as_deref(), Some(dir.as_path()));
+        match input.startup_read {
+            Some(CredentialStartupRead::Refused { reason }) => assert!(
+                reason.contains("missing") || reason.contains("untrusted"),
+                "the refusal fact carries the typed reason (missing leaf or the \
+                 unprivileged ownership walk): {reason}"
+            ),
+            other => panic!("a missing credential must record a Refused fact: {other:?}"),
+        }
+
+        // A current, integral envelope: the Read fact. Root-gated (the
+        // walk's ownership pass); the store suite pins the parse arms.
+        let envelope =
+            protonwire_store::session::SessionEnvelope::new(serde_json::json!({"k": "v"}))
+                .expect("the envelope mints its own digest");
+        let leaf = dir.join("protonwire-session");
+        std::fs::write(&leaf, serde_json::to_string(&envelope).unwrap()).unwrap();
+        std::fs::set_permissions(&leaf, std::fs::Permissions::from_mode(0o400)).unwrap();
+        let root_owned = std::fs::metadata(&leaf)
+            .map(|m| m.uid() == 0 && m.gid() == 0)
+            .unwrap_or(false);
+        let input =
+            resolve_credential_input_in(&config, Some(&dir), Arc::new(CredentialStore::default()))
+                .expect("the directory itself resolves");
+        if root_owned {
+            match input.startup_read {
+                Some(CredentialStartupRead::Read { schema_version }) => assert_eq!(
+                    schema_version,
+                    protonwire_store::session::SESSION_SCHEMA_VERSION
+                ),
+                other => panic!("an integral envelope must record a Read fact: {other:?}"),
+            }
+        } else {
+            eprintln!(
+                "NOTICE: the Read arm of systemd_startup_read_records_the_typed_fact needs a \
+                 root-owned credentials tree; the unprivileged run pins the Refused arm and the \
+                 resolution facts (visible via --nocapture)"
+            );
         }
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -86,6 +86,79 @@ impl RequestHandler for DaemonHandler {
                 self.stop.store(true, Ordering::SeqCst);
                 Ok(RequestResult::Acknowledged)
             }
+            // S2's redaction decision (PRD 6.3): the full-state snapshot
+            // hides the active owner's UID from every peer that is
+            // neither the owner nor root — null active_owner_uid.
+            Request::GetState => {
+                let mut state = self.core.state();
+                redact_state_for_peer(&mut state, ctx.peer.uid);
+                Ok(RequestResult::State { state })
+            }
+            // (d) The interactive credential source's IPC feed: the
+            // value crosses the daemon boundary straight into guarded
+            // peer-secret storage (zeroizing, never the scrub
+            // registry) keyed by its short name.
+            Request::SubmitCredential { name, value } => {
+                self.services
+                    .credentials
+                    .submit(&name, protonwire_core::redact::peer_secret(value.expose()));
+                Ok(RequestResult::Acknowledged)
+            }
+            // FR-7H's snapshot behind `account --json`: facts only,
+            // never a fabricated field.
+            Request::GetAccount => {
+                use protonwire_frontend_api::{
+                    AccountStatus, CredentialSourceStatus, SessionStatus, WritableStoreStatus,
+                };
+                use protonwire_store::credential_input::CredentialSource as LiveSource;
+                let login_status = match self.services.auth.current() {
+                    Some(auth) => services::login_status_to_wire(
+                        auth.login_status().map_err(services::api_error_to_rpc)?,
+                    ),
+                    // No engine installed: no session exists.
+                    None => SessionStatus::LoggedOut,
+                };
+                let credential_source = match &self.services.credential_input.source {
+                    LiveSource::Interactive { .. } => CredentialSourceStatus::Interactive,
+                    LiveSource::Systemd(dir) => CredentialSourceStatus::Systemd {
+                        directory: dir.directory().display().to_string(),
+                        startup_read: self
+                            .services
+                            .credential_input
+                            .startup_read
+                            .clone()
+                            .unwrap_or(protonwire_frontend_api::CredentialStartupRead::Refused {
+                                reason: "the startup read was not recorded".to_owned(),
+                            }),
+                    },
+                };
+                Ok(RequestResult::Account {
+                    account: AccountStatus {
+                        login_status,
+                        credential_source,
+                        writable_store: WritableStoreStatus {
+                            declared: self
+                                .services
+                                .config
+                                .account
+                                .writable_session_store
+                                .as_str()
+                                .to_owned(),
+                            priority: self
+                                .services
+                                .config
+                                .account
+                                .writable_store_priority
+                                .iter()
+                                .map(|entry| entry.as_str().to_owned())
+                                .collect(),
+                        },
+                        // S5b/S5c own the writable-store half; the
+                        // field stays absent — never fabricated.
+                        persistence_health: None,
+                    },
+                })
+            }
             // FR-10: serve the cached revision verbatim — no upstream
             // request. An absent cache is the legitimate nothing-yet
             // state (all-None fields); a PRESENT cache that fails the
@@ -230,6 +303,23 @@ fn no_engine_installed() -> RpcError {
     )
 }
 
+/// S2's GetState redaction decision (PRD 6.3, the round-1 finding-9
+/// close-out): a peer that is neither the active connection owner nor
+/// root sees `active_owner_uid: null` — the owner's identity is not
+/// cross-user observable. Pure so the decision matrix is unit-testable;
+/// the handler wiring is type-checked (no daemon-side test can record
+/// an owner yet — the M4 engine owns that transition — so the pure
+/// matrix is the enforceable pin, the `config_socket_group`
+/// pass-through precedent).
+pub fn redact_state_for_peer(state: &mut protonwire_frontend_api::DaemonState, peer_uid: u32) {
+    if let Some(owner) = state.active_owner_uid
+        && peer_uid != owner
+        && peer_uid != 0
+    {
+        state.active_owner_uid = None;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -241,13 +331,21 @@ mod tests {
     /// A handler over a first-boot services instance: an all-absent
     /// temp cache tree (the FR-13F bootstrap scheduler, no cached
     /// catalog) over the hermetic trust root — passes on every runner.
+    /// The directory is unique PER CALL: a test that triggers a refresh
+    /// makes the scheduler save (creating the tree), and a later call
+    /// re-constructing over an existing non-root-owned tree would fail
+    /// the walk's ownership pass by design.
     fn handler() -> (DaemonHandler, Arc<AtomicBool>) {
-        let dir =
-            std::env::temp_dir().join(format!("protonwire-daemon-handler-{}", std::process::id()));
+        static CALL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "protonwire-daemon-handler-{}-{}",
+            std::process::id(),
+            CALL.fetch_add(1, Ordering::Relaxed)
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         let paths = ConfigPaths::rooted(&dir);
         let services = Arc::new(
-            DaemonServices::build_with_trust_root(&SystemConfig::default(), &paths, &dir)
+            DaemonServices::build_with_trust_root(Arc::new(SystemConfig::default()), &paths, &dir)
                 .expect("first-boot services construct"),
         );
         let stop = Arc::new(AtomicBool::new(false));
@@ -407,6 +505,110 @@ mod tests {
             "the invalid-state refusal maps onto the wire code the \
              BeginLogin doc records: {err}"
         );
+    }
+
+    /// S9 (e), the redaction decision matrix (the pure pin — the
+    /// handler wiring is type-checked; no daemon test can record an
+    /// owner before the M4 engine transition): the owner and root see
+    /// the owner's UID, every other peer sees null, and a null owner
+    /// (no connection) stays null for everyone.
+    #[test]
+    fn get_state_redacts_the_owner_uid_for_non_owner_non_root_peers() {
+        use protonwire_frontend_api::{DaemonState, NetworkIntegration, VpnState};
+
+        fn state_with_owner(owner: Option<u32>) -> DaemonState {
+            DaemonState {
+                protocol_version: 1,
+                daemon_version: "t".into(),
+                vpn_state: VpnState::Disconnected,
+                network_integration: NetworkIntegration::Auto,
+                active_owner_uid: owner,
+                latest_event_seq: Some(0),
+            }
+        }
+
+        // The owner sees its own UID.
+        let mut state = state_with_owner(Some(1000));
+        redact_state_for_peer(&mut state, 1000);
+        assert_eq!(state.active_owner_uid, Some(1000));
+        // Root sees it too (PRD 6.3: the administrator is not redacted).
+        let mut state = state_with_owner(Some(1000));
+        redact_state_for_peer(&mut state, 0);
+        assert_eq!(state.active_owner_uid, Some(1000));
+        // Any other peer sees null.
+        let mut state = state_with_owner(Some(1000));
+        redact_state_for_peer(&mut state, 1001);
+        assert_eq!(
+            state.active_owner_uid, None,
+            "the owner's UID is cross-user invisible"
+        );
+        // No owner recorded: null for everyone (nothing to leak, and
+        // the redaction must not fabricate one).
+        let mut state = state_with_owner(None);
+        redact_state_for_peer(&mut state, 4242);
+        assert_eq!(state.active_owner_uid, None);
+    }
+
+    /// (d)+(e) through the handler: SubmitCredential lands the guarded
+    /// value in the interactive store (served back through the real
+    /// source's read), and GetAccount reports the interactive source
+    /// with the config's writable-store facts — persistence_health
+    /// absent (never fabricated before S5b/S5c). GetState answers with
+    /// the redaction applied (a null owner is a no-op here; the
+    /// decision matrix is pinned above).
+    #[test]
+    fn submit_credential_and_get_account_round_trip_the_facts() {
+        use protonwire_frontend_api::{CredentialSourceStatus, RequestResult, SecretParam};
+
+        let (handler, _) = handler();
+        match handler
+            .handle(
+                &admin_ctx(),
+                Request::SubmitCredential {
+                    name: "session".into(),
+                    value: SecretParam::new("the-value"),
+                },
+            )
+            .unwrap()
+        {
+            RequestResult::Acknowledged => {}
+            other => panic!("unexpected result: {other:?}"),
+        }
+        // The submitted value serves through the real source's read
+        // path (the interactive provider the source was resolved over).
+        let served = handler
+            .services
+            .credential_input
+            .source
+            .read("session")
+            .expect("the submitted value serves");
+        assert_eq!(served.expose(), "the-value");
+
+        match handler.handle(&admin_ctx(), Request::GetAccount).unwrap() {
+            RequestResult::Account { account } => {
+                assert_eq!(
+                    account.login_status,
+                    protonwire_frontend_api::SessionStatus::LoggedOut,
+                    "no engine installed: no session exists (never fabricated)"
+                );
+                assert_eq!(
+                    account.credential_source,
+                    CredentialSourceStatus::Interactive,
+                    "the default config source is interactive"
+                );
+                assert_eq!(account.writable_store.declared, "auto");
+                assert!(!account.writable_store.priority.is_empty());
+                assert_eq!(
+                    account.persistence_health, None,
+                    "the writable-store half is S5b/S5c's; never fabricated"
+                );
+            }
+            other => panic!("unexpected result: {other:?}"),
+        }
+        assert!(matches!(
+            handler.handle(&admin_ctx(), Request::GetState).unwrap(),
+            RequestResult::State { .. }
+        ));
     }
 }
 

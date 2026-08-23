@@ -251,9 +251,9 @@ fn run(
     // the injected directory — the hermetic-test opt-in, since an
     // unprivileged runner cannot construct a root-owned tree anywhere.
     let services = match &cache_dir {
-        None => protonwire_daemon::DaemonServices::build(&config_for_services, &paths),
+        None => protonwire_daemon::DaemonServices::build(Arc::clone(&config_for_services), &paths),
         Some(dir) => protonwire_daemon::DaemonServices::build_with_trust_root(
-            &config_for_services,
+            Arc::clone(&config_for_services),
             &paths,
             dir,
         ),
@@ -634,6 +634,46 @@ mod tests {
             code, 1,
             "first boot with no persisted deadlines must reach the bind \
              (exit 1 is the blocker, not a scheduler refusal)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// S9 (d), FR-7J at the startup boundary: a config naming the
+    /// systemd credential source with no systemd credentials directory
+    /// behind it ($CREDENTIALS_DIRECTORY absent — asserted as the
+    /// test's precondition) is a misdeployment that REFUSES STARTUP
+    /// (exit 15), never a silently-blank source. Toggle-red (the
+    /// credential resolution removed from the service construction):
+    /// `run` sailed past resolution to the blocked socket dir, exit 1.
+    #[test]
+    fn systemd_credential_source_without_systemd_refuses_startup() {
+        assert!(
+            std::env::var_os("CREDENTIALS_DIRECTORY").is_none(),
+            "this test's premise is a systemd-free environment"
+        );
+        let dir =
+            std::env::temp_dir().join(format!("protonwire-daemon-s9d-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = dir.join("config.yaml");
+        std::fs::write(
+            &config,
+            "schema_version: 2\naccount:\n  credential_input_source: systemd\n",
+        )
+        .unwrap();
+        let blocker = dir.join("not-a-directory");
+        std::fs::write(&blocker, b"").unwrap();
+
+        let args = Args {
+            config: Some(config),
+            socket_dir: Some(blocker),
+            log_level: None,
+        };
+        let code = run(args, &|_level: &str| {}, None, Some(&dir.join("cache")));
+        assert_eq!(
+            code, 15,
+            "a systemd source with no credentials directory must refuse startup \
+             (FR-7J), never serve with a silently-blank source"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
