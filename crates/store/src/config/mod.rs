@@ -4,13 +4,16 @@
 //! [`SystemConfig`], the load paths (`load`, `load_strict`), cross-field
 //! `validate`, the [`Authority`] table, and [`ConfigLoadError`];
 //! `sections` owns the section and enum types the document is composed
-//! of; `overlay` owns the per-UID [`UserOverlay`] document.
+//! of; `overlay` owns the per-UID [`UserOverlay`] document, its S11
+//! loader ([`overlay_path`], [`UserOverlay::load_for_uid`]) and merge
+//! ([`UserOverlay::merged_over`], [`effective_config`]).
 //!
 //! The system document is root-owned and host-global. The per-UID overlay is
 //! a separate document restricted to presentation preferences and per-user
 //! selectors; it uses `deny_unknown_fields`, so any attempt to express a
-//! system-only setting in an overlay is a parse error (the daemon revalidates
-//! on its side as well — T-37 lands with the overlay IPC in Milestone 2).
+//! system-only setting in an overlay is a parse error (the daemon
+//! revalidates at its consult seam — the client-submitted typed-overlay
+//! wire surface is the remaining T-37 half).
 //!
 //! `lan.policy` is the single global LAN setting; there is deliberately no
 //! `features.lan_access` configuration field (PRD section 10 closing rule).
@@ -26,8 +29,9 @@ mod overlay;
 mod sections;
 
 pub use overlay::{
-    OverlayFeatures, OverlayProfileDefault, OverlayProfileSelection, OverlayProfiles, OutputFormat,
-    UserOverlay, UserPresentation,
+    OutputFormat, OverlayError, OverlayFeatures, OverlayProfileDefault, OverlayProfileSelection,
+    OverlayProfiles, PRODUCTION_OVERLAY_BASE, UserOverlay, UserPresentation, effective_config,
+    overlay_path,
 };
 pub use sections::{
     AccountSection, AutoConnectRetry, AutoConnectSection, BalancedWeights, ConnectionGroupsSection,
