@@ -42,9 +42,8 @@ pub type FetchFuture =
 /// Drives a [`FetchFuture`] to completion on the adapter's runtime —
 /// the seam that keeps the sync trust boundary (`&dyn`-safe, no async
 /// in the trait surface).
-pub type BlockOn = std::sync::Arc<
-    dyn Fn(FetchFuture) -> muon::Result<muon::ProtonResponse> + Send + Sync,
->;
+pub type BlockOn =
+    std::sync::Arc<dyn Fn(FetchFuture) -> muon::Result<muon::ProtonResponse> + Send + Sync>;
 
 /// The shared loopback wire-seam harness (see the module's
 /// documentation for the two-way compilation and what deliberately

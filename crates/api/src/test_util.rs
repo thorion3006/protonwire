@@ -359,8 +359,12 @@ fn serve_exchange(
         out.push_str(&format!("{k}: {v}\r\n"));
     }
     out.push_str("\r\n");
-    stream.write_all(out.as_bytes()).expect("responder write head");
-    stream.write_all(&response.body).expect("responder write body");
+    stream
+        .write_all(out.as_bytes())
+        .expect("responder write head");
+    stream
+        .write_all(&response.body)
+        .expect("responder write body");
     stream.flush().expect("responder flush");
 }
 
@@ -399,7 +403,9 @@ pub fn loopback_env(port: u16) -> muon::Environment {
     let server: muon::common::Server = format!("http://127.0.0.1:{port}/")
         .parse()
         .expect("loopback server url");
-    muon::Environment::new_custom(LoopbackEnv { servers: vec![server] })
+    muon::Environment::new_custom(LoopbackEnv {
+        servers: vec![server],
+    })
 }
 
 /// TWO direct-class servers, the first dead — `find_available_sender`
