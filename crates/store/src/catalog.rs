@@ -22,7 +22,12 @@
 //! Every wire type uses `deny_unknown_fields` and no `default` on wire
 //! fields: an upstream field this module does not map, a renamed field,
 //! or a changed type is a hard [`CatalogError`] naming the field — never
-//! a silently dropped key. Fields the official clients disagree about
+//! a silently dropped key. The same doctrine governs VALUES: the
+//! recorded domains (`Status` 0/1, `Tier` 0–3, `Load` 0–100) are
+//! enforced at parse, so a number the model has no representation for
+//! fails loudly instead of silently reclassifying a server (a
+//! `Status: 2` is drift, not "offline"). Fields the official clients
+//! disagree about
 //! (one still maps it, another dropped it) are `Option`: absence stays
 //! absence. Nothing is ever fabricated: an absent status, load, score,
 //! gateway, or revision field is `None`, and [`LogicalServer::is_online`]
@@ -160,8 +165,56 @@ impl CatalogDocument {
                 physical,
             });
         }
+        validate_value_domains(&doc)?;
         Ok(doc)
     }
+}
+
+/// Enforces the recorded VALUE domains — the drift doctrine applied to
+/// values, not just field names: a structurally valid field carrying a
+/// number the model has no representation for (`Status: 2` mapped to
+/// "offline" by `is_online`'s `== 1`, a negative or >100 `Load` feeding
+/// ranking, a `Tier` outside the 0–3 plan vocabulary) is contract
+/// drift and fails loudly here, before anything may be cached or
+/// served (the Codex PR#4 finding; the module's own "drift fails
+/// loudly, never approximates" rule).
+fn validate_value_domains(doc: &CatalogDocument) -> Result<(), CatalogError> {
+    for (index, server) in doc.logical_servers.iter().enumerate() {
+        if let Some(status) = server.status
+            && status != 0
+            && status != 1
+        {
+            return Err(CatalogError::Malformed(format!(
+                "LogicalServers[{index}].Status = {status} is outside the recorded domain \
+                 (0 offline, 1 online; absent is unknown — never approximated)"
+            )));
+        }
+        if !(0..=3).contains(&server.tier) {
+            return Err(CatalogError::Malformed(format!(
+                "LogicalServers[{index}].Tier = {} is outside the recorded plan vocabulary \
+                 (0 free, 1 basic, 2 plus, 3 PM)",
+                server.tier
+            )));
+        }
+        if let Some(load) = server.load
+            && !(0..=100).contains(&load)
+        {
+            return Err(CatalogError::Malformed(format!(
+                "LogicalServers[{index}].Load = {load} is outside the recorded 0–100 \
+                 percentage domain"
+            )));
+        }
+        for (physical_index, physical) in server.servers.iter().enumerate() {
+            if physical.status != 0 && physical.status != 1 {
+                return Err(CatalogError::Malformed(format!(
+                    "LogicalServers[{index}].Servers[{physical_index}].Status = {} is outside \
+                     the recorded domain (0 offline/maintenance, 1 online)",
+                    physical.status
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// `ResponseMetadata` on the logicals envelope.
@@ -790,6 +843,118 @@ mod tests {
             Some("Scheduled maintenance window")
         );
         assert_eq!(ch10.is_online(), Some(true));
+    }
+
+    /// A one-logical catalog for the value-domain fixtures. `logical`
+    /// splices the logical's domain-carrying fields (the default carries
+    /// only the in-domain `,"Tier":0`), `physical` is the complete
+    /// physical object contents (default in-domain). Every override
+    /// REPLACES a field — no duplicate keys, so a failure can only come
+    /// from the arm under test.
+    fn domain_catalog(logical: &str, physical: &str) -> String {
+        let mut doc = String::from(
+            r#"{"Code":1000,"StatusID":"t","LogicalServers":[{"ID":"x","Name":"X#1","EntryCountry":"XX","ExitCountry":"XX","Features":0"#,
+        );
+        doc.push_str(logical);
+        doc.push_str(r#","Servers":[{"#);
+        doc.push_str(physical);
+        doc.push_str(r#"}]}]}"#);
+        doc
+    }
+
+    const IN_DOMAIN_LOGICAL: &str = r#","Tier":0"#;
+    const IN_DOMAIN_PHYSICAL: &str = r#""Domain":"x.example","Status":1"#;
+
+    // --- Value domains: drift fails loudly, never silently
+    // misclassifies (the Codex PR#4 finding; the module's own doctrine
+    // applied to VALUES, not just field names) ------------------------
+
+    #[test]
+    fn an_out_of_domain_logical_status_fails_loudly_not_offline() {
+        // Status 2 (or any value beyond the recorded 0/1) is contract
+        // drift: mapping it to `is_online() == Some(false)` would
+        // silently reclassify a server the model cannot represent.
+        let err = CatalogDocument::from_bytes(
+            domain_catalog(r#","Tier":0,"Status":2"#, IN_DOMAIN_PHYSICAL).as_bytes(),
+        )
+        .unwrap_err();
+        let CatalogError::Malformed(detail) = &err else {
+            panic!("an out-of-domain logical Status must be Malformed drift, got: {err}");
+        };
+        assert!(
+            detail.contains("Status"),
+            "the failure must name the field: {detail}"
+        );
+        // The control arms: both in-domain statuses parse.
+        for status in [0, 1] {
+            let body = domain_catalog(
+                &format!(r#","Tier":0,"Status":{status}"#),
+                IN_DOMAIN_PHYSICAL,
+            );
+            CatalogDocument::from_bytes(body.as_bytes())
+                .unwrap_or_else(|e| panic!("in-domain Status {status} must parse: {e}"));
+        }
+    }
+
+    #[test]
+    fn an_out_of_domain_physical_status_fails_loudly() {
+        let err = CatalogDocument::from_bytes(
+            domain_catalog(IN_DOMAIN_LOGICAL, r#""Domain":"x.example","Status":2"#).as_bytes(),
+        )
+        .unwrap_err();
+        let CatalogError::Malformed(detail) = &err else {
+            panic!("an out-of-domain physical Status must be Malformed drift, got: {err}");
+        };
+        assert!(
+            detail.contains("Status"),
+            "the failure must name the field: {detail}"
+        );
+    }
+
+    #[test]
+    fn an_out_of_domain_load_fails_loudly() {
+        // Load is a percentage; -1 and 101 are equally outside it.
+        for load in [-1, 101] {
+            let err = CatalogDocument::from_bytes(
+                domain_catalog(&format!(r#","Tier":0,"Load":{load}"#), IN_DOMAIN_PHYSICAL)
+                    .as_bytes(),
+            )
+            .unwrap_err();
+            let CatalogError::Malformed(detail) = &err else {
+                panic!("Load {load} must be Malformed drift, got: {err}");
+            };
+            assert!(
+                detail.contains("Load"),
+                "the failure must name the field: {detail}"
+            );
+        }
+        // Boundary controls: 0 and 100 are in-domain.
+        for load in [0, 100] {
+            let body = domain_catalog(
+                &format!(r#","Tier":0,"Load":{load}"#),
+                IN_DOMAIN_PHYSICAL,
+            );
+            CatalogDocument::from_bytes(body.as_bytes())
+                .unwrap_or_else(|e| panic!("boundary Load {load} must parse: {e}"));
+        }
+    }
+
+    #[test]
+    fn an_out_of_domain_tier_fails_loudly() {
+        // The recorded vocabulary is 0 free, 1 basic, 2 plus, 3 PM.
+        for tier in [-1, 4] {
+            let err = CatalogDocument::from_bytes(
+                domain_catalog(&format!(r#","Tier":{tier}"#), IN_DOMAIN_PHYSICAL).as_bytes(),
+            )
+            .unwrap_err();
+            let CatalogError::Malformed(detail) = &err else {
+                panic!("Tier {tier} must be Malformed drift, got: {err}");
+            };
+            assert!(
+                detail.contains("Tier"),
+                "the failure must name the field: {detail}"
+            );
+        }
     }
 
     #[test]
