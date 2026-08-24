@@ -930,10 +930,7 @@ mod tests {
         }
         // Boundary controls: 0 and 100 are in-domain.
         for load in [0, 100] {
-            let body = domain_catalog(
-                &format!(r#","Tier":0,"Load":{load}"#),
-                IN_DOMAIN_PHYSICAL,
-            );
+            let body = domain_catalog(&format!(r#","Tier":0,"Load":{load}"#), IN_DOMAIN_PHYSICAL);
             CatalogDocument::from_bytes(body.as_bytes())
                 .unwrap_or_else(|e| panic!("boundary Load {load} must parse: {e}"));
         }
