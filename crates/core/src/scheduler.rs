@@ -37,13 +37,12 @@
 //! `protonwire-core`, so the scheduler consumes the S6 adapter surface
 //! through [`CatalogFetch`] — a mirror of `CatalogApi::fetch(etag) ->
 //! Changed{etag,body}|NotModified` whose failure side carries the
-//! rate-limit classification. The daemon (S9) bridges `&dyn CatalogApi`
-//! onto this seam, mapping the adapter's `ApiError::RateLimited`
-//! (landing with the api-wire-fixture lane) onto
-//! [`FetchFailure::RateLimited`]; until that variant exists, the
-//! bridge's `ApiError::Transport` arm maps onto
-//! [`FetchFailure::Transport`]. The 429/503 wire-fixture obligation
-//! itself is tracked for S9.
+//! rate-limit classification. The daemon bridges `&dyn CatalogApi`
+//! onto this seam (`services::bridge_fetch`, landed with S9): the
+//! adapter's `ApiError::RateLimited{retry_after_seconds}` (the
+//! 429/503 wire fixtures behind it) maps onto
+//! [`FetchFailure::RateLimited`], and every other adapter failure
+//! maps onto [`FetchFailure::Transport`].
 
 use std::path::Path;
 

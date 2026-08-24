@@ -11,9 +11,12 @@
 //! client-supplied value — under a daemon-owned base
 //! ([`PRODUCTION_OVERLAY_BASE`]). The root daemon never expands `~`,
 //! derives a home directory, or follows a user-controlled config path
-//! (PRD section 10: the client loads its own `$XDG_CONFIG_HOME` copy and
-//! submits a typed overlay over IPC; this loader is the daemon-side
-//! revalidating half over daemon-store documents). The document is read
+//! (PRD section 10: the client loads its own `$XDG_CONFIG_HOME` copy
+//! and submits a typed overlay over IPC, and this loader is the
+//! daemon-side revalidating half over daemon-store documents. The
+//! typed submission wire is NOT landed — M2 shipped the load path
+//! only, and the write path is the tracked post-M2 item 2). The
+//! document is read
 //! through the SAME hardened loader as the system configuration
 //! ([`crate::yaml`]: anchors refused before parsing, size/depth/node
 //! caps, duplicate-key rejection), and a PRESENT document that fails any

@@ -584,7 +584,9 @@ impl<S: SecretBoundary> CredentialSource<S> {
 }
 
 /// The FR-7C envelope bridge: the deliberate consumer of the `session`
-/// credential, and the ONE `expose()` site in this crate. Mirrors the
+/// credential, and the SECOND of this crate's two deliberate `expose()`
+/// sites (the interactive arm's blankness check is the other — see the
+/// module documentation). Mirrors the
 /// fail-closed parse of `SessionEnvelopeStore::load` (unknown fields via
 /// serde, unsupported schema, digest integrity) — the input side already
 /// caps the value at [`MAX_CREDENTIAL_BYTES`], the same 64 KiB the
@@ -603,7 +605,7 @@ impl<S: SecretBoundary> CredentialSource<S> {
 pub fn parse_session_envelope<S: SecretBoundary>(
     secret: &S,
 ) -> Result<SessionEnvelope, CredentialInputError> {
-    // The deliberate consumer: the one expose() site in this crate.
+    // The deliberate consumer: the envelope-bridge expose() site.
     SessionEnvelope::from_strict_bytes(secret.expose().as_bytes())
         .map_err(CredentialInputError::Envelope)
 }
