@@ -105,6 +105,20 @@ pub enum ClientEvent {
     },
 }
 
+/// The cached server catalog as served by
+/// [`ProtonwireClient::servers_list`] (FR-10: the raw upstream body
+/// byte-for-byte, never rewritten). Every field is `None` when nothing
+/// is cached yet — the daemon never fabricates a catalog.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServersSnapshot {
+    /// The cached revision's `ETag`, for diagnostics.
+    pub etag: Option<String>,
+    /// When this revision was fetched (Unix seconds).
+    pub fetched_unix: Option<u64>,
+    /// The raw catalog JSON body, byte-for-byte as cached.
+    pub body: Option<String>,
+}
+
 /// A connected client session with the daemon.
 pub struct ProtonwireClient {
     ipc: IpcClient,
@@ -135,6 +149,26 @@ fn transport_failure(message: String) -> ClientError {
     ClientError::Io(std::io::Error::new(
         std::io::ErrorKind::ConnectionAborted,
         message,
+    ))
+}
+
+/// The M2 SDK surface's shared mapping: a request-level failure is
+/// either the daemon's structured RPC refusal (surfaced verbatim) or a
+/// transport failure (exit 13).
+fn map_request_error(error: RequestError) -> ClientError {
+    match error {
+        RequestError::Rpc(rpc) => ClientError::Rpc(rpc),
+        RequestError::Transport(message) => transport_failure(message),
+    }
+}
+
+/// The M2 SDK surface's shared "the daemon answered the wrong shape"
+/// refusal — the SDK's method contracts are typed; a mismatched reply
+/// is an internal daemon error, never a guess.
+fn unexpected_result(what: &str, result: RequestResult) -> ClientError {
+    ClientError::Rpc(RpcError::new(
+        RpcErrorCode::Internal,
+        format!("unexpected {what} result: {result:?}"),
     ))
 }
 
@@ -243,6 +277,146 @@ impl ProtonwireClient {
     /// `PermissionDenied` RPC error.
     pub fn shutdown_daemon(&mut self) -> Result<(), ClientError> {
         self.ack(Request::Shutdown)
+    }
+
+    // --- The M2 servers/account/credential surface (S9's wire family,
+    // exposed through the SDK — the one client surface every first-party
+    // frontend consumes) ---------------------------------------------
+
+    /// Serves the cached server catalog (FR-9/FR-10): the revision the
+    /// daemon reads strictly from its cache — no upstream request, no
+    /// fabrication; every field `None` when nothing is cached yet.
+    pub fn servers_list(&mut self) -> Result<ServersSnapshot, ClientError> {
+        match self.ipc.request(Request::ServersList) {
+            Ok(RequestResult::Servers {
+                etag,
+                fetched_unix,
+                body,
+            }) => Ok(ServersSnapshot {
+                etag,
+                fetched_unix,
+                body,
+            }),
+            Ok(other) => Err(unexpected_result("servers list", other)),
+            Err(error) => Err(map_request_error(error)),
+        }
+    }
+
+    /// Refreshes the server catalog through the single-flight scheduler
+    /// (FR-11/FR-13I). An early refresh is refused with
+    /// [`RpcErrorCode::ConfirmationRequired`]; the caller surfaces the
+    /// carried warning and replays the single-use
+    /// `confirmation_token` (see
+    /// [`ConfirmationRequirement::from_error`]). An active suppression
+    /// refuses even a confirmed request (ER-16).
+    pub fn servers_refresh(
+        &mut self,
+        confirmation_token: Option<&str>,
+    ) -> Result<protonwire_frontend_api::ServersRefreshReport, ClientError> {
+        match self
+            .ipc
+            .request(Request::ServersRefresh {
+                confirmation_token: confirmation_token.map(str::to_owned),
+            }) {
+            Ok(RequestResult::ServersRefreshed { report }) => Ok(report),
+            Ok(other) => Err(unexpected_result("servers refresh", other)),
+            Err(error) => Err(map_request_error(error)),
+        }
+    }
+
+    /// Begins SRP username/password login (PRD 7.1). The daemon
+    /// refuses with `InvalidParams` when a session or pending
+    /// second-factor challenge already exists.
+    pub fn begin_login(
+        &mut self,
+        username: impl Into<String>,
+        password: impl Into<String>,
+    ) -> Result<protonwire_frontend_api::LoginOutcome, ClientError> {
+        self.login_step(Request::BeginLogin {
+            username: protonwire_frontend_api::SecretParam::new(username),
+            password: protonwire_frontend_api::SecretParam::new(password),
+        })
+    }
+
+    /// Continues a login paused at the 2FA step with a TOTP code.
+    pub fn submit_two_factor(
+        &mut self,
+        code: impl Into<String>,
+    ) -> Result<protonwire_frontend_api::LoginOutcome, ClientError> {
+        self.login_step(Request::SubmitTwoFactor {
+            code: protonwire_frontend_api::SecretParam::new(code),
+        })
+    }
+
+    /// Continues a login paused at the 2FA step with an assembled
+    /// WebAuthn/FIDO2 assertion (base64 fields as on the wire).
+    pub fn submit_fido_payload(
+        &mut self,
+        client_data: impl Into<String>,
+        authenticator_data: impl Into<String>,
+        signature: impl Into<String>,
+        credential_id: Vec<u8>,
+    ) -> Result<protonwire_frontend_api::LoginOutcome, ClientError> {
+        self.login_step(Request::SubmitFidoPayload {
+            client_data: protonwire_frontend_api::SecretParam::new(client_data),
+            authenticator_data: protonwire_frontend_api::SecretParam::new(authenticator_data),
+            signature: protonwire_frontend_api::SecretParam::new(signature),
+            credential_id,
+        })
+    }
+
+    /// Forces a session token refresh (FR-3); returns the
+    /// post-refresh status.
+    pub fn refresh_session(&mut self) -> Result<protonwire_frontend_api::SessionStatus, ClientError> {
+        match self.ipc.request(Request::RefreshSession) {
+            Ok(RequestResult::LoginStatus { status }) => Ok(status),
+            Ok(other) => Err(unexpected_result("session refresh", other)),
+            Err(error) => Err(map_request_error(error)),
+        }
+    }
+
+    /// Logs out: best-effort remote teardown, guaranteed local
+    /// credential removal (FR-4).
+    pub fn logout(&mut self) -> Result<(), ClientError> {
+        self.ack(Request::Logout)
+    }
+
+    /// Submits one credential value for the INTERACTIVE input source
+    /// (FR-7F): the short-name vocabulary is `session`, `username`,
+    /// `password`; the value lands in the daemon's zeroizing input
+    /// store.
+    pub fn submit_credential(
+        &mut self,
+        name: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Result<(), ClientError> {
+        self.ack(Request::SubmitCredential {
+            name: name.into(),
+            value: protonwire_frontend_api::SecretParam::new(value),
+        })
+    }
+
+    /// The account snapshot behind `account --json` (FR-7H): login
+    /// status, credential input source, writable store, persistence
+    /// health when reported — facts only, never a secret.
+    pub fn get_account(&mut self) -> Result<protonwire_frontend_api::AccountStatus, ClientError> {
+        match self.ipc.request(Request::GetAccount) {
+            Ok(RequestResult::Account { account }) => Ok(account),
+            Ok(other) => Err(unexpected_result("account", other)),
+            Err(error) => Err(map_request_error(error)),
+        }
+    }
+
+    /// The login family's shared result mapping.
+    fn login_step(
+        &mut self,
+        request: Request,
+    ) -> Result<protonwire_frontend_api::LoginOutcome, ClientError> {
+        match self.ipc.request(request) {
+            Ok(RequestResult::LoginStep { step }) => Ok(step),
+            Ok(other) => Err(unexpected_result("login", other)),
+            Err(error) => Err(map_request_error(error)),
+        }
     }
 
     fn ack(&mut self, request: Request) -> Result<(), ClientError> {
@@ -521,6 +695,66 @@ mod tests {
                     }));
                     Ok(RequestResult::Acknowledged)
                 }
+                // The M2 servers/account/credential surface: scripted
+                // replies for the SDK wrapper suite. The refresh arm
+                // REFUSES without a token and answers with the report
+                // when one is replayed — the ceremony's wire shape.
+                Request::ServersList => Ok(RequestResult::Servers {
+                    etag: Some("\"rev-7\"".into()),
+                    fetched_unix: Some(1_771_000_000),
+                    body: Some("{\"Code\":1000}".into()),
+                }),
+                Request::ServersRefresh { confirmation_token } => {
+                    match confirmation_token {
+                        None => Err(RpcError::confirmation_required(
+                            "the server list is still fresh",
+                            protonwire_frontend_api::ConfirmationRequirement {
+                                catalog_age_seconds: 120,
+                                last_request_unix: Some(1_771_000_000),
+                                next_eligible_unix: 1_771_010_800,
+                                warning: "still fresh".into(),
+                                confirmation_token: "token-1".into(),
+                            },
+                        )),
+                        Some(token) => Ok(RequestResult::ServersRefreshed {
+                            report: protonwire_frontend_api::ServersRefreshReport {
+                                outcome: protonwire_frontend_api::ServersRefreshOutcome::Changed {
+                                    etag: Some("\"rev-8\"".into()),
+                                },
+                                coalesced: false,
+                                next_eligible_unix: 1_771_020_000,
+                                suppression_until_unix: None,
+                            },
+                        })
+                        .map(|result| {
+                            assert_eq!(token, "token-1", "the replayed token rides the wire");
+                            result
+                        }),
+                    }
+                }
+                Request::GetAccount => Ok(RequestResult::Account {
+                    account: protonwire_frontend_api::AccountStatus {
+                        login_status: protonwire_frontend_api::SessionStatus::LoggedOut,
+                        credential_source:
+                            protonwire_frontend_api::CredentialSourceStatus::Interactive,
+                        writable_store: protonwire_frontend_api::WritableStoreStatus {
+                            declared: "auto".into(),
+                            priority: vec![],
+                        },
+                        persistence_health: None,
+                    },
+                }),
+                Request::SubmitCredential { .. } | Request::Logout => {
+                    Ok(RequestResult::Acknowledged)
+                }
+                Request::BeginLogin { username, .. } => {
+                    Ok(RequestResult::LoginStep {
+                        step: protonwire_frontend_api::LoginOutcome::Session {
+                            user_id: format!("{}-ok", username.expose()),
+                            session_id: "s1".into(),
+                        },
+                    })
+                }
                 other => Err(RpcError::new(
                     RpcErrorCode::NotImplemented,
                     format!("{other:?}"),
@@ -565,6 +799,91 @@ mod tests {
         assert_eq!(client.ping().unwrap(), "ping");
         assert_eq!(client.state().unwrap().daemon_version, "test-daemon");
         assert_eq!(client.daemon_version(), "test-daemon");
+    }
+
+    // --- The M2 SDK wrappers (the S9 wire family, client-side) ---------
+
+    #[test]
+    fn servers_list_round_trips_the_cached_revision() {
+        let dir = tempfile::tempdir().unwrap();
+        let (server, _handler) = spawn_server(&dir);
+        let mut client = dev_client(server.socket_path());
+        let snapshot = client.servers_list().unwrap();
+        assert_eq!(snapshot.etag.as_deref(), Some("\"rev-7\""));
+        assert_eq!(snapshot.fetched_unix, Some(1_771_000_000));
+        assert_eq!(snapshot.body.as_deref(), Some("{\"Code\":1000}"));
+    }
+
+    #[test]
+    fn a_confirmation_required_refusal_carries_its_requirement_and_the_token_replays() {
+        let dir = tempfile::tempdir().unwrap();
+        let (server, _handler) = spawn_server(&dir);
+        let mut client = dev_client(server.socket_path());
+        // The unconfirmed refresh: a typed refusal whose requirement
+        // envelope the SDK surfaces verbatim (the ceremony's input).
+        let err = client.servers_refresh(None).unwrap_err();
+        let ClientError::Rpc(rpc) = &err else {
+            panic!("the early-refresh refusal is an RPC error: {err}");
+        };
+        assert_eq!(rpc.code, RpcErrorCode::ConfirmationRequired);
+        let requirement = protonwire_frontend_api::ConfirmationRequirement::from_error(rpc)
+            .expect("the refusal carries its typed requirement");
+        assert_eq!(requirement.catalog_age_seconds, 120);
+        assert_eq!(requirement.next_eligible_unix, 1_771_010_800);
+        assert_eq!(requirement.confirmation_token, "token-1");
+        // The confirmed replay: the single-use token rides the wire and
+        // the report comes back.
+        let report = client
+            .servers_refresh(Some(&requirement.confirmation_token))
+            .unwrap();
+        assert_eq!(
+            report.outcome,
+            protonwire_frontend_api::ServersRefreshOutcome::Changed {
+                etag: Some("\"rev-8\"".into())
+            }
+        );
+        // A non-ceremony code extracts no requirement (never guesses).
+        let plain = RpcError::new(RpcErrorCode::NotImplemented, "x");
+        assert!(
+            protonwire_frontend_api::ConfirmationRequirement::from_error(&plain).is_none()
+        );
+    }
+
+    #[test]
+    fn get_account_returns_the_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let (server, _handler) = spawn_server(&dir);
+        let mut client = dev_client(server.socket_path());
+        let account = client.get_account().unwrap();
+        assert_eq!(
+            account.login_status,
+            protonwire_frontend_api::SessionStatus::LoggedOut
+        );
+        assert_eq!(
+            account.credential_source,
+            protonwire_frontend_api::CredentialSourceStatus::Interactive
+        );
+        assert_eq!(account.persistence_health, None);
+    }
+
+    #[test]
+    fn the_login_family_and_credential_acknowledgements_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let (server, _handler) = spawn_server(&dir);
+        let mut client = dev_client(server.socket_path());
+        // begin_login: the secret params cross and the typed step
+        // returns (the fixture echoes the username — proof the value
+        // arrived, while SecretParam's Debug stays redacted).
+        let step = client.begin_login("user@example", "hunter2").unwrap();
+        assert_eq!(
+            step,
+            protonwire_frontend_api::LoginOutcome::Session {
+                user_id: "user@example-ok".into(),
+                session_id: "s1".into(),
+            }
+        );
+        client.logout().unwrap();
+        client.submit_credential("session", "envelope-bytes").unwrap();
     }
 
     #[test]
