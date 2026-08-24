@@ -32,6 +32,28 @@ pub mod entitlements;
 pub mod location;
 pub mod runtime;
 
+/// The boxed muon fetch future the sync adapters drive through their
+/// [`BlockOn`] bridge — defined once here; `catalog`, `entitlements`,
+/// and `location` re-export it (the three units grew identical private
+/// twins of this and [`BlockOn`] across S6/S8/S10).
+pub type FetchFuture =
+    std::pin::Pin<Box<dyn std::future::Future<Output = muon::Result<muon::ProtonResponse>>>>;
+
+/// Drives a [`FetchFuture`] to completion on the adapter's runtime —
+/// the seam that keeps the sync trust boundary (`&dyn`-safe, no async
+/// in the trait surface).
+pub type BlockOn = std::sync::Arc<
+    dyn Fn(FetchFuture) -> muon::Result<muon::ProtonResponse> + Send + Sync,
+>;
+
+/// The shared loopback wire-seam harness (see the module's
+/// documentation for the two-way compilation and what deliberately
+/// stays per-file). `#[allow(dead_code)]`: the unit-test and
+/// integration-test compilation contexts each use a subset of the kit.
+#[cfg(test)]
+#[allow(dead_code)]
+mod test_util;
+
 /// Authentication capabilities the adapter must expose.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LoginStatus {

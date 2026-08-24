@@ -102,8 +102,6 @@
 //! side composes with). NO daemon or core wiring: the trait is the
 //! `&dyn` seam the future unit injects.
 
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -343,14 +341,16 @@ fn optional_f32(
 // ---------------------------------------------------------------------------
 
 /// One in-flight location request, as presented to the blocking bridge
-/// (the S4/S6/S8 seam idiom).
-pub type FetchFuture = Pin<Box<dyn Future<Output = muon::Result<muon::ProtonResponse>>>>;
+/// (the S4/S6/S8 seam idiom) — the crate-level definition
+/// (`crate::FetchFuture`), re-exported at this path unchanged.
+pub use crate::FetchFuture;
 
 /// The sync→async bridge: blocks on a Muon response future. Injected
 /// at construction so this crate depends on no runtime; the daemon's
 /// engine runtime ([`crate::runtime::TokioBridge`]) is wired by its
-/// lane.
-pub type BlockOn = Arc<dyn Fn(FetchFuture) -> muon::Result<muon::ProtonResponse> + Send + Sync>;
+/// lane. The crate-level definition (`crate::BlockOn`), re-exported at
+/// this path unchanged.
+pub use crate::BlockOn;
 
 type SendLocation = Arc<dyn Fn(HttpReq) -> muon::Result<muon::ProtonResponse> + Send + Sync>;
 
@@ -657,256 +657,27 @@ mod model_tests {
 // ---------------------------------------------------------------------------
 #[cfg(test)]
 mod wire_tests {
-    use std::io::{Read as _, Write as _};
-    use std::net::{TcpListener, TcpStream};
-    use std::sync::{Arc, Mutex};
-    use std::time::{Duration, Instant};
+    use std::sync::Arc;
 
     use super::*;
+    use crate::test_util::{Step, dead_port, loopback_env, spawn_scripted, test_sdk};
 
     /// The recorded location fixture (provenance in the module
     /// documentation): synthetic values, the recorded contract shape,
     /// an RFC 5737 documentation IP.
     const FIXTURE: &str = include_str!("../testdata/location_fixture.json");
 
-    /// The anonymous-session mint muon performs before the first send
-    /// on a credential-less session (spike memo; the S6/S8 body).
-    const ANON_SESSION_BODY: &str = r#"{"UID":"anon-uid","UserID":null,"AccessToken":"anon-token","RefreshToken":"anon-refresh","Scopes":["unauth"]}"#;
-
-    // ===== the std HTTP/1.1 KEEP-ALIVE responder ==========================
-    //
-    // Serves the script sequentially over keep-alive connections (the
-    // S8 copy, verbatim discipline: NOT `Connection: close` — closing
-    // under Muon's pooled sender triggers its channel-closed retry
-    // path, whose redial stalls under the sync adapter's foreign-thread
-    // `block_on` drive; keep-alive avoids that path and matches
-    // production).
-
-    /// One recorded request: method, path, and headers (lower-cased
-    /// names).
-    #[derive(Debug, Clone)]
-    struct Recorded {
-        method: String,
-        path: String,
-        headers: Vec<(String, String)>,
-    }
-
-    impl Recorded {
-        fn header(&self, name: &str) -> Option<&str> {
-            let name = name.to_ascii_lowercase();
-            self.headers
-                .iter()
-                .find(|(k, _)| *k == name)
-                .map(|(_, v)| v.as_str())
-        }
-    }
-
-    /// One scripted response, with the request the responder expects
-    /// to be serving it.
-    struct Step {
-        method: &'static str,
-        path: &'static str,
-        status: &'static str,
-        body: Vec<u8>,
-    }
-
-    impl Step {
-        /// The anonymous-session mint (POST /auth/v4/sessions).
-        fn anon_session() -> Self {
-            Self {
-                method: "POST",
-                path: "/auth/v4/sessions",
-                status: "200 OK",
-                body: ANON_SESSION_BODY.as_bytes().to_vec(),
-            }
-        }
-
-        /// The location response.
-        fn location(status: &'static str, body: Vec<u8>) -> Self {
-            Self {
-                method: "GET",
-                path: LOCATION_PATH,
-                status,
-                body,
-            }
-        }
-    }
-
-    /// Hard ceilings so an unexpected protocol stall fails the test
-    /// instead of hanging it.
-    const ACCEPT_TIMEOUT: Duration = Duration::from_secs(10);
-    const IO_TIMEOUT: Duration = Duration::from_secs(10);
-
-    /// Serves the script sequentially over keep-alive connections,
-    /// recording every request; after the script the listener closes.
-    fn spawn_responder(
-        script: Vec<Step>,
-    ) -> (std::thread::JoinHandle<()>, u16, Arc<Mutex<Vec<Recorded>>>) {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
-        let port = listener.local_addr().unwrap().port();
-        let recorded = Arc::new(Mutex::new(Vec::new()));
-        let seen = Arc::clone(&recorded);
-        let handle = std::thread::spawn(move || {
-            listener
-                .set_nonblocking(true)
-                .expect("responder nonblocking");
-            let mut script = script.into_iter().peekable();
-            'script: loop {
-                if script.peek().is_none() {
-                    break 'script;
-                }
-                let waited = Instant::now();
-                let mut stream = 'accept: loop {
-                    match listener.accept() {
-                        Ok((stream, _)) => break 'accept stream,
-                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                            if waited.elapsed() > ACCEPT_TIMEOUT {
-                                break 'script;
-                            }
-                            std::thread::sleep(Duration::from_millis(5));
-                        }
-                        Err(e) => panic!("responder accept failed: {e}"),
-                    }
-                };
-                stream.set_nonblocking(false).expect("blocking stream");
-                stream.set_read_timeout(Some(IO_TIMEOUT)).unwrap();
-                stream.set_write_timeout(Some(IO_TIMEOUT)).unwrap();
-                // Serve as many steps as the client pipelines onto this
-                // connection; stop when it closes or a read times out.
-                while script.peek().is_some() {
-                    let step = script.next().expect("peeked");
-                    match read_request(&mut stream) {
-                        Ok(recorded) => serve_exchange(&mut stream, step, recorded, &seen),
-                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-                        Err(e) => panic!("responder read failed: {e}"),
-                    }
-                }
-            }
-        });
-        (handle, port, recorded)
-    }
-
-    /// Reads one request (headers + any Content-Length body) from the
-    /// live connection.
-    fn read_request(stream: &mut TcpStream) -> std::io::Result<Recorded> {
-        let mut buf: Vec<u8> = Vec::with_capacity(1024);
-        let mut chunk = [0u8; 4096];
-        let header_end;
-        loop {
-            if let Some(pos) = find_terminator(&buf) {
-                header_end = pos;
-                break;
-            }
-            let n = stream.read(&mut chunk)?;
-            if n == 0 {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    "connection closed between requests",
-                ));
-            }
-            buf.extend_from_slice(&chunk[..n]);
-        }
-        let head = String::from_utf8_lossy(&buf[..header_end]).into_owned();
-        let mut lines = head.split("\r\n");
-        let request_line = lines.next().unwrap_or_default().to_owned();
-        let (method, path) = match request_line.split_once(' ') {
-            Some((m, rest)) => (
-                m.to_owned(),
-                rest.split(' ').next().unwrap_or_default().to_owned(),
-            ),
-            None => (String::new(), String::new()),
-        };
-        let headers: Vec<(String, String)> = lines
-            .filter_map(|line| line.split_once(':'))
-            .map(|(k, v)| (k.to_ascii_lowercase(), v.trim().to_owned()))
-            .collect();
-        // Drain any body the client claims (muon sends none on these
-        // requests, but robustness is free).
-        if let Some((_, len)) = headers.iter().find(|(k, _)| k == "content-length")
-            && let Ok(len) = len.parse::<usize>()
-        {
-            let mut taken = buf[header_end..].len();
-            while taken < len {
-                let n = stream.read(&mut chunk)?;
-                if n == 0 {
-                    break;
-                }
-                taken += n;
-            }
-        }
-        Ok(Recorded {
-            method,
-            path,
-            headers,
-        })
-    }
-
-    /// Serves one scripted response on the live keep-alive connection.
-    fn serve_exchange(
-        stream: &mut TcpStream,
-        step: Step,
-        recorded: Recorded,
-        seen: &Mutex<Vec<Recorded>>,
-    ) {
-        // The responder enforces its own script: an unexpected exchange
-        // fails the test here rather than deep inside muon's error
-        // mapping.
-        assert_eq!(
-            recorded.method, step.method,
-            "responder script mismatch on method (path {})",
-            recorded.path
-        );
-        let bare_path = recorded.path.split('?').next().unwrap_or(&recorded.path);
-        assert_eq!(
-            bare_path, step.path,
-            "responder script mismatch on path (method {})",
-            recorded.method
-        );
-        seen.lock().unwrap().push(recorded);
-        let out = format!(
-            "HTTP/1.1 {}\r\nContent-Length: {}\r\nContent-Type: application/json\r\n\r\n",
-            step.status,
-            step.body.len()
-        );
-        stream
-            .write_all(out.as_bytes())
-            .expect("responder write head");
-        stream.write_all(&step.body).expect("responder write body");
-        stream.flush().expect("responder flush");
-    }
-
-    fn find_terminator(buf: &[u8]) -> Option<usize> {
-        buf.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4)
+    /// The location response step.
+    fn location(status: &'static str, body: Vec<u8>) -> Step {
+        Step::static_bytes("GET", LOCATION_PATH, status, body)
     }
 
     // ===== the muon client against the loopback env ========================
-
-    /// The custom environment: one direct loopback `http://` server —
-    /// `Scheme::Http` skips TLS entirely (spike memo Q3), and being
-    /// the only direct server it is always the one chosen.
-    #[derive(Debug, Clone)]
-    struct LoopbackEnv {
-        server: muon::common::Server,
-    }
-
-    impl muon::env::Env for LoopbackEnv {
-        fn servers(&self, _version: &muon::app::AppVersion) -> Vec<muon::common::Server> {
-            vec![self.server.clone()]
-        }
-        fn ar_pins(&self) -> Option<&muon::tls::pins::TlsPinSet> {
-            None
-        }
-        fn api_pins(&self) -> Option<&muon::tls::pins::TlsPinSet> {
-            None
-        }
-    }
-
-    /// The ProtonWire SDK identity for the tests.
-    fn test_sdk() -> muon::common::sdk::Sdk {
-        muon::common::sdk::Sdk::new("protonwire", env!("CARGO_PKG_VERSION"))
-            .expect("valid sdk identity")
-    }
+    // (the shared responder, environment, and SDK identity live in
+    // `crate::test_util` — the adapter builder stays per-file: the
+    // adapters' `new<C>` seam is deliberately generic over the muon
+    // session context, and sharing the builder would force naming
+    // muon's concrete context internals here)
 
     /// Builds the adapter against the loopback env on a dedicated
     /// MULTI-thread runtime — multi-thread is load-bearing (the S4
@@ -928,11 +699,8 @@ mod wire_tests {
             .enable_all()
             .build()
             .expect("test runtime");
-        let server: muon::common::Server = format!("http://127.0.0.1:{port}/")
-            .parse()
-            .expect("loopback server url");
         let app = muon::App::new("linux-vpn@0.1.0").expect("app version");
-        let env = muon::Environment::new_custom(LoopbackEnv { server });
+        let env = loopback_env(port);
         let sdk = test_sdk();
 
         let session = rt.block_on(async {
@@ -967,9 +735,9 @@ mod wire_tests {
     /// `&dyn LocationApi` seam idiom for the S10 composition.
     #[test]
     fn fetch_round_trips_the_recorded_fixture() {
-        let (handle, port, seen) = spawn_responder(vec![
+        let (handle, port, seen) = spawn_scripted(vec![
             Step::anon_session(),
-            Step::location("200 OK", FIXTURE.as_bytes().to_vec()),
+            location("200 OK", FIXTURE.as_bytes().to_vec()),
         ]);
         let (adapter, _rt) = adapter_against(port);
 
@@ -1014,9 +782,9 @@ mod wire_tests {
     #[test]
     fn fetch_maps_envelope_refusals() {
         let refused = r#"{"Code":5003,"Error":"app no longer supported"}"#.to_string();
-        let (handle, port, _seen) = spawn_responder(vec![
+        let (handle, port, _seen) = spawn_scripted(vec![
             Step::anon_session(),
-            Step::location("200 OK", refused.into_bytes()),
+            location("200 OK", refused.into_bytes()),
         ]);
         let (adapter, _rt) = adapter_against(port);
 
@@ -1035,11 +803,7 @@ mod wire_tests {
     /// location).
     #[test]
     fn fetch_maps_transport_failures() {
-        // Bind, learn the port, drop the listener: nothing listens.
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
-        let (adapter, _rt) = adapter_against(port);
+        let (adapter, _rt) = adapter_against(dead_port());
 
         match adapter.fetch() {
             Err(LocationError::Transport(report)) => {

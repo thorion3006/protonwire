@@ -23,15 +23,9 @@
 //! `protonwire_core::redact::canary::assert_no_secrets_reach_logs`
 //! unchanged.
 
-use std::io::Read as _;
-use std::io::Write as _;
-use std::net::TcpListener;
-use std::net::TcpStream;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
-use std::time::Duration;
-use std::time::Instant;
 
 use serde_json::Value;
 use serde_json::json;
@@ -47,262 +41,22 @@ use protonwire_api::auth::MuonAuth;
 use protonwire_api::runtime::EngineBridge as _;
 use protonwire_api::runtime::TokioBridge;
 
-// ===========================================================================
-// The std HTTP/1.1 responder with scripted, computable responses
-// ===========================================================================
+// The shared loopback harness (kept at `src/test_util.rs` so the
+// crate's unit tests and this integration test compile the ONE
+// responder — see that module's documentation for why not a feature
+// or a self dev-dependency).
+#[path = "../src/test_util.rs"]
+#[allow(dead_code)]
+mod test_util;
 
-/// One recorded request.
-#[derive(Debug, Clone)]
-struct Recorded {
-    method: String,
-    path: String,
-    headers: Vec<(String, String)>,
-    body: Vec<u8>,
-}
-
-impl Recorded {
-    fn header(&self, name: &str) -> Option<&str> {
-        let name = name.to_ascii_lowercase();
-        self.headers
-            .iter()
-            .find(|(k, _)| *k == name)
-            .map(|(_, v)| v.as_str())
-    }
-
-    fn json(&self) -> Value {
-        serde_json::from_slice(&self.body).expect("recorded body is JSON")
-    }
-}
-
-/// One scripted response.
-struct Response {
-    status: &'static str,
-    headers: Vec<(String, String)>,
-    body: Vec<u8>,
-}
-
-impl Response {
-    fn json(status: &'static str, body: Value) -> Self {
-        Self {
-            status,
-            headers: vec![("Content-Type".into(), "application/json".into())],
-            body: serde_json::to_vec(&body).expect("serialize scripted body"),
-        }
-    }
-
-    fn error(status: &'static str, code: u16, message: &str) -> Self {
-        Self::json(status, json!({"Code": code, "Error": message}))
-    }
-
-    fn empty(status: &'static str) -> Self {
-        Self {
-            status,
-            headers: Vec::new(),
-            body: Vec::new(),
-        }
-    }
-}
-
-/// One exchange: serve `respond(&recorded)` for the request matching
-/// `method`/`path` (the responder serves steps strictly in order and
-/// asserts each request matches its step).
-struct Step {
-    method: &'static str,
-    path: String,
-    respond: Box<dyn Fn(&Recorded) -> Response + Send>,
-}
-
-impl Step {
-    fn static_json(
-        method: &'static str,
-        path: impl Into<String>,
-        status: &'static str,
-        body: Value,
-    ) -> Self {
-        Self {
-            method,
-            path: path.into(),
-            respond: Box::new(move |_| Response::json(status, body.clone())),
-        }
-    }
-
-    fn computed(
-        method: &'static str,
-        path: impl Into<String>,
-        respond: impl Fn(&Recorded) -> Response + Send + 'static,
-    ) -> Self {
-        Self {
-            method,
-            path: path.into(),
-            respond: Box::new(respond),
-        }
-    }
-}
-
-/// Serves the script sequentially over KEEP-ALIVE connections: the
-/// client's whole exchange (anonymous-session mint, SRP handshake, 2FA,
-/// ...) rides the one pooled HTTP/1.1 connection Muon's pool maintains —
-/// exactly how the real API is spoken. A new connection is accepted
-/// only when the client opens one (e.g. a resend after a scripted
-/// error). Bounded waits so an unexpected stall fails the test instead
-/// of hanging it.
-///
-/// (Why not `Connection: close` per exchange, the way a naive responder
-/// does it: closing under Muon's pooled sender triggers its
-/// channel-closed retry path, whose redial stalls under the sync
-/// adapter's foreign-thread `block_on` drive — observed as a 30 s
-/// timeout with the retry connecting only at teardown. Keeping the
-/// pooled connection alive avoids that path entirely and matches the
-/// production wire.)
-fn spawn_scripted(
-    steps: Vec<Step>,
-) -> (std::thread::JoinHandle<()>, u16, Arc<Mutex<Vec<Recorded>>>) {
-    const ACCEPT_TIMEOUT: Duration = Duration::from_secs(30);
-    const IO_TIMEOUT: Duration = Duration::from_secs(30);
-
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
-    let port = listener.local_addr().unwrap().port();
-    let recorded = Arc::new(Mutex::new(Vec::new()));
-    let seen = Arc::clone(&recorded);
-    let handle = std::thread::spawn(move || {
-        listener
-            .set_nonblocking(true)
-            .expect("responder nonblocking");
-        let mut steps = steps.into_iter().peekable();
-        'script: loop {
-            if steps.peek().is_none() {
-                break 'script;
-            }
-            // Wait for a connection (bounded poll; the client may still
-            // be on the previous one, so this is not the only path).
-            let waited = Instant::now();
-            let mut stream = 'accept: loop {
-                match listener.accept() {
-                    Ok((stream, _)) => break 'accept stream,
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        if waited.elapsed() > ACCEPT_TIMEOUT {
-                            break 'script;
-                        }
-                        std::thread::sleep(Duration::from_millis(5));
-                    }
-                    Err(e) => panic!("responder accept failed: {e}"),
-                }
-            };
-            stream.set_nonblocking(false).expect("blocking stream");
-            stream.set_read_timeout(Some(IO_TIMEOUT)).unwrap();
-            stream.set_write_timeout(Some(IO_TIMEOUT)).unwrap();
-            // Serve as many steps as the client pipelines onto this
-            // connection; close when it closes or a read times out.
-            while steps.peek().is_some() {
-                let step = steps.next().expect("peeked");
-                match read_request(&mut stream) {
-                    Ok(recorded) => serve_exchange(&mut stream, step, recorded, &seen),
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                    Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-                    Err(e) => panic!("responder read failed: {e}"),
-                }
-            }
-        }
-    });
-    (handle, port, recorded)
-}
-
-/// Reads one request (headers + Content-Length body) from the live
-/// connection.
-fn read_request(stream: &mut TcpStream) -> std::io::Result<Recorded> {
-    let mut buf: Vec<u8> = Vec::with_capacity(1024);
-    let mut chunk = [0u8; 8192];
-    let header_end;
-    loop {
-        if let Some(pos) = find_terminator(&buf) {
-            header_end = pos;
-            break;
-        }
-        let n = stream.read(&mut chunk)?;
-        if n == 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "connection closed between requests",
-            ));
-        }
-        buf.extend_from_slice(&chunk[..n]);
-    }
-    let head = String::from_utf8_lossy(&buf[..header_end]).into_owned();
-    let mut lines = head.split("\r\n");
-    let request_line = lines.next().unwrap_or_default().to_owned();
-    let (method, path) = match request_line.split_once(' ') {
-        Some((m, rest)) => (
-            m.to_owned(),
-            rest.split(' ').next().unwrap_or_default().to_owned(),
-        ),
-        None => (String::new(), String::new()),
-    };
-    let headers: Vec<(String, String)> = lines
-        .filter_map(|line| line.split_once(':'))
-        .map(|(k, v)| (k.to_ascii_lowercase(), v.trim().to_owned()))
-        .collect();
-    let content_length = headers
-        .iter()
-        .find(|(k, _)| k == "content-length")
-        .and_then(|(_, v)| v.parse::<usize>().ok())
-        .unwrap_or(0);
-    let mut body = buf[header_end..].to_vec();
-    while body.len() < content_length {
-        let n = stream.read(&mut chunk)?;
-        if n == 0 {
-            break;
-        }
-        body.extend_from_slice(&chunk[..n]);
-    }
-    body.truncate(content_length);
-    Ok(Recorded {
-        method,
-        path,
-        headers,
-        body,
-    })
-}
-
-/// Serves one scripted response on the live keep-alive connection.
-fn serve_exchange(
-    stream: &mut TcpStream,
-    step: Step,
-    recorded: Recorded,
-    seen: &Mutex<Vec<Recorded>>,
-) {
-    assert_eq!(
-        recorded.method, step.method,
-        "scripted step order: expected {} {}, got {} {}",
-        step.method, step.path, recorded.method, recorded.path
-    );
-    assert_eq!(
-        recorded.path, step.path,
-        "scripted step order: expected {} {}",
-        step.method, step.path
-    );
-    let response = (step.respond)(&recorded);
-    seen.lock().unwrap().push(recorded);
-    let mut out = format!(
-        "HTTP/1.1 {}\r\nContent-Length: {}\r\n",
-        response.status,
-        response.body.len()
-    );
-    for (k, v) in &response.headers {
-        out.push_str(&format!("{k}: {v}\r\n"));
-    }
-    out.push_str("\r\n");
-    stream
-        .write_all(out.as_bytes())
-        .expect("responder write head");
-    stream
-        .write_all(&response.body)
-        .expect("responder write body");
-    stream.flush().expect("responder flush");
-}
-
-fn find_terminator(buf: &[u8]) -> Option<usize> {
-    buf.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4)
-}
+use test_util::LoopbackEnv;
+use test_util::Recorded;
+use test_util::Response;
+use test_util::Step;
+use test_util::dead_port;
+use test_util::loopback_env;
+use test_util::spawn_scripted;
+use test_util::two_direct_servers_env;
 
 // ===========================================================================
 // The real SRP server half (proton-srp — muon's own SRP implementation)
@@ -513,45 +267,8 @@ fn fork_get_response(uid: &str, user_id: &str) -> Value {
 // ===========================================================================
 // The loopback environment and the adapter harness
 // ===========================================================================
-
-/// The custom environment: direct-class loopback `http://` servers
-/// (spike memo Q3 — `Scheme::Http` skips TLS).
-#[derive(Debug, Clone)]
-struct LoopbackEnv {
-    servers: Vec<muon::common::Server>,
-}
-
-impl muon::env::Env for LoopbackEnv {
-    fn servers(&self, _version: &muon::app::AppVersion) -> Vec<muon::common::Server> {
-        self.servers.clone()
-    }
-    fn ar_pins(&self) -> Option<&muon::tls::pins::TlsPinSet> {
-        None
-    }
-    fn api_pins(&self) -> Option<&muon::tls::pins::TlsPinSet> {
-        None
-    }
-}
-
-fn loopback_env(port: u16) -> muon::Environment {
-    let server: muon::common::Server = format!("http://127.0.0.1:{port}/")
-        .parse()
-        .expect("loopback server url");
-    muon::Environment::new_custom(LoopbackEnv {
-        servers: vec![server],
-    })
-}
-
-fn two_direct_servers_env(dead_port: u16, live_port: u16) -> muon::Environment {
-    let servers: Vec<muon::common::Server> = [
-        format!("http://127.0.0.1:{dead_port}/"),
-        format!("http://127.0.0.1:{live_port}/"),
-    ]
-    .iter()
-    .map(|url| url.parse().expect("loopback server url"))
-    .collect();
-    muon::Environment::new_custom(LoopbackEnv { servers })
-}
+// (the `LoopbackEnv`, `loopback_env`, `two_direct_servers_env`, and
+// `dead_port` pieces are the shared module's, imported above)
 
 fn adapter_against(env: muon::Environment) -> MuonAuth {
     let app = muon::App::new("linux-vpn@1.0.0").expect("app version");
@@ -560,14 +277,6 @@ fn adapter_against(env: muon::Environment) -> MuonAuth {
 
 fn adapter_on_port(port: u16) -> MuonAuth {
     adapter_against(loopback_env(port))
-}
-
-/// A port nothing listens on.
-fn dead_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
-    drop(listener);
-    port
 }
 
 // ===========================================================================
