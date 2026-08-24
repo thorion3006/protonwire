@@ -395,6 +395,14 @@ pub enum FetchFailure {
     /// Any other transport failure: no suppression, but the deadline
     /// still resets from the attempt so failures cannot hammer either.
     Transport(String),
+    /// The fetch was REFUSED because the local pacing anchor could not
+    /// persist (the deadline store is unwritable — Codex PR#4 round 2,
+    /// P2). Contacting the upstream without a durable pre-fetch
+    /// timestamp lets a restart bypass the window (the FR-13H
+    /// restart-storm class) and would lose any Retry-After suppression
+    /// signaled this round. The failure path still resets the in-memory
+    /// window; the next attempt retries (and the store may heal).
+    Persistence(String),
 }
 
 /// The injected fetch service: `Fn(stored etag) -> fetch result` — the
@@ -971,24 +979,45 @@ impl Scheduler {
             .conditional_requests
             .then(|| guard.etag.clone())
             .flatten();
-        if let Err(error) = self.store.save(&guard.persisted) {
-            // Restart-persistence is at risk, not the refresh itself:
-            // warn loudly, keep going (data availability outranks local
-            // pacing bookkeeping), and re-attempt the post-fetch save.
-            tracing::warn!(error = %error, "persisting pre-fetch deadlines failed");
-        }
+        let anchored = match self.store.save(&guard.persisted) {
+            Ok(()) => true,
+            Err(error) => {
+                // Codex PR#4 round 2 (P2): the pacing anchor must be
+                // DURABLE before the upstream is contacted — a fetch
+                // whose last_request cannot survive a restart lets the
+                // next boot bypass the window (the FR-13H restart-storm
+                // class), and any Retry-After suppression signaled this
+                // round would be lost the same way. Refuse the fetch;
+                // the in-memory window still resets and the next
+                // attempt retries the store.
+                tracing::error!(
+                    error = %error,
+                    "persisting pre-fetch deadlines failed; refusing the fetch \
+                     (restart pacing protection)"
+                );
+                false
+            }
+        };
         drop(guard);
 
         // A panicking fetch bridge must not wedge the single-flight
         // forever (joiners park on `in_flight`): convert a panic into a
         // transport failure so the generation resolves either way.
-        let fetched = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            (self.fetch)(etag.as_deref())
-        }))
-        .unwrap_or_else(|_panic| {
-            tracing::error!("catalog fetch panicked inside the bridge");
-            Err(FetchFailure::Transport("fetch bridge panicked".to_owned()))
-        });
+        let fetched = if anchored {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                (self.fetch)(etag.as_deref())
+            }))
+            .unwrap_or_else(|_panic| {
+                tracing::error!("catalog fetch panicked inside the bridge");
+                Err(FetchFailure::Transport("fetch bridge panicked".to_owned()))
+            })
+        } else {
+            Err(FetchFailure::Persistence(
+                "the deadline store is unwritable; the fetch was refused so a restart cannot \
+                 bypass the window"
+                    .to_owned(),
+            ))
+        };
 
         let mut guard = self.inner.lock().expect("scheduler lock");
         let finished = self.observe_now(&mut guard);
@@ -1017,12 +1046,13 @@ impl Scheduler {
             Ok(FetchOutcome::Changed { etag, body }) => {
                 match adopt_fetched_revision(&mut guard.cache, etag, body, effective_now) {
                     RevisionVerdict::Adopted => {
-                        // The revision is the server's current one (and,
-                        // when a cache is wired, durably stored — or
-                        // adopted in memory despite a persist failure;
-                        // never dropped while the etag advances): adopt
-                        // it for the next conditional request and the
-                        // age anchor.
+                        // The revision is the server's current one AND,
+                        // when a cache is wired, DURABLY stored (a store
+                        // failure refuses the revision — never a split
+                        // world where the refresh reports Changed while
+                        // clients keep the old catalog): adopt it for
+                        // the next conditional request and the age
+                        // anchor.
                         guard.etag = etag.clone();
                         guard.persisted.last_success_unix = Some(effective_now);
                         RefreshOutcome::Changed {
@@ -1054,9 +1084,11 @@ impl Scheduler {
             }) => RefreshOutcome::RateLimited {
                 retry_after_seconds: *retry_after_seconds,
             },
-            Err(FetchFailure::Transport(message)) => RefreshOutcome::Failed {
-                reason: message.clone(),
-            },
+            Err(FetchFailure::Transport(message)) | Err(FetchFailure::Persistence(message)) => {
+                RefreshOutcome::Failed {
+                    reason: message.clone(),
+                }
+            }
         };
         match kind {
             RefreshKind::Automatic => guard.persisted.automatic_refresh_count += 1,
@@ -1098,11 +1130,12 @@ impl Scheduler {
 
 /// Whether a fetched `Changed` revision may be adopted.
 enum RevisionVerdict {
-    /// The revision is usable (and, with a wired cache, persisted or
-    /// warned-and-skipped on a local I/O failure).
+    /// The revision is usable AND, with a wired cache, DURABLY stored
+    /// (a store failure refuses the revision — see below).
     Adopted,
-    /// The body failed the live catalog model: nothing adopted, stored,
-    /// or anchored — the refresh reports failure instead.
+    /// The revision is not adopted — the body failed the live catalog
+    /// model, or the durable cache could not retain it: nothing
+    /// adopted, stored, or anchored; the refresh reports failure.
     Unusable(String),
 }
 
@@ -1116,19 +1149,15 @@ enum RevisionVerdict {
 /// fail every future boot until the file is removed by hand). A body
 /// that fails validation is [`RevisionVerdict::Unusable`]: the refresh
 /// reports `Failed` naming the drift, the last good cache survives,
-/// and no etag or age anchor advances. A cache WRITE I/O failure only
-/// warns — the deadline-save precedent: data availability outranks
-/// local bookkeeping, and the fetched data is still ADOPTED in memory.
-/// The in-memory adoption is load-bearing (the Codex PR#4 P2): the
-/// `Adopted` verdict advances the conditional etag, so the retained
-/// [`CacheState::current`] must be the fetched revision — otherwise
-/// the etag names a body nothing holds, every later conditional fetch
-/// can answer `304`, and the process strands itself on the old (or
-/// absent) catalog while reporting success. The durable store
-/// re-attempts itself two ways: the next `NotModified` persists the
-/// adopted revision through the FR-13E freshness write-through, and a
-/// restart re-issues a conditional request from the OLDER persisted
-/// revision, fetching the body again.
+/// and no etag or age anchor advances. A cache WRITE I/O failure is
+/// the same verdict (Codex PR#4 round 2, tightening the round-1 fix):
+/// the daemon's client-visible read path serves from the DURABLE
+/// store, so adopting a revision only in memory would report
+/// `Changed` while clients keep the old catalog — a split world. The
+/// old durable revision keeps serving, the conditional etag keeps
+/// naming what the disk actually retains, and the next eligible
+/// window re-attempts the whole fetch-and-store (the filesystem may
+/// heal).
 fn adopt_fetched_revision(
     cache: &mut Option<CacheState>,
     etag: &Option<String>,
@@ -1160,14 +1189,19 @@ fn adopt_fetched_revision(
         body: text,
     };
     if let Err(error) = state.cache.store(&doc) {
-        tracing::warn!(
-            error = %error,
-            "persisting the fetched catalog revision failed; adopted in memory — the next \
-             freshness write-through (or a restart) re-attempts the durable store"
-        );
+        // Codex PR#4 round 2 (P2): a revision the CLIENT-VISIBLE cache
+        // does not durably retain is not adopted. The daemon's read
+        // path (`ServersList`) serves from the durable store, so an
+        // in-memory-only adoption reports `Changed` while clients keep
+        // seeing the old catalog until some later write-through — a
+        // split world. Refuse the revision: the failure path resets
+        // the window, the old durable revision keeps serving, and the
+        // next eligible refresh re-attempts (the filesystem may heal).
+        return RevisionVerdict::Unusable(format!(
+            "persisting the fetched catalog revision failed (clients keep the last durable \
+             catalog; the next window retries): {error}"
+        ));
     }
-    // Adopted in memory on BOTH arms: the etag that `Adopted` advances
-    // must always name a revision the scheduler retains.
     state.current = Some(doc);
     RevisionVerdict::Adopted
 }
@@ -2967,34 +3001,55 @@ mod runtime_tests {
             .expect("plant the obstructing directory");
     }
 
-    /// The Codex PR#4 P2: a failed cache WRITE must still ADOPT the
-    /// fetched revision in memory. The recorded rationale on
-    /// `adopt_fetched_revision` says "the fetched data is still adopted
-    /// and served" — but the pre-fix code dropped the body while the
-    /// `Adopted` verdict advanced `guard.etag` past it: the etag then
-    /// pointed at a revision nothing retained, so every later
-    /// conditional fetch could answer `304` and the process would
-    /// serve the old (or absent) catalog forever while reporting
-    /// success. Adoption, etag, and age anchor must stay coherent.
+    /// The Codex PR#4 round-2 tightening (P2): a failed cache WRITE
+    /// REFUSES the revision. The round-1 fix adopted it in memory (so
+    /// the etag never named an unretained body — coherent locally),
+    /// but the daemon's client-visible read path serves from the
+    /// DURABLE store: an in-memory-only adoption reports `Changed`
+    /// while `ServersList` keeps serving the old catalog until some
+    /// later write-through — a split world. No adoption, no etag
+    /// advance, no age anchor; the old durable revision keeps serving.
     #[test]
-    fn a_failed_cache_write_still_adopts_the_revision_in_memory() {
+    fn a_failed_cache_write_refuses_the_revision() {
         let clock = VirtualClock::new(T0);
         let fetch = FakeFetch::new(vec![Ok(FetchOutcome::Changed {
             etag: Some("\"rev-2\"".to_owned()),
             body: VALID_BODY.as_bytes().to_vec(),
         })]);
         let (scheduler, dir) = wired(&clock, &fetch);
+        // Seed a durable good revision the clients keep serving.
+        let good = stored_doc(Some("\"rev-1\""), T0 - 500, VALID_BODY);
+        CatalogCache::new(dir.path().join("servers.json"))
+            .store(&good)
+            .unwrap();
+        scheduler.inner.lock().unwrap().cache = Some(CacheState {
+            cache: CatalogCache::new(dir.path().join("servers.json")),
+            current: Some(good),
+        });
+        scheduler.inner.lock().unwrap().etag = Some("\"rev-1\"".to_owned());
+        // Swap the durable file for the write obstruction: the seeded
+        // in-memory `current` still names rev-1 (what clients were
+        // serving), while every store() attempt fails on the rename.
+        std::fs::remove_file(dir.path().join("servers.json")).unwrap();
         break_the_cache_store(&dir);
 
         match scheduler.refresh_automatic() {
-            AutomaticOutcome::Due(RefreshReport {
-                outcome: RefreshOutcome::Changed { etag, .. },
-                ..
-            }) => assert_eq!(etag.as_deref(), Some("\"rev-2\"")),
-            other => panic!("the fetched revision must still be adopted, got {other:?}"),
+            AutomaticOutcome::Due(report) => match report.outcome {
+                RefreshOutcome::Failed { reason } => assert!(
+                    reason.contains("clients keep the last durable catalog"),
+                    "the failure must name the durability refusal: {reason}"
+                ),
+                other => panic!("an unretainable revision must fail, got {other:?}"),
+            },
+            other => panic!("expected Due, got {other:?}"),
         }
-        // The adoption triple, coherent: the retained in-memory
-        // revision IS the fetched one...
+        // The split world does not open: etag, in-memory current, and
+        // the age anchor all still name rev-1 (the durable file was
+        // swapped for the obstruction; nothing overwrote it).
+        assert_eq!(
+            scheduler.inner.lock().unwrap().etag.as_deref(),
+            Some("\"rev-1\"")
+        );
         let current = scheduler
             .inner
             .lock()
@@ -3002,38 +3057,62 @@ mod runtime_tests {
             .cache
             .as_ref()
             .and_then(|state| state.current.clone())
-            .expect("the revision must be adopted in memory despite the failed write");
-        assert_eq!(current.etag.as_deref(), Some("\"rev-2\""));
-        assert_eq!(current.body, VALID_BODY);
-        assert_eq!(current.fetched_unix, T0);
-        // ...so the advanced conditional etag and the age anchor point
-        // at a revision the scheduler actually holds.
+            .expect("the last durable revision stays adopted");
+        assert_eq!(current.etag.as_deref(), Some("\"rev-1\""));
+        assert!(dir.path().join("servers.json").is_dir());
         assert_eq!(
-            scheduler.inner.lock().unwrap().etag.as_deref(),
-            Some("\"rev-2\"")
+            scheduler.diagnostics().last_success_unix,
+            None,
+            "an unretained fetch is not a successful fetch"
         );
-        assert_eq!(scheduler.diagnostics().last_success_unix, Some(T0));
+        // Pacing still advanced from the attempt.
+        assert!(scheduler.next_due_unix().unwrap() >= T0 + FRESHNESS_FLOOR_SECONDS);
     }
 
-    /// The stranded-304 end to end: with the write obstruction CLEARED,
-    /// the next `304 NotModified` must persist the adopted revision
-    /// through the FR-13E freshness write-through — the disk heals.
-    /// Pre-fix, the process stayed stranded on the old/absent on-disk
-    /// catalog forever (nothing retained the body the etag named).
+    /// The healing path under the tightened contract: with the write
+    /// obstruction CLEARED and the next window open, the refresh
+    /// re-offers the OLD conditional etag, re-fetches the body, and
+    /// stores it — the disk heals, clients see the new revision.
     #[test]
-    fn the_next_not_modified_persists_the_adopted_revision_and_heals_the_disk() {
+    fn the_next_window_after_a_write_failure_heals_the_disk() {
         let clock = VirtualClock::new(T0);
         let fetch = FakeFetch::new(vec![
             Ok(FetchOutcome::Changed {
                 etag: Some("\"rev-2\"".to_owned()),
                 body: VALID_BODY.as_bytes().to_vec(),
             }),
-            not_modified(),
+            Ok(FetchOutcome::Changed {
+                etag: Some("\"rev-2\"".to_owned()),
+                body: VALID_BODY.as_bytes().to_vec(),
+            }),
         ]);
         let (scheduler, dir) = wired(&clock, &fetch);
+        let good = stored_doc(Some("\"rev-1\""), T0 - 500, VALID_BODY);
+        CatalogCache::new(dir.path().join("servers.json"))
+            .store(&good)
+            .unwrap();
+        scheduler.inner.lock().unwrap().cache = Some(CacheState {
+            cache: CatalogCache::new(dir.path().join("servers.json")),
+            current: Some(good),
+        });
+        scheduler.inner.lock().unwrap().etag = Some("\"rev-1\"".to_owned());
+        std::fs::remove_file(dir.path().join("servers.json")).unwrap();
         break_the_cache_store(&dir);
 
-        // Refresh 1: fetched, adopted in memory, persist refused.
+        // Refresh 1: fetch succeeds, store fails, revision refused.
+        assert!(matches!(
+            scheduler.refresh_automatic(),
+            AutomaticOutcome::Due(RefreshReport {
+                outcome: RefreshOutcome::Failed { .. },
+                ..
+            })
+        ));
+        // The obstruction heals; the next window opens.
+        std::fs::remove_dir(dir.path().join("servers.json")).unwrap();
+        clock.set_wall(scheduler.next_due_unix().unwrap());
+
+        // Refresh 2: the OLD etag is re-offered (nothing advanced past
+        // rev-1), the body is re-fetched, and this time stored.
         assert!(matches!(
             scheduler.refresh_automatic(),
             AutomaticOutcome::Due(RefreshReport {
@@ -3041,36 +3120,65 @@ mod runtime_tests {
                 ..
             })
         ));
-        // The obstruction clears (operator fixes the path / transient
-        // I/O recovers); the window becomes eligible again (past the
-        // full jitter ceiling — the draw is CSPRNG, the advance must
-        // dominate it deterministically).
-        std::fs::remove_dir_all(dir.path().join("servers.json")).unwrap();
-        let t2 = T0 + FRESHNESS_FLOOR_SECONDS + JITTER + 2;
-        clock.set_wall(t2);
-
-        // Refresh 2 rides the ADOPTED etag (nothing re-fetches a body
-        // it conditionally holds)...
-        assert!(matches!(
-            scheduler.refresh_automatic(),
-            AutomaticOutcome::Due(RefreshReport {
-                outcome: RefreshOutcome::NotModified,
-                ..
-            })
-        ));
         assert_eq!(
-            fetch.seen_etags()[1],
-            Some("\"rev-2\"".to_owned()),
-            "the conditional request must carry the adopted revision's etag"
+            fetch.seen_etags(),
+            vec![Some("\"rev-1\"".to_owned()), Some("\"rev-1\"".to_owned())],
+            "the conditional etag must keep naming what the disk retains"
         );
-        // ...and the freshness write-through persisted the ADOPTED
-        // revision: the disk now holds what the etag names.
         let stored = read_stored_cache(&dir);
         assert_eq!(stored.etag.as_deref(), Some("\"rev-2\""));
         assert_eq!(stored.body, VALID_BODY);
-        assert_eq!(stored.fetched_unix, t2);
     }
 
+    /// Codex PR#4 round 2 (P2): an unwritable DEADLINE store refuses
+    /// the fetch outright — contacting the upstream without a durable
+    /// pre-fetch timestamp would let a restart bypass the window (the
+    /// FR-13H restart-storm class) and lose any Retry-After
+    /// suppression signaled this round.
+    #[test]
+    fn an_unwritable_deadline_store_refuses_the_fetch() {
+        let clock = VirtualClock::new(T0);
+        let fetch = FakeFetch::new(vec![Ok(FetchOutcome::Changed {
+            etag: Some("\"rev-2\"".to_owned()),
+            body: VALID_BODY.as_bytes().to_vec(),
+        })]);
+        let dir = tempfile::tempdir().unwrap();
+        // `blocker` is a regular FILE: the deadlines path beneath it
+        // can never be created or written.
+        std::fs::write(dir.path().join("blocker"), b"").unwrap();
+        let scheduler = Scheduler::new(
+            SchedulerConfig::new(FRESHNESS_FLOOR_SECONDS, JITTER, true)
+                .expect("the standard suite config is valid"),
+            Arc::new(clock.clone()),
+            fetch.service(),
+            DeadlineStore::new(dir.path().join("blocker").join("deadlines.json")),
+            SchedulerDeadlines::default(),
+            None,
+        );
+        match scheduler.refresh_automatic() {
+            AutomaticOutcome::Due(report) => match report.outcome {
+                RefreshOutcome::Failed { reason } => assert!(
+                    reason.contains("deadline store is unwritable"),
+                    "the failure must name the refused anchor: {reason}"
+                ),
+                other => panic!("an un-anchored fetch must fail, got {other:?}"),
+            },
+            other => panic!("expected Due, got {other:?}"),
+        }
+        assert_eq!(
+            fetch.calls(),
+            0,
+            "the upstream is never contacted without a durable pacing anchor"
+        );
+        // Pacing still advanced in memory: the refusal cannot hammer.
+        assert!(scheduler.next_due_unix().unwrap() >= T0 + FRESHNESS_FLOOR_SECONDS);
+    }
+
+    /// (Superseded by `the_next_window_after_a_write_failure_heals_the_disk`
+    /// under the round-2 contract: a write failure now REFUSES the
+    /// revision, so there is no in-memory adoption for a later 304 to
+    /// write through — the healing path re-fetches instead.)
+    ///
     /// The production constructor's strict happy path: both documents
     /// load under the trust root, the stored revision seeds conditional
     /// requests, and the loaded deadlines govern. Root-gated (the

@@ -358,12 +358,21 @@ pub fn automatic_refresh_driver(
             .next_due_unix()
             .map_or(0, |due| due.saturating_sub(now_unix()));
         if wait_secs > 0 {
-            // Sleep to the deadline in stop-responsive slices.
-            let mut remaining = std::time::Duration::from_secs(wait_secs);
-            while !stop.load(Ordering::SeqCst) && !remaining.is_zero() {
-                let slice = remaining.min(DRIVER_STOP_POLL_SLICE);
+            // Sleep to the deadline in stop-responsive slices,
+            // RE-DERIVING the remaining wait from the wall clock after
+            // every slice (Codex PR#4 round 2, P2): a forward clock
+            // correction, or a suspend/resume where the monotonic sleep
+            // clock does not advance, must not leave an already-due
+            // refresh asleep for the originally computed duration.
+            while !stop.load(Ordering::SeqCst) {
+                let remaining = scheduler
+                    .next_due_unix()
+                    .map_or(0, |due| due.saturating_sub(now_unix()));
+                if remaining == 0 {
+                    break;
+                }
+                let slice = std::time::Duration::from_secs(remaining).min(DRIVER_STOP_POLL_SLICE);
                 sleep_for(slice);
-                remaining = remaining.saturating_sub(slice);
             }
             continue;
         }
@@ -1098,6 +1107,91 @@ mod driver_tests {
             .next_due_unix()
             .expect("a completed refresh arms the next window");
         assert!(due > 1_771_000_000, "the next window must be in the future");
+    }
+
+    /// Codex PR#4 round 2 (P2): the wait is RE-DERIVED from the wall
+    /// clock after every sleep slice — a forward clock correction must
+    /// wake an already-due refresh instead of sleeping out the
+    /// originally computed duration (the pre-fix inner loop consumed a
+    /// one-shot `remaining` to zero, blind to the clock).
+    #[test]
+    fn the_driver_wakes_when_the_wall_clock_jumps_past_the_deadline() {
+        use protonwire_core::scheduler::{Clock, FetchOutcome, Scheduler, SchedulerConfig};
+        use protonwire_store::deadlines::{DeadlineStore, SchedulerDeadlines};
+        use std::sync::atomic::AtomicU64;
+
+        struct SharedWall(Arc<AtomicU64>);
+        impl Clock for SharedWall {
+            fn now_unix(&self) -> u64 {
+                self.0.load(Ordering::SeqCst)
+            }
+            fn monotonic_ms(&self) -> u64 {
+                0
+            }
+        }
+
+        let t0 = 1_771_000_000u64;
+        // Beyond the crash-re-derivation floor (last_request + 3h):
+        // the seeded next_eligible must DOMINATE, or the floor governs
+        // the wait instead of the jump target.
+        let far_future = t0 + 10_800 + 600;
+        let wall = Arc::new(AtomicU64::new(t0));
+        static DRIVER_CALL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "protonwire-daemon-clockjump-{}-{}",
+            std::process::id(),
+            DRIVER_CALL.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let fetches = Arc::new(AtomicU64::new(0));
+        let fetch_counter = Arc::clone(&fetches);
+        let fetch = Arc::new(move |_etag: Option<&str>| {
+            fetch_counter.fetch_add(1, Ordering::SeqCst);
+            Ok::<_, protonwire_core::scheduler::FetchFailure>(FetchOutcome::NotModified)
+        });
+        let scheduler = Scheduler::new(
+            SchedulerConfig::new(10_800, 0, true).expect("valid config"),
+            Arc::new(SharedWall(Arc::clone(&wall))),
+            fetch,
+            DeadlineStore::new(dir.join("deadlines.json")),
+            SchedulerDeadlines {
+                last_request_unix: Some(t0),
+                last_success_unix: Some(t0),
+                next_eligible_unix: Some(far_future),
+                ..SchedulerDeadlines::default()
+            },
+            None,
+        );
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_flag = Arc::clone(&stop);
+        let wall_for_sleep = Arc::clone(&wall);
+        let mut sleeps = 0u32;
+        let sleep_for = move |_slice: std::time::Duration| {
+            sleeps += 1;
+            if sleeps == 1 {
+                // The clock corrects forward PAST the deadline while
+                // the very first slice "runs" (suspend/resume or NTP).
+                wall_for_sleep.store(far_future + 1, Ordering::SeqCst);
+            } else {
+                // The post-fetch wait: end the driver.
+                stop_flag.store(true, Ordering::SeqCst);
+            }
+        };
+
+        automatic_refresh_driver(&scheduler, &stop, || wall.load(Ordering::SeqCst), sleep_for);
+
+        assert_eq!(
+            fetches.load(Ordering::SeqCst),
+            1,
+            "the forward clock jump must wake the driver to service the now-due window"
+        );
+        assert!(
+            sleeps <= 2,
+            "the wait must re-derive from the wall clock, not consume the one-shot duration \
+             ({sleeps} slices)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The ordering pin: when the window is NOT due, the driver waits
