@@ -1,7 +1,9 @@
 //! Daemon-side plumbing shared by `main` and tests: the event-sink bridge,
-//! the request handler that couples core to the admin stop flag, and the
-//! M2 S11 per-UID configuration consult
-//! ([`DaemonHandler::effective_config_for`]).
+//! the request handler that couples core to the admin stop flag, the M2
+//! S11 per-UID configuration consult
+//! ([`DaemonHandler::effective_config_for`]), and the automatic
+//! catalog-refresh driver
+//! ([`automatic_refresh_driver`]/[`spawn_automatic_refresh_driver`]).
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -316,6 +318,116 @@ impl DaemonHandler {
         )
         .map_err(|error| RpcError::new(RpcErrorCode::ConfigInvalid, error.to_string()))
     }
+}
+
+/// The longest the automatic-refresh driver ever sleeps without
+/// re-checking the stop flag: stop latency stays sub-second no matter
+/// how far out the next window is.
+pub const DRIVER_STOP_POLL_SLICE: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Drives the scheduler's AUTOMATIC refresh door (FR-12/FR-13C): a
+/// stop-aware loop that sleeps to the next eligibility
+/// (`Scheduler::next_due_unix`; `None`
+/// is the FR-13F bootstrap — never fetched, due immediately) and calls
+/// `Scheduler::refresh_automatic` when
+/// the window opens. Constructing the scheduler services no window by
+/// itself: without this loop the first-boot due window is never
+/// fetched and persisted deadlines are never honored when they become
+/// due — catalog freshness would depend entirely on a user issuing
+/// `ServersRefresh` (the Codex PR#4 P1).
+///
+/// Determinism seams: `now_unix` and `sleep_for` are injected — the
+/// scheduler's own policy decisions stay on ITS clock; the driver only
+/// decides how long to wait. Waits are sliced at
+/// [`DRIVER_STOP_POLL_SLICE`] so a stop request is honored promptly
+/// mid-wait. Every refresh outcome is logged (a rate-limited or failed
+/// window names its reason; the suppression the scheduler minted is
+/// honored by `Scheduler::refresh_automatic` itself).
+pub fn automatic_refresh_driver(
+    scheduler: &protonwire_core::scheduler::Scheduler,
+    stop: &AtomicBool,
+    mut now_unix: impl FnMut() -> u64,
+    mut sleep_for: impl FnMut(std::time::Duration),
+) {
+    use protonwire_core::scheduler::AutomaticOutcome;
+    use protonwire_core::scheduler::RefreshOutcome;
+
+    while !stop.load(Ordering::SeqCst) {
+        // None = the FR-13F bootstrap: due immediately.
+        let wait_secs = scheduler
+            .next_due_unix()
+            .map_or(0, |due| due.saturating_sub(now_unix()));
+        if wait_secs > 0 {
+            // Sleep to the deadline in stop-responsive slices.
+            let mut remaining = std::time::Duration::from_secs(wait_secs);
+            while !stop.load(Ordering::SeqCst) && !remaining.is_zero() {
+                let slice = remaining.min(DRIVER_STOP_POLL_SLICE);
+                sleep_for(slice);
+                remaining = remaining.saturating_sub(slice);
+            }
+            continue;
+        }
+        match scheduler.refresh_automatic() {
+            AutomaticOutcome::Due(report) => match report.outcome {
+                RefreshOutcome::Changed { etag, .. } => tracing::info!(
+                    etag = ?etag,
+                    next_eligible_unix = report.next_eligible_unix,
+                    "automatic catalog refresh: new revision"
+                ),
+                RefreshOutcome::NotModified => tracing::info!(
+                    next_eligible_unix = report.next_eligible_unix,
+                    "automatic catalog refresh: revision unchanged"
+                ),
+                RefreshOutcome::RateLimited {
+                    retry_after_seconds,
+                } => tracing::warn!(
+                    ?retry_after_seconds,
+                    suppression_until_unix = ?report.suppression_until_unix,
+                    "automatic catalog refresh rate-limited (the scheduler's suppression is honored)"
+                ),
+                RefreshOutcome::Failed { reason } => tracing::warn!(
+                    reason,
+                    next_eligible_unix = report.next_eligible_unix,
+                    "automatic catalog refresh failed"
+                ),
+            },
+            // Raced a lead from the manual door; the window re-armed —
+            // the next iteration recomputes from next_due_unix.
+            AutomaticOutcome::NotDue { next_eligible_unix } => tracing::trace!(
+                next_eligible_unix,
+                "automatic refresh arrived before its window; re-armed"
+            ),
+        }
+    }
+}
+
+/// Spawns the production automatic-refresh driver: the real wall clock,
+/// real sleeps, stop-flag responsive. `main` joins the handle after
+/// `serve` returns, so the daemon never exits with a live refresh in
+/// flight.
+///
+/// # Panics
+/// Only if the OS refuses the thread spawn (resource exhaustion at
+/// startup — the same fail-loud posture as the bind).
+pub fn spawn_automatic_refresh_driver(
+    scheduler: Arc<protonwire_core::scheduler::Scheduler>,
+    stop: Arc<AtomicBool>,
+) -> std::thread::JoinHandle<()> {
+    use protonwire_core::scheduler::Clock as _;
+    use protonwire_core::scheduler::SystemClock;
+
+    std::thread::Builder::new()
+        .name("catalog-auto-refresh".to_owned())
+        .spawn(move || {
+            let clock = SystemClock;
+            automatic_refresh_driver(
+                scheduler.as_ref(),
+                stop.as_ref(),
+                || clock.now_unix(),
+                std::thread::sleep,
+            )
+        })
+        .expect("spawn the automatic catalog-refresh driver")
 }
 
 #[cfg(test)]
@@ -890,6 +1002,151 @@ mod bind_location_tests {
                 PathBuf::from("/run/protonwire"),
                 "protonwire.sock".to_owned()
             )
+        );
+    }
+}
+
+/// The automatic-refresh driver suite (the Codex PR#4 P1): the loop
+/// that services the scheduler's AUTOMATIC door — construction alone
+/// never fetched a window.
+#[cfg(test)]
+mod driver_tests {
+    use super::*;
+    use crate::services::testkit::FakeCatalog;
+    use protonwire_api::CatalogFetch;
+    use protonwire_store::config::SystemConfig;
+    use protonwire_store::paths::ConfigPaths;
+
+    /// A first-boot scheduler over the hermetic root with a counting,
+    /// always-`NotModified` adapter installed. Returns the services
+    /// and a shared event log the adapter and the sleep seam both
+    /// append to — the driver's ordering observable (`fetch` entries
+    /// vs `sleep` entries, in arrival order).
+    fn driven_first_boot() -> (Arc<DaemonServices>, Arc<std::sync::Mutex<Vec<String>>>) {
+        static DRIVER_CALL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "protonwire-daemon-driver-{}-{}",
+            std::process::id(),
+            DRIVER_CALL.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let paths = ConfigPaths::rooted(&dir);
+        let services = Arc::new(
+            DaemonServices::build_with_trust_root(Arc::new(SystemConfig::default()), &paths, &dir)
+                .expect("first-boot services construct"),
+        );
+        let events: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+        let sink = Arc::clone(&events);
+        services
+            .catalog
+            .install(Arc::new(FakeCatalog::always(move || {
+                sink.lock()
+                    .expect("driver event log")
+                    .push("fetch".to_owned());
+                Ok(CatalogFetch::NotModified)
+            })));
+        (services, events)
+    }
+
+    /// The bootstrap window is serviced AUTOMATICALLY: a first-boot
+    /// scheduler (next_due `None` — never fetched, FR-13F) must be
+    /// fetched by the driver without any manual `ServersRefresh`, and
+    /// the driver must then WAIT for the next window (a capped slice)
+    /// rather than spin — the stop flag ends it mid-wait.
+    #[test]
+    fn the_driver_services_the_bootstrap_window_then_waits_for_the_next_one() {
+        let (services, events) = driven_first_boot();
+        let stop = Arc::new(AtomicBool::new(false));
+
+        // The sleep seam: record every requested slice; the FIRST one
+        // (the wait for the next window) also raises the stop flag —
+        // the driver must exit from inside a wait.
+        let stop_flag = Arc::clone(&stop);
+        let log_sink = Arc::clone(&events);
+        let mut first_wait = true;
+        let sleep_for = move |slice: std::time::Duration| {
+            assert!(
+                slice <= DRIVER_STOP_POLL_SLICE,
+                "every requested slice is stop-poll capped: {slice:?}"
+            );
+            log_sink
+                .lock()
+                .expect("driver event log")
+                .push(format!("sleep:{}ms", slice.as_millis()));
+            if std::mem::take(&mut first_wait) {
+                stop_flag.store(true, Ordering::SeqCst);
+            }
+        };
+
+        automatic_refresh_driver(&services.scheduler, &stop, || 1_771_000_000, sleep_for);
+
+        let log = events.lock().expect("driver event log").clone();
+        assert!(
+            log.first().is_some_and(|entry| entry == "fetch"),
+            "the bootstrap window must be fetched BEFORE any waiting (the \
+             finding's core: construction alone services nothing): {log:?}"
+        );
+        assert!(
+            log.iter().any(|entry| entry.starts_with("sleep:")),
+            "after the bootstrap fetch the driver must WAIT for the next \
+             window (no hot loop around the refresh door): {log:?}"
+        );
+        // And the scheduler's window advanced: the next due is the
+        // three-hour floor out (or further), never still-open.
+        let due = services
+            .scheduler
+            .next_due_unix()
+            .expect("a completed refresh arms the next window");
+        assert!(due > 1_771_000_000, "the next window must be in the future");
+    }
+
+    /// The ordering pin: when the window is NOT due, the driver waits
+    /// first and fetches nothing — the automatic door can never jump
+    /// its own deadline (FR-12's floor is the scheduler's to enforce;
+    /// the driver must not route around it).
+    #[test]
+    fn the_driver_never_fetches_before_its_window_opens() {
+        let (services, events) = driven_first_boot();
+        // A manual bootstrap refresh makes the next window ~3 h out on
+        // the REAL clock the scheduler used.
+        use protonwire_core::scheduler::ManualOutcome;
+        assert!(matches!(
+            services.scheduler.refresh_manual(None),
+            ManualOutcome::Refreshed(_)
+        ));
+        let fetched_before = events
+            .lock()
+            .expect("driver event log")
+            .iter()
+            .filter(|entry| *entry == "fetch")
+            .count();
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_flag = Arc::clone(&stop);
+        let mut first_wait = true;
+        let sleep_for = move |_slice: std::time::Duration| {
+            if std::mem::take(&mut first_wait) {
+                stop_flag.store(true, Ordering::SeqCst);
+            }
+        };
+        // The scheduler's deadlines ride the real clock; now must read
+        // the same one or every window looks due. A snapshot reading
+        // stays before the armed window — the not-due arm under test.
+        let base = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("the wall clock is past the epoch")
+            .as_secs();
+        automatic_refresh_driver(&services.scheduler, &stop, || base, sleep_for);
+
+        let fetched_after = events
+            .lock()
+            .expect("driver event log")
+            .iter()
+            .filter(|entry| *entry == "fetch")
+            .count();
+        assert_eq!(
+            fetched_before, fetched_after,
+            "a not-yet-due window must not be fetched — the driver waits"
         );
     }
 }

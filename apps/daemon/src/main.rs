@@ -302,8 +302,22 @@ fn run(
     // it was set (signal or administrator Shutdown), so the join is
     // prompt and never outlives the drain it may itself have started.
     let terminate_watcher = watch_for_termination(Arc::clone(&stop));
+    // Codex PR#4 P1 (M2 S9 completion): the scheduler's AUTOMATIC door
+    // needs a driver — constructing the scheduler services no window.
+    // FR-12/FR-13C: this loop fetches the first-boot due window and
+    // every persisted deadline that becomes due, independent of any
+    // user issuing ServersRefresh. Until the session lane installs the
+    // catalog adapter, its windows fail with the empty cell's typed
+    // transport refusal (logged once per window); the loop itself is
+    // the missing production wiring. Joined after serve returns so a
+    // stop never races a live refresh.
+    let refresh_driver = protonwire_daemon::spawn_automatic_refresh_driver(
+        Arc::clone(&handler.services.scheduler),
+        Arc::clone(&stop),
+    );
     server.serve(handler, stop);
     let _ = terminate_watcher.join();
+    let _ = refresh_driver.join();
     info!("protonwire-daemon stopped");
     0
 }

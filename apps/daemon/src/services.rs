@@ -680,12 +680,38 @@ pub(crate) mod testkit {
             Err(ApiError::InvalidState("an active session exists"))
         }
     }
+
+    /// A fake catalog adapter scripting one result per call
+    /// (`ApiError` is not `Clone` — it owns its detail strings — so the
+    /// fake produces a fresh result per call). Shared by the services
+    /// suite and the automatic-refresh driver suite (the driver's
+    /// fetch-count observable).
+    pub(crate) struct FakeCatalog {
+        produce: Box<dyn Fn() -> Result<CatalogFetch, ApiError> + Send + Sync>,
+    }
+
+    impl FakeCatalog {
+        /// A fake whose every fetch produces `produce()`'s result.
+        pub(crate) fn always(
+            produce: impl Fn() -> Result<CatalogFetch, ApiError> + Send + Sync + 'static,
+        ) -> Self {
+            Self {
+                produce: Box::new(produce),
+            }
+        }
+    }
+
+    impl CatalogApi for FakeCatalog {
+        fn fetch(&self, _etag: Option<&str>) -> Result<CatalogFetch, ApiError> {
+            (self.produce)()
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::services::testkit::FakeAuth;
+    use crate::services::testkit::{FakeAuth, FakeCatalog};
 
     /// S9 (c), the named obligation: begin_login at a NON-logged-out
     /// status refuses with `ApiError::InvalidState` and NEVER reaches
@@ -713,29 +739,6 @@ mod tests {
         let fake = FakeAuth::new(LoginStatus::LoggedOut);
         assert!(begin_login_guarded(&fake, "user", "pass").is_ok());
         assert!(fake.begin_login_was_called());
-    }
-
-    /// A fake adapter scripting one result per call. `ApiError` is not
-    /// `Clone` (it owns its detail strings), so the fake produces a
-    /// fresh result per call.
-    struct FakeCatalog {
-        produce: Box<dyn Fn() -> Result<CatalogFetch, ApiError> + Send + Sync>,
-    }
-
-    impl FakeCatalog {
-        fn always(
-            produce: impl Fn() -> Result<CatalogFetch, ApiError> + Send + Sync + 'static,
-        ) -> Self {
-            Self {
-                produce: Box::new(produce),
-            }
-        }
-    }
-
-    impl CatalogApi for FakeCatalog {
-        fn fetch(&self, _etag: Option<&str>) -> Result<CatalogFetch, ApiError> {
-            (self.produce)()
-        }
     }
 
     fn changed() -> Result<CatalogFetch, ApiError> {
