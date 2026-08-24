@@ -1007,10 +1007,12 @@ call.
 
 ## 2026-08-23 — M2 close: Muon auth + server cache (feat/m2-muon-auth)
 
-M2 executed docs/m2-plan.md in full: 16 units (S0-S14), every unit
-landed through the standing per-unit SDLC (implementation + the full
-matching reviewer set; FAIL = hard blocker; P1s verified dead with git
-evidence). Unit verdicts:
+M2 executed docs/m2-plan.md in full: S0-S14 with S5 delivered as its
+three slices — 17 per-unit verdict rows below (the earlier draft of
+this entry said "16 units", which matched neither counting; corrected
+at the doc audit). Every unit landed through the standing per-unit SDLC
+(implementation + the full matching reviewer set; FAIL = hard blocker;
+P1s verified dead with git evidence). Unit verdicts:
 
 | Unit | Verdicts | Notes |
 |------|----------|-------|
@@ -1073,11 +1075,15 @@ empirical capture is the tiebreaker.**
   rule); (2) `git commit --amend` TOCTOU on shared branches — twice,
   both repaired hash-pinned, rule: no amend while lanes are active;
   (3) the index sweep — `git add <paths> && git commit` commits the
-  ENTIRE shared index, so a sibling's staged hunk rides (cb33bd2);
-  rule: PATHSPEC commits (`git commit -- <paths>`). Also: F3-class
-  module-registration races (d44396e doesn't compile alone — bisect
+  ENTIRE shared index, so a sibling's staged hunk rides; the carrier
+  was cb33bd2 (the S4 qa peer-secret-pin commit, which absorbed a
+  sibling's staged hunk); rule: PATHSPEC commits
+  (`git commit -- <paths>`). Also: F3-class module-registration races
+  (d44396e, the S6 catalog commit, doesn't compile alone — bisect
   hazard recorded); a lockfile hunk landing 3 commits late (the qa
-  P1: ad51356 not `--locked`-buildable; closed at 89bc163).
+  P1: ad51356, the S4 adapter commit, was not `--locked`-buildable at
+  its own tree; the hunk it needed landed inside 89bc163, the S7
+  scheduler commit).
 - **The dev-cycle lesson**: a test-only store→core dev edge makes
   cargo build store twice; an impl in core resolves only against the
   dependency instance (E0599 for the local view). The SecretBoundary
@@ -1128,3 +1134,100 @@ empirical capture is the tiebreaker.**
    post-M2 (parity-manifest note required); envelope-encryption at
    rest for encrypted-local; zbus transit buffers (inherent, same
    class as muon transport buffers).
+
+## 2026-08-24 — Post-M2 close passes (refactorer + doc-writer)
+
+Two consolidated work orders on the closed M2 tree (the parallel
+launches were lost in the third agent wipeout; nothing was salvageable,
+both relaunched sequentially — the standing sequential-dispatch rule).
+
+### The refactorer's M2 pass (behavior-gated; suite-identity proven)
+
+Survey-then-act over the M2 diff; three restructures landed, three
+candidates rejected with reasons. Landed:
+
+1. **The shared loopback wire-seam harness** (750a7a1): the S8
+   entitlements and S10 location wire tests were verbatim twins and the
+   S4 integration test carried a third richer copy of the same
+   keep-alive responder/env plumbing; one `crates/api/src/test_util.rs`
+   now serves all three (compiled as `#[cfg(test)]` for the unit tests
+   and `#[path]`-included into `tests/wire.rs` — deliberately NO
+   feature and NO self dev-dependency, the dev-cycle lesson). The three
+   identical `FetchFuture`/`BlockOn` type twins lifted to crate level.
+   1399d09 is its fmt followup (see the incident note below).
+2. **One strict envelope parse** (d13e3b5): the two parse-error
+   reducers had drifted (`json Data error …` vs `data error …` — the
+   S5a twin-fix half-landed); `SessionEnvelope::from_strict_bytes` is
+   now the one definition of the fail-closed triple, the store loader
+   and `parse_session_envelope` delegate, and `writable_store.rs` keeps
+   its local wrapper untouched (frozen file; delegation is the recorded
+   follow-up when it unfreezes).
+3. **Daemon handler arms** (60efb90): the five login-family arms shared
+   one `with_auth` guard; GetAccount's assembly moved to
+   `DaemonServices::account_status`.
+
+Rejected, with reasons (the negative results are the deliverable):
+
+- **fs_trust/peer.rs walker consolidation**: dep-gate-blocked (T-23
+  forbids ipc→store; frontend-api is wire-types-only), and the
+  conformance drift-pin is post-M2 track item 3 — additive testing,
+  not a behavior-preserving restructure.
+- **The atomic-write/strict-load kit**: the temp-name+fsync+rename
+  mechanics exist 5x (state/session/catalog/location/deadlines), but
+  each copy embeds individually-sec-reviewed parameters (0600+create_new
+  vs 0644+truncate; dir-mode pinning) inside distinct typed error
+  taxonomies; extraction saves ~12 lines per settled unit. Revisit when
+  the next persisted document lands.
+- **redact.rs stub-emitter**: pin-shaped repetition — each `event!`
+  block is a distinct verbatim upstream site with its own field set; a
+  table shape would obscure the verbatim property that gives the canary
+  its teeth. Also rejected within item 1: sharing the S6 catalog
+  harness (different wire discipline) and the S8/S10 adapter builders
+  (the `new<C>` seam is deliberately generic; sharing forces naming
+  muon's concrete context internals).
+
+Proof of behavior identity: temp-worktree test run at 17fd802 vs the
+refactored tree — identical per-target counts (api 49+22, daemon 23+6,
+store 257); full gates green (fmt, clippy -D warnings, 697 tests / 29
+targets, xtask all).
+
+**Incident (the bea8f4d class, again):** 750a7a1 verified fmt with
+`-p protonwire-daemon` — a concurrent-lane habit with no concurrent
+lanes active — and the two api files landed unformatted; caught by the
+next workspace-wide `--check`, fixed in 1399d09. The rule: the fmt gate
+must cover the paths your commit touches, not your crate only.
+
+### The doc-writer's audit
+
+- **CONTRIBUTING.md**: rule 1 now mandates PATHSPEC commits
+  (`git commit -- <paths>`, never `git add … && git commit` — the
+  cb33bd2 index sweep) and new rule 8 forbids amend while lanes are
+  active (the two TOCTOU repairs). Existing rule NUMBERS are unchanged
+  — six code comments cite them (rule 5 ×5, rule 7 ×1).
+- **spike-2026-08.md**: retitled as the standing dependency-decision
+  record (M1 + dated M2 addenda); the Q9 table now carries an explicit
+  "source-reading pass only" forward reference to its two extensions;
+  the S6 responder-discipline bullet records the keep-alive correction
+  (and that the S6 harness's tolerance of close-per-exchange was never
+  re-derived — a scoped fact, not a license); the S5c audit table gains
+  its advisory column (the spike standard the compliance round
+  restored).
+- **m2-plan.md**: completion note added at the top (normative content
+  untouched).
+- **README.md**: status now M1+M2 complete with the M2 capability
+  summary (auth, scheduler, credential handling), both PRs noted as
+  UNMERGED (the initial draft of this edit wrongly said M1 was merged —
+  caught against the refs before landing), and an explicit
+  "no tunneling yet" honesty line; license-gate language untouched.
+- **Module-doc accuracy sweep** (the three-stale-doc-P2 class):
+  scheduler's fetch-seam note described the RateLimited bridge as
+  future work ("landing with the api-wire-fixture lane") — S9 landed
+  it; rewritten to the landed state. overlay's header implied the IPC
+  submission path exists — it is post-M2 track item 2; now says so.
+  credential_input claimed "the ONE expose() site" for
+  `parse_session_envelope` while the module header (correctly) says
+  two — reconciled. writable_store's header audited clean, untouched.
+- **Close-entry corrections** (this file): "16 units" was right under
+  neither counting — 17 verdict rows (S0-S14, S5 as three slices); the
+  cb33bd2/d44396e/ad51356/89bc163 hashes in the incident trilogy now
+  name their commits.

@@ -1,5 +1,14 @@
 # Milestone 2 Plan — Muon Auth and Server Cache
 
+> **COMPLETED (2026-08-23).** Every unit in this plan landed: S0 through
+> S14, with S5 delivered as its three slices (S5a/S5b/S5c) — 17 per-unit
+> reviewer-verdict rows. The close record (per-unit verdicts, the yaml
+> scanner chain, the S4 security chain, incidents, and the post-M2 track
+> items) is the review-log entry dated 2026-08-23 in
+> `docs/review-log.md`; the work is on `feat/m2-muon-auth`, PR #4. The
+> text below is the normative plan as written before execution and is
+> intentionally unchanged.
+
 Branch: `feat/m2-muon-auth` from master (`5baa12a`). Normative scope: PRD §18 M2, §7.1/7.1A/7.2, §10; tracked M2 items per docs/review-log.md. Conventions per CONTRIBUTING.md.
 
 ## Units (dependency order)

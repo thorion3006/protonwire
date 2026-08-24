@@ -8,15 +8,39 @@ transport. ProtonWire is a local VPN control plane — not a wrapper around
 clients (CLI, Ratatui TUI, Tauri GUI) speaking one versioned Unix-socket
 frontend API.
 
-Status: **Milestone 1 (Foundation) complete** on `feat/m1-foundation`;
-next: Milestone 2 (Muon API, authentication, server cache). The
-authoritative specification set is:
+Status: **Milestones 1 (Foundation) and 2 (Muon auth + server cache)
+complete** — M1 on `feat/m1-foundation` (PR #3), M2 stacked on it on
+`feat/m2-muon-auth` (PR #4); neither is merged to `master` yet — both
+await the owner's merge calls. What builds and runs today:
+
+- the M1 surface: the daemon, the versioned Unix-socket frontend API,
+  CLI/TUI/GUI clients over the shared SDK, validated system
+  configuration, repo-wide validation gates
+- M2 authentication: Muon-backed SRP login with TOTP and FIDO2 second
+  factor, session refresh/logout, external-session (fork) import —
+  with secret-log suppression and a canary suite pinning that no
+  secret class reaches any log writer
+- M2 credential handling: interactive and systemd `LoadCredential`
+  input; encrypted-local and Secret Service (keyring) writable session
+  stores, fail-closed everywhere
+- M2 server cache: catalog fetch with conditional (ETag) refresh, a
+  strict-loaded on-disk cache, and a single-flight scheduler with
+  persisted rate-limit suppression and warned manual-override
+  confirmation; entitlement and user-location models over the same
+  transport; per-UID configuration overlays; hardened IPC socket trust
+
+Next per the PRD: Milestone 3 (server selection). Not present yet: any
+tunneling (M4 ProTUN core is the first engine milestone) — connecting
+is not possible in this tree today. The authoritative specification
+set is:
 
 - `docs/PRD-proton-wire.md` — the product requirements (normative)
 - `docs/ADR-0001-monorepo-core-and-clients.md` — the architecture decision
 - `docs/official-parity.yaml` — the official-client parity contract
 - `docs/connection-groups.yaml` — the connection-group catalog
-- `docs/spike-2026-08.md` — Milestone 1 dependency spike decisions
+- `docs/spike-2026-08.md` — dependency spike decisions (M1) and the
+  M2 addenda (Muon surface memo, wire-seam records, keyring audit)
+- `docs/m2-plan.md` — the M2 unit plan (completed; see its header note)
 
 ## ⚠ Development builds only — no distribution
 
