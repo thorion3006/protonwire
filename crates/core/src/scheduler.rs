@@ -1018,9 +1018,11 @@ impl Scheduler {
                 match adopt_fetched_revision(&mut guard.cache, etag, body, effective_now) {
                     RevisionVerdict::Adopted => {
                         // The revision is the server's current one (and,
-                        // when a cache is wired, durably stored or
-                        // test-only un-cached): adopt it for the next
-                        // conditional request and the age anchor.
+                        // when a cache is wired, durably stored — or
+                        // adopted in memory despite a persist failure;
+                        // never dropped while the etag advances): adopt
+                        // it for the next conditional request and the
+                        // age anchor.
                         guard.etag = etag.clone();
                         guard.persisted.last_success_unix = Some(effective_now);
                         RefreshOutcome::Changed {
@@ -1116,7 +1118,17 @@ enum RevisionVerdict {
 /// reports `Failed` naming the drift, the last good cache survives,
 /// and no etag or age anchor advances. A cache WRITE I/O failure only
 /// warns — the deadline-save precedent: data availability outranks
-/// local bookkeeping, and the fetched data is still adopted and served.
+/// local bookkeeping, and the fetched data is still ADOPTED in memory.
+/// The in-memory adoption is load-bearing (the Codex PR#4 P2): the
+/// `Adopted` verdict advances the conditional etag, so the retained
+/// [`CacheState::current`] must be the fetched revision — otherwise
+/// the etag names a body nothing holds, every later conditional fetch
+/// can answer `304`, and the process strands itself on the old (or
+/// absent) catalog while reporting success. The durable store
+/// re-attempts itself two ways: the next `NotModified` persists the
+/// adopted revision through the FR-13E freshness write-through, and a
+/// restart re-issues a conditional request from the OLDER persisted
+/// revision, fetching the body again.
 fn adopt_fetched_revision(
     cache: &mut Option<CacheState>,
     etag: &Option<String>,
@@ -1148,10 +1160,15 @@ fn adopt_fetched_revision(
         body: text,
     };
     if let Err(error) = state.cache.store(&doc) {
-        tracing::warn!(error = %error, "persisting the fetched catalog revision failed");
-    } else {
-        state.current = Some(doc);
+        tracing::warn!(
+            error = %error,
+            "persisting the fetched catalog revision failed; adopted in memory — the next \
+             freshness write-through (or a restart) re-attempts the durable store"
+        );
     }
+    // Adopted in memory on BOTH arms: the etag that `Adopted` advances
+    // must always name a revision the scheduler retains.
+    state.current = Some(doc);
     RevisionVerdict::Adopted
 }
 
@@ -2938,6 +2955,120 @@ mod runtime_tests {
         // Pacing still advanced from the attempt: the failure cannot
         // hammer Proton either.
         assert!(scheduler.next_due_unix().unwrap() >= T0 + FRESHNESS_FLOOR_SECONDS);
+    }
+
+    /// Breaks the wired cache's store deterministically: a directory at
+    /// the cache path makes every atomic rename fail (EISDIR on Linux:
+    /// rename(2) refuses a file→directory target) with the temp write
+    /// succeeding first — exactly the "local I/O failed mid-persist"
+    /// window.
+    fn break_the_cache_store(dir: &tempfile::TempDir) {
+        std::fs::create_dir_all(dir.path().join("servers.json"))
+            .expect("plant the obstructing directory");
+    }
+
+    /// The Codex PR#4 P2: a failed cache WRITE must still ADOPT the
+    /// fetched revision in memory. The recorded rationale on
+    /// `adopt_fetched_revision` says "the fetched data is still adopted
+    /// and served" — but the pre-fix code dropped the body while the
+    /// `Adopted` verdict advanced `guard.etag` past it: the etag then
+    /// pointed at a revision nothing retained, so every later
+    /// conditional fetch could answer `304` and the process would
+    /// serve the old (or absent) catalog forever while reporting
+    /// success. Adoption, etag, and age anchor must stay coherent.
+    #[test]
+    fn a_failed_cache_write_still_adopts_the_revision_in_memory() {
+        let clock = VirtualClock::new(T0);
+        let fetch = FakeFetch::new(vec![Ok(FetchOutcome::Changed {
+            etag: Some("\"rev-2\"".to_owned()),
+            body: VALID_BODY.as_bytes().to_vec(),
+        })]);
+        let (scheduler, dir) = wired(&clock, &fetch);
+        break_the_cache_store(&dir);
+
+        match scheduler.refresh_automatic() {
+            AutomaticOutcome::Due(RefreshReport {
+                outcome: RefreshOutcome::Changed { etag, .. },
+                ..
+            }) => assert_eq!(etag.as_deref(), Some("\"rev-2\"")),
+            other => panic!("the fetched revision must still be adopted, got {other:?}"),
+        }
+        // The adoption triple, coherent: the retained in-memory
+        // revision IS the fetched one...
+        let current = scheduler
+            .inner
+            .lock()
+            .unwrap()
+            .cache
+            .as_ref()
+            .and_then(|state| state.current.clone())
+            .expect("the revision must be adopted in memory despite the failed write");
+        assert_eq!(current.etag.as_deref(), Some("\"rev-2\""));
+        assert_eq!(current.body, VALID_BODY);
+        assert_eq!(current.fetched_unix, T0);
+        // ...so the advanced conditional etag and the age anchor point
+        // at a revision the scheduler actually holds.
+        assert_eq!(
+            scheduler.inner.lock().unwrap().etag.as_deref(),
+            Some("\"rev-2\"")
+        );
+        assert_eq!(scheduler.diagnostics().last_success_unix, Some(T0));
+    }
+
+    /// The stranded-304 end to end: with the write obstruction CLEARED,
+    /// the next `304 NotModified` must persist the adopted revision
+    /// through the FR-13E freshness write-through — the disk heals.
+    /// Pre-fix, the process stayed stranded on the old/absent on-disk
+    /// catalog forever (nothing retained the body the etag named).
+    #[test]
+    fn the_next_not_modified_persists_the_adopted_revision_and_heals_the_disk() {
+        let clock = VirtualClock::new(T0);
+        let fetch = FakeFetch::new(vec![
+            Ok(FetchOutcome::Changed {
+                etag: Some("\"rev-2\"".to_owned()),
+                body: VALID_BODY.as_bytes().to_vec(),
+            }),
+            not_modified(),
+        ]);
+        let (scheduler, dir) = wired(&clock, &fetch);
+        break_the_cache_store(&dir);
+
+        // Refresh 1: fetched, adopted in memory, persist refused.
+        assert!(matches!(
+            scheduler.refresh_automatic(),
+            AutomaticOutcome::Due(RefreshReport {
+                outcome: RefreshOutcome::Changed { .. },
+                ..
+            })
+        ));
+        // The obstruction clears (operator fixes the path / transient
+        // I/O recovers); the window becomes eligible again (past the
+        // full jitter ceiling — the draw is CSPRNG, the advance must
+        // dominate it deterministically).
+        std::fs::remove_dir_all(dir.path().join("servers.json")).unwrap();
+        let t2 = T0 + FRESHNESS_FLOOR_SECONDS + JITTER + 2;
+        clock.set_wall(t2);
+
+        // Refresh 2 rides the ADOPTED etag (nothing re-fetches a body
+        // it conditionally holds)...
+        assert!(matches!(
+            scheduler.refresh_automatic(),
+            AutomaticOutcome::Due(RefreshReport {
+                outcome: RefreshOutcome::NotModified,
+                ..
+            })
+        ));
+        assert_eq!(
+            fetch.seen_etags()[1],
+            Some("\"rev-2\"".to_owned()),
+            "the conditional request must carry the adopted revision's etag"
+        );
+        // ...and the freshness write-through persisted the ADOPTED
+        // revision: the disk now holds what the etag names.
+        let stored = read_stored_cache(&dir);
+        assert_eq!(stored.etag.as_deref(), Some("\"rev-2\""));
+        assert_eq!(stored.body, VALID_BODY);
+        assert_eq!(stored.fetched_unix, t2);
     }
 
     /// The production constructor's strict happy path: both documents
