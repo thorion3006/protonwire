@@ -307,17 +307,15 @@ impl ProtonwireClient {
     /// [`RpcErrorCode::ConfirmationRequired`]; the caller surfaces the
     /// carried warning and replays the single-use
     /// `confirmation_token` (see
-    /// [`ConfirmationRequirement::from_error`]). An active suppression
-    /// refuses even a confirmed request (ER-16).
+    /// `protonwire_frontend_api::ConfirmationRequirement::from_error`).
+    /// An active suppression refuses even a confirmed request (ER-16).
     pub fn servers_refresh(
         &mut self,
         confirmation_token: Option<&str>,
     ) -> Result<protonwire_frontend_api::ServersRefreshReport, ClientError> {
-        match self
-            .ipc
-            .request(Request::ServersRefresh {
-                confirmation_token: confirmation_token.map(str::to_owned),
-            }) {
+        match self.ipc.request(Request::ServersRefresh {
+            confirmation_token: confirmation_token.map(str::to_owned),
+        }) {
             Ok(RequestResult::ServersRefreshed { report }) => Ok(report),
             Ok(other) => Err(unexpected_result("servers refresh", other)),
             Err(error) => Err(map_request_error(error)),
@@ -367,7 +365,9 @@ impl ProtonwireClient {
 
     /// Forces a session token refresh (FR-3); returns the
     /// post-refresh status.
-    pub fn refresh_session(&mut self) -> Result<protonwire_frontend_api::SessionStatus, ClientError> {
+    pub fn refresh_session(
+        &mut self,
+    ) -> Result<protonwire_frontend_api::SessionStatus, ClientError> {
         match self.ipc.request(Request::RefreshSession) {
             Ok(RequestResult::LoginStatus { status }) => Ok(status),
             Ok(other) => Err(unexpected_result("session refresh", other)),
@@ -704,34 +704,31 @@ mod tests {
                     fetched_unix: Some(1_771_000_000),
                     body: Some("{\"Code\":1000}".into()),
                 }),
-                Request::ServersRefresh { confirmation_token } => {
-                    match confirmation_token {
-                        None => Err(RpcError::confirmation_required(
-                            "the server list is still fresh",
-                            protonwire_frontend_api::ConfirmationRequirement {
-                                catalog_age_seconds: 120,
-                                last_request_unix: Some(1_771_000_000),
-                                next_eligible_unix: 1_771_010_800,
-                                warning: "still fresh".into(),
-                                confirmation_token: "token-1".into(),
+                Request::ServersRefresh { confirmation_token } => match confirmation_token {
+                    None => Err(RpcError::confirmation_required(
+                        "the server list is still fresh",
+                        protonwire_frontend_api::ConfirmationRequirement {
+                            catalog_age_seconds: 120,
+                            last_request_unix: Some(1_771_000_000),
+                            next_eligible_unix: 1_771_010_800,
+                            warning: "still fresh".into(),
+                            confirmation_token: "token-1".into(),
+                        },
+                    )),
+                    Some(token) => Ok(RequestResult::ServersRefreshed {
+                        report: protonwire_frontend_api::ServersRefreshReport {
+                            outcome: protonwire_frontend_api::ServersRefreshOutcome::Changed {
+                                etag: Some("\"rev-8\"".into()),
                             },
-                        )),
-                        Some(token) => Ok(RequestResult::ServersRefreshed {
-                            report: protonwire_frontend_api::ServersRefreshReport {
-                                outcome: protonwire_frontend_api::ServersRefreshOutcome::Changed {
-                                    etag: Some("\"rev-8\"".into()),
-                                },
-                                coalesced: false,
-                                next_eligible_unix: 1_771_020_000,
-                                suppression_until_unix: None,
-                            },
-                        })
-                        .map(|result| {
-                            assert_eq!(token, "token-1", "the replayed token rides the wire");
-                            result
-                        }),
-                    }
-                }
+                            coalesced: false,
+                            next_eligible_unix: 1_771_020_000,
+                            suppression_until_unix: None,
+                        },
+                    })
+                    .inspect(|_| {
+                        assert_eq!(token, "token-1", "the replayed token rides the wire");
+                    }),
+                },
                 Request::GetAccount => Ok(RequestResult::Account {
                     account: protonwire_frontend_api::AccountStatus {
                         login_status: protonwire_frontend_api::SessionStatus::LoggedOut,
@@ -747,14 +744,12 @@ mod tests {
                 Request::SubmitCredential { .. } | Request::Logout => {
                     Ok(RequestResult::Acknowledged)
                 }
-                Request::BeginLogin { username, .. } => {
-                    Ok(RequestResult::LoginStep {
-                        step: protonwire_frontend_api::LoginOutcome::Session {
-                            user_id: format!("{}-ok", username.expose()),
-                            session_id: "s1".into(),
-                        },
-                    })
-                }
+                Request::BeginLogin { username, .. } => Ok(RequestResult::LoginStep {
+                    step: protonwire_frontend_api::LoginOutcome::Session {
+                        user_id: format!("{}-ok", username.expose()),
+                        session_id: "s1".into(),
+                    },
+                }),
                 other => Err(RpcError::new(
                     RpcErrorCode::NotImplemented,
                     format!("{other:?}"),
@@ -844,9 +839,7 @@ mod tests {
         );
         // A non-ceremony code extracts no requirement (never guesses).
         let plain = RpcError::new(RpcErrorCode::NotImplemented, "x");
-        assert!(
-            protonwire_frontend_api::ConfirmationRequirement::from_error(&plain).is_none()
-        );
+        assert!(protonwire_frontend_api::ConfirmationRequirement::from_error(&plain).is_none());
     }
 
     #[test]
@@ -883,7 +876,9 @@ mod tests {
             }
         );
         client.logout().unwrap();
-        client.submit_credential("session", "envelope-bytes").unwrap();
+        client
+            .submit_credential("session", "envelope-bytes")
+            .unwrap();
     }
 
     #[test]
