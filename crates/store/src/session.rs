@@ -160,6 +160,36 @@ impl SessionEnvelope {
         self.source_digest == canonical_digest(&self.credentials).unwrap_or_default()
     }
 
+    /// The strict parse every consumer of envelope bytes must run:
+    /// serde with `deny_unknown_fields`, the supported-schema check,
+    /// and the digest-integrity check — each refusal fail-closed, and
+    /// the parse refusal reduced to kind+position (serde's `Display`
+    /// embeds the offending VALUE verbatim; an `invalid type: string
+    /// "…"` refusal would carry a password straight into error logs —
+    /// the S5a rust-review P1, killed in both files that parsed
+    /// envelopes). One definition so a future parse site cannot forget
+    /// an arm of the triple: the store loader and the credential-input
+    /// parse both delegate here.
+    ///
+    /// # Errors
+    /// [`SessionEnvelopeError::Parse`] (kind+position only) on a
+    /// malformed document; [`SessionEnvelopeError::UnsupportedSchema`]
+    /// on a schema this reader does not know;
+    /// [`SessionEnvelopeError::Integrity`] on a digest mismatch.
+    pub fn from_strict_bytes(bytes: &[u8]) -> Result<Self, SessionEnvelopeError> {
+        let envelope: SessionEnvelope = serde_json::from_slice(bytes)
+            .map_err(|e| SessionEnvelopeError::Parse(parse_error_summary(&e)))?;
+        if envelope.schema_version != SESSION_SCHEMA_VERSION {
+            return Err(SessionEnvelopeError::UnsupportedSchema(
+                envelope.schema_version,
+            ));
+        }
+        if !envelope.verify_integrity() {
+            return Err(SessionEnvelopeError::Integrity);
+        }
+        Ok(envelope)
+    }
+
     /// The embedded serialized credentials (the value to hand back to
     /// Muon).
     #[must_use]
@@ -168,25 +198,21 @@ impl SessionEnvelope {
     }
 }
 
-/// Reduces a serde error to its KIND and POSITION: `json data error at
-/// line 1 column 50`. The message text is dropped because serde's
-/// `invalid type` Display prints the offending VALUE — a password in a
-/// misprovisioned slot would land verbatim in the error string (S5a
-/// rust-review FAIL P1, identical arm probed there; this file's twin
-/// is fixed by the S5a lane).
-fn parse_error_kind_at(e: serde_json::Error) -> String {
-    format!(
-        "json {:?} error at line {} column {}",
-        e.classify(),
-        e.line(),
-        e.column()
-    )
-}
+/// serde's error Display embeds the offending VALUE verbatim (an
+/// `invalid type: string "…"` refusal carries the misprovisioned bytes —
+/// for a session slot, that is a password riding daemon error logs).
+/// The parse refusal is therefore reduced to its value-free facts: the
+/// `classify()` category (kind, never the message) plus line/column.
+/// The shared helper (the S5a fix's twin was drift — `json {:?}` here
+/// vs the lowercase kind everywhere else — unified onto the S5a
+/// wording); it lives in `credential_input` because the frozen
+/// `writable_store` imports it from there.
+use crate::credential_input::parse_error_summary;
 
 /// Hex SHA-256 over the canonical (compact) serialization of `value`.
 fn canonical_digest(value: &serde_json::Value) -> Result<String, SessionEnvelopeError> {
     let bytes = serde_json::to_vec(value)
-        .map_err(|e| SessionEnvelopeError::Parse(parse_error_kind_at(e)))?;
+        .map_err(|e| SessionEnvelopeError::Parse(parse_error_summary(&e)))?;
     use sha2::Digest as _;
     let digest = sha2::Sha256::digest(&bytes);
     Ok(digest.iter().map(|b| format!("{b:02x}")).collect())
@@ -243,17 +269,7 @@ impl SessionEnvelopeStore {
                 "session document exceeds size cap".into(),
             ));
         }
-        let envelope: SessionEnvelope = serde_json::from_slice(&bytes)
-            .map_err(|e| SessionEnvelopeError::Parse(parse_error_kind_at(e)))?;
-        if envelope.schema_version != SESSION_SCHEMA_VERSION {
-            return Err(SessionEnvelopeError::UnsupportedSchema(
-                envelope.schema_version,
-            ));
-        }
-        if !envelope.verify_integrity() {
-            return Err(SessionEnvelopeError::Integrity);
-        }
-        Ok(Some(envelope))
+        Ok(Some(SessionEnvelope::from_strict_bytes(&bytes)?))
     }
 
     /// Persists the envelope atomically: sibling temp file (mode 0600),
@@ -282,7 +298,7 @@ impl SessionEnvelopeStore {
             });
         }
         let bytes = serde_json::to_vec(envelope)
-            .map_err(|e| SessionEnvelopeError::Parse(parse_error_kind_at(e)))?;
+            .map_err(|e| SessionEnvelopeError::Parse(parse_error_summary(&e)))?;
         if bytes.len() > MAX_SESSION_BYTES {
             return Err(SessionEnvelopeError::Parse(
                 "session document exceeds size cap".into(),

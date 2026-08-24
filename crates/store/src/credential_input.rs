@@ -135,7 +135,6 @@ use crate::config::CredentialInputSource as ConfiguredCredentialSource;
 use crate::fs_trust::FsTrustError;
 use crate::fs_trust::MissingLeaf;
 use crate::fs_trust::verify_trusted_path;
-use crate::session::SESSION_SCHEMA_VERSION;
 use crate::session::SessionEnvelope;
 use crate::session::SessionEnvelopeError;
 
@@ -589,34 +588,24 @@ impl<S: SecretBoundary> CredentialSource<S> {
 /// fail-closed parse of `SessionEnvelopeStore::load` (unknown fields via
 /// serde, unsupported schema, digest integrity) — the input side already
 /// caps the value at [`MAX_CREDENTIAL_BYTES`], the same 64 KiB the
-/// store side enforces. (The duplication is deliberate: `session.rs`
-/// parses from a file path, and lifting a shared bytes-parser is S5b's
-/// to make in its own file.)
+/// store side enforces. The strict triple itself is
+/// [`SessionEnvelope::from_strict_bytes`] — the one definition shared
+/// with the store loader (this module's inline copy and the store's
+/// were drift twins; `writable_store` keeps its own local wrapper,
+/// frozen this round).
 ///
 /// # Errors
 /// [`CredentialInputError::Envelope`] wrapping the store's typed
 /// refusals — never a best-effort envelope. The `Parse` refusal is
-/// reduced to serde's error CATEGORY plus line/column (see the private
-/// `parse_error_summary` helper): serde's Display embeds the offending
-/// value verbatim, and this module never carries value bytes.
+/// reduced to serde's error CATEGORY plus line/column: serde's Display
+/// embeds the offending value verbatim, and this module never carries
+/// value bytes.
 pub fn parse_session_envelope<S: SecretBoundary>(
     secret: &S,
 ) -> Result<SessionEnvelope, CredentialInputError> {
     // The deliberate consumer: the one expose() site in this crate.
-    let envelope: SessionEnvelope = serde_json::from_str(secret.expose()).map_err(|e| {
-        CredentialInputError::Envelope(SessionEnvelopeError::Parse(parse_error_summary(&e)))
-    })?;
-    if envelope.schema_version != SESSION_SCHEMA_VERSION {
-        return Err(CredentialInputError::Envelope(
-            SessionEnvelopeError::UnsupportedSchema(envelope.schema_version),
-        ));
-    }
-    if !envelope.verify_integrity() {
-        return Err(CredentialInputError::Envelope(
-            SessionEnvelopeError::Integrity,
-        ));
-    }
-    Ok(envelope)
+    SessionEnvelope::from_strict_bytes(secret.expose().as_bytes())
+        .map_err(CredentialInputError::Envelope)
 }
 
 /// The systemd arm's directory resolution, shared by the env-backed and
