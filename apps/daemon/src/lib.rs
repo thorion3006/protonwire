@@ -111,57 +111,8 @@ impl RequestHandler for DaemonHandler {
             // FR-7H's snapshot behind `account --json`: facts only,
             // never a fabricated field.
             Request::GetAccount => {
-                use protonwire_frontend_api::{
-                    AccountStatus, CredentialSourceStatus, SessionStatus, WritableStoreStatus,
-                };
-                use protonwire_store::credential_input::CredentialSource as LiveSource;
-                let login_status = match self.services.auth.current() {
-                    Some(auth) => services::login_status_to_wire(
-                        auth.login_status().map_err(services::api_error_to_rpc)?,
-                    ),
-                    // No engine installed: no session exists.
-                    None => SessionStatus::LoggedOut,
-                };
-                let credential_source = match &self.services.credential_input.source {
-                    LiveSource::Interactive { .. } => CredentialSourceStatus::Interactive,
-                    LiveSource::Systemd(dir) => CredentialSourceStatus::Systemd {
-                        directory: dir.directory().display().to_string(),
-                        startup_read: self
-                            .services
-                            .credential_input
-                            .startup_read
-                            .clone()
-                            .unwrap_or(protonwire_frontend_api::CredentialStartupRead::Refused {
-                                reason: "the startup read was not recorded".to_owned(),
-                            }),
-                    },
-                };
-                Ok(RequestResult::Account {
-                    account: AccountStatus {
-                        login_status,
-                        credential_source,
-                        writable_store: WritableStoreStatus {
-                            declared: self
-                                .services
-                                .config
-                                .account
-                                .writable_session_store
-                                .as_str()
-                                .to_owned(),
-                            priority: self
-                                .services
-                                .config
-                                .account
-                                .writable_store_priority
-                                .iter()
-                                .map(|entry| entry.as_str().to_owned())
-                                .collect(),
-                        },
-                        // S5b/S5c own the writable-store half; the
-                        // field stays absent — never fabricated.
-                        persistence_health: None,
-                    },
-                })
+                let account = self.services.account_status()?;
+                Ok(RequestResult::Account { account })
             }
             // FR-10: serve the cached revision verbatim — no upstream
             // request. An absent cache is the legitimate nothing-yet
@@ -219,79 +170,78 @@ impl RequestHandler for DaemonHandler {
             // The login family: through the auth provider cell. An
             // empty cell (the engine wiring is the session lane's) is
             // a typed NotImplemented — never a fabricated login state.
-            Request::BeginLogin { username, password } => match self.services.auth.current() {
-                Some(auth) => {
-                    let step = services::begin_login_guarded(
-                        auth.as_ref(),
-                        username.expose(),
-                        password.expose(),
-                    )
-                    .map_err(services::api_error_to_rpc)?;
-                    Ok(RequestResult::LoginStep {
-                        step: services::login_step_to_wire(step),
-                    })
-                }
-                None => Err(no_engine_installed()),
-            },
-            Request::SubmitTwoFactor { code } => match self.services.auth.current() {
-                Some(auth) => {
-                    let step = auth
-                        .submit_two_factor(code.expose())
+            // The five arms share the guard via `with_auth`.
+            Request::BeginLogin { username, password } => self.with_auth(|auth| {
+                let step =
+                    services::begin_login_guarded(auth, username.expose(), password.expose())
                         .map_err(services::api_error_to_rpc)?;
-                    Ok(RequestResult::LoginStep {
-                        step: services::login_step_to_wire(step),
-                    })
-                }
-                None => Err(no_engine_installed()),
-            },
+                Ok(RequestResult::LoginStep {
+                    step: services::login_step_to_wire(step),
+                })
+            }),
+            Request::SubmitTwoFactor { code } => self.with_auth(|auth| {
+                let step = auth
+                    .submit_two_factor(code.expose())
+                    .map_err(services::api_error_to_rpc)?;
+                Ok(RequestResult::LoginStep {
+                    step: services::login_step_to_wire(step),
+                })
+            }),
             Request::SubmitFidoPayload {
                 client_data,
                 authenticator_data,
                 signature,
                 credential_id,
-            } => match self.services.auth.current() {
-                Some(auth) => {
-                    let payload = protonwire_api::Fido2Payload {
-                        client_data: client_data.expose().to_owned(),
-                        authenticator_data: authenticator_data.expose().to_owned(),
-                        signature: signature.expose().to_owned(),
-                        credential_id,
-                    };
-                    let step = auth
-                        .submit_fido_payload(&payload)
-                        .map_err(services::api_error_to_rpc)?;
-                    Ok(RequestResult::LoginStep {
-                        step: services::login_step_to_wire(step),
-                    })
-                }
-                None => Err(no_engine_installed()),
-            },
-            Request::RefreshSession => match self.services.auth.current() {
-                Some(auth) => {
-                    let status = auth.refresh().map_err(services::api_error_to_rpc)?;
-                    Ok(RequestResult::LoginStatus {
-                        status: services::login_status_to_wire(status),
-                    })
-                }
-                None => Err(no_engine_installed()),
-            },
-            Request::Logout => match self.services.auth.current() {
-                Some(auth) => {
-                    // FR-4: best-effort remote teardown, guaranteed
-                    // local credential removal (Muon's logout is
-                    // infallible by design; a transport failure is
-                    // reported but the local state is the adapter's).
-                    auth.logout().map_err(services::api_error_to_rpc)?;
-                    Ok(RequestResult::Acknowledged)
-                }
-                None => Err(no_engine_installed()),
-            },
+            } => self.with_auth(|auth| {
+                let payload = protonwire_api::Fido2Payload {
+                    client_data: client_data.expose().to_owned(),
+                    authenticator_data: authenticator_data.expose().to_owned(),
+                    signature: signature.expose().to_owned(),
+                    credential_id,
+                };
+                let step = auth
+                    .submit_fido_payload(&payload)
+                    .map_err(services::api_error_to_rpc)?;
+                Ok(RequestResult::LoginStep {
+                    step: services::login_step_to_wire(step),
+                })
+            }),
+            Request::RefreshSession => self.with_auth(|auth| {
+                let status = auth.refresh().map_err(services::api_error_to_rpc)?;
+                Ok(RequestResult::LoginStatus {
+                    status: services::login_status_to_wire(status),
+                })
+            }),
+            Request::Logout => self.with_auth(|auth| {
+                // FR-4: best-effort remote teardown, guaranteed
+                // local credential removal (Muon's logout is
+                // infallible by design; a transport failure is
+                // reported but the local state is the adapter's).
+                auth.logout().map_err(services::api_error_to_rpc)?;
+                Ok(RequestResult::Acknowledged)
+            }),
             other => self.core.handle_request(ctx.peer.uid, other),
         }
     }
 
     fn event_bus(&self) -> &EventBus {
         &self.bus
+    }
+}
+
+impl DaemonHandler {
+    /// Runs `call` against the installed auth adapter — the login
+    /// family's shared empty-cell guard: no adapter installed (the
+    /// engine wiring is the session lane's) is the typed
+    /// [`no_engine_installed`] refusal, never a fabricated login state.
+    fn with_auth<T>(
+        &self,
+        call: impl FnOnce(&dyn protonwire_api::AuthenticationApi) -> Result<T, RpcError>,
+    ) -> Result<T, RpcError> {
+        match self.services.auth.current() {
+            Some(auth) => call(auth.as_ref()),
+            None => Err(no_engine_installed()),
+        }
     }
 }
 

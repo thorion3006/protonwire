@@ -510,6 +510,61 @@ impl DaemonServices {
     ) -> Result<Option<protonwire_store::catalog::CachedCatalog>, CatalogCacheError> {
         CatalogCache::new(&self.cache_file).load_strict(&self.trust_root)
     }
+
+    /// Assembles the `GetAccount` snapshot (FR-7H): login status through
+    /// the auth provider cell (an empty cell is LoggedOut — no session
+    /// exists), the resolved credential source with its startup-read
+    /// facts, and the configured writable-store declarations. Facts
+    /// only, never a fabricated field; `persistence_health` stays
+    /// absent until its owner reports it (S5b/S5c).
+    ///
+    /// # Errors
+    /// [`protonwire_frontend_api::RpcError`] when the adapter's login
+    /// status cannot be determined (mapped by [`api_error_to_rpc`]).
+    pub fn account_status(
+        &self,
+    ) -> Result<protonwire_frontend_api::AccountStatus, protonwire_frontend_api::RpcError> {
+        use protonwire_frontend_api::{AccountStatus, CredentialSourceStatus, SessionStatus};
+
+        let login_status = match self.auth.current() {
+            Some(auth) => login_status_to_wire(auth.login_status().map_err(api_error_to_rpc)?),
+            // No engine installed: no session exists.
+            None => SessionStatus::LoggedOut,
+        };
+        let credential_source = match &self.credential_input.source {
+            CredentialSource::Interactive { .. } => CredentialSourceStatus::Interactive,
+            CredentialSource::Systemd(dir) => CredentialSourceStatus::Systemd {
+                directory: dir.directory().display().to_string(),
+                startup_read: self.credential_input.startup_read.clone().unwrap_or(
+                    protonwire_frontend_api::CredentialStartupRead::Refused {
+                        reason: "the startup read was not recorded".to_owned(),
+                    },
+                ),
+            },
+        };
+        Ok(AccountStatus {
+            login_status,
+            credential_source,
+            writable_store: protonwire_frontend_api::WritableStoreStatus {
+                declared: self
+                    .config
+                    .account
+                    .writable_session_store
+                    .as_str()
+                    .to_owned(),
+                priority: self
+                    .config
+                    .account
+                    .writable_store_priority
+                    .iter()
+                    .map(|entry| entry.as_str().to_owned())
+                    .collect(),
+            },
+            // S5b/S5c own the writable-store half; the field stays
+            // absent — never fabricated.
+            persistence_health: None,
+        })
+    }
 }
 
 /// Converts one scheduler refresh outcome onto the wire report
