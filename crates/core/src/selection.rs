@@ -1944,7 +1944,7 @@ mod tests {
         assert!(
             matches!(
                 err,
-                SelectionError::StandardFleetFeatureContradiction { .. }
+                SelectionError::StandardFleetFeatureContradiction
             ),
             "the typed contradiction, got: {err}"
         );
