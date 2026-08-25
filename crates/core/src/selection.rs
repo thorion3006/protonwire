@@ -52,6 +52,24 @@
 //!   ([`SelectionContext::random_entropy`]) and refuses typed without
 //!   it — no fabricated randomness.
 //!
+//! ## Secure Core routing (FR-23A..F, T-11)
+//!
+//! [`Target::SecureCore`] is the routed target: the entry→exit pair
+//! over the Secure Core fleet. Each side is fastest (`None`) or a
+//! pinned country; a route's entry and exit countries always differ
+//! (the hop-through that defines Secure Core — the same country on
+//! both sides is a typed validation refusal, FR-23F). The fleet is
+//! the exact complement of the Standard fleet (route shape or catalog
+//! bit; gateways are their own connection type), so every non-gateway
+//! logical belongs to exactly one fleet. The generic country
+//! constraints keep meaning the EXIT country (the canonical
+//! selector); the dedicated entry/exit exclusion lists are this
+//! target's alone and are refused typed on every other target
+//! (FR-23F). "Lowest load" and "lowest latency" are the policies over
+//! this target, not separate targets (FR-23C). Both ends of the
+//! selected route ride the logical's `EntryCountry`/`ExitCountry`
+//! for the status surface (FR-23D; composed at the daemon, U6).
+//!
 //! ## No speed, ever (FR-19, T-1)
 //!
 //! A `speed` sort mode or weight — and the catalog contract's other
@@ -122,6 +140,21 @@ pub enum Target {
     /// A named gateway's logicals (dedicated-server fleet identity; the
     /// *authorization* is S8 entitlement data composed at the daemon).
     Gateway(String),
+    /// A routed Secure Core target: the entry→exit pair over the Secure
+    /// Core fleet (FR-23A..F). Each side is `None` (fastest / any
+    /// eligible country) or a pinned country, and a route's entry and
+    /// exit countries always differ — the hop-through that defines
+    /// Secure Core. The generic country constraints keep meaning the
+    /// EXIT country (the canonical selector); the dedicated entry/exit
+    /// exclusion lists ([`Constraints::excluded_entry_countries`],
+    /// [`Constraints::excluded_exit_countries`]) belong to this target
+    /// alone (FR-23F).
+    SecureCore {
+        /// The entry side: fastest (`None`) or a pinned country.
+        entry_country: Option<String>,
+        /// The exit side: fastest (`None`) or a pinned country.
+        exit_country: Option<String>,
+    },
 }
 
 /// The ranking policy applied after hard filters (FR-14).
@@ -281,8 +314,12 @@ pub enum FeatureConstraint {
     P2p,
     /// Tor-over-VPN (catalog feature bit).
     Tor,
-    /// Secure Core server (catalog feature bit; the *routed* Secure
-    /// Core target is milestone 3 PR-3).
+    /// Secure Core server (catalog feature bit). The routed Secure
+    /// Core TARGET ([`Target::SecureCore`]) is how Secure Core
+    /// connectivity is requested; this constraint under a Standard-
+    /// fleet target is the typed contradiction (a bit-marked
+    /// Standard fleet does not exist), and under the routed target it
+    /// is legal, tautological, and still evaluates against the bit.
     SecureCore,
     /// Streaming-capable where exposed (catalog feature bit).
     Streaming,
@@ -319,6 +356,13 @@ pub struct Constraints {
     pub excluded_cities: Vec<String>,
     /// Never select these logical servers by name (FR-21A).
     pub excluded_servers: Vec<String>,
+    /// Never ROUTE THROUGH these entry countries (FR-23C's excluded
+    /// entry countries). Secure Core targets only — every other target
+    /// refuses them typed as incompatible options (FR-23F).
+    pub excluded_entry_countries: Vec<String>,
+    /// Never EXIT through these countries (FR-23C's excluded exit
+    /// countries). Secure Core targets only (FR-23F).
+    pub excluded_exit_countries: Vec<String>,
     /// Exclude the physical country — set by the
     /// fastest-excluding-my-country semantics; the country itself comes
     /// from [`Self::physical_country`] (FR-23Q's resolution is PR-2's;
@@ -399,6 +443,10 @@ pub enum FilterStage {
     PhysicalCountryExclusion,
     /// An explicitly excluded country (FR-21).
     ExcludedCountry,
+    /// An explicitly excluded Secure Core ENTRY country (FR-23C).
+    ExcludedEntryCountry,
+    /// An explicitly excluded Secure Core EXIT country (FR-23C).
+    ExcludedExitCountry,
     /// An explicitly excluded state/region (FR-21A).
     ExcludedState,
     /// An explicitly excluded city (FR-21A).
@@ -443,6 +491,8 @@ impl FilterStage {
             "physical-country-exclusion",
         ),
         (FilterStage::ExcludedCountry, "excluded-country"),
+        (FilterStage::ExcludedEntryCountry, "excluded-entry-country"),
+        (FilterStage::ExcludedExitCountry, "excluded-exit-country"),
         (FilterStage::ExcludedState, "excluded-state"),
         (FilterStage::ExcludedCity, "excluded-city"),
         (FilterStage::ExcludedServer, "excluded-server"),
@@ -696,16 +746,39 @@ pub enum SelectionError {
     /// constraint — unsatisfiable BY CONSTRUCTION (Codex PR#5, P1: the
     /// type stage removes every Secure Core logical, the feature stage
     /// then removes every Standard one). Secure Core connectivity is a
-    /// TARGET (the routed form, milestone 3 PR-3), never a
+    /// TARGET (the routed [`Target::SecureCore`]), never a
     /// Standard-fleet feature filter; the contradiction is refused at
     /// validation with this error rather than the pipeline's
     /// all-stages-empty report.
     #[error(
         "unsatisfiable request: a Standard-fleet target cannot require the `secure-core` \
-         feature — Secure Core connectivity is a routed TARGET (milestone 3 PR-3), \
+         feature — Secure Core connectivity is a routed TARGET (`secure-core`), \
          not a Standard-fleet feature filter"
     )]
     StandardFleetFeatureContradiction,
+    /// A Secure Core target naming the same country for both sides of
+    /// the route — unsatisfiable BY CONSTRUCTION: Secure Core IS the
+    /// hop-through where the entry and exit countries differ (FR-23F's
+    /// clear-error rule).
+    #[error(
+        "unsatisfiable request: a Secure Core route cannot enter and exit through the same \
+         country (`{country}` was named for both sides) — the entry and exit of a Secure Core \
+         route always differ (FR-23F)"
+    )]
+    SecureCoreEntryEqualsExit {
+        /// The country named for both sides.
+        country: String,
+    },
+    /// The Secure Core routing constraints (the excluded entry/exit
+    /// country lists) on a target that is not the routed Secure Core
+    /// target: they express routing-side exclusions only that target
+    /// evaluates (FR-23F) — refused, never silently ignored, never
+    /// repurposed as generic exclusions.
+    #[error(
+        "the excluded entry/exit country constraints apply only to a Secure Core target — \
+         request the routed `secure-core` target to use them (FR-23F)"
+    )]
+    SecureCoreOnlyConstraints,
 }
 
 impl Target {
@@ -749,8 +822,8 @@ fn validate_country(code: &str) -> Result<(), SelectionError> {
     }
 }
 
-/// Validates every country input on the request (FR-20/FR-21/FR-23Q)
-/// before any candidate work.
+/// Validates every country input on the request (FR-20/FR-21/FR-23Q/
+/// FR-23C/FR-23F) before any candidate work.
 fn validate_request_countries(request: &SelectionRequest) -> Result<(), SelectionError> {
     match &request.target {
         Target::Country(code) => validate_country(code)?,
@@ -759,9 +832,37 @@ fn validate_request_countries(request: &SelectionRequest) -> Result<(), Selectio
                 validate_country(code)?;
             }
         }
+        Target::SecureCore {
+            entry_country,
+            exit_country,
+        } => {
+            if let Some(entry) = entry_country {
+                validate_country(entry)?;
+            }
+            if let Some(exit) = exit_country {
+                validate_country(exit)?;
+            }
+            // FR-23F: the two sides of a Secure Core route always
+            // differ — the same country on both ends contradicts the
+            // definition, and the contradiction is refused here rather
+            // than surfacing as the pipeline's all-stages-empty report.
+            if let (Some(entry), Some(exit)) = (entry_country, exit_country)
+                && entry == exit
+            {
+                return Err(SelectionError::SecureCoreEntryEqualsExit {
+                    country: entry.clone(),
+                });
+            }
+        }
         _ => {}
     }
     for code in &request.constraints.excluded_countries {
+        validate_country(code)?;
+    }
+    for code in &request.constraints.excluded_entry_countries {
+        validate_country(code)?;
+    }
+    for code in &request.constraints.excluded_exit_countries {
         validate_country(code)?;
     }
     if let Some(code) = &request.constraints.physical_country {
@@ -782,6 +883,18 @@ fn eq_fold(value: Option<&str>, wanted: &str) -> bool {
 /// Standard-fleet capabilities, not types.
 fn is_standard_fleet(server: &LogicalServer) -> bool {
     !server.is_gateway() && !server.is_secure_core_route() && !server.features.secure_core()
+}
+
+/// Whether the logical belongs to the Secure Core fleet for the routed
+/// Secure Core target — the exact complement of [`is_standard_fleet`]
+/// within the non-gateway catalog (whatever makes a logical
+/// non-Standard — the route shape or the catalog bit — is what this
+/// fleet claims; no logical is orphaned from both fleets). Fleet
+/// membership is not routability: a bit-marked logical whose entry
+/// equals its exit is a member that can serve no pair (the geography
+/// stage refuses it).
+fn is_secure_core_fleet(server: &LogicalServer) -> bool {
+    !server.is_gateway() && (server.is_secure_core_route() || server.features.secure_core())
 }
 
 /// The online-state stage: unknown is never online (FR-13B,
@@ -805,13 +918,23 @@ fn online_stage(server: &LogicalServer) -> Option<FilterStage> {
 }
 
 /// The target geography/type stage. Exact targets match identity here;
-/// filtered targets require the Standard fleet, then geography
-/// (FR-23L/FR-20). Host-country (smart routing) is reported metadata,
-/// never a match key — the exit country is the canonical selector.
+/// Standard-fleet targets require that fleet, then geography
+/// (FR-23L/FR-20); the routed Secure Core target requires ITS fleet,
+/// then the entry/exit pair. Host-country (smart routing) is reported
+/// metadata, never a match key — the exit country is the canonical
+/// selector.
 fn target_stage(server: &LogicalServer, target: &Target) -> Option<FilterStage> {
     if target.is_exact() {
         return (!target.matches_exact(server)).then_some(FilterStage::TargetGeography);
     }
+    match target {
+        Target::SecureCore { .. } => secure_core_stage(server, target),
+        _ => standard_stage(server, target),
+    }
+}
+
+/// The geography/type stage of a Standard-fleet target.
+fn standard_stage(server: &LogicalServer, target: &Target) -> Option<FilterStage> {
     if !is_standard_fleet(server) {
         return Some(FilterStage::ServerType);
     }
@@ -821,9 +944,38 @@ fn target_stage(server: &LogicalServer, target: &Target) -> Option<FilterStage> 
         Target::Countries(codes) => !codes.contains(&server.exit_country),
         Target::State(name) => !eq_fold(server.state.as_deref(), name),
         Target::City(name) => !eq_fold(server.city.as_deref(), name),
-        Target::Server(_) | Target::Gateway(_) => unreachable!("handled above"),
+        Target::Server(_) | Target::Gateway(_) | Target::SecureCore { .. } => {
+            unreachable!("routed or exact targets never reach the Standard geography stage")
+        }
     };
     miss.then_some(FilterStage::TargetGeography)
+}
+
+/// The geography/type stage of the routed Secure Core target (T-11,
+/// FR-23C): the Secure Core fleet, then each side of the pair — the
+/// pinned exit(s) must match the logical's exit country, the pinned
+/// entry its entry country, and the logical must BE a route (entry ≠
+/// exit — the hop-through that defines Secure Core; a bit-marked
+/// non-route can serve no pair).
+fn secure_core_stage(server: &LogicalServer, target: &Target) -> Option<FilterStage> {
+    if !is_secure_core_fleet(server) {
+        return Some(FilterStage::ServerType);
+    }
+    let Target::SecureCore {
+        entry_country,
+        exit_country,
+    } = target
+    else {
+        unreachable!("the caller routed a Secure Core target here");
+    };
+    let exit_miss = exit_country
+        .as_ref()
+        .is_some_and(|wanted| server.exit_country != *wanted);
+    let entry_miss = entry_country
+        .as_ref()
+        .is_some_and(|wanted| server.entry_country != *wanted);
+    let not_a_route = !server.is_secure_core_route();
+    (exit_miss || entry_miss || not_a_route).then_some(FilterStage::TargetGeography)
 }
 
 /// The physical-country exclusion stage (FR-23Q): exit country equals
@@ -939,6 +1091,29 @@ fn protocol_stage(server: &LogicalServer, constraints: &Constraints) -> Option<F
         .then_some(FilterStage::ProtocolCompatibility)
 }
 
+/// The Secure Core routing exclusions (FR-23C): the dedicated lists
+/// remove routes THROUGH an entry country / ENDING in an exit country.
+/// Only the routed target may carry them (validated up front), so this
+/// effectively charges Secure Core candidates alone.
+fn secure_core_exclusion_stage(
+    server: &LogicalServer,
+    constraints: &Constraints,
+) -> Option<FilterStage> {
+    if constraints
+        .excluded_entry_countries
+        .contains(&server.entry_country)
+    {
+        return Some(FilterStage::ExcludedEntryCountry);
+    }
+    if constraints
+        .excluded_exit_countries
+        .contains(&server.exit_country)
+    {
+        return Some(FilterStage::ExcludedExitCountry);
+    }
+    None
+}
+
 /// The first stage that eliminates this candidate, in FR-23P order.
 fn eliminating_stage(
     server: &LogicalServer,
@@ -949,6 +1124,7 @@ fn eliminating_stage(
         .or_else(|| target_stage(server, &request.target))
         .or_else(|| physical_country_stage(server, &request.constraints))
         .or_else(|| exclusion_stage(server, &request.constraints))
+        .or_else(|| secure_core_exclusion_stage(server, &request.constraints))
         .or_else(|| required_features_stage(server, &request.constraints, context))
         .or_else(|| protocol_stage(server, &request.constraints))
 }
@@ -985,14 +1161,26 @@ pub fn filter_candidates<'a>(
     context: &SelectionContext,
 ) -> Result<(Vec<&'a LogicalServer>, EliminationReport), SelectionError> {
     validate_request_countries(request)?;
+    // FR-23F: the Secure Core routing constraints (the dedicated
+    // entry/exit exclusion lists) express ROUTED exclusions only the
+    // secure-core target evaluates — on any other target they are
+    // incompatible options, refused here rather than silently ignored
+    // or repurposed as generic exclusions.
+    if !matches!(request.target, Target::SecureCore { .. })
+        && (!request.constraints.excluded_entry_countries.is_empty()
+            || !request.constraints.excluded_exit_countries.is_empty())
+    {
+        return Err(SelectionError::SecureCoreOnlyConstraints);
+    }
     // Codex PR#5 (P1): a Standard-fleet target plus the secure-core
     // feature constraint is unsatisfiable BY CONSTRUCTION — refuse at
     // validation with the typed contradiction instead of letting the
-    // pipeline produce its baffling all-stages-empty report. (Exact
-    // targets match identity before any fleet filtering, so an exact
-    // SC server name remains the working spelling until PR-3's
-    // routed target lands.)
+    // pipeline produce its baffling all-stages-empty report. The scope
+    // is Standard-fleet and exact targets only: under the routed
+    // Secure Core target the constraint is legal (the fleet IS Secure
+    // Core) and still evaluates against the catalog bit (T-4).
     if !request.target.is_exact()
+        && !matches!(request.target, Target::SecureCore { .. })
         && request
             .constraints
             .required_features
@@ -3170,5 +3358,360 @@ mod tests {
         assert_eq!(outcome.report.survivors(), ranked.len());
         assert_eq!(stage_count(&outcome.report, FilterStage::Offline), 1);
         assert_eq!(stage_count(&outcome.report, FilterStage::ExcludedCountry), 1);
+    }
+
+    // ------------------------------------------------------------------
+    // Slice 6 — routed Secure Core selection (M3 U4; T-11, FR-23A..F):
+    // the entry→exit pair over the Secure Core fleet. The target names
+    // each side (`None` = fastest / any eligible country); a logical's
+    // EntryCountry is the entry hop, its ExitCountry the exit, and the
+    // two always differ — the hop-through that defines Secure Core.
+    // ------------------------------------------------------------------
+
+    fn sc(entry: Option<&str>, exit: Option<&str>) -> Target {
+        Target::SecureCore {
+            entry_country: entry.map(str::to_owned),
+            exit_country: exit.map(str::to_owned),
+        }
+    }
+
+    /// The canonical route shape: a Secure Core bit and an entry that
+    /// differs from the exit.
+    fn route(name: &'static str, entry: &'static str, exit: &'static str) -> Spec {
+        Spec {
+            entry,
+            features: 1,
+            ..Spec::new(name, exit)
+        }
+    }
+
+    #[test]
+    fn secure_core_targets_the_secure_core_fleet_only() {
+        // FR-23A/FR-23L: the routed target addresses the Secure Core
+        // fleet — Standard logicals and gateways fall at the type
+        // stage, and a bit-marked logical that is not a route (entry
+        // == exit) is a fleet member that can serve NO pair.
+        let catalog = build_catalog(&[
+            route("CH-SE#1", "CH", "SE"),
+            Spec::new("GB#1", "GB"),
+            Spec {
+                gateway: Some("acme-corp"),
+                ..Spec::new("acme-corp#1", "SE")
+            },
+            Spec {
+                features: 1,
+                ..Spec::new("SE#9", "SE")
+            },
+        ]);
+        let (survivors, report) = filter_candidates(
+            &catalog,
+            &official(sc(None, None)),
+            &SelectionContext::default(),
+        )
+        .unwrap();
+        assert_eq!(names(&survivors), ["CH-SE#1"]);
+        assert_eq!(
+            stage_count(&report, FilterStage::ServerType),
+            2,
+            "Standard + gateway are other connection types"
+        );
+        assert_eq!(
+            stage_count(&report, FilterStage::TargetGeography),
+            1,
+            "bit-marked but entry == exit: fleet member, no routable pair"
+        );
+    }
+
+    #[test]
+    fn the_two_fleets_partition_the_non_gateway_catalog() {
+        // is_standard_fleet and is_secure_core_fleet are exact
+        // complements (mod gateways): no logical is orphaned from both
+        // fleets and none belongs to both — whatever marks a logical
+        // as non-Standard (the route shape or the catalog bit) is
+        // exactly what the Secure Core fleet claims.
+        let cases = [
+            (Spec::new("GB#1", "GB"), true, false), // plain Standard
+            (
+                Spec {
+                    entry: "CH",
+                    ..Spec::new("CH-SE#1", "SE")
+                },
+                false,
+                true,
+            ), // route shape, no bit
+            (
+                Spec {
+                    features: 1,
+                    ..Spec::new("SE#9", "SE")
+                },
+                false,
+                true,
+            ), // bit, no route
+            (route("IS-GB#1", "IS", "GB"), false, true), // both markings
+        ];
+        for (spec, standard, secure_core) in cases {
+            let catalog = build_catalog(&[spec]);
+            let server = &catalog.logical_servers[0];
+            assert_eq!(is_standard_fleet(server), standard, "{}", server.name);
+            assert_eq!(is_secure_core_fleet(server), secure_core, "{}", server.name);
+            assert_ne!(
+                standard, secure_core,
+                "{}: never both fleets, never neither",
+                server.name
+            );
+        }
+        let catalog = build_catalog(&[Spec {
+            gateway: Some("acme-corp"),
+            ..Spec::new("acme-corp#1", "SE")
+        }]);
+        let gateway = &catalog.logical_servers[0];
+        assert!(!is_standard_fleet(gateway) && !is_secure_core_fleet(gateway));
+    }
+
+    #[test]
+    fn secure_core_sides_pin_the_entry_exit_pair() {
+        // FR-23C: exit-country, entry-country, and both together — each
+        // side filters its own end of the route.
+        let catalog = build_catalog(&[
+            route("CH-SE#1", "CH", "SE"),
+            route("CH-GB#1", "CH", "GB"),
+            route("IS-SE#1", "IS", "SE"),
+        ]);
+        let (survivors, report) = filter_candidates(
+            &catalog,
+            &official(sc(Some("CH"), Some("GB"))),
+            &SelectionContext::default(),
+        )
+        .unwrap();
+        assert_eq!(names(&survivors), ["CH-GB#1"]);
+        assert_eq!(stage_count(&report, FilterStage::TargetGeography), 2);
+
+        let (survivors, _) = filter_candidates(
+            &catalog,
+            &official(sc(None, Some("GB"))),
+            &SelectionContext::default(),
+        )
+        .unwrap();
+        assert_eq!(names(&survivors), ["CH-GB#1"]);
+
+        let (survivors, _) = filter_candidates(
+            &catalog,
+            &official(sc(Some("IS"), None)),
+            &SelectionContext::default(),
+        )
+        .unwrap();
+        assert_eq!(names(&survivors), ["IS-SE#1"]);
+
+        // An exit side nothing satisfies: the structured FR-22 report —
+        // the Standard GB server is NOT offered as a fallback.
+        let catalog = build_catalog(&[route("CH-SE#1", "CH", "SE"), Spec::new("GB#1", "GB")]);
+        let err = select(
+            &catalog,
+            &official(sc(None, Some("GB"))),
+            &SelectionContext::default(),
+        )
+        .unwrap_err();
+        match &err {
+            SelectionError::ConstraintsNotSatisfied { report } => {
+                assert_eq!(stage_count(report, FilterStage::ServerType), 1);
+                assert_eq!(stage_count(report, FilterStage::TargetGeography), 1);
+                assert!(
+                    err.to_string().contains("no eligible server"),
+                    "the Display carries the accounting: {err}"
+                );
+            }
+            other => panic!("expected the FR-22 error, got {other}"),
+        }
+    }
+
+    #[test]
+    fn secure_core_entry_equals_exit_refuses_at_validation() {
+        // FR-23F: the same country on both sides contradicts the
+        // definition of Secure Core — a typed validation refusal, never
+        // the pipeline's all-stages-empty report.
+        let catalog = build_catalog(&[route("CH-SE#1", "CH", "SE")]);
+        let err = filter_candidates(
+            &catalog,
+            &official(sc(Some("CH"), Some("CH"))),
+            &SelectionContext::default(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            SelectionError::SecureCoreEntryEqualsExit {
+                country: "CH".to_owned()
+            }
+        );
+        let message = err.to_string();
+        assert!(
+            message.contains("FR-23F") && message.contains("CH"),
+            "the refusal names the country and cites the rule: {message}"
+        );
+    }
+
+    #[test]
+    fn excluded_entry_and_exit_countries_eliminate_their_sides() {
+        // FR-23C's dedicated exclusion lists: the entry list removes
+        // routes THROUGH a country, the exit list routes ENDING in one —
+        // each charged to its own stage in the exclusion family.
+        let catalog = build_catalog(&[
+            route("CH-SE#1", "CH", "SE"),
+            route("IS-SE#1", "IS", "SE"),
+            route("CH-GB#1", "CH", "GB"),
+        ]);
+        let mut request = official(sc(None, Some("SE")));
+        request.constraints.excluded_entry_countries = vec!["CH".into()];
+        let (survivors, report) =
+            filter_candidates(&catalog, &request, &SelectionContext::default()).unwrap();
+        assert_eq!(names(&survivors), ["IS-SE#1"]);
+        assert_eq!(stage_count(&report, FilterStage::ExcludedEntryCountry), 1);
+
+        let mut request = official(sc(None, None));
+        request.constraints.excluded_exit_countries = vec!["SE".into()];
+        let (survivors, report) =
+            filter_candidates(&catalog, &request, &SelectionContext::default()).unwrap();
+        assert_eq!(names(&survivors), ["CH-GB#1"]);
+        assert_eq!(stage_count(&report, FilterStage::ExcludedExitCountry), 2);
+    }
+
+    #[test]
+    fn generic_country_exclusions_apply_to_the_exit_under_secure_core() {
+        // The generic FR-21 list keeps one meaning under the routed
+        // target: the EXIT country is the canonical selector, so
+        // `--exclude-country` removes routes ending there (the
+        // dedicated entry list is the user's tool for the other side).
+        let catalog = build_catalog(&[route("CH-SE#1", "CH", "SE"), route("CH-GB#1", "CH", "GB")]);
+        let mut request = official(sc(None, None));
+        request.constraints.excluded_countries = vec!["SE".into()];
+        let (survivors, report) =
+            filter_candidates(&catalog, &request, &SelectionContext::default()).unwrap();
+        assert_eq!(names(&survivors), ["CH-GB#1"]);
+        assert_eq!(stage_count(&report, FilterStage::ExcludedCountry), 1);
+    }
+
+    #[test]
+    fn secure_core_routing_constraints_refuse_on_other_targets() {
+        // FR-23F: the entry/exit exclusion lists express ROUTED
+        // exclusions only the secure-core target evaluates. On any
+        // other target they are incompatible options — a typed
+        // refusal, never silently ignored, never repurposed as generic
+        // exclusions (exact server names included: the flags are the
+        // secure-core grammar's).
+        let catalog = build_catalog(&[Spec::new("GB#1", "GB")]);
+        let mut entry = official(Target::Fastest);
+        entry.constraints.excluded_entry_countries = vec!["US".into()];
+        assert_eq!(
+            filter_candidates(&catalog, &entry, &SelectionContext::default()).unwrap_err(),
+            SelectionError::SecureCoreOnlyConstraints
+        );
+        let mut exit = official(Target::Fastest);
+        exit.constraints.excluded_exit_countries = vec!["AU".into()];
+        assert_eq!(
+            filter_candidates(&catalog, &exit, &SelectionContext::default()).unwrap_err(),
+            SelectionError::SecureCoreOnlyConstraints
+        );
+        let mut exact = official(Target::Server("GB#1".into()));
+        exact.constraints.excluded_entry_countries = vec!["US".into()];
+        assert_eq!(
+            filter_candidates(&catalog, &exact, &SelectionContext::default()).unwrap_err(),
+            SelectionError::SecureCoreOnlyConstraints
+        );
+        assert!(
+            SelectionError::SecureCoreOnlyConstraints
+                .to_string()
+                .contains("FR-23F"),
+            "the refusal cites the rule"
+        );
+    }
+
+    #[test]
+    fn secure_core_country_inputs_must_be_canonical() {
+        // The matching discipline extends to both routed sides and both
+        // dedicated lists: uppercase ISO alpha-2, refused typed — the
+        // pure core never uppercases user input.
+        let catalog = build_catalog(&[route("CH-SE#1", "CH", "SE")]);
+        let err = filter_candidates(
+            &catalog,
+            &official(sc(Some("ch"), None)),
+            &SelectionContext::default(),
+        )
+        .unwrap_err();
+        assert_eq!(err, SelectionError::InvalidCountry("ch".to_owned()));
+        let err = filter_candidates(
+            &catalog,
+            &official(sc(None, Some("se"))),
+            &SelectionContext::default(),
+        )
+        .unwrap_err();
+        assert_eq!(err, SelectionError::InvalidCountry("se".to_owned()));
+
+        let mut request = official(sc(None, None));
+        request.constraints.excluded_entry_countries = vec!["usa".into()];
+        assert_eq!(
+            filter_candidates(&catalog, &request, &SelectionContext::default()).unwrap_err(),
+            SelectionError::InvalidCountry("usa".to_owned())
+        );
+    }
+
+    #[test]
+    fn physical_country_exclusion_composes_on_the_exit_side() {
+        // U1's FR-23Q rule composes unchanged with the routed target:
+        // the exit country is the canonical selector, so a route ENDING
+        // in the physical country is eliminated at the dedicated stage
+        // (the entry side has no physical-country composition in v1 —
+        // the dedicated entry exclusion list is the user's tool).
+        let catalog = build_catalog(&[route("CH-GB#1", "CH", "GB"), route("CH-SE#1", "CH", "SE")]);
+        let mut request = official(sc(None, None));
+        request.constraints.exclude_physical_country = true;
+        request.constraints.physical_country = Some("GB".into());
+        let (survivors, report) =
+            filter_candidates(&catalog, &request, &SelectionContext::default()).unwrap();
+        assert_eq!(names(&survivors), ["CH-SE#1"]);
+        assert_eq!(
+            stage_count(&report, FilterStage::PhysicalCountryExclusion),
+            1
+        );
+    }
+
+    #[test]
+    fn the_secure_core_feature_constraint_is_tautological_under_the_routed_target() {
+        // The Codex PR#5 contradiction is SCOPED to Standard-fleet
+        // targets: under the routed target the constraint is legal —
+        // and still evaluates against the catalog BIT (T-4), so a
+        // route-shaped logical without the marking falls at the
+        // feature stage, never silently passes.
+        let catalog = build_catalog(&[
+            route("CH-SE#1", "CH", "SE"),
+            Spec {
+                entry: "IS",
+                ..Spec::new("IS-SE#1", "SE")
+            },
+        ]);
+        let mut request = official(sc(None, None));
+        request.constraints.required_features = vec![FeatureConstraint::SecureCore];
+        let (survivors, report) =
+            filter_candidates(&catalog, &request, &SelectionContext::default()).unwrap();
+        assert_eq!(names(&survivors), ["CH-SE#1"]);
+        assert_eq!(stage_count(&report, FilterStage::RequiredFeatures), 1);
+    }
+
+    #[test]
+    fn secure_core_routes_compose_with_the_load_policy() {
+        // FR-23C's "lowest load" arm: the routed target under the load
+        // policy ranks the Secure Core fleet by Proton-exposed load.
+        let mut busy = route("CH-SE#1", "CH", "SE");
+        busy.load = Some(80);
+        let mut idle = route("IS-SE#1", "IS", "SE");
+        idle.load = Some(10);
+        let catalog = build_catalog(&[busy, idle]);
+        let mut request = official(sc(None, Some("SE")));
+        request.policy = RankingPolicy::LowestLoad;
+        let outcome = select(&catalog, &request, &SelectionContext::default()).unwrap();
+        let ranked: Vec<&str> = outcome
+            .ranked
+            .iter()
+            .map(|c| c.server.name.as_str())
+            .collect();
+        assert_eq!(ranked, ["IS-SE#1", "CH-SE#1"]);
     }
 }
