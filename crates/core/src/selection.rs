@@ -1942,10 +1942,7 @@ mod tests {
         request.constraints.required_features = vec![FeatureConstraint::SecureCore];
         let err = select(&catalog, &request, &SelectionContext::default()).unwrap_err();
         assert!(
-            matches!(
-                err,
-                SelectionError::StandardFleetFeatureContradiction
-            ),
+            matches!(err, SelectionError::StandardFleetFeatureContradiction),
             "the typed contradiction, got: {err}"
         );
         let message = err.to_string();
