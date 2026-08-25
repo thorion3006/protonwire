@@ -5,8 +5,8 @@
 //!
 //! FR-23I: `protonwire-core` owns ONE connection-group registry,
 //! generated and validated from `docs/connection-groups.yaml` by
-//! `cargo xtask groups-gen`. The generated data lives in
-//! [`registry`] (never hand-edited; `groups-gen --check` in
+//! `cargo xtask groups-gen`. The generated data lives in the private
+//! `registry` submodule (never hand-edited; `groups-gen --check` in
 //! `cargo xtask all` fails on drift, and generation itself refuses a
 //! document that fails the S13 golden-table validation). Consumers —
 //! CLI, TUI, GUI, the daemon, the wire — reach groups through this
