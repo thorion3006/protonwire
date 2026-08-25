@@ -61,11 +61,11 @@
 //! Exact server requests never silently fall back to another server
 //! (FR-23): an unmatchable, offline, or eliminated exact target is a
 //! typed error naming the server and the stage that refused it.
-//! City names compare ASCII-case-insensitively (user-typed prose
-//! against catalog casing); server and gateway names compare exactly.
-//! Country codes are ISO 3166-1 alpha-2 and must arrive uppercase —
-//! canonicalization is the calling surface's job, and this module
-//! refuses anything non-canonical rather than approximating.
+//! State and city names compare ASCII-case-insensitively (user-typed
+//! prose against catalog casing); server and gateway names compare
+//! exactly. Country codes are ISO 3166-1 alpha-2 and must arrive
+//! uppercase — canonicalization is the calling surface's job, and this
+//! module refuses anything non-canonical rather than approximating.
 //!
 //! Non-goal: NetShield level is a per-session feature REQUEST carried
 //! to the tunnel (PRD §11.4), never a server filter — this module has
