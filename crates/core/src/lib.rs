@@ -10,6 +10,7 @@
 pub mod error;
 pub mod redact;
 pub mod scheduler;
+pub mod selection;
 pub mod state;
 
 pub use error::CoreError;
