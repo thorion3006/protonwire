@@ -24,7 +24,7 @@
 //! ## Regional membership (FR-23N/O, T-30)
 //!
 //! The six `protonwire:fastest-*` groups target a primary UN M49
-//! region. Membership is the generated [`registry::COUNTRY_REGIONS`]
+//! region. Membership is the generated the generated `registry::COUNTRY_REGIONS` table
 //! table — country to exactly one continent, derived from the
 //! vendored, checksummed `resources/geo/un-m49.csv` (generation rides
 //! the `m49-verify` gate; runtime never parses the CSV). North America
@@ -188,7 +188,7 @@ pub enum GroupTarget {
         country: &'static str,
     },
     /// Fastest eligible target within one primary UN M49 region (U3;
-    /// membership from [`registry::COUNTRY_REGIONS`]).
+    /// membership from the generated `registry::COUNTRY_REGIONS` table).
     FastestInRegion {
         /// The primary region name (the taxonomy vocabulary).
         region: &'static str,
