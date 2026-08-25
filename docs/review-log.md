@@ -1378,3 +1378,9 @@ behavior-preserving scope, so they are recorded, not dispositioned:
    the current behavior IS the decision as written; the finding
    argues an exact-target exemption. A carve-out changes a frozen
    decision and is the owner's call to make or decline.
+   *(Resolution, post-close: the exemption was taken — `61e54db`,
+   red-first, OFFICIAL-only; decision 3 in docs/m3-plan.md now records
+   the exception inline so later stack PRs treat it as normative. The
+   round-2 tightening (`80e815a`) restricted the exemption to the
+   Official policy so it cannot bypass Balanced's weight validation or
+   Random's entropy requirement.)*

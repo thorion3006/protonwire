@@ -1201,6 +1201,22 @@ fn rank_balanced<'a>(
             let history_term = 0.0;
             let total =
                 load_term + latency_term + stability_term + feature_match_term + history_term;
+            // Codex PR#5 round 3 (P2): multiple large-but-finite
+            // weights pass `is_valid` yet their computed total can
+            // overflow to infinity — overflowed candidates then
+            // compare EQUAL (`inf == inf`) and fall through to the
+            // logical-ID tiebreaker instead of the requested weighted
+            // order. A non-finite computed term is a malformed weight
+            // set for THIS candidate pool: refuse typed, never
+            // mis-order.
+            if !total.is_finite() {
+                return Err(SelectionError::InvalidWeights(
+                    "the weighted total overflows to a non-finite value for at least one \
+                     candidate — the weight magnitudes cannot be ranked (the configuration \
+                     surface expects weights summing to approximately 1.0)"
+                        .to_owned(),
+                ));
+            }
             let signals = ScoringSignals {
                 proton_score: server.score,
                 load: server.load,
@@ -1214,9 +1230,9 @@ fn rank_balanced<'a>(
                     total,
                 }),
             };
-            RankedCandidate { server, signals }
+            Ok(RankedCandidate { server, signals })
         })
-        .collect();
+        .collect::<Result<Vec<RankedCandidate>, SelectionError>>()?;
     ranked.sort_by(|a, b| {
         let (Some(a_total), Some(b_total)) = (a.signals.weighted, b.signals.weighted) else {
             unreachable!("balanced always carries the breakdown")
@@ -1957,6 +1973,43 @@ mod tests {
         assert!(
             matches!(err, SelectionError::InvalidWeights { .. }),
             "the shortcut must not bypass weight validation: {err}"
+        );
+    }
+
+    /// Codex PR#5 round 3 (P2): large-but-finite weights pass
+    /// `is_valid` yet their computed total can overflow to infinity —
+    /// overflowed candidates then compare EQUAL and fall to the
+    /// logical-ID tiebreaker instead of the requested weighted order.
+    /// A non-finite computed total refuses typed.
+    #[test]
+    fn balanced_totals_that_overflow_refuse_rather_than_mis_order() {
+        // load 100/100 and a zero optional-match ratio saturate BOTH
+        // terms: f32::MAX + f32::MAX = +inf — the shape the old check
+        // let through to the id tiebreaker.
+        let mut uk1 = Spec::new("UK#1", "GB");
+        uk1.load = Some(100);
+        let mut gb2 = Spec::new("GB#2", "GB");
+        gb2.load = Some(100);
+        let catalog = build_catalog(&[uk1, gb2]);
+        let mut request = official(Target::Country("GB".into()));
+        // The servers lack Tor: the optional-match ratio is 0, so the
+        // feature term saturates too — MAX + MAX = inf.
+        request.constraints.optional_features = vec![FeatureConstraint::Tor];
+        request.policy = RankingPolicy::Balanced {
+            weights: WeightedSignals {
+                load: f32::MAX,
+                feature_match: f32::MAX,
+                ..WeightedSignals::DEFAULT_ZEROED
+            },
+        };
+        let err = select(&catalog, &request, &SelectionContext::default()).unwrap_err();
+        assert!(
+            matches!(err, SelectionError::InvalidWeights { .. }),
+            "an overflowing weight set must refuse, never mis-order: {err}"
+        );
+        assert!(
+            err.to_string().contains("non-finite"),
+            "the refusal names the overflow: {err}"
         );
     }
 

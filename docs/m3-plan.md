@@ -116,7 +116,14 @@ pinned underneath it.
    candidate lacking `Score` is a typed `official-score-unavailable`
    refusal naming the count and suggesting an eligible catalog refresh —
    never a silent substitution of the balanced model, never a silent
-   drop.
+   drop. *(Codex PR#5 round 1, folded into this decision: an EXACT
+   target with exactly ONE surviving candidate is exempt — identity is
+   the answer, no ranking decision exists, and the refusal governs
+   ordering a field of candidates, not a single match's eligibility.
+   The exemption is OFFICIAL-only by construction — every other policy
+   keeps its validation and data requirements. Later PRs treat this
+   section as normative: U6/U7 must not reintroduce the unconditional
+   refusal for the exact-single-candidate case.)*
 4. **Missing load under `load` and `balanced`.** A server without an
    exposed `Load` is excluded-with-structured-report (FR-22) under `load`,
    and excluded-with-report from `balanced`'s load term is impossible
