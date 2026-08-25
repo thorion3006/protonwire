@@ -112,6 +112,16 @@ fn generate_at(
         &golden,
     );
 
+    // Gate 1b — the S13 taxonomy pin (the verdict round's P2-1: the
+    // golden table covers only `groups`; a drifted `regional_taxonomy`
+    // passed BOTH gates and rewrote the registry, caught only by
+    // groups-validate elsewhere in `xtask all`. Standalone
+    // `groups-gen` now refuses the same drift itself).
+    let validation_doc: groups::GroupsFile = serde_norway::from_str(yaml_text)
+        .with_context(|| format!("failed to parse {}", yaml_path.display()))?;
+    let taxonomy = groups::check_taxonomy(&validation_doc);
+    reporter.rule("regional taxonomy passes the S13 pin", &taxonomy);
+
     // Gate 2 — m49-verify's row contract on the actual CSV bytes,
     // against the taxonomy the SAME document declares.
     let doc: GenFile = serde_norway::from_str(yaml_text)
@@ -125,7 +135,7 @@ fn generate_at(
         &outcome.violations,
     );
 
-    if !golden.is_empty() || !outcome.violations.is_empty() {
+    if !golden.is_empty() || !taxonomy.is_empty() || !outcome.violations.is_empty() {
         return Ok(reporter
             .finish("generation refused: the source documents failed their validation gates"));
     }

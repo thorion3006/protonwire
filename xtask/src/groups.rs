@@ -686,7 +686,7 @@ fn check_physical_country(doc: &GroupsFile) -> Vec<String> {
     violations
 }
 
-fn check_taxonomy(doc: &GroupsFile) -> Vec<String> {
+pub(crate) fn check_taxonomy(doc: &GroupsFile) -> Vec<String> {
     let mut violations = Vec::new();
     let Some(taxonomy) = &doc.regional_taxonomy else {
         return vec!["regional_taxonomy is missing".to_string()];

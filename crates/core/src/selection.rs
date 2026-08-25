@@ -1113,12 +1113,12 @@ pub fn select<'a>(
             RankingPolicy::Balanced { weights } => {
                 rank_balanced(candidates, *weights, request, context, &mut report)?
             }
-        }
-        RankingPolicy::Random => {
-            let entropy = context
-                .random_entropy
-                .ok_or(SelectionError::RandomEntropyRequired)?;
-            rank_random(candidates, entropy)
+            RankingPolicy::Random => {
+                let entropy = context
+                    .random_entropy
+                    .ok_or(SelectionError::RandomEntropyRequired)?;
+                rank_random(candidates, entropy)
+            }
         }
     };
     if ranked.is_empty() {
@@ -1226,12 +1226,7 @@ fn rank_random<'a>(candidates: Vec<&'a LogicalServer>, entropy: u64) -> Vec<Rank
         fisher_yates(&mut servers, &mut rng);
         ranked.extend(servers.into_iter().map(|server| RankedCandidate {
             server,
-            signals: ScoringSignals {
-                proton_score: server.score,
-                load: server.load,
-                latency: None,
-                weighted: None,
-            },
+            signals: ScoringSignals::catalog_only(server),
         }));
     }
     ranked
