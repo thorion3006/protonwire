@@ -430,7 +430,7 @@ pub(crate) struct PhysicalCountry {
 
 #[derive(Deserialize)]
 pub(crate) struct RegionalTaxonomy {
-    id: Option<String>,
+    pub(crate) id: Option<String>,
     pub(crate) vendored_snapshot: Option<VendoredSnapshot>,
     pub(crate) primary_regions: Option<BTreeMap<String, PrimaryRegion>>,
 }
@@ -449,7 +449,7 @@ pub(crate) struct PrimaryRegion {
 
 #[derive(Deserialize)]
 struct Group {
-    id: Option<String>,
+    pub(crate) id: Option<String>,
     definition_source: Option<String>,
     immutable: Option<bool>,
     ranking_policy: Option<String>,

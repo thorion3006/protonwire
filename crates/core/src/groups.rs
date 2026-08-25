@@ -41,6 +41,22 @@ use protonwire_store::catalog::CatalogDocument;
 
 mod registry;
 
+/// The registry document's own provenance stamp — which catalog
+/// revision produced the groups (PRD §7.3B; Codex PR#6, P2: consumers
+/// report the revision instead of guessing it from source keys).
+#[must_use]
+pub fn catalog_revision() -> &'static str {
+    registry::CATALOG_REVISION
+}
+
+/// The regional taxonomy's revision identity — the taxonomy id plus
+/// the vendored M49 snapshot's source date (PRD §7.3B's "taxonomy
+/// revision" arm).
+#[must_use]
+pub fn taxonomy_revision() -> &'static str {
+    registry::TAXONOMY_REVISION
+}
+
 /// Which ecosystem a group's behavior reproduces (FR-23J: `proton:*` is
 /// behavior reproduced from an official Proton selector or preset;
 /// `protonwire:*` is an added group).
@@ -625,6 +641,31 @@ mod tests {
             let entry = group(id).unwrap_or_else(|| panic!("`{id}` must resolve"));
             assert_eq!(entry.id, id);
         }
+    }
+
+    /// Codex PR#6 (P2), PRD §7.3B: the registry PRESERVES the source
+    /// document's provenance — the catalog revision and the taxonomy
+    /// revision are runtime-visible, so consumers report which
+    /// revision produced a group instead of guessing from source
+    /// keys. The freshness gate (`groups-gen --check` in `xtask all`)
+    /// pins the VALUES against the yaml: a revision change forces
+    /// regeneration or fails CI.
+    #[test]
+    fn the_registry_preserves_the_source_revisions() {
+        let catalog = catalog_revision();
+        let taxonomy = taxonomy_revision();
+        assert!(
+            !catalog.trim().is_empty(),
+            "the catalog revision must be carried, never elided"
+        );
+        assert!(
+            taxonomy.contains('@'),
+            "the taxonomy revision names the taxonomy id and its snapshot date: {taxonomy}"
+        );
+        assert!(
+            taxonomy.starts_with("un-m49-six-continent-view@"),
+            "the current taxonomy identity: {taxonomy}"
+        );
     }
 
     #[test]
