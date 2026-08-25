@@ -363,6 +363,35 @@ impl fmt::Display for FilterStage {
 }
 
 impl FilterStage {
+    /// The stages in evaluation order (FR-23P's hard-filter prefix,
+    /// then the policy stages). A candidate is charged to the FIRST
+    /// stage that eliminates it; the report renders in this order.
+    const ORDER: [FilterStage; 15] = [
+        FilterStage::UnknownStatus,
+        FilterStage::Offline,
+        FilterStage::AllPhysicalsOffline,
+        FilterStage::AbsentFromCatalog,
+        FilterStage::ServerType,
+        FilterStage::TargetGeography,
+        FilterStage::PhysicalCountryExclusion,
+        FilterStage::ExcludedCountry,
+        FilterStage::ExcludedState,
+        FilterStage::ExcludedCity,
+        FilterStage::ExcludedServer,
+        FilterStage::RequiredFeatures,
+        FilterStage::ProtocolCompatibility,
+        FilterStage::LoadNotExposed,
+        FilterStage::NoLatencyObservation,
+    ];
+
+    /// The stage's position in [`Self::ORDER`].
+    fn ordinal(self) -> usize {
+        Self::ORDER
+            .iter()
+            .position(|s| *s == self)
+            .expect("every stage is in ORDER")
+    }
+
     /// The stage's report label.
     fn label(self) -> &'static str {
         match self {
@@ -563,6 +592,311 @@ pub enum SelectionError {
     },
 }
 
+impl Target {
+    /// Whether this target names specific logicals (exact match, no
+    /// fallback per FR-23) rather than a filtered set.
+    fn is_exact(&self) -> bool {
+        matches!(self, Target::Server(_) | Target::Gateway(_))
+    }
+
+    /// The exact name, when [`Self::is_exact`].
+    fn exact_name(&self) -> Option<&str> {
+        match self {
+            Target::Server(name) | Target::Gateway(name) => Some(name),
+            _ => None,
+        }
+    }
+}
+
+/// ISO 3166-1 alpha-2, uppercase. Canonicalizing user input is the
+/// calling surface's job; the pure core refuses non-canonical input
+/// rather than approximating it (see the module docs).
+fn validate_country(code: &str) -> Result<(), SelectionError> {
+    if code.len() == 2 && code.bytes().all(|b| b.is_ascii_uppercase()) {
+        Ok(())
+    } else {
+        Err(SelectionError::InvalidCountry(code.to_owned()))
+    }
+}
+
+/// Validates every country input on the request (FR-20/FR-21/FR-23Q)
+/// before any candidate work.
+fn validate_request_countries(request: &SelectionRequest) -> Result<(), SelectionError> {
+    if let Target::Country(code) = &request.target {
+        validate_country(code)?;
+    }
+    for code in &request.constraints.excluded_countries {
+        validate_country(code)?;
+    }
+    if let Some(code) = &request.constraints.physical_country {
+        validate_country(code)?;
+    }
+    Ok(())
+}
+
+/// ASCII-case-insensitive equality for user-typed prose against
+/// catalog casing (non-ASCII bytes compare exactly — deterministic).
+fn eq_fold(value: Option<&str>, wanted: &str) -> bool {
+    value.is_some_and(|v| v.eq_ignore_ascii_case(wanted))
+}
+
+/// Whether the logical belongs to the Standard fleet for type-filtered
+/// targets (FR-23L: Fastest means the eligible Standard target; gateway
+/// and Secure Core are other connection types). Tor/P2P/streaming are
+/// Standard-fleet capabilities, not types.
+fn is_standard_fleet(server: &LogicalServer) -> bool {
+    !server.is_gateway() && !server.is_secure_core_route() && !server.features.secure_core()
+}
+
+/// The online-state stage: unknown is never online (FR-13B,
+/// fail-closed), offline is offline, and an online logical needs at
+/// least one online physical to be connectable.
+fn online_stage(server: &LogicalServer) -> Option<FilterStage> {
+    match server.status {
+        None => Some(FilterStage::UnknownStatus),
+        Some(0) => Some(FilterStage::Offline),
+        Some(1) => {
+            if server.servers.iter().any(|p| p.is_online()) {
+                None
+            } else {
+                Some(FilterStage::AllPhysicalsOffline)
+            }
+        }
+        // The S6 parse enforces the recorded 0/1 domain before any
+        // candidate is ever seen here.
+        _ => unreachable!("logical Status outside the recorded 0/1 domain"),
+    }
+}
+
+/// The target geography/type stage. Exact targets match identity here;
+/// filtered targets require the Standard fleet, then geography
+/// (FR-23L/FR-20). Host-country (smart routing) is reported metadata,
+/// never a match key — the exit country is the canonical selector.
+fn target_stage(server: &LogicalServer, target: &Target) -> Option<FilterStage> {
+    if let Target::Server(name) = target {
+        return (server.name != *name).then_some(FilterStage::TargetGeography);
+    }
+    if let Target::Gateway(name) = target {
+        return (server.gateway_name.as_deref() != Some(name.as_str()))
+            .then_some(FilterStage::TargetGeography);
+    }
+    if !is_standard_fleet(server) {
+        return Some(FilterStage::ServerType);
+    }
+    let miss = match target {
+        Target::Fastest => false,
+        Target::Country(code) => server.exit_country != *code,
+        Target::State(name) => !eq_fold(server.state.as_deref(), name),
+        Target::City(name) => !eq_fold(server.city.as_deref(), name),
+        Target::Server(_) | Target::Gateway(_) => unreachable!("handled above"),
+    };
+    miss.then_some(FilterStage::TargetGeography)
+}
+
+/// The physical-country exclusion stage (FR-23Q): exit country equals
+/// the known physical country.
+fn physical_country_stage(
+    server: &LogicalServer,
+    constraints: &Constraints,
+) -> Option<FilterStage> {
+    constraints
+        .exclude_physical_country
+        .then(|| {
+            constraints
+                .physical_country
+                .as_deref()
+                .filter(|cc| **cc == server.exit_country)
+                .map(|_| FilterStage::PhysicalCountryExclusion)
+        })
+        .flatten()
+}
+
+/// The explicit user exclusions (FR-21/FR-21A) — the same hard-filter
+/// stage as country exclusion, applied to Fastest too.
+fn exclusion_stage(server: &LogicalServer, constraints: &Constraints) -> Option<FilterStage> {
+    if constraints
+        .excluded_countries
+        .contains(&server.exit_country)
+    {
+        return Some(FilterStage::ExcludedCountry);
+    }
+    if constraints
+        .excluded_states
+        .iter()
+        .any(|name| eq_fold(server.state.as_deref(), name))
+    {
+        return Some(FilterStage::ExcludedState);
+    }
+    if constraints
+        .excluded_cities
+        .iter()
+        .any(|name| eq_fold(server.city.as_deref(), name))
+    {
+        return Some(FilterStage::ExcludedCity);
+    }
+    if constraints.excluded_servers.contains(&server.name) {
+        return Some(FilterStage::ExcludedServer);
+    }
+    None
+}
+
+/// Whether a catalog-exposed feature bit holds (T-4). Port forwarding
+/// has no catalog bit and is evaluated against the entitlement seam in
+/// [`required_features_stage`].
+fn catalog_feature_holds(server: &LogicalServer, feature: FeatureConstraint) -> bool {
+    match feature {
+        FeatureConstraint::P2p => server.features.p2p(),
+        FeatureConstraint::Tor => server.features.tor(),
+        FeatureConstraint::SecureCore => server.features.secure_core(),
+        FeatureConstraint::Streaming => server.features.streaming(),
+        FeatureConstraint::Ipv6 => server.features.ipv6(),
+        FeatureConstraint::PortForwarding => false,
+    }
+}
+
+/// The required-features stage (T-4/FR-23H). Port forwarding evaluates
+/// against the entitlement seam (`unwrap_or(false)` is fail-closed;
+/// the up-front composition check makes `None` unreachable here).
+fn required_features_stage(
+    server: &LogicalServer,
+    constraints: &Constraints,
+    context: &SelectionContext,
+) -> Option<FilterStage> {
+    constraints
+        .required_features
+        .iter()
+        .any(|feature| match feature {
+            FeatureConstraint::PortForwarding => !context.port_forwarding_entitled.unwrap_or(false),
+            other => !catalog_feature_holds(server, *other),
+        })
+        .then_some(FilterStage::RequiredFeatures)
+}
+
+/// Whether an online physical exposes the required protocol (the
+/// per-protocol presence map IS the support set per the S6 catalog
+/// contract; a legacy `EntryIP`-only physical proves nothing).
+fn protocol_holds(server: &LogicalServer, required: ProtocolConstraint) -> bool {
+    server.servers.iter().filter(|p| p.is_online()).any(|p| {
+        let Some(map) = p.entry_per_protocol.as_ref() else {
+            return false;
+        };
+        match required {
+            ProtocolConstraint::WireguardUdp => map.wireguard_udp.is_some(),
+            ProtocolConstraint::WireguardTcp => map.wireguard_tcp.is_some(),
+            ProtocolConstraint::Stealth => map.wireguard_tls.is_some(),
+        }
+    })
+}
+
+/// The protocol-compatibility stage (FR-23P's last core-owned filter).
+fn protocol_stage(server: &LogicalServer, constraints: &Constraints) -> Option<FilterStage> {
+    constraints
+        .required_protocol
+        .is_some_and(|required| !protocol_holds(server, required))
+        .then_some(FilterStage::ProtocolCompatibility)
+}
+
+/// The first stage that eliminates this candidate, in FR-23P order.
+fn eliminating_stage(
+    server: &LogicalServer,
+    request: &SelectionRequest,
+    context: &SelectionContext,
+) -> Option<FilterStage> {
+    online_stage(server)
+        .or_else(|| target_stage(server, &request.target))
+        .or_else(|| physical_country_stage(server, &request.constraints))
+        .or_else(|| exclusion_stage(server, &request.constraints))
+        .or_else(|| required_features_stage(server, &request.constraints, context))
+        .or_else(|| protocol_stage(server, &request.constraints))
+}
+
+/// Whether port forwarding appears in the required or optional set
+/// (either slot needs the entitlement composition before it can be
+/// evaluated — FR-23H).
+fn needs_port_forwarding_composition(request: &SelectionRequest) -> bool {
+    request
+        .constraints
+        .required_features
+        .iter()
+        .chain(request.constraints.optional_features.iter())
+        .any(|f| *f == FeatureConstraint::PortForwarding)
+}
+
+/// Runs the hard-filter pipeline over the whole catalog: the survivors
+/// plus FR-22's structured account of where every other candidate
+/// went. Pure; no ranking (that is [`select`]'s policy stage).
+///
+/// Errors before any candidate work for malformed country inputs
+/// ([`SelectionError::InvalidCountry`]), a country-excluding request
+/// with no known physical country ([`SelectionError::PhysicalCountryRequired`],
+/// FR-23Q), and a port-forwarding constraint without entitlement
+/// composition ([`SelectionError::RequiresEntitlementComposition`],
+/// FR-23H). An exact target reduced to nothing is
+/// [`SelectionError::ExactServerUnavailable`] naming the refusing
+/// stage — never a fallback (FR-23). A non-exact target reduced to
+/// nothing returns an empty survivor set with the report; [`select`]
+/// turns that into [`SelectionError::ConstraintsNotSatisfied`].
+pub fn filter_candidates<'a>(
+    catalog: &'a protonwire_store::catalog::CatalogDocument,
+    request: &SelectionRequest,
+    context: &SelectionContext,
+) -> Result<(Vec<&'a LogicalServer>, EliminationReport), SelectionError> {
+    validate_request_countries(request)?;
+    if request.constraints.exclude_physical_country
+        && request.constraints.physical_country.is_none()
+    {
+        return Err(SelectionError::PhysicalCountryRequired);
+    }
+    if needs_port_forwarding_composition(request) && context.port_forwarding_entitled.is_none() {
+        return Err(SelectionError::RequiresEntitlementComposition);
+    }
+
+    let mut counts = [0usize; FilterStage::ORDER.len()];
+    let mut survivors = Vec::new();
+    for server in &catalog.logical_servers {
+        match eliminating_stage(server, request, context) {
+            Some(stage) => counts[stage.ordinal()] += 1,
+            None => survivors.push(server),
+        }
+    }
+
+    if request.target.is_exact() && survivors.is_empty() {
+        // FR-23: never fall back. If the name matched nothing at all the
+        // reason is absence; otherwise the first eliminating stage the
+        // MATCHED server hit (skipping TargetGeography, which under an
+        // exact target only counts every OTHER server in the catalog).
+        let name = request.target.exact_name().unwrap_or_default().to_owned();
+        let matched = |server: &LogicalServer| match &request.target {
+            Target::Server(wanted) => server.name == *wanted,
+            Target::Gateway(wanted) => server.gateway_name.as_deref() == Some(wanted.as_str()),
+            _ => false,
+        };
+        let stage = if !catalog.logical_servers.iter().any(matched) {
+            FilterStage::AbsentFromCatalog
+        } else {
+            FilterStage::ORDER
+                .iter()
+                .find(|stage| {
+                    **stage != FilterStage::TargetGeography && counts[stage.ordinal()] > 0
+                })
+                .copied()
+                .expect("a matched-but-eliminated exact target has a nonzero eliminating stage")
+        };
+        return Err(SelectionError::ExactServerUnavailable { name, stage });
+    }
+
+    let report = EliminationReport {
+        considered: catalog.logical_servers.len(),
+        survivors: survivors.len(),
+        stages: FilterStage::ORDER
+            .iter()
+            .zip(counts)
+            .map(|(s, c)| (*s, c))
+            .collect(),
+    };
+    Ok((survivors, report))
+}
+
 /// Selects and ranks eligible servers from the cached catalog. Pure:
 /// no I/O, no network, no clock, no RNG. See the module docs for the
 /// stage order and the policy semantics.
@@ -571,10 +905,10 @@ pub fn select<'a>(
     _request: &SelectionRequest,
     _context: &SelectionContext,
 ) -> Result<SelectionOutcome<'a>, SelectionError> {
-    // Slices 2-3 of this PR implement the filter pipeline and the
-    // ranking policies; the parameters underscore until then so every
+    // Slice 3 of this PR implements the ranking policies over
+    // filter_candidates; the parameters underscore until then so every
     // intermediate commit gates clean.
-    todo!("slices 2-3")
+    todo!("slice 3")
 }
 
 #[cfg(test)]
@@ -709,5 +1043,690 @@ mod tests {
         }
         // Boundary control: 0.0 is legal (disables a signal).
         assert!(WeightedSignals::from_pairs(&pairs(&[("load", 0.0)])).is_ok());
+    }
+
+    // ------------------------------------------------------------------
+    // Slice 2 — the hard-filter pipeline and the exact match (T-2/T-3/
+    // T-4, FR-22). Everything drives filter_candidates over synthetic
+    // catalogs that parse against the recorded S6 contract.
+    // ------------------------------------------------------------------
+
+    /// A synthetic logical-server spec: everything the pipeline reads,
+    /// defaulted to an unremarkable online Standard server.
+    struct Spec {
+        name: &'static str,
+        entry: &'static str,
+        exit: &'static str,
+        tier: i8,
+        features: u64,
+        status: Option<i8>,
+        load: Option<i8>,
+        score: Option<f32>,
+        city: Option<&'static str>,
+        state: Option<&'static str>,
+        gateway: Option<&'static str>,
+        online_physicals: usize,
+        offline_physicals: usize,
+        protocols: Vec<&'static str>,
+        /// Append one extra OFFLINE physical carrying the full protocol
+        /// map (the "the map exists but only on a dead physical" case).
+        offline_physical_with_map: bool,
+    }
+
+    impl Spec {
+        fn new(name: &'static str, exit: &'static str) -> Self {
+            Self {
+                name,
+                entry: exit,
+                exit,
+                tier: 2,
+                features: 0,
+                status: Some(1),
+                load: Some(20),
+                score: Some(1.0),
+                city: None,
+                state: None,
+                gateway: None,
+                online_physicals: 1,
+                offline_physicals: 0,
+                protocols: vec!["wireguard_udp"],
+                offline_physical_with_map: false,
+            }
+        }
+
+        fn json(&self) -> String {
+            let mut fields = format!(
+                r#""ID":"id-{}","Name":"{}","EntryCountry":"{}","ExitCountry":"{}","Tier":{},"Features":{}"#,
+                self.name, self.name, self.entry, self.exit, self.tier, self.features
+            );
+            if let Some(status) = self.status {
+                fields.push_str(&format!(r#","Status":{status}"#));
+            }
+            if let Some(load) = self.load {
+                fields.push_str(&format!(r#","Load":{load}"#));
+            }
+            if let Some(score) = self.score {
+                fields.push_str(&format!(r#","Score":{score:?}"#));
+            }
+            if let Some(city) = self.city {
+                fields.push_str(&format!(r#","City":"{city}""#));
+            }
+            if let Some(state) = self.state {
+                fields.push_str(&format!(r#","State":"{state}""#));
+            }
+            if let Some(gateway) = self.gateway {
+                fields.push_str(&format!(r#","GatewayName":"{gateway}""#));
+            }
+            let protocol_map = |protocols: &[&str]| {
+                let map: Vec<String> = protocols
+                    .iter()
+                    .map(|protocol| {
+                        let field = match *protocol {
+                            "wireguard_udp" => "WireGuardUDP",
+                            "wireguard_tcp" => "WireGuardTCP",
+                            "stealth" => "WireGuardTLS",
+                            _ => panic!("unknown test protocol {protocol}"),
+                        };
+                        format!(r#""{field}":{{"IPv4":"192.0.2.1","Ports":[443]}}"#)
+                    })
+                    .collect();
+                if map.is_empty() {
+                    String::new()
+                } else {
+                    format!(r#","EntryPerProtocol":{{{}}}"#, map.join(","))
+                }
+            };
+            let mut physicals = Vec::new();
+            let total = self.online_physicals
+                + self.offline_physicals
+                + usize::from(self.offline_physical_with_map);
+            for index in 0..total {
+                let online = index < self.online_physicals;
+                // The protocol map rides the first ONLINE physical —
+                // unless the offline-with-map knob is set, in which case
+                // the map lives ONLY on the appended dead physical.
+                let map = if (index == 0 && online && !self.offline_physical_with_map)
+                    || (self.offline_physical_with_map && index == total - 1)
+                {
+                    protocol_map(&self.protocols)
+                } else {
+                    String::new()
+                };
+                let status = if online { 1 } else { 0 };
+                physicals.push(format!(
+                    r#"{{"Domain":"p{index}.example","Status":{status}{map}}}"#
+                ));
+            }
+            format!(r#"{{{fields},"Servers":[{}]}}"#, physicals.join(","))
+        }
+    }
+
+    fn build_catalog(specs: &[Spec]) -> protonwire_store::catalog::CatalogDocument {
+        let servers: Vec<String> = specs.iter().map(|s| s.json()).collect();
+        let body = format!(
+            r#"{{"Code":1000,"StatusID":"t","LogicalServers":[{}]}}"#,
+            servers.join(",")
+        );
+        protonwire_store::catalog::CatalogDocument::from_bytes(body.as_bytes())
+            .unwrap_or_else(|e| panic!("test catalog must parse against the S6 contract: {e}"))
+    }
+
+    fn official(target: Target) -> SelectionRequest {
+        SelectionRequest {
+            target,
+            policy: RankingPolicy::Official,
+            constraints: Constraints::default(),
+        }
+    }
+
+    fn stage_count(report: &EliminationReport, stage: FilterStage) -> usize {
+        report
+            .stages()
+            .iter()
+            .find(|(s, _)| *s == stage)
+            .map(|(_, count)| *count)
+            .expect("every stage appears in the report")
+    }
+
+    fn names<'a>(servers: &[&'a LogicalServer]) -> Vec<&'a str> {
+        servers.iter().map(|s| s.name.as_str()).collect()
+    }
+
+    #[test]
+    fn country_target_limits_to_that_country() {
+        // FR-20: a provided country limits selection to it.
+        let catalog = build_catalog(&[
+            Spec::new("GB#1", "GB"),
+            Spec::new("GB#2", "GB"),
+            Spec::new("US#1", "US"),
+        ]);
+        let (survivors, report) = filter_candidates(
+            &catalog,
+            &official(Target::Country("GB".into())),
+            &SelectionContext::default(),
+        )
+        .unwrap();
+        assert_eq!(names(&survivors), ["GB#1", "GB#2"]);
+        assert_eq!(stage_count(&report, FilterStage::TargetGeography), 1);
+        assert_eq!(report.considered(), 3);
+        assert_eq!(report.survivors(), 2);
+    }
+
+    #[test]
+    fn excluded_countries_are_never_selected_and_apply_to_fastest() {
+        // T-2/FR-21/FR-21A: exclusions are hard filters on the Fastest
+        // pool too.
+        let catalog = build_catalog(&[
+            Spec::new("GB#1", "GB"),
+            Spec::new("US#1", "US"),
+            Spec::new("AU#1", "AU"),
+        ]);
+        let mut request = official(Target::Fastest);
+        request.constraints.excluded_countries = vec!["US".into(), "AU".into()];
+        let (survivors, report) =
+            filter_candidates(&catalog, &request, &SelectionContext::default()).unwrap();
+        assert_eq!(names(&survivors), ["GB#1"]);
+        assert_eq!(stage_count(&report, FilterStage::ExcludedCountry), 2);
+    }
+
+    #[test]
+    fn the_fr23p_stage_order_charges_the_earliest_stage() {
+        // FR-23P's order is observable: a server that is BOTH offline
+        // and excluded counts as offline (online state precedes the
+        // exclusions); a country-target miss that is also excluded
+        // counts as a geography miss (geography precedes exclusions).
+        let catalog = build_catalog(&[
+            Spec::new("GB#1", "GB"), // right country, excluded -> ExcludedCountry
+            Spec {
+                status: Some(0),
+                ..Spec::new("US#1", "US")
+            }, // offline AND excluded -> Offline (online precedes exclusions)
+            Spec::new("DE#1", "DE"), // wrong country AND excluded -> TargetGeography
+            Spec::new("GB#2", "GB"), // right country, excluded -> ExcludedCountry
+        ]);
+        let mut request = official(Target::Country("GB".into()));
+        request.constraints.excluded_countries = vec!["US".into(), "DE".into(), "GB".into()];
+        let (survivors, report) =
+            filter_candidates(&catalog, &request, &SelectionContext::default()).unwrap();
+        assert!(survivors.is_empty());
+        assert_eq!(stage_count(&report, FilterStage::Offline), 1);
+        assert_eq!(stage_count(&report, FilterStage::TargetGeography), 1);
+        assert_eq!(stage_count(&report, FilterStage::ExcludedCountry), 2);
+    }
+
+    #[test]
+    fn excluded_states_cities_and_servers_are_enforced() {
+        // FR-21A: state/city/exact-server exclusions sit at the same
+        // hard-filter stage as countries.
+        let catalog = build_catalog(&[
+            Spec {
+                state: Some("California"),
+                ..Spec::new("US-CA#1", "US")
+            },
+            Spec {
+                city: Some("London"),
+                ..Spec::new("GB#1", "GB")
+            },
+            Spec {
+                city: Some("Manchester"),
+                ..Spec::new("GB#2", "GB")
+            },
+        ]);
+        let mut request = official(Target::Fastest);
+        request.constraints.excluded_states = vec!["California".into()];
+        request.constraints.excluded_cities = vec!["London".into()];
+        request.constraints.excluded_servers = vec!["GB#2".into()];
+        let (survivors, report) =
+            filter_candidates(&catalog, &request, &SelectionContext::default()).unwrap();
+        assert!(survivors.is_empty(), "every candidate is excluded");
+        assert_eq!(stage_count(&report, FilterStage::ExcludedState), 1);
+        assert_eq!(stage_count(&report, FilterStage::ExcludedCity), 1);
+        assert_eq!(stage_count(&report, FilterStage::ExcludedServer), 1);
+    }
+
+    #[test]
+    fn state_and_city_targets_match_case_insensitively() {
+        // User-typed prose against catalog casing: ASCII-folded
+        // equality, disclosed canonicalization (not approximation —
+        // no substring or prefix matching anywhere).
+        let catalog = build_catalog(&[
+            Spec {
+                state: Some("California"),
+                ..Spec::new("US-CA#1", "US")
+            },
+            Spec {
+                city: Some("London"),
+                ..Spec::new("GB#1", "GB")
+            },
+            Spec {
+                city: Some("Londonderry"),
+                ..Spec::new("GB#2", "GB")
+            },
+        ]);
+        let (survivors, _) = filter_candidates(
+            &catalog,
+            &official(Target::State("california".into())),
+            &SelectionContext::default(),
+        )
+        .unwrap();
+        assert_eq!(names(&survivors), ["US-CA#1"]);
+
+        let (survivors, _) = filter_candidates(
+            &catalog,
+            &official(Target::City("london".into())),
+            &SelectionContext::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            names(&survivors),
+            ["GB#1"],
+            "prefix/suffix names must not match: only exact folded equality"
+        );
+    }
+
+    #[test]
+    fn physical_country_exclusion_removes_only_that_country() {
+        // FR-23Q semantics as the core enforces them once GIVEN the
+        // country (the resolution precedence is PR-2's): exits in the
+        // physical country are eliminated at its dedicated stage.
+        let catalog = build_catalog(&[
+            Spec::new("GB#1", "GB"),
+            Spec::new("CH#1", "CH"),
+            Spec::new("GB#2", "GB"),
+        ]);
+        let mut request = official(Target::Fastest);
+        request.constraints.exclude_physical_country = true;
+        request.constraints.physical_country = Some("GB".into());
+        let (survivors, report) =
+            filter_candidates(&catalog, &request, &SelectionContext::default()).unwrap();
+        assert_eq!(names(&survivors), ["CH#1"]);
+        assert_eq!(
+            stage_count(&report, FilterStage::PhysicalCountryExclusion),
+            2
+        );
+    }
+
+    #[test]
+    fn country_exclusion_without_a_physical_country_refuses() {
+        // FR-23Q: it must not connect without the exclusion.
+        let catalog = build_catalog(&[Spec::new("GB#1", "GB")]);
+        let mut request = official(Target::Fastest);
+        request.constraints.exclude_physical_country = true;
+        let err = filter_candidates(&catalog, &request, &SelectionContext::default()).unwrap_err();
+        assert_eq!(err, SelectionError::PhysicalCountryRequired);
+    }
+
+    #[test]
+    fn non_canonical_country_inputs_are_refused() {
+        // Uppercase alpha-2 only; canonicalization belongs to the
+        // calling surface, not the pure core.
+        let catalog = build_catalog(&[Spec::new("GB#1", "GB")]);
+        for bad in ["gb", "USA", "G", "G1"] {
+            let err = filter_candidates(
+                &catalog,
+                &official(Target::Country(bad.into())),
+                &SelectionContext::default(),
+            )
+            .unwrap_err();
+            assert_eq!(err, SelectionError::InvalidCountry(bad.to_owned()));
+        }
+        let mut request = official(Target::Fastest);
+        request.constraints.excluded_countries = vec!["usa".into()];
+        let err = filter_candidates(&catalog, &request, &SelectionContext::default()).unwrap_err();
+        assert_eq!(err, SelectionError::InvalidCountry("usa".into()));
+    }
+
+    #[test]
+    fn unknown_status_is_excluded_fail_closed() {
+        // FR-13B: an absent status is UNKNOWN — never fabricated to
+        // online, never connectable.
+        let catalog = build_catalog(&[
+            Spec {
+                status: None,
+                ..Spec::new("GB#1", "GB")
+            },
+            Spec::new("GB#2", "GB"),
+        ]);
+        let (survivors, report) = filter_candidates(
+            &catalog,
+            &official(Target::Country("GB".into())),
+            &SelectionContext::default(),
+        )
+        .unwrap();
+        assert_eq!(names(&survivors), ["GB#2"]);
+        assert_eq!(stage_count(&report, FilterStage::UnknownStatus), 1);
+    }
+
+    #[test]
+    fn offline_logicals_and_dead_physical_sets_are_excluded() {
+        let catalog = build_catalog(&[
+            Spec {
+                status: Some(0),
+                ..Spec::new("GB#1", "GB")
+            },
+            Spec {
+                online_physicals: 0,
+                offline_physicals: 2,
+                ..Spec::new("GB#2", "GB")
+            },
+            Spec::new("GB#3", "GB"),
+        ]);
+        let (survivors, report) = filter_candidates(
+            &catalog,
+            &official(Target::Country("GB".into())),
+            &SelectionContext::default(),
+        )
+        .unwrap();
+        assert_eq!(names(&survivors), ["GB#3"]);
+        assert_eq!(stage_count(&report, FilterStage::Offline), 1);
+        assert_eq!(stage_count(&report, FilterStage::AllPhysicalsOffline), 1);
+    }
+
+    #[test]
+    fn fastest_targets_the_standard_fleet_only() {
+        // FR-23L: gateway and Secure Core logicals are other connection
+        // types; Fastest means the Standard target. Tor/P2P bits are
+        // Standard-fleet capabilities.
+        let catalog = build_catalog(&[
+            Spec::new("GB#1", "GB"),
+            Spec {
+                gateway: Some("acme-corp"),
+                ..Spec::new("acme-corp#1", "SE")
+            },
+            Spec {
+                entry: "CH",
+                features: 1, // Secure Core bit
+                ..Spec::new("CH-SE#1", "SE")
+            },
+            Spec {
+                features: 4 | 2, // P2P | Tor
+                ..Spec::new("NL#1", "NL")
+            },
+        ]);
+        let (survivors, report) = filter_candidates(
+            &catalog,
+            &official(Target::Fastest),
+            &SelectionContext::default(),
+        )
+        .unwrap();
+        assert_eq!(names(&survivors), ["GB#1", "NL#1"]);
+        assert_eq!(stage_count(&report, FilterStage::ServerType), 2);
+    }
+
+    #[test]
+    fn required_features_filter_on_the_catalog_bits() {
+        // T-4: p2p/tor/secure-core/streaming/ipv6 constraints.
+        let catalog = build_catalog(&[
+            Spec {
+                features: 4, // P2P
+                ..Spec::new("GB#1", "GB")
+            },
+            Spec {
+                features: 2, // Tor
+                ..Spec::new("GB#2", "GB")
+            },
+            Spec::new("GB#3", "GB"),
+        ]);
+        let mut request = official(Target::Fastest);
+        request.constraints.required_features = vec![FeatureConstraint::P2p];
+        let (survivors, report) =
+            filter_candidates(&catalog, &request, &SelectionContext::default()).unwrap();
+        assert_eq!(names(&survivors), ["GB#1"]);
+        assert_eq!(stage_count(&report, FilterStage::RequiredFeatures), 2);
+
+        // The whole catalog-bit family holds.
+        let mut request = official(Target::Fastest);
+        request.constraints.required_features = vec![FeatureConstraint::Tor];
+        let (survivors, _) =
+            filter_candidates(&catalog, &request, &SelectionContext::default()).unwrap();
+        assert_eq!(names(&survivors), ["GB#2"]);
+
+        let mut streaming = Spec::new("US#1", "US");
+        streaming.features = 8; // Streaming
+        let mut ipv6 = Spec::new("US#2", "US");
+        ipv6.features = 16; // IPv6
+        let catalog = build_catalog(&[streaming, ipv6]);
+        let mut request = official(Target::Fastest);
+        request.constraints.required_features =
+            vec![FeatureConstraint::Streaming, FeatureConstraint::Ipv6];
+        let (survivors, report) =
+            filter_candidates(&catalog, &request, &SelectionContext::default()).unwrap();
+        assert!(survivors.is_empty(), "no single server carries both bits");
+        assert_eq!(stage_count(&report, FilterStage::RequiredFeatures), 2);
+    }
+
+    #[test]
+    fn port_forwarding_requires_entitlement_composition() {
+        // FR-23H: no catalog field exists upstream; the constraint
+        // refuses typed until the daemon composes S8 entitlement — in
+        // the required AND the optional slot (the optional one feeds
+        // scoring, so it cannot be silently ignored either).
+        let catalog = build_catalog(&[Spec::new("GB#1", "GB")]);
+        let mut required = official(Target::Fastest);
+        required.constraints.required_features = vec![FeatureConstraint::PortForwarding];
+        let err = filter_candidates(&catalog, &required, &SelectionContext::default()).unwrap_err();
+        assert_eq!(err, SelectionError::RequiresEntitlementComposition);
+
+        let mut optional = official(Target::Fastest);
+        optional.constraints.optional_features = vec![FeatureConstraint::PortForwarding];
+        let err = filter_candidates(&catalog, &optional, &SelectionContext::default()).unwrap_err();
+        assert_eq!(err, SelectionError::RequiresEntitlementComposition);
+
+        // Composed false: every candidate fails the feature stage; the
+        // report says so (FR-22, not a bare refusal).
+        let context = SelectionContext {
+            port_forwarding_entitled: Some(false),
+            ..SelectionContext::default()
+        };
+        let (survivors, report) = filter_candidates(&catalog, &required, &context).unwrap();
+        assert!(survivors.is_empty());
+        assert_eq!(stage_count(&report, FilterStage::RequiredFeatures), 1);
+
+        // Composed true: the constraint passes (support itself derives
+        // from the entitlement composition, never from a catalog bit).
+        let context = SelectionContext {
+            port_forwarding_entitled: Some(true),
+            ..SelectionContext::default()
+        };
+        let (survivors, _) = filter_candidates(&catalog, &required, &context).unwrap();
+        assert_eq!(names(&survivors), ["GB#1"]);
+    }
+
+    #[test]
+    fn protocol_compatibility_uses_online_physical_presence() {
+        // The per-protocol map IS the support set (S6): a physical with
+        // no map (the legacy EntryIP-only shape) proves nothing, and a
+        // map that exists only on an OFFLINE physical does not save the
+        // candidate.
+        let mut legacy = Spec::new("GB#1", "GB");
+        legacy.protocols = Vec::new(); // no per-protocol map at all
+        let mut stealth = Spec::new("GB#2", "GB");
+        stealth.protocols = vec!["stealth"];
+        let mut both = Spec::new("GB#3", "GB");
+        both.protocols = vec!["wireguard_udp", "wireguard_tcp", "stealth"];
+        let mut dead_map = Spec::new("GB#4", "GB");
+        dead_map.protocols = vec!["wireguard_tcp"];
+        dead_map.offline_physical_with_map = true; // the only map is on a dead physical
+        let catalog = build_catalog(&[legacy, stealth, both, dead_map]);
+
+        let mut request = official(Target::Fastest);
+        request.constraints.required_protocol = Some(ProtocolConstraint::WireguardTcp);
+        let (survivors, report) =
+            filter_candidates(&catalog, &request, &SelectionContext::default()).unwrap();
+        assert_eq!(names(&survivors), ["GB#3"]);
+        assert_eq!(stage_count(&report, FilterStage::ProtocolCompatibility), 3);
+
+        let mut request = official(Target::Fastest);
+        request.constraints.required_protocol = Some(ProtocolConstraint::Stealth);
+        let (survivors, _) =
+            filter_candidates(&catalog, &request, &SelectionContext::default()).unwrap();
+        assert_eq!(
+            names(&survivors),
+            ["GB#2", "GB#3"],
+            "Stealth maps to the catalog's WireGuardTLS presence"
+        );
+    }
+
+    #[test]
+    fn exact_server_selects_that_server() {
+        // T-3/FR-23: the exact name — and only it.
+        let catalog = build_catalog(&[
+            Spec::new("UK#42", "GB"),
+            Spec::new("UK#43", "GB"),
+            Spec::new("GB#1", "GB"),
+        ]);
+        let (survivors, report) = filter_candidates(
+            &catalog,
+            &official(Target::Server("UK#42".into())),
+            &SelectionContext::default(),
+        )
+        .unwrap();
+        assert_eq!(names(&survivors), ["UK#42"]);
+        assert_eq!(stage_count(&report, FilterStage::TargetGeography), 2);
+    }
+
+    #[test]
+    fn exact_server_absent_never_falls_back() {
+        // FR-23: no silent substitution of another server.
+        let catalog = build_catalog(&[Spec::new("UK#42", "GB"), Spec::new("GB#1", "GB")]);
+        let err = filter_candidates(
+            &catalog,
+            &official(Target::Server("UK#99".into())),
+            &SelectionContext::default(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            SelectionError::ExactServerUnavailable {
+                name: "UK#99".into(),
+                stage: FilterStage::AbsentFromCatalog,
+            }
+        );
+        let message = err.to_string();
+        assert!(
+            message.contains("UK#99") && message.contains("FR-23"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn exact_server_offline_never_falls_back() {
+        // The name matches but the server is unusable: name the stage.
+        let catalog = build_catalog(&[
+            Spec {
+                status: Some(0),
+                ..Spec::new("UK#42", "GB")
+            },
+            Spec::new("GB#1", "GB"),
+        ]);
+        let err = filter_candidates(
+            &catalog,
+            &official(Target::Server("UK#42".into())),
+            &SelectionContext::default(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            SelectionError::ExactServerUnavailable {
+                name: "UK#42".into(),
+                stage: FilterStage::Offline,
+            }
+        );
+    }
+
+    #[test]
+    fn exact_matching_covers_special_name_forms() {
+        // Secure Core `CH-SE#1` and gateway `acme-corp#1` are logical
+        // names: exact matching serves them without the Standard-type
+        // filter (the routed-Secure-Core TARGET is this milestone's
+        // PR-3; the NAME resolves today).
+        let mut secure_core = Spec::new("CH-SE#1", "SE");
+        secure_core.entry = "CH";
+        secure_core.features = 1;
+        let mut gateway = Spec::new("acme-corp#1", "SE");
+        gateway.gateway = Some("acme-corp");
+        let catalog = build_catalog(&[secure_core, gateway, Spec::new("GB#1", "GB")]);
+
+        let (survivors, _) = filter_candidates(
+            &catalog,
+            &official(Target::Server("CH-SE#1".into())),
+            &SelectionContext::default(),
+        )
+        .unwrap();
+        assert_eq!(names(&survivors), ["CH-SE#1"]);
+
+        let (survivors, _) = filter_candidates(
+            &catalog,
+            &official(Target::Server("acme-corp#1".into())),
+            &SelectionContext::default(),
+        )
+        .unwrap();
+        assert_eq!(names(&survivors), ["acme-corp#1"]);
+
+        // The gateway TARGET form matches the fleet identity.
+        let (survivors, _) = filter_candidates(
+            &catalog,
+            &official(Target::Gateway("acme-corp".into())),
+            &SelectionContext::default(),
+        )
+        .unwrap();
+        assert_eq!(names(&survivors), ["acme-corp#1"]);
+
+        let err = filter_candidates(
+            &catalog,
+            &official(Target::Gateway("other-corp".into())),
+            &SelectionContext::default(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            SelectionError::ExactServerUnavailable {
+                name: "other-corp".into(),
+                stage: FilterStage::AbsentFromCatalog,
+            }
+        );
+    }
+
+    #[test]
+    fn the_report_accounts_for_every_candidate() {
+        // FR-22: considered == survivors + the sum of every stage count.
+        let catalog = build_catalog(&[
+            Spec {
+                features: 4, // P2P — the survivor
+                ..Spec::new("GB#1", "GB")
+            },
+            Spec {
+                status: Some(0),
+                ..Spec::new("US#1", "US")
+            },
+            Spec {
+                gateway: Some("acme-corp"),
+                ..Spec::new("acme-corp#1", "SE")
+            },
+            Spec {
+                features: 4,
+                ..Spec::new("DE#1", "DE")
+            },
+        ]);
+        let mut request = official(Target::Fastest);
+        request.constraints.excluded_countries = vec!["DE".into()];
+        request.constraints.required_features = vec![FeatureConstraint::P2p];
+        let (survivors, report) =
+            filter_candidates(&catalog, &request, &SelectionContext::default()).unwrap();
+        assert_eq!(names(&survivors), ["GB#1"]);
+        let eliminated: usize = report.stages().iter().map(|(_, count)| count).sum();
+        assert_eq!(
+            report.considered(),
+            report.survivors() + eliminated,
+            "every candidate is accounted for exactly once"
+        );
+        assert_eq!(stage_count(&report, FilterStage::Offline), 1);
+        assert_eq!(stage_count(&report, FilterStage::ServerType), 1);
+        assert_eq!(stage_count(&report, FilterStage::ExcludedCountry), 1);
+        let rendered = report.to_string();
+        assert!(
+            rendered.contains("4 considered, 1 survivors") && rendered.contains("1 offline"),
+            "the Display carries the accounting: {rendered}"
+        );
     }
 }
