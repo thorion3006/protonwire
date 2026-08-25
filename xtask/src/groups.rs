@@ -768,7 +768,7 @@ fn render_group_entry(entry: &serde_json::Value) -> String {
 /// structural rules it does NOT subsume (id set, namespaces, target-kind
 /// vocabulary, per-kind required fields, cross-references into
 /// contract/sources/taxonomy) stay in `check_groups`/`check_target`.
-fn check_golden_groups_table(raw: &serde_json::Value) -> Vec<String> {
+pub(crate) fn check_golden_groups_table(raw: &serde_json::Value) -> Vec<String> {
     let Some(entries) = raw.get("groups").and_then(serde_json::Value::as_array) else {
         // The `groups` structural rule already reports the missing list.
         return Vec::new();

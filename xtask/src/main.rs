@@ -12,6 +12,7 @@
 
 mod deps;
 mod groups;
+mod groups_gen;
 mod license;
 mod m49;
 mod manifest;
@@ -30,6 +31,7 @@ subcommands:
   manifest-validate      validate docs/official-parity.yaml (parity manifest contract, T-19)
   groups-validate        validate docs/connection-groups.yaml (connection-groups contract)
   m49-verify             verify resources/geo/un-m49.csv against docs/connection-groups.yaml
+  groups-gen [--check]   regenerate (or check) crates/core/src/groups/registry.rs (FR-23I)
   dep-graph              enforce monorepo dependency rules (forbidden edges, lockfiles, wildcards)
   schema-gen [--check]   regenerate (or check) JSON Schemas from protonwire-frontend-api
   license-scan           license inventory: unlicensed-baseline drift + GPL-3 compatibility (NFR-35)
@@ -57,6 +59,17 @@ fn run(args: &[String]) -> Result<bool> {
         Some("manifest-validate") => manifest::run(&root),
         Some("groups-validate") => groups::run(&root),
         Some("m49-verify") => m49::run(&root),
+        Some("groups-gen") => {
+            let rest = &args[1..];
+            match rest.first().map(String::as_str) {
+                None => groups_gen::run(&root, false),
+                Some("--check") if rest.len() == 1 => groups_gen::run(&root, true),
+                _ => Err(anyhow!(
+                    "unexpected groups-gen arguments: {}",
+                    rest.join(" ")
+                )),
+            }
+        }
         Some("dep-graph") => deps::run(&root),
         Some("schema-gen") => {
             let rest = &args[1..];
@@ -84,6 +97,7 @@ fn run(args: &[String]) -> Result<bool> {
             ok &= manifest::run(&root)?;
             ok &= groups::run(&root)?;
             ok &= m49::run(&root)?;
+            ok &= groups_gen::run(&root, true)?;
             ok &= deps::run(&root)?;
             ok &= license::run(&root)?;
             ok &= schema_gen::run(&root, true)?;
