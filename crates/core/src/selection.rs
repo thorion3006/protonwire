@@ -2385,4 +2385,198 @@ mod tests {
         }
         assert_eq!(ranked_names(&first), ranked_names(&second));
     }
+
+    // ------------------------------------------------------------------
+    // Slice 4 — the 20k synthetic benchmark (the M3 normative exit:
+    // selection <= 500 ms on 20k synthetic servers). Plan decision 1:
+    // 20k servers = 5,000 logicals x 4 physicals each, inside the
+    // landed S6 caps (16,384 logicals / 262,144 physicals — a 20k
+    // LOGICAL fixture is unrepresentable). Deterministic generation:
+    // a fixed-seed LCG, no wall clock, no RNG dependency.
+    // ------------------------------------------------------------------
+
+    /// A deterministic LCG with a splitmix64 output mix (test fixture
+    /// generation only — never product randomness; the scheduler's
+    /// jitter uses the OS CSPRNG). The mix matters: a raw LCG's low
+    /// bits have tiny periods (bit 0 alternates every call), which
+    /// bit-biased a first draft of this fixture into setting the
+    /// Secure Core feature on 100% of "standard" logicals.
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn next_u64(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            z ^ (z >> 31)
+        }
+
+        fn below(&mut self, bound: u64) -> u64 {
+            self.next_u64() % bound
+        }
+    }
+
+    const BENCH_COUNTRIES: &[&str] = &[
+        "AT", "BE", "BG", "CH", "CZ", "DE", "DK", "EE", "ES", "FI", "FR", "GB", "HR", "HU", "IE",
+        "IS", "IT", "LT", "LU", "LV", "NL", "NO", "PL", "PT", "RO", "SE", "SI", "SK", "US", "CA",
+        "MX", "BR", "AR", "CL", "CO", "AU", "NZ", "JP", "KR", "SG", "HK", "IN", "ID", "ZA", "AE",
+        "IL", "TR",
+    ];
+
+    const BENCH_LOGICALS: usize = 5_000;
+    const BENCH_PHYSICALS_EACH: usize = 4;
+
+    /// Builds the 20k-server catalog document (5,000 logicals x 4
+    /// physicals = 20,000 server entries): mixed countries, tiers,
+    /// feature bits, protocols, 90/5/5 online/offline/unknown logical
+    /// statuses, 90% exposed loads (10% absent — real LoadNotExposed
+    /// work), scores on every logical, ~2% gateways and ~5%
+    /// Secure-Core-shaped entries.
+    fn synthetic_catalog_20k() -> String {
+        let mut rng = Lcg(0x5EED_2026_0825);
+        let mut doc = String::with_capacity(8 << 20);
+        doc.push_str(r#"{"Code":1000,"StatusID":"bench","LogicalServers":["#);
+        for index in 0..BENCH_LOGICALS {
+            if index > 0 {
+                doc.push(',');
+            }
+            let exit = BENCH_COUNTRIES[rng.below(BENCH_COUNTRIES.len() as u64) as usize];
+            let kind = rng.below(100);
+            let (name, entry, gateway, mut features) = if kind < 2 {
+                // Gateway logical.
+                (
+                    format!("bench-gw-{index}#1"),
+                    exit.to_owned(),
+                    format!("bench-gw-{index}"),
+                    0u64,
+                )
+            } else if kind < 7 {
+                // Secure-Core-shaped logical (entry differs from exit).
+                let mut entry_index = rng.below(BENCH_COUNTRIES.len() as u64 - 1) as usize + 1; // 1..len
+                if BENCH_COUNTRIES[entry_index] == exit {
+                    entry_index = 0;
+                }
+                (
+                    format!("{}-{exit}#{index}", BENCH_COUNTRIES[entry_index]),
+                    BENCH_COUNTRIES[entry_index].to_owned(),
+                    String::new(),
+                    1u64,
+                )
+            } else {
+                // Standard logical: non-SC capability bits only — a
+                // logical carrying the Secure Core bit IS a Secure Core
+                // server, not a standard one with noise.
+                (
+                    format!("{exit}#{index}"),
+                    exit.to_owned(),
+                    String::new(),
+                    rng.below(32) << 1,
+                )
+            };
+            features |= rng.below(4) & !1; // extra capability bits, SC bit never
+            let tier = rng.below(4);
+            let mut fields = format!(
+                r#""ID":"bench-id-{index}","Name":"{name}","EntryCountry":"{entry}","ExitCountry":"{exit}","Tier":{tier},"Features":{features}"#
+            );
+            let status_roll = rng.below(100);
+            if status_roll < 90 {
+                fields.push_str(",\"Status\":1");
+            } else if status_roll < 95 {
+                fields.push_str(",\"Status\":0");
+            } // else: absent — unknown status, fail-closed at the filter
+            if rng.below(100) < 90 {
+                fields.push_str(&format!(",\"Load\":{}", rng.below(101)));
+            }
+            fields.push_str(&format!(
+                ",\"Score\":{:.3}",
+                rng.below(10_000) as f32 / 1000.0
+            ));
+            if !gateway.is_empty() {
+                fields.push_str(&format!(",\"GatewayName\":\"{gateway}\""));
+            }
+            let mut physicals = Vec::with_capacity(BENCH_PHYSICALS_EACH);
+            for physical in 0..BENCH_PHYSICALS_EACH {
+                let online = rng.below(100) < 90;
+                let status = if online { 1 } else { 0 };
+                let mut entry_json =
+                    format!(r#""Domain":"b{index}-{physical}.example","Status":{status}"#);
+                if online && rng.below(100) < 80 {
+                    let protocols = match rng.below(3) {
+                        0 => r#""WireGuardUDP":{"IPv4":"192.0.2.1","Ports":[443]}"#.to_owned(),
+                        1 => r#""WireGuardUDP":{"IPv4":"192.0.2.1","Ports":[443]},"WireGuardTCP":{"IPv4":"192.0.2.1","Ports":[443]}"#.to_owned(),
+                        _ => r#""WireGuardUDP":{"IPv4":"192.0.2.1","Ports":[443]},"WireGuardTLS":{"IPv4":"192.0.2.1","Ports":[443]}"#.to_owned(),
+                    };
+                    entry_json.push_str(&format!(r#","EntryPerProtocol":{{{protocols}}}"#));
+                }
+                physicals.push(format!("{{{entry_json}}}"));
+            }
+            doc.push_str(&format!(
+                r#"{{{fields},"Servers":[{}]}}"#,
+                physicals.join(",")
+            ));
+        }
+        doc.push_str("]}");
+        doc
+    }
+
+    #[test]
+    fn selection_pipeline_on_20k_synthetic_servers_within_500ms() {
+        // The M3 normative exit, as a real wall-clock assert on the
+        // FULL pipeline (strict parse of the raw bytes + hard filters +
+        // a load-weighted balanced ranking + the report). Margin
+        // disclosure: the assert IS the normative 500 ms bar with no
+        // inflation; the measured headroom on this runner is printed
+        // under --nocapture and must stay generous, not sit at the bar.
+        let body = synthetic_catalog_20k();
+        let started = std::time::Instant::now();
+        let catalog = protonwire_store::catalog::CatalogDocument::from_bytes(body.as_bytes())
+            .expect("the synthetic 20k document must parse against the S6 contract");
+        let parsed_after = started.elapsed();
+        let request = SelectionRequest {
+            target: Target::Fastest,
+            policy: RankingPolicy::Balanced {
+                weights: WeightedSignals {
+                    load: 1.0,
+                    ..WeightedSignals::DEFAULT_ZEROED
+                },
+            },
+            constraints: Constraints::default(),
+        };
+        let outcome = select(&catalog, &request, &SelectionContext::default())
+            .expect("the synthetic fleet must yield ranked candidates");
+        let total = started.elapsed();
+
+        // Shape pins: 20,000 server entries, 5,000 logicals, and a
+        // non-trivial surviving set (the filters and the LoadNotExposed
+        // policy stage both did real work).
+        let physicals: usize = catalog
+            .logical_servers
+            .iter()
+            .map(|s| s.servers.len())
+            .sum();
+        assert_eq!(catalog.logical_servers.len(), BENCH_LOGICALS);
+        assert_eq!(physicals, 20_000, "5,000 x 4 = 20k total server entries");
+        assert_eq!(outcome.report.considered(), BENCH_LOGICALS);
+        assert!(
+            !outcome.ranked.is_empty() && outcome.ranked.len() > 1_000,
+            "an implausibly small survivor set would void the measurement: {}",
+            outcome.ranked.len()
+        );
+
+        eprintln!(
+            "20k benchmark: parse {:?}, select {:?}, total {:?} (bar: 500ms)",
+            parsed_after,
+            total - parsed_after,
+            total
+        );
+        assert!(
+            total <= Duration::from_millis(500),
+            "selection pipeline on 20k synthetic servers took {total:?} (parse {parsed_after:?}); \
+             the M3 exit bar is 500 ms"
+        );
+    }
 }
