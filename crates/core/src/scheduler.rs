@@ -502,9 +502,17 @@ pub struct SchedulerDiagnostics {
     pub next_eligible_source: Option<IntervalSource>,
     /// Active suppression deadline, if any.
     pub suppression_until_unix: Option<u64>,
-    /// Completed automatic refreshes (separately counted, FR-13I).
+    /// Completed automatic refreshes through the AUTOMATIC door
+    /// (separately counted, FR-13I): every completed automatic-path
+    /// refresh, whether due-window or coalesced-lead — a DOOR counter,
+    /// not a confirmed-override counter (the S7 review's adjudicated
+    /// semantics; the leader's kind owns the increment).
     pub automatic_refresh_count: u64,
-    /// Completed confirmed manual overrides (separately counted).
+    /// Completed refreshes through the MANUAL door (separately
+    /// counted, FR-13I): every completed manual-path refresh — due
+    /// (no ceremony needed) or confirmed early override alike — a
+    /// DOOR counter, not a confirmed-override counter (same
+    /// adjudication as [`Self::automatic_refresh_count`]).
     pub manual_refresh_count: u64,
     /// Whether a wall-clock rollback was ever detected this run.
     pub clock_rollback_detected: bool,
@@ -559,6 +567,16 @@ struct Inner {
     /// successful fetches write the new revision through it (FR-10/
     /// FR-13B/FR-13E). `None` for test-only schedulers.
     cache: Option<CacheState>,
+    /// Whether the deadline store is currently accepting writes. Set
+    /// false by ANY save failure (pre- or post-fetch); while false, the
+    /// next lead first RETRIES a bare save of the current state — if it
+    /// succeeds the flag clears and the refresh proceeds; if not, the
+    /// refresh is refused without contacting the upstream (Codex PR#4
+    /// round 3, P2: a Retry-After longer than the floor that only
+    /// exists in memory must not be silently lost to a restart — the
+    /// process refuses further upstream contact until its suppression
+    /// state is durably recorded).
+    persistence_healthy: bool,
 }
 
 /// The confirmation-token mint source (see
@@ -661,6 +679,7 @@ impl Scheduler {
                 rollback: RollbackTracker::default(),
                 minter: MintSource::default(),
                 cache,
+                persistence_healthy: true,
             }),
             cv: std::sync::Condvar::new(),
         }
@@ -921,6 +940,17 @@ impl Scheduler {
         guard.persisted.next_eligible_unix
     }
 
+    /// Test-only: the persistence-health flag's current state (the
+    /// degraded-state observable; the refusal behavior itself is pinned
+    /// end-to-end by the unwritable-store tests).
+    #[cfg(test)]
+    pub(crate) fn persistence_healthy_for_tests(&self) -> bool {
+        self.inner
+            .lock()
+            .expect("scheduler lock")
+            .persistence_healthy
+    }
+
     /// Mints one fresh confirmation requirement (and replaces any
     /// outstanding token: confirmation is per-request, FR-13I). The
     /// warning is the compile-time constant — no peer-derived value
@@ -966,6 +996,33 @@ impl Scheduler {
         let generation = guard.generation;
         guard.in_flight = Some(generation);
 
+        // The round-3 persistence-health gate: after a save failure the
+        // in-memory state (notably a Retry-After suppression LONGER than
+        // the reconstructable floor) may outrun what the disk holds.
+        // Before any upstream contact, retry a bare save of the CURRENT
+        // state — success clears the flag and the refresh proceeds;
+        // failure refuses the fetch (the suppression must be durably
+        // recorded before normal operation resumes).
+        let persistence_cleared = if !guard.persistence_healthy {
+            match self.store.save(&guard.persisted) {
+                Ok(()) => {
+                    tracing::info!("deadline store recovered; resuming refreshes");
+                    guard.persistence_healthy = true;
+                    true
+                }
+                Err(error) => {
+                    tracing::error!(
+                        error = %error,
+                        "deadline store still unwritable; refusing the fetch \
+                         (suppression state must be durable before normal operation resumes)"
+                    );
+                    false
+                }
+            }
+        } else {
+            true
+        };
+
         // Pre-fetch persistence (FR-13H/T-26): the request is about to
         // reach Proton; a crash after it must not forget that. Anchor
         // every wall timestamp in the rollback-clamped effective time so
@@ -979,24 +1036,29 @@ impl Scheduler {
             .conditional_requests
             .then(|| guard.etag.clone())
             .flatten();
-        let anchored = match self.store.save(&guard.persisted) {
-            Ok(()) => true,
-            Err(error) => {
-                // Codex PR#4 round 2 (P2): the pacing anchor must be
-                // DURABLE before the upstream is contacted — a fetch
-                // whose last_request cannot survive a restart lets the
-                // next boot bypass the window (the FR-13H restart-storm
-                // class), and any Retry-After suppression signaled this
-                // round would be lost the same way. Refuse the fetch;
-                // the in-memory window still resets and the next
-                // attempt retries the store.
-                tracing::error!(
-                    error = %error,
-                    "persisting pre-fetch deadlines failed; refusing the fetch \
-                     (restart pacing protection)"
-                );
-                false
+        let anchored = if persistence_cleared {
+            match self.store.save(&guard.persisted) {
+                Ok(()) => true,
+                Err(error) => {
+                    // Codex PR#4 round 2 (P2): the pacing anchor must be
+                    // DURABLE before the upstream is contacted — a fetch
+                    // whose last_request cannot survive a restart lets the
+                    // next boot bypass the window (the FR-13H restart-storm
+                    // class), and any Retry-After suppression signaled this
+                    // round would be lost the same way. Refuse the fetch;
+                    // the in-memory window still resets and the next
+                    // attempt retries the store.
+                    tracing::error!(
+                        error = %error,
+                        "persisting pre-fetch deadlines failed; refusing the fetch \
+                         (restart pacing protection)"
+                    );
+                    guard.persistence_healthy = false;
+                    false
+                }
             }
+        } else {
+            false
         };
         drop(guard);
 
@@ -1108,7 +1170,22 @@ impl Scheduler {
         guard.persisted.wall_high_water_unix =
             guard.persisted.wall_high_water_unix.max(effective_now);
         if let Err(error) = self.store.save(&guard.persisted) {
-            tracing::warn!(error = %error, "persisting post-fetch deadlines failed");
+            // Codex PR#4 round 3 (P2): a post-fetch save failure means
+            // the freshly computed deadlines — notably any Retry-After
+            // suppression LONGER than the restart-reconstructable floor
+            // — exist only in memory. Mark persistence unhealthy: the
+            // next lead retries a bare save before ANY upstream contact
+            // (see the gate at the top of lead_refresh), so the process
+            // cannot keep fetching while its suppression state is
+            // undurable. (A crash while unhealthy still degrades to the
+            // floor on restart — the recorded residual; the fs being
+            // broken makes full durability impossible.)
+            tracing::warn!(
+                error = %error,
+                "persisting post-fetch deadlines failed; persistence degraded — the next \
+                 refresh requires a durable save first"
+            );
+            guard.persistence_healthy = false;
         }
         let report = std::sync::Arc::new(RefreshReport {
             outcome,
@@ -3128,6 +3205,124 @@ mod runtime_tests {
         let stored = read_stored_cache(&dir);
         assert_eq!(stored.etag.as_deref(), Some("\"rev-2\""));
         assert_eq!(stored.body, VALID_BODY);
+    }
+
+    /// Codex PR#4 round 3 (P2): a POST-fetch save failure that strands
+    /// a Retry-After suppression LONGER than the restart floor puts the
+    /// scheduler into the persistence-degraded state — the next refresh
+    /// is refused without upstream contact until a bare save succeeds
+    /// (the suppression must be durably recorded before normal
+    /// operation resumes).
+    #[test]
+    fn a_post_fetch_save_failure_degrades_persistence_until_a_save_succeeds() {
+        // A plain (non-TempDir) directory so the fetch seam can break
+        // it mid-refresh: the pre-fetch save succeeds, the fetch plants
+        // a FILE at the directory path, the post-fetch save fails.
+        static CALL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "pw-sched-degraded-{}-{}",
+            std::process::id(),
+            CALL.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let clock = VirtualClock::new(T0);
+        let upstream_calls = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let counter = Arc::clone(&upstream_calls);
+        let obstruct_dir = dir.clone();
+        let fetch_fn: CatalogFetch = Arc::new(move |_etag| {
+            if counter.fetch_add(1, Ordering::SeqCst) == 0 {
+                // First fetch: the rate-limit response, THEN obstruct
+                // the store so the post-fetch save fails. The retry
+                // exceeds the floor — the restart-reconstructable state
+                // is WEAKER than what only memory holds.
+                std::fs::remove_dir_all(&obstruct_dir).ok();
+                std::fs::write(&obstruct_dir, b"").ok();
+                Err(FetchFailure::RateLimited {
+                    retry_after_seconds: Some(FRESHNESS_FLOOR_SECONDS + 600),
+                })
+            } else {
+                Ok(FetchOutcome::NotModified)
+            }
+        });
+        let scheduler = Arc::new(Scheduler::new(
+            SchedulerConfig::new(FRESHNESS_FLOOR_SECONDS, JITTER, true)
+                .expect("the standard suite config is valid"),
+            Arc::new(clock.clone()),
+            fetch_fn,
+            DeadlineStore::new(dir.join("deadlines.json")),
+            SchedulerDeadlines::default(),
+            None,
+        ));
+
+        // Refresh 1: RateLimited honored in memory; the post-fetch save
+        // fails (the store path's parent is now a file) — degraded.
+        match scheduler.refresh_automatic() {
+            AutomaticOutcome::Due(report) => assert!(
+                matches!(report.outcome, RefreshOutcome::RateLimited { .. }),
+                "the rate limit itself is reported: {:?}",
+                report.outcome
+            ),
+            other => panic!("expected Due, got {other:?}"),
+        }
+        assert_eq!(
+            scheduler.diagnostics().suppression_until_unix,
+            Some(T0 + FRESHNESS_FLOOR_SECONDS + 600),
+            "the longer-than-floor suppression is honored in memory"
+        );
+        // The degradation itself: the post-fetch save failure flipped
+        // the health flag (the next lead retries a bare save before ANY
+        // upstream contact — the refusal mechanics are pinned
+        // end-to-end by the unwritable-store tests below).
+        assert!(
+            !scheduler.persistence_healthy_for_tests(),
+            "a post-fetch save failure must degrade persistence"
+        );
+        // The restart hazard the guard exists for: the durable document
+        // is still the PRE-fetch one (the obstruction prevented the
+        // write), so a restarted scheduler would reconstruct only the
+        // floor — weaker than the suppression memory holds. The
+        // degraded flag keeps THIS process from further upstream
+        // contact until a save succeeds.
+        assert!(
+            !dir.join("deadlines.json").is_file(),
+            "the durable document never landed"
+        );
+
+        // Heal the store and verify recovery end-to-end: the next lead
+        // retries the bare save, succeeds (clearing the flag), and
+        // proceeds to the upstream — the NotModified below is the
+        // proof the gate opened.
+        std::fs::remove_file(&dir).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        match scheduler.refresh_automatic() {
+            AutomaticOutcome::Due(report) => assert!(
+                matches!(report.outcome, RefreshOutcome::NotModified),
+                "after healing, the refresh proceeds: {:?}",
+                report.outcome
+            ),
+            AutomaticOutcome::NotDue { next_eligible_unix } => {
+                // The failure window may still be closed — chase it
+                // open (bounded) and require the refresh to eventually
+                // reach the upstream.
+                clock.set_wall(next_eligible_unix + 1);
+                match scheduler.refresh_automatic() {
+                    AutomaticOutcome::Due(report) => assert!(
+                        matches!(report.outcome, RefreshOutcome::NotModified),
+                        "after healing + window open, the refresh proceeds: {:?}",
+                        report.outcome
+                    ),
+                    other => panic!("expected Due after the window opened, got {other:?}"),
+                }
+            }
+        }
+        assert_eq!(
+            upstream_calls.load(Ordering::SeqCst),
+            2,
+            "the healed store resumed upstream contact"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Codex PR#4 round 2 (P2): an unwritable DEADLINE store refuses

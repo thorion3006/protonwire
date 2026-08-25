@@ -19,7 +19,12 @@ pub enum Command {
     /// Sign out and clear the session (Milestone 2).
     Logout,
     /// Show account, plan, and entitlement (Milestone 2).
-    Account,
+    Account {
+        /// Machine-readable JSON — the typed FR-7H snapshot
+        /// serialized verbatim (PRD 9.1 automation surface).
+        #[arg(long)]
+        json: bool,
+    },
     /// Credential storage management (Milestone 2).
     Credentials {
         #[command(subcommand)]
@@ -202,7 +207,7 @@ pub fn run(command: &Command, socket: Option<&Path>, no_input: bool) -> RunResul
         // SDK methods existed but no first-party client dispatched to
         // them — `planned()` caught these commands first).
         Command::Servers { sub } => servers_command(socket, sub, no_input),
-        Command::Account => account_command(socket),
+        Command::Account { json } => account_command(socket, *json),
         Command::Logout => {
             let mut client = connect(socket)?;
             client.logout()
@@ -272,10 +277,7 @@ fn servers_command(socket: Option<&Path>, sub: &Option<ServersSub>, no_input: bo
             Ok(())
         }
         Some(ServersSub::Refresh { yes }) => match client.servers_refresh(None) {
-            Ok(report) => {
-                print_refresh_report(&report);
-                Ok(())
-            }
+            Ok(report) => refresh_report_result(&report),
             Err(ClientError::Rpc(rpc)) if rpc.code == RpcErrorCode::ConfirmationRequired => {
                 let Some(requirement) = ConfirmationRequirement::from_error(&rpc) else {
                     return Err(ClientError::Rpc(rpc));
@@ -303,11 +305,31 @@ fn servers_command(socket: Option<&Path>, sub: &Option<ServersSub>, no_input: bo
                     }
                 }
                 let report = client.servers_refresh(Some(&requirement.confirmation_token))?;
-                print_refresh_report(&report);
-                Ok(())
+                refresh_report_result(&report)
             }
             Err(other) => Err(other),
         },
+    }
+}
+
+/// Renders the report; an unsuccessful refresh (rate-limited or
+/// failed) renders AND returns a typed error — scripts must distinguish
+/// a refreshed catalog from an unsuccessful attempt by exit code
+/// (Codex PR#4 round 3).
+fn refresh_report_result(report: &protonwire_frontend_api::ServersRefreshReport) -> RunResult {
+    use protonwire_frontend_api::ServersRefreshOutcome;
+    print_refresh_report(report);
+    match &report.outcome {
+        ServersRefreshOutcome::Changed { .. } | ServersRefreshOutcome::NotModified => Ok(()),
+        ServersRefreshOutcome::RateLimited { .. } => Err(ClientError::Rpc(RpcError::new(
+            RpcErrorCode::RateLimited,
+            "the upstream rate-limited the refresh; the suppression deadline governs the \
+             next attempt",
+        ))),
+        ServersRefreshOutcome::Failed { reason } => Err(ClientError::Rpc(RpcError::new(
+            RpcErrorCode::Internal,
+            format!("the refresh failed: {reason}"),
+        ))),
     }
 }
 
@@ -334,22 +356,49 @@ fn print_refresh_report(report: &protonwire_frontend_api::ServersRefreshReport) 
     println!("Next eligible:      {}", report.next_eligible_unix);
 }
 
-/// `protonwire account` — the FR-7H snapshot, human-rendered.
-fn account_command(socket: Option<&Path>) -> RunResult {
+/// `protonwire account [--json]` — the FR-7H snapshot, human-rendered
+/// or serialized verbatim (the automation contract: `--json` prints
+/// the TYPED document, never a human rendering re-parsed).
+fn account_command(socket: Option<&Path>, json: bool) -> RunResult {
     let mut client = connect(socket)?;
     let account = client.get_account()?;
-    println!("Login status:       {:?}", account.login_status);
-    println!("Credential source:  {:?}", account.credential_source);
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&account).expect("the typed snapshot serializes")
+        );
+        return Ok(());
+    }
+    // The serde kebab/string forms are the display contract; the Debug
+    // fallback covers a non-string serialization shape.
+    let login_status = &account.login_status;
+    println!(
+        "Login status:       {}",
+        serde_json::to_value(login_status)
+            .ok()
+            .and_then(|v| v.as_str().map(str::to_owned))
+            .unwrap_or_else(|| format!("{login_status:?}"))
+    );
+    let credential_source = &account.credential_source;
+    println!(
+        "Credential source:  {}",
+        serde_json::to_value(credential_source)
+            .ok()
+            .and_then(|v| v.as_str().map(str::to_owned))
+            .unwrap_or_else(|| format!("{credential_source:?}"))
+    );
     println!(
         "Writable store:     declared {}, priority {:?}",
         account.writable_store.declared, account.writable_store.priority
     );
+    // Absence is the wire contract's UNKNOWN (not-yet-wired) — never
+    // fabricated into a verdict (Codex PR#4 round 3).
     println!(
         "Persistence health: {}",
-        account
-            .persistence_health
-            .as_ref()
-            .map_or("healthy".to_owned(), |h| format!("{h:?}"))
+        account.persistence_health.as_ref().map_or_else(
+            || "unknown (no writable store reporting)".to_owned(),
+            |h| serde_json::to_string(h).unwrap_or_else(|_| format!("{h:?}"))
+        )
     );
     Ok(())
 }
@@ -357,7 +406,7 @@ fn account_command(socket: Option<&Path>) -> RunResult {
 /// `protonwire credentials` (status view): the credential facts of the
 /// FR-7H snapshot.
 fn credentials_status(socket: Option<&Path>) -> RunResult {
-    account_command(socket)
+    account_command(socket, false)
 }
 
 /// `protonwire login` — interactive-source login over the SDK.
@@ -553,7 +602,7 @@ fn command_name(command: &Command) -> String {
     match command {
         Command::Login => "login".into(),
         Command::Logout => "logout".into(),
-        Command::Account => "account".into(),
+        Command::Account { .. } => "account".into(),
         Command::Credentials { .. } => "credentials".into(),
         Command::Protocols => "protocols".into(),
         Command::Integration => "integration".into(),
@@ -660,7 +709,7 @@ mod tests {
     fn the_m2_commands_dispatch_to_the_client_not_the_refusal() {
         for command in [
             Command::Logout,
-            Command::Account,
+            Command::Account { json: false },
             Command::Servers { sub: None },
             Command::Servers {
                 sub: Some(ServersSub::Refresh { yes: true }),
@@ -854,7 +903,7 @@ mod tests {
             match command {
                 Command::Login
                 | Command::Logout
-                | Command::Account
+                | Command::Account { .. }
                 | Command::Credentials { .. }
                 | Command::Protocols
                 | Command::Integration
@@ -885,7 +934,7 @@ mod tests {
         let cases: Vec<(&str, Command)> = vec![
             ("login", Command::Login),
             ("logout", Command::Logout),
-            ("account", Command::Account),
+            ("account", Command::Account { json: false }),
             ("credentials", Command::Credentials { sub: None }),
             ("protocols", Command::Protocols),
             ("integration", Command::Integration),
