@@ -903,25 +903,30 @@ pub fn filter_candidates<'a>(
 
     if request.target.is_exact() && survivors.is_empty() {
         // FR-23: never fall back. If the name matched nothing at all the
-        // reason is absence; otherwise the first eliminating stage the
-        // MATCHED server hit (skipping TargetGeography, which under an
-        // exact target only counts every OTHER server in the catalog).
+        // reason is absence; otherwise the eliminating stage of the
+        // MATCHED server itself (M3 U1 review, P2: the pre-fix scan
+        // took the first catalog-wide nonzero stage — an online-but-
+        // eliminated exact target essentially always misreported
+        // `offline` because some other server in any real catalog is
+        // offline; the diagnosis must describe the matched server).
         let name = request.target.exact_name().unwrap_or_default().to_owned();
         let matched = |server: &LogicalServer| match &request.target {
             Target::Server(wanted) => server.name == *wanted,
             Target::Gateway(wanted) => server.gateway_name.as_deref() == Some(wanted.as_str()),
             _ => false,
         };
-        let stage = if !catalog.logical_servers.iter().any(matched) {
-            FilterStage::AbsentFromCatalog
-        } else {
-            FilterStage::ORDER
-                .iter()
-                .find(|stage| {
-                    **stage != FilterStage::TargetGeography && counts[stage.ordinal()] > 0
-                })
-                .copied()
-                .expect("a matched-but-eliminated exact target has a nonzero eliminating stage")
+        let stage = match catalog
+            .logical_servers
+            .iter()
+            .find(|server| matched(server))
+        {
+            None => FilterStage::AbsentFromCatalog,
+            // Under an exact target the matched server cannot be the
+            // TARGET-GEOGRAPHY elimination (it matches the target), so
+            // its own eliminating stage is the honest diagnosis; the
+            // unwrap_or is defensive depth only.
+            Some(matched_server) => eliminating_stage(matched_server, request, context)
+                .unwrap_or(FilterStage::AbsentFromCatalog),
         };
         return Err(SelectionError::ExactServerUnavailable { name, stage });
     }
@@ -1882,6 +1887,37 @@ mod tests {
                 name: "UK#42".into(),
                 stage: FilterStage::Offline,
             }
+        );
+    }
+
+    /// M3 U1 review, P2: the exact-refusal's stage diagnosis must be
+    /// the MATCHED server's own eliminating stage — never the first
+    /// catalog-wide nonzero stage. Pre-fix, an ONLINE exact target
+    /// eliminated by the user's server exclusion misreported `offline`
+    /// whenever any unrelated server in the catalog was offline (which
+    /// real catalogs always have).
+    #[test]
+    fn exact_server_elimination_names_the_matched_servers_own_stage() {
+        let catalog = build_catalog(&[
+            // The exact target: online, but user-excluded.
+            Spec::new("UK#42", "GB"),
+            // An unrelated OFFLINE server whose stage would have won
+            // the pre-fix catalog-wide ordinal race.
+            Spec {
+                status: Some(0),
+                ..Spec::new("GB#1", "GB")
+            },
+        ]);
+        let mut request = official(Target::Server("UK#42".into()));
+        request.constraints.excluded_servers = vec!["UK#42".into()];
+        let err = filter_candidates(&catalog, &request, &SelectionContext::default()).unwrap_err();
+        assert_eq!(
+            err,
+            SelectionError::ExactServerUnavailable {
+                name: "UK#42".into(),
+                stage: FilterStage::ExcludedServer,
+            },
+            "the diagnosis describes the matched server (user-excluded), not GB#1's offline"
         );
     }
 
