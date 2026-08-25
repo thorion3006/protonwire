@@ -33,6 +33,11 @@
 //! unmapped-and-ineligible: it belongs to no region group.
 
 use crate::selection::ProtocolConstraint;
+use crate::selection::{
+    Constraints, FORBIDDEN_RANKING_SIGNALS, RankingPolicy, SelectionContext, SelectionError,
+    SelectionOutcome, SelectionRequest, Target, WeightedSignals,
+};
+use protonwire_store::catalog::CatalogDocument;
 
 mod registry;
 
@@ -293,6 +298,296 @@ pub fn country_region(iso: &str) -> Option<&'static str> {
         .map(|(_, region)| *region)
 }
 
+// --- Resolution (M3 U2) ------------------------------------------------------
+//
+// The resolver maps a group's frozen catalog definition onto the pure
+// selection core's request vocabulary. Everything a group request
+// needs flows through here — no consumer re-derives a preset.
+
+/// FR-23Q's three physical-country sources. The resolver composes the
+/// precedence; the value itself is used verbatim (non-canonical codes
+/// refuse at selection, never approximated).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PhysicalCountrySources<'a> {
+    /// An explicit per-request country (`--physical-country GB`).
+    pub explicit_request: Option<&'a str>,
+    /// The explicitly configured `connection_groups.physical_country`.
+    pub config: Option<&'a str>,
+    /// The latest cached Proton user-location country (obtained through
+    /// Muon while disconnected; S10's cache).
+    pub cached_location: Option<&'a str>,
+}
+
+impl PhysicalCountrySources<'_> {
+    /// The precedence FR-23Q prescribes: explicit request → explicit
+    /// config → cached Muon location. `None` when no source is set.
+    pub fn resolve(&self) -> Option<&str> {
+        self.explicit_request
+            .or(self.config)
+            .or(self.cached_location)
+    }
+}
+
+/// Group resolution failures — typed at the source. None of these ever
+/// falls back to a different group, target, or policy.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum GroupError {
+    /// T-28: the id is not part of the canonical catalog. Never a fuzzy
+    /// match, never another group's outcome.
+    #[error(
+        "unknown group `{id}`: not part of the canonical catalog — stable ids are the `proton:*` \
+         official sets and the `protonwire:fastest-*` regional sets"
+    )]
+    UnknownGroup {
+        /// The requested id.
+        id: String,
+    },
+    /// T-1's every-input-schema clause, this schema's arm: a forbidden
+    /// throughput signal in a ranking-override request (checked before
+    /// permission — the signal ban is universal).
+    #[error(
+        "unsupported ranking signal `{key}`: FR-19 forbids speed/throughput ranking in every \
+         input schema"
+    )]
+    UnsupportedRankingSignal {
+        /// The rejected key.
+        key: String,
+    },
+    /// FR-23P/T-33: official `proton:*` presets reproduce pinned
+    /// semantics; a request-time ranking override would change them.
+    #[error(
+        "ranking override `{requested}` forbidden on `{id}`: official proton groups reproduce \
+         pinned official semantics — official group ranking overrides are forbidden (FR-23P)"
+    )]
+    RankingOverrideForbidden {
+        /// The group refusing the override.
+        id: &'static str,
+        /// The requested mode.
+        requested: String,
+    },
+    /// The group's catalog entry does not declare this request-time
+    /// override (regional groups declare exactly `balanced`, `load`,
+    /// `latency` in the v1 catalog).
+    #[error("ranking override `{requested}` is not declared by `{id}` (declared: {declared})")]
+    RankingOverrideNotDeclared {
+        /// The group.
+        id: &'static str,
+        /// The requested mode.
+        requested: String,
+        /// The declared override list, comma-separated.
+        declared: String,
+    },
+    /// Declared by the catalog but not yet selectable: `latency` needs
+    /// the bounded on-demand prober (M3 PR-3).
+    #[error(
+        "ranking policy `{requested}` on `{id}` is declared but unavailable until M3 PR-3 wires \
+         the bounded on-demand latency prober"
+    )]
+    RankingOverrideUnavailable {
+        /// The group.
+        id: &'static str,
+        /// The requested policy token.
+        requested: String,
+    },
+    /// The Secure Core routing unit (M3 PR-3/U4) owns this target; its
+    /// resolution is delegated, not approximated here.
+    #[error(
+        "group `{id}` selects a Secure Core entry/exit route — Secure Core routing lands with M3 \
+         PR-3 (the group's frozen definition remains available through the registry)"
+    )]
+    SecureCoreRoutingPending {
+        /// The group.
+        id: &'static str,
+    },
+}
+
+/// How the applied ranking policy was chosen (FR-23P/T-33: a declared
+/// regional override must be explicit in status).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PolicyProvenance {
+    /// The catalog's declared default policy.
+    CatalogDefault,
+    /// A request-time override the catalog declares for this group.
+    DeclaredOverride,
+}
+
+/// A group resolved onto the selection core's request vocabulary.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResolvedGroup {
+    /// The frozen catalog definition (id, origin, entitlement,
+    /// overrides — the FR-23T provenance inputs and the status
+    /// surface).
+    pub group: &'static GroupEntry,
+    /// The selection request: feed to [`crate::selection::select`].
+    pub request: SelectionRequest,
+    /// How `request.policy` was chosen.
+    pub policy_provenance: PolicyProvenance,
+}
+
+/// Maps a catalog ranking-policy token onto the executable policy.
+/// `latency` is declared vocabulary but unconstructible until PR-3's
+/// prober exists — a typed refusal, never a silent substitute.
+fn to_selection_policy(
+    id: &'static str,
+    policy: GroupRankingPolicy,
+) -> Result<RankingPolicy, GroupError> {
+    match policy {
+        GroupRankingPolicy::ProtonScore => Ok(RankingPolicy::Official),
+        GroupRankingPolicy::Balanced => Ok(RankingPolicy::Balanced {
+            weights: WeightedSignals::DEFAULT,
+        }),
+        GroupRankingPolicy::Load => Ok(RankingPolicy::LowestLoad),
+        GroupRankingPolicy::RandomCountryThenServer => Ok(RankingPolicy::Random),
+        GroupRankingPolicy::Latency => Err(GroupError::RankingOverrideUnavailable {
+            id,
+            requested: "latency".to_owned(),
+        }),
+    }
+}
+
+/// The comma-separated declared-override list for refusal messages.
+fn declared_overrides(group: &GroupEntry) -> String {
+    if group.allowed_ranking_overrides.is_empty() {
+        "none".to_owned()
+    } else {
+        group
+            .allowed_ranking_overrides
+            .iter()
+            .map(|policy| policy.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+/// Resolves a group request: the frozen catalog definition mapped onto
+/// a [`SelectionRequest`]. `ranking_override` is the request-time
+/// `--by` value (T-33's discipline: `proton:*` forbids overrides
+/// outright; regional groups honor exactly their declared list).
+/// `physical` carries FR-23Q's three sources — the resolver composes
+/// the precedence and the selection core enforces the rest.
+pub fn resolve_group(
+    id: &str,
+    ranking_override: Option<&str>,
+    physical: &PhysicalCountrySources<'_>,
+) -> Result<ResolvedGroup, GroupError> {
+    let group = group(id).ok_or_else(|| GroupError::UnknownGroup { id: id.to_owned() })?;
+
+    // T-1 discipline at this schema: the forbidden throughput signals
+    // are their own class, checked before any permission question.
+    if let Some(mode) = ranking_override
+        && FORBIDDEN_RANKING_SIGNALS.contains(&mode)
+    {
+        return Err(GroupError::UnsupportedRankingSignal {
+            key: mode.to_owned(),
+        });
+    }
+
+    let (policy, policy_provenance) = match ranking_override {
+        None => (
+            to_selection_policy(group.id, group.ranking_policy)?,
+            PolicyProvenance::CatalogDefault,
+        ),
+        Some(mode) => {
+            if group.origin == GroupOrigin::Proton {
+                return Err(GroupError::RankingOverrideForbidden {
+                    id: group.id,
+                    requested: mode.to_owned(),
+                });
+            }
+            let requested = GroupRankingPolicy::parse(mode).ok_or_else(|| {
+                GroupError::RankingOverrideNotDeclared {
+                    id: group.id,
+                    requested: mode.to_owned(),
+                    declared: declared_overrides(group),
+                }
+            })?;
+            if !group.allowed_ranking_overrides.contains(&requested) {
+                return Err(GroupError::RankingOverrideNotDeclared {
+                    id: group.id,
+                    requested: mode.to_owned(),
+                    declared: declared_overrides(group),
+                });
+            }
+            (
+                to_selection_policy(group.id, requested)?,
+                PolicyProvenance::DeclaredOverride,
+            )
+        }
+    };
+
+    let mut constraints = Constraints {
+        required_protocol: group.protocol_override,
+        ..Constraints::default()
+    };
+
+    let target = match &group.target {
+        GroupTarget::Fastest {
+            exclude_physical_country,
+        } => {
+            constraints.exclude_physical_country = *exclude_physical_country;
+            if *exclude_physical_country {
+                constraints.physical_country = physical.resolve().map(str::to_owned);
+            }
+            Target::Fastest
+        }
+        GroupTarget::FastestInCountry { country } => Target::Country((*country).to_owned()),
+        GroupTarget::FastestInRegion { region } => {
+            // Generation asserts every declared region has members, so
+            // this is total over the registry's own data.
+            let countries = region_countries(region).unwrap_or_else(|| {
+                unreachable!("registry guarantees membership for declared region `{region}`")
+            });
+            Target::Countries(countries.into_iter().map(str::to_owned).collect())
+        }
+        GroupTarget::Random => Target::Fastest,
+        GroupTarget::SecureCore { .. } => {
+            return Err(GroupError::SecureCoreRoutingPending { id: group.id });
+        }
+    };
+
+    Ok(ResolvedGroup {
+        group,
+        request: SelectionRequest {
+            target,
+            policy,
+            constraints,
+        },
+        policy_provenance,
+    })
+}
+
+/// The composed group entry point: resolve, then select, in one call.
+/// The daemon/CLI boundary (M3 PR-4) calls this; the split errors stay
+/// distinguishable for exit-code mapping.
+#[derive(Debug, PartialEq, thiserror::Error)]
+pub enum GroupSelectionError {
+    /// Resolution refused (unknown group, override discipline, the
+    /// Secure Core delegation).
+    #[error(transparent)]
+    Group(#[from] GroupError),
+    /// Selection refused (the FR-22 report, FR-23Q/FR-23H typed
+    /// refusals, policy refusals).
+    #[error(transparent)]
+    Selection(#[from] SelectionError),
+}
+
+/// Resolves and selects in one call over the cached catalog (FR-23R:
+/// no network — the catalog bytes are the daemon's cached document).
+pub fn select_group<'a>(
+    catalog: &'a CatalogDocument,
+    id: &str,
+    ranking_override: Option<&str>,
+    physical: &PhysicalCountrySources<'_>,
+    context: &SelectionContext,
+) -> Result<SelectionOutcome<'a>, GroupSelectionError> {
+    let resolved = resolve_group(id, ranking_override, physical)?;
+    Ok(crate::selection::select(
+        catalog,
+        &resolved.request,
+        context,
+    )?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -487,6 +782,682 @@ mod tests {
             region_countries("europe").unwrap().first(),
             Some(&"AD"),
             "members arrive in ascending ISO order"
+        );
+    }
+
+    // --- Resolution (M3 U2): T-28's typed refusal, T-33's ranking
+    // discipline, FR-23Q's physical-country precedence, T-29's pinned
+    // official semantics, T-30's regional selection. -------------------------
+
+    use crate::selection::{
+        ProtocolConstraint, RankingPolicy, SelectionContext, SelectionError, Target,
+    };
+
+    fn resolve(id: &str) -> Result<ResolvedGroup, GroupError> {
+        resolve_group(id, None, &PhysicalCountrySources::default())
+    }
+
+    /// T-28: the canonical catalog resolves — every group except the
+    /// Secure Core one maps onto selection parameters; `proton:max-security`
+    /// is the DELEGATION case (U4 lands with M3 PR-3), and its frozen
+    /// definition stays available through the registry either way.
+    #[test]
+    fn every_canonical_group_resolves_or_delegates() {
+        for entry in all_groups() {
+            match resolve(entry.id) {
+                Ok(resolved) => {
+                    assert_eq!(resolved.group.id, entry.id);
+                }
+                Err(GroupError::SecureCoreRoutingPending { id }) => {
+                    assert_eq!(id, "proton:max-security", "the one delegated kind");
+                }
+                Err(other) => panic!("{}: unexpected resolution failure: {other}", entry.id),
+            }
+        }
+        let max_security = group("proton:max-security").expect("the definition stays available");
+        assert_eq!(
+            max_security.target,
+            GroupTarget::SecureCore {
+                entry_country: "fastest",
+                exit_country: "fastest",
+            }
+        );
+        assert_eq!(
+            max_security.connection_overrides,
+            &[("lan_access", "block")],
+            "the lan_access override rides the definition (connection-time, M4)"
+        );
+    }
+
+    /// T-28's refusal half at the CONNECT path: an unknown id is the
+    /// typed refusal naming the id — never a fuzzy match, never another
+    /// group's outcome.
+    #[test]
+    fn unknown_group_is_the_typed_refusal_never_a_fallback() {
+        for unknown in [
+            "proton:atlantis",
+            "protonwire:fastest-antarctica",
+            "fastest-country",
+        ] {
+            let err = resolve(unknown).unwrap_err();
+            assert_eq!(
+                err,
+                GroupError::UnknownGroup {
+                    id: unknown.to_owned()
+                },
+                "`{unknown}` must be the typed unknown-group refusal"
+            );
+            assert!(
+                err.to_string().contains(unknown),
+                "the refusal names the id: {err}"
+            );
+        }
+    }
+
+    /// T-33: official groups rank by Proton score and REJECT request-time
+    /// ranking overrides — the refusal is its own class, citing FR-23P.
+    #[test]
+    fn official_groups_rank_by_proton_score_and_reject_overrides() {
+        for id in [
+            "proton:fastest-country",
+            "proton:fastest-excluding-my-country",
+            "proton:streaming-us",
+            "proton:gaming",
+            "proton:anti-censorship",
+            "proton:work-school",
+        ] {
+            let resolved = resolve(id).unwrap();
+            assert_eq!(resolved.request.policy, RankingPolicy::Official, "{id}");
+            assert_eq!(
+                resolved.policy_provenance,
+                PolicyProvenance::CatalogDefault,
+                "{id}"
+            );
+            for mode in ["official", "balanced", "load"] {
+                let err =
+                    resolve_group(id, Some(mode), &PhysicalCountrySources::default()).unwrap_err();
+                assert_eq!(
+                    err,
+                    GroupError::RankingOverrideForbidden {
+                        id,
+                        requested: mode.to_owned(),
+                    },
+                    "{id} + `--by {mode}`: official semantics are immutable (FR-23P)"
+                );
+                assert!(
+                    err.to_string().contains("FR-23P"),
+                    "the refusal cites the rule: {err}"
+                );
+            }
+        }
+    }
+
+    /// T-33: the random group's official semantics ARE the two-level
+    /// draw (the catalog declares `random-country-then-server`, not
+    /// proton-score) — and it rejects overrides like every proton:*.
+    #[test]
+    fn random_country_resolves_the_random_policy() {
+        let resolved = resolve("proton:random-country").unwrap();
+        assert_eq!(resolved.request.policy, RankingPolicy::Random);
+        assert_eq!(resolved.request.target, Target::Fastest);
+        assert_eq!(
+            resolved.group.selection_authority,
+            Some("proton-backend-when-required"),
+            "the authority annotation rides the definition (FR-23G's backend-authorized \
+             changes are the daemon boundary's to honor)"
+        );
+        let err = resolve_group(
+            "proton:random-country",
+            Some("load"),
+            &PhysicalCountrySources::default(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            GroupError::RankingOverrideForbidden {
+                id: "proton:random-country",
+                requested: "load".to_owned(),
+            }
+        );
+    }
+
+    /// T-1/T-33: the forbidden throughput signals are their OWN class on
+    /// this schema too, and outrank the permission questions — a `speed`
+    /// override on a proton group is the signal rejection, not the
+    /// (also-true) forbidden-override rejection.
+    #[test]
+    fn speed_overrides_are_the_signal_rejection_on_both_namespaces() {
+        for id in ["proton:fastest-country", "protonwire:fastest-europe"] {
+            for signal in ["speed", "estimated-throughput"] {
+                let err = resolve_group(id, Some(signal), &PhysicalCountrySources::default())
+                    .unwrap_err();
+                assert_eq!(
+                    err,
+                    GroupError::UnsupportedRankingSignal {
+                        key: signal.to_owned()
+                    },
+                    "{id} + `{signal}`"
+                );
+                assert!(
+                    err.to_string().contains("FR-19"),
+                    "the refusal cites the rule: {err}"
+                );
+            }
+        }
+    }
+
+    /// T-33: regional groups default to Proton score.
+    #[test]
+    fn regional_groups_default_to_proton_score() {
+        for entry in all_groups()
+            .iter()
+            .filter(|e| e.origin == GroupOrigin::Protonwire)
+        {
+            let resolved = resolve(entry.id).unwrap();
+            assert_eq!(
+                resolved.request.policy,
+                RankingPolicy::Official,
+                "{}",
+                entry.id
+            );
+            assert_eq!(
+                resolved.policy_provenance,
+                PolicyProvenance::CatalogDefault,
+                "{}",
+                entry.id
+            );
+        }
+    }
+
+    /// T-33: declared regional overrides apply and are explicit in the
+    /// resolution (status-visible); undeclared ones refuse naming the
+    /// declared list; latency is declared but pending PR-3.
+    #[test]
+    fn regional_declared_overrides_apply_and_undeclared_refuse() {
+        let load = resolve_group(
+            "protonwire:fastest-europe",
+            Some("load"),
+            &PhysicalCountrySources::default(),
+        )
+        .unwrap();
+        assert_eq!(load.request.policy, RankingPolicy::LowestLoad);
+        assert_eq!(load.policy_provenance, PolicyProvenance::DeclaredOverride);
+
+        let balanced = resolve_group(
+            "protonwire:fastest-europe",
+            Some("balanced"),
+            &PhysicalCountrySources::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            balanced.request.policy,
+            RankingPolicy::Balanced {
+                weights: crate::selection::WeightedSignals::DEFAULT
+            }
+        );
+        assert_eq!(
+            balanced.policy_provenance,
+            PolicyProvenance::DeclaredOverride
+        );
+
+        for undeclared in ["official", "cheapest"] {
+            let err = resolve_group(
+                "protonwire:fastest-europe",
+                Some(undeclared),
+                &PhysicalCountrySources::default(),
+            )
+            .unwrap_err();
+            assert_eq!(
+                err,
+                GroupError::RankingOverrideNotDeclared {
+                    id: "protonwire:fastest-europe",
+                    requested: undeclared.to_owned(),
+                    declared: "balanced, load, latency".to_owned(),
+                },
+                "`{undeclared}`: only the catalog-declared list applies (the proton-score \
+                 default is what no-override means)"
+            );
+        }
+
+        let err = resolve_group(
+            "protonwire:fastest-europe",
+            Some("latency"),
+            &PhysicalCountrySources::default(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            GroupError::RankingOverrideUnavailable {
+                id: "protonwire:fastest-europe",
+                requested: "latency".to_owned(),
+            },
+            "declared-but-pending is distinct from not-declared"
+        );
+    }
+
+    /// FR-23Q: explicit request → explicit config → cached Muon
+    /// location; no source → none.
+    #[test]
+    fn physical_country_precedence_follows_fr23q() {
+        let all = PhysicalCountrySources {
+            explicit_request: Some("DE"),
+            config: Some("GB"),
+            cached_location: Some("US"),
+        };
+        assert_eq!(all.resolve(), Some("DE"));
+        assert_eq!(
+            PhysicalCountrySources {
+                explicit_request: None,
+                config: Some("GB"),
+                cached_location: Some("US"),
+            }
+            .resolve(),
+            Some("GB")
+        );
+        assert_eq!(
+            PhysicalCountrySources {
+                explicit_request: None,
+                config: None,
+                cached_location: Some("US"),
+            }
+            .resolve(),
+            Some("US")
+        );
+        assert_eq!(PhysicalCountrySources::default().resolve(), None);
+    }
+
+    /// T-29/FR-23Q: the excluding group resolves the composed country
+    /// into its constraints; without any source the constraint stays
+    /// unset and selection refuses `physical-country-required` (U1's
+    /// typed refusal, reached through the composed path).
+    #[test]
+    fn fastest_excluding_resolves_the_physical_country_into_constraints() {
+        let sources = PhysicalCountrySources {
+            explicit_request: Some("GB"),
+            config: Some("DE"),
+            cached_location: None,
+        };
+        let resolved =
+            resolve_group("proton:fastest-excluding-my-country", None, &sources).unwrap();
+        assert!(resolved.request.constraints.exclude_physical_country);
+        assert_eq!(
+            resolved.request.constraints.physical_country,
+            Some("GB".into())
+        );
+
+        let none = resolve_group(
+            "proton:fastest-excluding-my-country",
+            None,
+            &PhysicalCountrySources::default(),
+        )
+        .unwrap();
+        assert_eq!(none.request.constraints.physical_country, None);
+    }
+
+    /// T-29's per-group resolution pins: country + protocol (streaming),
+    /// the stealth pair (anti-censorship/work-school), and gaming's NAT
+    /// override as connection-time DATA, never a selection filter.
+    #[test]
+    fn the_official_presets_resolve_their_pinned_semantics() {
+        let streaming = resolve("proton:streaming-us").unwrap();
+        assert_eq!(streaming.request.target, Target::Country("US".to_owned()));
+        assert_eq!(
+            streaming.request.constraints.required_protocol,
+            Some(ProtocolConstraint::WireguardUdp)
+        );
+
+        let anti = resolve("proton:anti-censorship").unwrap();
+        assert_eq!(anti.request.target, Target::Fastest);
+        assert!(anti.request.constraints.exclude_physical_country);
+        assert_eq!(
+            anti.request.constraints.required_protocol,
+            Some(ProtocolConstraint::Stealth)
+        );
+
+        let work = resolve("proton:work-school").unwrap();
+        assert!(!work.request.constraints.exclude_physical_country);
+        assert_eq!(
+            work.request.constraints.required_protocol,
+            Some(ProtocolConstraint::Stealth)
+        );
+        assert_eq!(work.group.connection_overrides, &[("lan_access", "block")]);
+
+        let gaming = resolve("proton:gaming").unwrap();
+        assert_eq!(
+            gaming.request.constraints.required_protocol, None,
+            "NAT is a connection-time request (M4), never a selection filter"
+        );
+        assert_eq!(gaming.group.connection_overrides, &[("nat", "moderate")]);
+    }
+
+    /// T-30: regional groups resolve to their membership country sets —
+    /// the composite North America carries US (021), MX (013), JM (029)
+    /// and nothing from other regions.
+    #[test]
+    fn regional_targets_resolve_to_their_membership_country_sets() {
+        let europe = resolve("protonwire:fastest-europe").unwrap();
+        match &europe.request.target {
+            Target::Countries(codes) => {
+                for member in ["GB", "DE", "FR", "CH"] {
+                    assert!(codes.contains(&member.to_owned()), "{member} ∈ europe");
+                }
+                for outsider in ["US", "JP", "BR", "AU", "ZA"] {
+                    assert!(!codes.contains(&outsider.to_owned()), "{outsider} ∉ europe");
+                }
+            }
+            other => panic!("europe resolves to a country set, got {other:?}"),
+        }
+        let north_america = resolve("protonwire:fastest-north-america").unwrap();
+        match &north_america.request.target {
+            Target::Countries(codes) => {
+                for member in ["US", "MX", "JM", "CA"] {
+                    assert!(
+                        codes.contains(&member.to_owned()),
+                        "{member} ∈ north-america"
+                    );
+                }
+                assert!(!codes.contains(&"GB".to_owned()));
+            }
+            other => panic!("north-america resolves to a country set, got {other:?}"),
+        }
+    }
+
+    // --- Selection through the composed entry point (T-29/T-30
+    // end-to-end against a fixture catalog). --------------------------------
+
+    /// A minimal S6-shaped catalog: online Standard logicals, every
+    /// physical carrying UDP+TLS maps (the `udp = false` arm carries
+    /// TLS only — the streaming pin needs a UDP-less US server).
+    fn fixture_catalog(specs: &[(&str, &str, f32, bool)]) -> CatalogDocument {
+        let servers: Vec<String> = specs
+            .iter()
+            .map(|(name, exit, score, udp)| {
+                let maps = if *udp {
+                    r#""WireGuardUDP":{"IPv4":"192.0.2.1","Ports":[443]},"WireGuardTLS":{"IPv4":"192.0.2.1","Ports":[443]}"#
+                } else {
+                    r#""WireGuardTLS":{"IPv4":"192.0.2.1","Ports":[443]}"#
+                };
+                format!(
+                    r#"{{"ID":"id-{name}","Name":"{name}","EntryCountry":"{exit}","ExitCountry":"{exit}","Tier":2,"Features":0,"Status":1,"Load":20,"Score":{score},"Servers":[{{"Domain":"p0.example","Status":1,"EntryPerProtocol":{{{maps}}}}}]}}"#
+                )
+            })
+            .collect();
+        let body = format!(
+            r#"{{"Code":1000,"StatusID":"t","LogicalServers":[{}]}}"#,
+            servers.join(",")
+        );
+        CatalogDocument::from_bytes(body.as_bytes())
+            .unwrap_or_else(|e| panic!("fixture catalog must parse: {e}"))
+    }
+
+    fn sources(country: Option<&'static str>) -> PhysicalCountrySources<'static> {
+        PhysicalCountrySources {
+            explicit_request: country,
+            config: None,
+            cached_location: None,
+        }
+    }
+
+    #[test]
+    fn fastest_country_selects_official_order() {
+        // T-29: Fastest = official semantics — lowest Proton score wins.
+        let catalog = fixture_catalog(&[
+            ("GB#1", "GB", 1.5, true),
+            ("DE#1", "DE", 0.5, true),
+            ("US#1", "US", 2.5, true),
+        ]);
+        let outcome = select_group(
+            &catalog,
+            "proton:fastest-country",
+            None,
+            &sources(None),
+            &SelectionContext::default(),
+        )
+        .unwrap();
+        assert_eq!(outcome.ranked[0].server.name, "DE#1");
+    }
+
+    #[test]
+    fn fastest_excluding_my_country_selects_away_from_the_physical_country() {
+        let catalog = fixture_catalog(&[
+            ("GB#1", "GB", 0.2, true),
+            ("DE#1", "DE", 1.0, true),
+            ("CH#1", "CH", 2.0, true),
+        ]);
+        let outcome = select_group(
+            &catalog,
+            "proton:fastest-excluding-my-country",
+            None,
+            &sources(Some("GB")),
+            &SelectionContext::default(),
+        )
+        .unwrap();
+        assert_eq!(outcome.ranked[0].server.name, "DE#1");
+        assert!(
+            outcome.ranked.iter().all(|c| c.server.exit_country != "GB"),
+            "the physical country never wins under the exclusion"
+        );
+
+        // No source anywhere: FR-23Q's typed refusal through the
+        // composed path — it must not connect without the exclusion.
+        let err = select_group(
+            &catalog,
+            "proton:fastest-excluding-my-country",
+            None,
+            &sources(None),
+            &SelectionContext::default(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            GroupSelectionError::Selection(SelectionError::PhysicalCountryRequired)
+        );
+    }
+
+    #[test]
+    fn a_non_canonical_physical_country_source_refuses_never_approximates() {
+        let catalog = fixture_catalog(&[("GB#1", "GB", 1.0, true)]);
+        let err = select_group(
+            &catalog,
+            "proton:fastest-excluding-my-country",
+            None,
+            &sources(Some("gb")),
+            &SelectionContext::default(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            GroupSelectionError::Selection(SelectionError::InvalidCountry("gb".to_owned()))
+        );
+    }
+
+    /// T-30 end-to-end: regional selection stays inside the membership —
+    /// the composite North America selects across US+MX+JM while Europe
+    /// excludes all of them; an unmapped catalog country is ineligible
+    /// for every region.
+    #[test]
+    fn regional_groups_select_within_their_membership() {
+        let catalog = fixture_catalog(&[
+            ("US#1", "US", 3.0, true),
+            ("MX#1", "MX", 1.0, true),
+            ("JM#1", "JM", 2.0, true),
+            ("GB#1", "GB", 0.1, true),
+            ("DE#1", "DE", 0.2, true),
+            ("XX#1", "XX", 0.01, true), // ISO user-assigned: in no region
+        ]);
+        let north_america = select_group(
+            &catalog,
+            "protonwire:fastest-north-america",
+            None,
+            &sources(None),
+            &SelectionContext::default(),
+        )
+        .unwrap();
+        let ranked: Vec<&str> = north_america
+            .ranked
+            .iter()
+            .map(|c| c.server.name.as_str())
+            .collect();
+        assert_eq!(
+            ranked,
+            ["MX#1", "JM#1", "US#1"],
+            "all three composite members"
+        );
+
+        let europe = select_group(
+            &catalog,
+            "protonwire:fastest-europe",
+            None,
+            &sources(None),
+            &SelectionContext::default(),
+        )
+        .unwrap();
+        let ranked: Vec<&str> = europe
+            .ranked
+            .iter()
+            .map(|c| c.server.name.as_str())
+            .collect();
+        assert_eq!(ranked, ["GB#1", "DE#1"]);
+        assert!(
+            !ranked.contains(&"XX#1"),
+            "an unmapped country is ineligible for every regional group (T-30)"
+        );
+    }
+
+    /// T-30: the declared `load` override changes the regional order and
+    /// the resolution reports the override provenance (status-visible).
+    #[test]
+    fn regional_load_override_selects_by_load() {
+        let catalog = fixture_catalog(&[
+            ("GB#1", "GB", 0.1, true), // best score
+            ("DE#1", "DE", 5.0, true), // worst score
+        ]);
+        let outcome = select_group(
+            &catalog,
+            "protonwire:fastest-europe",
+            Some("load"),
+            &sources(None),
+            &SelectionContext::default(),
+        )
+        .unwrap();
+        // Identical loads: the id tiebreak orders them; the pin is that
+        // the override applied (both survive; the policy is LowestLoad).
+        assert_eq!(outcome.ranked.len(), 2);
+        let resolved = resolve_group(
+            "protonwire:fastest-europe",
+            Some("load"),
+            &PhysicalCountrySources::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            resolved.policy_provenance,
+            PolicyProvenance::DeclaredOverride
+        );
+    }
+
+    /// T-29: streaming-us selects the fastest US server WITH WireGuard
+    /// UDP — a UDP-less US server is eliminated at protocol
+    /// compatibility, not silently selected.
+    #[test]
+    fn streaming_us_requires_wireguard_udp() {
+        let catalog = fixture_catalog(&[
+            ("US#1", "US", 0.1, false), // best score, no UDP map
+            ("US#2", "US", 1.0, true),
+            ("GB#1", "GB", 0.05, true),
+        ]);
+        let outcome = select_group(
+            &catalog,
+            "proton:streaming-us",
+            None,
+            &sources(None),
+            &SelectionContext::default(),
+        )
+        .unwrap();
+        assert_eq!(outcome.ranked[0].server.name, "US#2");
+        let ranked: Vec<&str> = outcome
+            .ranked
+            .iter()
+            .map(|c| c.server.name.as_str())
+            .collect();
+        assert_eq!(ranked, &["US#2"], "US#1 falls at protocol compatibility");
+    }
+
+    /// T-29: the random group draws through the same composed path —
+    /// deterministic per seed, always inside the eligible set, and the
+    /// typed entropy refusal without any.
+    #[test]
+    fn random_country_selects_through_the_composed_path() {
+        let catalog = fixture_catalog(&[
+            ("GB#1", "GB", 1.0, true),
+            ("DE#1", "DE", 1.0, true),
+            ("US#1", "US", 1.0, true),
+        ]);
+        let context = SelectionContext {
+            random_entropy: Some(9),
+            ..SelectionContext::default()
+        };
+        let first = select_group(
+            &catalog,
+            "proton:random-country",
+            None,
+            &sources(None),
+            &context,
+        )
+        .unwrap();
+        let second = select_group(
+            &catalog,
+            "proton:random-country",
+            None,
+            &sources(None),
+            &context,
+        )
+        .unwrap();
+        assert_eq!(
+            first
+                .ranked
+                .iter()
+                .map(|c| c.server.name.as_str())
+                .collect::<Vec<_>>(),
+            second
+                .ranked
+                .iter()
+                .map(|c| c.server.name.as_str())
+                .collect::<Vec<_>>(),
+            "same entropy, same draw"
+        );
+
+        let err = select_group(
+            &catalog,
+            "proton:random-country",
+            None,
+            &sources(None),
+            &SelectionContext::default(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            GroupSelectionError::Selection(SelectionError::RandomEntropyRequired)
+        );
+    }
+
+    /// The delegation refusal through the composed path (selection-time,
+    /// not lookup-time — FR-23S keeps the group visible).
+    #[test]
+    fn max_security_selection_delegates_to_secure_core_routing() {
+        let catalog = fixture_catalog(&[("CH-SE#1", "SE", 1.0, true)]);
+        let err = select_group(
+            &catalog,
+            "proton:max-security",
+            None,
+            &sources(None),
+            &SelectionContext::default(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            GroupSelectionError::Group(GroupError::SecureCoreRoutingPending {
+                id: "proton:max-security",
+            })
         );
     }
 }
