@@ -98,7 +98,7 @@ each other's commits and test runs.
 ```sh
 cargo fmt --all --check               # formatting
 cargo clippy --all-targets -- -D warnings
-cargo test                            # 27 test targets
+cargo test                            # 29 test targets
 cargo xtask all                       # parity manifest, groups, M49,
                                        # registry freshness, dep-graph,
                                        # license inventory, schema freshness
