@@ -342,6 +342,17 @@ pub struct SelectionContext {
     /// entitlement not composed yet — a port-forwarding constraint then
     /// refuses typed rather than guessing).
     pub port_forwarding_entitled: Option<bool>,
+    /// Per-server port-forwarding CAPABILITY, by logical id (Codex
+    /// PR#5 round 4, P1 / FR-87: entitlement is account permission,
+    /// NOT server capability — the catalog exposes no PF bit upstream,
+    /// so the caller supplies the capability set it composed (the
+    /// daemon's PR-4/M6 wiring; official sources provision PF on a
+    /// server subset). `None`: capability not composed — a
+    /// port-forwarding constraint refuses typed, never
+    /// entitled-⇒-every-server. An empty set is a composed "no server
+    /// is capable" answer (the request then finds no survivor — the
+    /// honest FR-87 outcome).
+    pub port_forwarding_capable: Option<std::collections::BTreeSet<String>>,
 }
 
 /// One hard-filter (or policy) stage, in the order FR-23P prescribes
@@ -627,6 +638,19 @@ pub enum SelectionError {
     /// entitlement composition that must evaluate it (FR-23H).
     #[error("port-forwarding requires entitlement composition before selection can evaluate it")]
     RequiresEntitlementComposition,
+    /// A port-forwarding constraint reached the core entitled but
+    /// WITHOUT the per-server capability data FR-87 requires (Codex
+    /// PR#5 round 4, P1: entitlement is account permission, not
+    /// server capability — the pre-fix arm treated entitled as
+    /// every-server-capable and could select a server that cannot
+    /// provide the feature). The caller must compose the capability
+    /// set (the catalog exposes no PF bit upstream).
+    #[error(
+        "port-forwarding capability data unavailable: the account is entitled but no \
+         per-server capability set was supplied — supply SelectionContext.port_forwarding_capable \
+         (FR-87: only servers that support port forwarding may be selected)"
+    )]
+    PortForwardingCapabilityUnavailable,
     /// No candidate satisfies the constraints; the report names which
     /// stage eliminated what (FR-22).
     #[error("no eligible server: {report}")]
@@ -846,7 +870,18 @@ fn required_features_stage(
         .required_features
         .iter()
         .any(|feature| match feature {
-            FeatureConstraint::PortForwarding => !context.port_forwarding_entitled.unwrap_or(false),
+            // FR-87: entitled AND this server is in the composed
+            // capability set. The set is provably present here (the
+            // entry checks refuse None under entitlement); an empty
+            // composed set eliminates every server — the honest "no
+            // server is capable" outcome.
+            FeatureConstraint::PortForwarding => {
+                !context.port_forwarding_entitled.unwrap_or(false)
+                    || !context
+                        .port_forwarding_capable
+                        .as_ref()
+                        .is_some_and(|capable| capable.contains(&server.id))
+            }
             other => !catalog_feature_holds(server, *other),
         })
         .then_some(FilterStage::RequiredFeatures)
@@ -944,6 +979,17 @@ pub fn filter_candidates<'a>(
     }
     if needs_port_forwarding_composition(request) && context.port_forwarding_entitled.is_none() {
         return Err(SelectionError::RequiresEntitlementComposition);
+    }
+    // Codex PR#5 round 4 (P1, FR-87): entitlement is account
+    // permission, NOT server capability. An entitled request must
+    // still carry the per-server capability set — the pre-fix arm
+    // treated entitled as every-server-capable and could select a
+    // server that cannot provide the feature.
+    if needs_port_forwarding_composition(request)
+        && context.port_forwarding_entitled == Some(true)
+        && context.port_forwarding_capable.is_none()
+    {
+        return Err(SelectionError::PortForwardingCapabilityUnavailable);
     }
 
     let mut counts = [0usize; FilterStage::STAGES.len()];
@@ -1869,14 +1915,46 @@ mod tests {
         assert!(survivors.is_empty());
         assert_eq!(stage_count(&report, FilterStage::RequiredFeatures), 1);
 
-        // Composed true: the constraint passes (support itself derives
-        // from the entitlement composition, never from a catalog bit).
+        // Composed true WITHOUT the capability set: the typed refusal
+        // (Codex PR#5 round 4 — the pre-fix shape passed here for
+        // every server, selecting PF-incapable servers under an
+        // entitled account).
         let context = SelectionContext {
             port_forwarding_entitled: Some(true),
             ..SelectionContext::default()
         };
-        let (survivors, _) = filter_candidates(&catalog, &required, &context).unwrap();
+        let err = filter_candidates(&catalog, &required, &context).unwrap_err();
+        assert_eq!(
+            err,
+            SelectionError::PortForwardingCapabilityUnavailable,
+            "entitlement alone must never satisfy FR-87"
+        );
+
+        // Entitled + the composed capability set naming GB#1 only:
+        // GB#2 eliminates at the feature stage; GB#1 survives.
+        let capable: std::collections::BTreeSet<String> =
+            ["id-GB#1".to_owned()].into_iter().collect();
+        let context = SelectionContext {
+            port_forwarding_entitled: Some(true),
+            port_forwarding_capable: Some(capable),
+            ..SelectionContext::default()
+        };
+        let two = build_catalog(&[Spec::new("GB#1", "GB"), Spec::new("GB#2", "GB")]);
+        let (survivors, report) = filter_candidates(&two, &required, &context).unwrap();
         assert_eq!(names(&survivors), ["GB#1"]);
+        assert_eq!(stage_count(&report, FilterStage::RequiredFeatures), 1);
+
+        // Entitled + an EMPTY composed set: the honest "no server is
+        // capable" outcome — every candidate eliminates with the
+        // report, not a bare refusal.
+        let context = SelectionContext {
+            port_forwarding_entitled: Some(true),
+            port_forwarding_capable: Some(std::collections::BTreeSet::new()),
+            ..SelectionContext::default()
+        };
+        let (survivors, report) = filter_candidates(&two, &required, &context).unwrap();
+        assert!(survivors.is_empty());
+        assert_eq!(stage_count(&report, FilterStage::RequiredFeatures), 2);
     }
 
     #[test]
@@ -2358,6 +2436,7 @@ mod tests {
                 .map(|(id, ms)| ((*id).to_owned(), Duration::from_millis(*ms)))
                 .collect(),
             port_forwarding_entitled: None,
+            port_forwarding_capable: None,
         }
     }
 
