@@ -175,6 +175,16 @@ impl WeightedSignals {
         history: 0.00,
     };
 
+    /// Every signal disabled — the base for callers composing a
+    /// partial weight set by hand.
+    pub const DEFAULT_ZEROED: Self = Self {
+        load: 0.0,
+        latency: 0.0,
+        stability: 0.0,
+        feature_match: 0.0,
+        history: 0.0,
+    };
+
     /// Parses weight pairs (the wire `weights` map). Known keys: load,
     /// latency, stability, feature_match, history; missing keys are 0.
     /// Rejects the forbidden throughput signals with the typed T-1
@@ -221,6 +231,21 @@ impl WeightedSignals {
             *slot = *value;
         }
         Ok(out)
+    }
+
+    /// Whether every weight is finite and non-negative — a hand-built
+    /// struct bypassed [`Self::from_pairs`], so `select` re-checks (a
+    /// NaN would poison every comparison silently).
+    fn is_valid(&self) -> bool {
+        [
+            self.load,
+            self.latency,
+            self.stability,
+            self.feature_match,
+            self.history,
+        ]
+        .iter()
+        .all(|w| w.is_finite() && *w >= 0.0)
     }
 }
 
@@ -440,6 +465,22 @@ impl EliminationReport {
     /// The per-stage counts, in evaluation order.
     pub fn stages(&self) -> &[(FilterStage, usize)] {
         &self.stages
+    }
+
+    /// Charges `count` eliminations to `stage` and reduces the survivor
+    /// count — the policy stages run after the hard filters and report
+    /// through the same accounting (FR-22).
+    fn charge(&mut self, stage: FilterStage, count: usize) {
+        if count == 0 {
+            return;
+        }
+        for (slot, tally) in &mut self.stages {
+            if *slot == stage {
+                *tally += count;
+                break;
+            }
+        }
+        self.survivors -= count;
     }
 }
 
@@ -901,14 +942,224 @@ pub fn filter_candidates<'a>(
 /// no I/O, no network, no clock, no RNG. See the module docs for the
 /// stage order and the policy semantics.
 pub fn select<'a>(
-    _catalog: &'a protonwire_store::catalog::CatalogDocument,
-    _request: &SelectionRequest,
-    _context: &SelectionContext,
+    catalog: &'a protonwire_store::catalog::CatalogDocument,
+    request: &SelectionRequest,
+    context: &SelectionContext,
 ) -> Result<SelectionOutcome<'a>, SelectionError> {
-    // Slice 3 of this PR implements the ranking policies over
-    // filter_candidates; the parameters underscore until then so every
-    // intermediate commit gates clean.
-    todo!("slice 3")
+    let (candidates, mut report) = filter_candidates(catalog, request, context)?;
+    let ranked = match &request.policy {
+        RankingPolicy::Official => rank_official(candidates)?,
+        RankingPolicy::LowestLoad => rank_lowest_load(candidates, &mut report)?,
+        RankingPolicy::Balanced { weights } => {
+            rank_balanced(candidates, *weights, request, context, &mut report)?
+        }
+    };
+    if ranked.is_empty() {
+        // A policy stage eliminated every survivor (FR-22 carries why).
+        return Err(SelectionError::ConstraintsNotSatisfied { report });
+    }
+    Ok(SelectionOutcome { ranked, report })
+}
+
+/// The official policy: Proton's opaque catalog `Score` ascending
+/// (FR-14/FR-19A). ANY eligible candidate lacking a score is the typed
+/// missing-score refusal (T-1) — never a silent drop, never the
+/// balanced model. Ties break by Proton-exposed load ascending, then
+/// by logical id (the m3-plan's decision 2: deterministic output from
+/// allowed signals only).
+fn rank_official<'a>(
+    candidates: Vec<&'a LogicalServer>,
+) -> Result<Vec<RankedCandidate<'a>>, SelectionError> {
+    let lacking = candidates
+        .iter()
+        .filter(|server| server.score.is_none())
+        .count();
+    if lacking > 0 {
+        return Err(SelectionError::OfficialScoreUnavailable {
+            lacking,
+            eligible: candidates.len(),
+        });
+    }
+    let mut ranked: Vec<RankedCandidate> = candidates
+        .into_iter()
+        .map(|server| {
+            let signals = ScoringSignals {
+                proton_score: server.score,
+                load: server.load,
+                latency: None,
+                weighted: None,
+            };
+            RankedCandidate { server, signals }
+        })
+        .collect();
+    ranked.sort_by(|a, b| {
+        a.server
+            .score
+            .unwrap_or(f32::MAX)
+            .total_cmp(&b.server.score.unwrap_or(f32::MAX))
+            .then_with(|| {
+                a.server
+                    .load
+                    .unwrap_or(i8::MAX)
+                    .cmp(&b.server.load.unwrap_or(i8::MAX))
+            })
+            .then_with(|| a.server.id.cmp(&b.server.id))
+    });
+    Ok(ranked)
+}
+
+/// The `load` policy (FR-17): lowest Proton-exposed load; a candidate
+/// without an exposed load is excluded WITH a report entry (decision 4
+/// — never approximated).
+fn rank_lowest_load<'a>(
+    candidates: Vec<&'a LogicalServer>,
+    report: &mut EliminationReport,
+) -> Result<Vec<RankedCandidate<'a>>, SelectionError> {
+    let mut ranked = Vec::with_capacity(candidates.len());
+    let mut missing = 0usize;
+    for server in candidates {
+        match server.load {
+            Some(_) => ranked.push(RankedCandidate {
+                server,
+                signals: ScoringSignals {
+                    proton_score: server.score,
+                    load: server.load,
+                    latency: None,
+                    weighted: None,
+                },
+            }),
+            None => missing += 1,
+        }
+    }
+    report.charge(FilterStage::LoadNotExposed, missing);
+    ranked.sort_by(|a, b| {
+        a.server
+            .load
+            .unwrap_or(i8::MAX)
+            .cmp(&b.server.load.unwrap_or(i8::MAX))
+            .then_with(|| a.server.id.cmp(&b.server.id))
+    });
+    Ok(ranked)
+}
+
+/// The satisfied fraction of the optional feature set (FR-16's
+/// feature-match signal; port forwarding evaluates against the
+/// entitlement seam — fail-closed when unset).
+fn optional_match_ratio(
+    server: &LogicalServer,
+    optional: &[FeatureConstraint],
+    context: &SelectionContext,
+) -> f32 {
+    if optional.is_empty() {
+        return 1.0;
+    }
+    let held = optional
+        .iter()
+        .filter(|feature| match feature {
+            FeatureConstraint::PortForwarding => context.port_forwarding_entitled.unwrap_or(false),
+            other => catalog_feature_holds(server, **other),
+        })
+        .count();
+    held as f32 / optional.len() as f32
+}
+
+/// The ProtonWire `balanced` policy (FR-16, lower is better): the
+/// weighted sum over load (Proton-exposed, normalized 0–1), latency
+/// (caller-supplied, normalized against the observed set), feature
+/// match, and — uniformly zero until their data sources exist post-M4 —
+/// stability and history (the m3-plan's decision 5). A positive
+/// latency weight with no observations at all refuses typed; a
+/// candidate simply lacking an observation is excluded WITH a report
+/// entry (the FR-18 shortlist boundary).
+fn rank_balanced<'a>(
+    candidates: Vec<&'a LogicalServer>,
+    weights: WeightedSignals,
+    request: &SelectionRequest,
+    context: &SelectionContext,
+    report: &mut EliminationReport,
+) -> Result<Vec<RankedCandidate<'a>>, SelectionError> {
+    if !weights.is_valid() {
+        return Err(SelectionError::InvalidWeights(
+            "hand-built weights must be finite and non-negative".to_owned(),
+        ));
+    }
+    if weights.latency > 0.0 && context.latency.is_empty() {
+        return Err(SelectionError::LatencyDataUnavailable {
+            weight: weights.latency,
+        });
+    }
+
+    let mut pool = Vec::with_capacity(candidates.len());
+    let mut no_load = 0usize;
+    let mut no_latency = 0usize;
+    for server in candidates {
+        if weights.load > 0.0 && server.load.is_none() {
+            no_load += 1;
+            continue;
+        }
+        if weights.latency > 0.0 && !context.latency.contains_key(&server.id) {
+            no_latency += 1;
+            continue;
+        }
+        pool.push(server);
+    }
+    report.charge(FilterStage::LoadNotExposed, no_load);
+    report.charge(FilterStage::NoLatencyObservation, no_latency);
+
+    let max_latency = pool
+        .iter()
+        .filter_map(|server| context.latency.get(&server.id))
+        .map(Duration::as_secs_f32)
+        .fold(0.0_f32, f32::max);
+
+    let mut ranked: Vec<RankedCandidate> = pool
+        .into_iter()
+        .map(|server| {
+            let load_term = if weights.load > 0.0 {
+                weights.load * (server.load.unwrap_or(0) as f32 / 100.0)
+            } else {
+                0.0
+            };
+            let observed = context.latency.get(&server.id).copied();
+            let latency_term = match (weights.latency > 0.0, observed) {
+                (true, Some(latency)) if max_latency > 0.0 => {
+                    weights.latency * (latency.as_secs_f32() / max_latency)
+                }
+                _ => 0.0,
+            };
+            let ratio =
+                optional_match_ratio(server, &request.constraints.optional_features, context);
+            let feature_match_term = weights.feature_match * (1.0 - ratio);
+            let stability_term = 0.0;
+            let history_term = 0.0;
+            let total =
+                load_term + latency_term + stability_term + feature_match_term + history_term;
+            let signals = ScoringSignals {
+                proton_score: server.score,
+                load: server.load,
+                latency: observed,
+                weighted: Some(WeightedBreakdown {
+                    load_term,
+                    latency_term,
+                    stability_term,
+                    feature_match_term,
+                    history_term,
+                    total,
+                }),
+            };
+            RankedCandidate { server, signals }
+        })
+        .collect();
+    ranked.sort_by(|a, b| {
+        let (Some(a_total), Some(b_total)) = (a.signals.weighted, b.signals.weighted) else {
+            unreachable!("balanced always carries the breakdown")
+        };
+        a_total
+            .total
+            .total_cmp(&b_total.total)
+            .then_with(|| a.server.id.cmp(&b.server.id))
+    });
+    Ok(ranked)
 }
 
 #[cfg(test)]
@@ -1728,5 +1979,410 @@ mod tests {
             rendered.contains("4 considered, 1 survivors") && rendered.contains("1 offline"),
             "the Display carries the accounting: {rendered}"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Slice 3 — the ranking policies through select (T-1): official
+    // ordering and its refusal class, lowest load, the balanced
+    // weighted model, and the FR-22 end-to-end error.
+    // ------------------------------------------------------------------
+
+    fn spec_with(
+        name: &'static str,
+        exit: &'static str,
+        score: Option<f32>,
+        load: Option<i8>,
+    ) -> Spec {
+        Spec {
+            score,
+            load,
+            ..Spec::new(name, exit)
+        }
+    }
+
+    #[test]
+    fn official_orders_by_proton_score_ascending() {
+        // FR-14/FR-19A: official = Proton's opaque catalog Score
+        // ascending after hard filters; no local signal participates.
+        let catalog = build_catalog(&[
+            spec_with("GB#1", "GB", Some(1.5), Some(50)),
+            spec_with("GB#2", "GB", Some(0.5), Some(90)),
+            spec_with("GB#3", "GB", Some(2.5), Some(10)),
+        ]);
+        let outcome = select(
+            &catalog,
+            &official(Target::Country("GB".into())),
+            &SelectionContext::default(),
+        )
+        .unwrap();
+        let ranked: Vec<&str> = outcome
+            .ranked
+            .iter()
+            .map(|c| c.server.name.as_str())
+            .collect();
+        assert_eq!(ranked, ["GB#2", "GB#1", "GB#3"]);
+        assert_eq!(outcome.ranked[0].signals.proton_score, Some(0.5));
+        assert_eq!(outcome.ranked[0].signals.weighted, None);
+        assert_eq!(outcome.report.survivors(), 3);
+    }
+
+    #[test]
+    fn official_ties_break_by_load_then_id() {
+        // The plan's decision 2: Score ascending, ties by Proton-exposed
+        // Load ascending (an allowed Proton-exposed signal, FR-19), then
+        // by logical id — deterministic output, never locally invented.
+        let catalog = build_catalog(&[
+            spec_with("GB#B", "GB", Some(1.0), Some(40)),
+            spec_with("GB#A", "GB", Some(1.0), Some(40)),
+            spec_with("GB#C", "GB", Some(1.0), Some(10)),
+        ]);
+        let outcome = select(
+            &catalog,
+            &official(Target::Country("GB".into())),
+            &SelectionContext::default(),
+        )
+        .unwrap();
+        let ranked: Vec<&str> = outcome
+            .ranked
+            .iter()
+            .map(|c| c.server.name.as_str())
+            .collect();
+        assert_eq!(ranked, ["GB#C", "GB#A", "GB#B"]);
+    }
+
+    #[test]
+    fn official_missing_score_refuses_never_substitutes_balanced() {
+        // T-1/FR-19A: ANY eligible candidate lacking a Score is a typed
+        // refusal suggesting an eligible catalog refresh — never a
+        // silent drop, never the balanced model in disguise.
+        let catalog = build_catalog(&[
+            spec_with("GB#1", "GB", Some(1.0), Some(50)),
+            spec_with("GB#2", "GB", None, Some(50)),
+        ]);
+        let err = select(
+            &catalog,
+            &official(Target::Country("GB".into())),
+            &SelectionContext::default(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            SelectionError::OfficialScoreUnavailable {
+                lacking: 1,
+                eligible: 2,
+            }
+        );
+        let message = err.to_string();
+        assert!(
+            message.contains("official-score-unavailable") && message.contains("refresh"),
+            "the refusal carries its PRD token and the remediation: {message}"
+        );
+    }
+
+    #[test]
+    fn lowest_load_orders_by_exposed_load_and_reports_missing() {
+        // FR-17 + decision 4: lowest Proton-exposed load; a missing load
+        // is excluded WITH a report entry, never approximated.
+        let catalog = build_catalog(&[
+            spec_with("GB#1", "GB", Some(1.0), Some(80)),
+            spec_with("GB#2", "GB", Some(2.0), Some(10)),
+            spec_with("GB#3", "GB", Some(0.5), None),
+        ]);
+        let mut request = official(Target::Country("GB".into()));
+        request.policy = RankingPolicy::LowestLoad;
+        let outcome = select(&catalog, &request, &SelectionContext::default()).unwrap();
+        let ranked: Vec<&str> = outcome
+            .ranked
+            .iter()
+            .map(|c| c.server.name.as_str())
+            .collect();
+        assert_eq!(ranked, ["GB#2", "GB#1"]);
+        assert_eq!(stage_count(&outcome.report, FilterStage::LoadNotExposed), 1);
+        assert_eq!(outcome.report.survivors(), 2);
+
+        // ALL loads missing: the policy eliminated everyone — FR-22
+        // carries the reason.
+        let catalog = build_catalog(&[
+            spec_with("GB#1", "GB", Some(1.0), None),
+            spec_with("GB#2", "GB", Some(2.0), None),
+        ]);
+        let err = select(&catalog, &request, &SelectionContext::default()).unwrap_err();
+        match err {
+            SelectionError::ConstraintsNotSatisfied { report } => {
+                assert_eq!(stage_count(&report, FilterStage::LoadNotExposed), 2);
+            }
+            other => panic!("expected the FR-22 error, got {other}"),
+        }
+    }
+
+    fn latency_context(pairs: &[(&str, u64)]) -> SelectionContext {
+        SelectionContext {
+            latency: pairs
+                .iter()
+                .map(|(id, ms)| ((*id).to_owned(), Duration::from_millis(*ms)))
+                .collect(),
+            port_forwarding_entitled: None,
+        }
+    }
+
+    fn balanced(weights: WeightedSignals, target: Target) -> SelectionRequest {
+        SelectionRequest {
+            target,
+            policy: RankingPolicy::Balanced { weights },
+            constraints: Constraints::default(),
+        }
+    }
+
+    #[test]
+    fn balanced_orders_by_the_hand_computed_weighted_sum() {
+        // FR-16, hand-checked: loads A=80 B=20 C=50; latencies
+        // A=100ms B=200ms C=50ms; weights load=.5 latency=.5.
+        // normalized latency (max 200ms): A=.5 B=1.0 C=.25.
+        // totals: A=.5*.8+.5*.5=.65 B=.5*.2+.5*1=.6 C=.5*.5+.5*.25=.375.
+        let catalog = build_catalog(&[
+            spec_with("GB#A", "GB", Some(1.0), Some(80)),
+            spec_with("GB#B", "GB", Some(1.0), Some(20)),
+            spec_with("GB#C", "GB", Some(1.0), Some(50)),
+        ]);
+        let weights = WeightedSignals {
+            load: 0.5,
+            latency: 0.5,
+            ..WeightedSignals::DEFAULT_ZEROED
+        };
+        let outcome = select(
+            &catalog,
+            &balanced(weights, Target::Country("GB".into())),
+            &latency_context(&[("id-GB#A", 100), ("id-GB#B", 200), ("id-GB#C", 50)]),
+        )
+        .unwrap();
+        let ranked: Vec<&str> = outcome
+            .ranked
+            .iter()
+            .map(|c| c.server.name.as_str())
+            .collect();
+        assert_eq!(ranked, ["GB#C", "GB#B", "GB#A"]);
+        let winner = &outcome.ranked[0];
+        let breakdown = winner
+            .signals
+            .weighted
+            .expect("balanced carries the breakdown");
+        assert!((breakdown.load_term - 0.25).abs() < 1e-6);
+        assert!((breakdown.latency_term - 0.125).abs() < 1e-6);
+        assert!((breakdown.total - 0.375).abs() < 1e-6);
+        assert_eq!(winner.signals.latency, Some(Duration::from_millis(50)));
+    }
+
+    #[test]
+    fn balanced_latency_weight_without_observations_refuses() {
+        // Decision 5: latency probing is PR-3; no table and a positive
+        // latency weight is a typed refusal — no fabricated latencies.
+        let catalog = build_catalog(&[spec_with("GB#1", "GB", Some(1.0), Some(50))]);
+        let weights = WeightedSignals {
+            latency: 0.4,
+            ..WeightedSignals::DEFAULT_ZEROED
+        };
+        let err = select(
+            &catalog,
+            &balanced(weights, Target::Country("GB".into())),
+            &SelectionContext::default(),
+        )
+        .unwrap_err();
+        assert_eq!(err, SelectionError::LatencyDataUnavailable { weight: 0.4 });
+    }
+
+    #[test]
+    fn balanced_ranks_the_observed_shortlist_and_reports_the_boundary() {
+        // FR-18's shortlist boundary: candidates without an observation
+        // are excluded WITH a report entry (never probed, never
+        // guessed), not a global refusal.
+        let catalog = build_catalog(&[
+            spec_with("GB#1", "GB", Some(1.0), Some(50)),
+            spec_with("GB#2", "GB", Some(1.0), Some(50)),
+            spec_with("GB#3", "GB", Some(1.0), Some(50)),
+        ]);
+        let weights = WeightedSignals {
+            latency: 1.0,
+            ..WeightedSignals::DEFAULT_ZEROED
+        };
+        let outcome = select(
+            &catalog,
+            &balanced(weights, Target::Country("GB".into())),
+            &latency_context(&[("id-GB#1", 80), ("id-GB#3", 20)]),
+        )
+        .unwrap();
+        let ranked: Vec<&str> = outcome
+            .ranked
+            .iter()
+            .map(|c| c.server.name.as_str())
+            .collect();
+        assert_eq!(ranked, ["GB#3", "GB#1"]);
+        assert_eq!(
+            stage_count(&outcome.report, FilterStage::NoLatencyObservation),
+            1
+        );
+    }
+
+    #[test]
+    fn balanced_missing_load_is_excluded_with_a_report_entry() {
+        let catalog = build_catalog(&[
+            spec_with("GB#1", "GB", Some(1.0), Some(50)),
+            spec_with("GB#2", "GB", Some(1.0), None),
+        ]);
+        let weights = WeightedSignals {
+            load: 1.0,
+            ..WeightedSignals::DEFAULT_ZEROED
+        };
+        let outcome = select(
+            &catalog,
+            &balanced(weights, Target::Country("GB".into())),
+            &SelectionContext::default(),
+        )
+        .unwrap();
+        let ranked: Vec<&str> = outcome
+            .ranked
+            .iter()
+            .map(|c| c.server.name.as_str())
+            .collect();
+        assert_eq!(ranked, ["GB#1"]);
+        assert_eq!(stage_count(&outcome.report, FilterStage::LoadNotExposed), 1);
+    }
+
+    #[test]
+    fn balanced_stability_and_history_are_uniformly_zero_and_disclosed() {
+        // Decision 5: no data source exists until post-M4 connection
+        // statistics — the terms contribute uniformly zero (order-
+        // neutral) and the report says nothing was fabricated.
+        let catalog = build_catalog(&[
+            spec_with("GB#1", "GB", Some(1.0), Some(50)),
+            spec_with("GB#2", "GB", Some(1.0), Some(50)),
+        ]);
+        let outcome = select(
+            &catalog,
+            &balanced(WeightedSignals::DEFAULT, Target::Country("GB".into())),
+            &latency_context(&[("id-GB#1", 100), ("id-GB#2", 100)]),
+        )
+        .unwrap();
+        for candidate in &outcome.ranked {
+            let breakdown = candidate.signals.weighted.as_ref().unwrap();
+            assert_eq!(breakdown.stability_term, 0.0);
+            assert_eq!(breakdown.history_term, 0.0);
+        }
+        // Equal load+latency inputs: the stability/history weights do
+        // not perturb the order (id tiebreak decides).
+        let ranked: Vec<&str> = outcome
+            .ranked
+            .iter()
+            .map(|c| c.server.name.as_str())
+            .collect();
+        assert_eq!(ranked, ["GB#1", "GB#2"]);
+    }
+
+    #[test]
+    fn balanced_feature_match_rewards_optional_coverage() {
+        // FR-16's feature_match term: among otherwise-equal candidates
+        // the one satisfying the optional features scores lower
+        // (better).
+        let mut with_p2p = spec_with("GB#1", "GB", Some(1.0), Some(50));
+        with_p2p.features = 4;
+        let catalog = build_catalog(&[with_p2p, spec_with("GB#2", "GB", Some(1.0), Some(50))]);
+        let mut request = balanced(
+            WeightedSignals {
+                feature_match: 0.2,
+                ..WeightedSignals::DEFAULT_ZEROED
+            },
+            Target::Country("GB".into()),
+        );
+        request.constraints.optional_features = vec![FeatureConstraint::P2p];
+        let outcome = select(&catalog, &request, &SelectionContext::default()).unwrap();
+        let ranked: Vec<&str> = outcome
+            .ranked
+            .iter()
+            .map(|c| c.server.name.as_str())
+            .collect();
+        assert_eq!(ranked, ["GB#1", "GB#2"]);
+        let satisfied = outcome.ranked[0].signals.weighted.unwrap();
+        let unsatisfied = outcome.ranked[1].signals.weighted.unwrap();
+        assert_eq!(satisfied.feature_match_term, 0.0);
+        assert!((unsatisfied.feature_match_term - 0.2).abs() < 1e-6);
+    }
+
+    #[test]
+    fn balanced_hand_built_invalid_weights_refuse_at_select() {
+        // from_pairs validates, but a hand-built struct bypasses it;
+        // select re-checks (NaN would poison every comparison).
+        let catalog = build_catalog(&[spec_with("GB#1", "GB", Some(1.0), Some(50))]);
+        let weights = WeightedSignals {
+            load: f32::NAN,
+            ..WeightedSignals::DEFAULT_ZEROED
+        };
+        let err = select(
+            &catalog,
+            &balanced(weights, Target::Country("GB".into())),
+            &SelectionContext::default(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, SelectionError::InvalidWeights(_)), "{err}");
+    }
+
+    #[test]
+    fn unsatisfiable_requests_carry_the_structured_report() {
+        // FR-22 end-to-end through select: the error explains which
+        // constraints eliminated the candidates.
+        let catalog = build_catalog(&[
+            Spec {
+                gateway: Some("acme-corp"),
+                ..Spec::new("acme-corp#1", "SE")
+            },
+            Spec {
+                features: 4,
+                ..spec_with("DE#1", "DE", Some(1.0), Some(50))
+            },
+        ]);
+        let mut request = official(Target::Fastest);
+        request.constraints.excluded_countries = vec!["DE".into()];
+        let err = select(&catalog, &request, &SelectionContext::default()).unwrap_err();
+        match &err {
+            SelectionError::ConstraintsNotSatisfied { report } => {
+                assert_eq!(stage_count(report, FilterStage::ServerType), 1);
+                assert_eq!(stage_count(report, FilterStage::ExcludedCountry), 1);
+                let rendered = err.to_string();
+                assert!(
+                    rendered.contains("no eligible server") && rendered.contains("server-type"),
+                    "the Display names the eliminating stages: {rendered}"
+                );
+            }
+            other => panic!("expected the FR-22 error, got {other}"),
+        }
+    }
+
+    #[test]
+    fn selection_is_deterministic_for_identical_inputs() {
+        // Pure core, pinned: same catalog + request + context, same
+        // order — the tiebreak discipline guarantees it.
+        let catalog = build_catalog(&[
+            spec_with("GB#1", "GB", Some(1.0), Some(50)),
+            spec_with("GB#2", "GB", Some(1.0), Some(50)),
+            spec_with("GB#3", "GB", Some(0.5), Some(99)),
+        ]);
+        let first = select(
+            &catalog,
+            &official(Target::Fastest),
+            &SelectionContext::default(),
+        )
+        .unwrap();
+        let second = select(
+            &catalog,
+            &official(Target::Fastest),
+            &SelectionContext::default(),
+        )
+        .unwrap();
+        fn ranked_names<'r>(outcome: &'r SelectionOutcome<'_>) -> Vec<&'r str> {
+            outcome
+                .ranked
+                .iter()
+                .map(|c| c.server.name.as_str())
+                .collect()
+        }
+        assert_eq!(ranked_names(&first), ranked_names(&second));
     }
 }
