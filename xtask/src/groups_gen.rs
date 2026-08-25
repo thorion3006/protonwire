@@ -543,24 +543,10 @@ mod tests {
         (yaml, csv, out, text)
     }
 
-    /// The 14 canonical ids (mirrors the S13 pin; the registry must
-    /// carry each one).
-    const CANONICAL_IDS: [&str; 14] = [
-        "proton:anti-censorship",
-        "proton:fastest-country",
-        "proton:fastest-excluding-my-country",
-        "proton:gaming",
-        "proton:max-security",
-        "proton:random-country",
-        "proton:streaming-us",
-        "proton:work-school",
-        "protonwire:fastest-africa",
-        "protonwire:fastest-asia",
-        "protonwire:fastest-europe",
-        "protonwire:fastest-north-america",
-        "protonwire:fastest-oceania",
-        "protonwire:fastest-south-america",
-    ];
+    /// The canonical ids come from THE S13 pin (`groups::EXPECTED_GROUP_IDS`)
+    /// — no mirror list here: the registry must carry each pinned id, and a
+    /// pin edit flows into this check without a second copy to drift.
+    use crate::groups::EXPECTED_GROUP_IDS as CANONICAL_IDS;
 
     #[test]
     fn generating_from_the_real_sources_is_complete_and_deterministic() {

@@ -70,8 +70,10 @@ const EXPECTED_GROUP_COUNT: usize = 14;
 /// The v1 catalog's canonical id set (docs/connection-groups.yaml): 8
 /// `proton:*` official groups plus 6 `protonwire:*` regional fastest groups.
 /// The count check alone would let a renamed entry through, so the set
-/// itself is pinned against schema-version-1 documents.
-const EXPECTED_GROUP_IDS: [&str; EXPECTED_GROUP_COUNT] = [
+/// itself is pinned against schema-version-1 documents. THE pin for the
+/// whole xtask crate: groups-gen's own tests assert against this array
+/// (pub(crate) so they can — no mirror copies).
+pub(crate) const EXPECTED_GROUP_IDS: [&str; EXPECTED_GROUP_COUNT] = [
     "proton:anti-censorship",
     "proton:fastest-country",
     "proton:fastest-excluding-my-country",
