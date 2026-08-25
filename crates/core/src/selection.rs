@@ -61,11 +61,16 @@
 //! Exact server requests never silently fall back to another server
 //! (FR-23): an unmatchable, offline, or eliminated exact target is a
 //! typed error naming the server and the stage that refused it.
+//! City names compare ASCII-case-insensitively (user-typed prose
+//! against catalog casing); server and gateway names compare exactly.
 //! Country codes are ISO 3166-1 alpha-2 and must arrive uppercase —
 //! canonicalization is the calling surface's job, and this module
-//! refuses anything non-canonical rather than approximating. State and
-//! city names compare ASCII-case-insensitively (user-typed prose
-//! against catalog casing); server and gateway names compare exactly.
+//! refuses anything non-canonical rather than approximating.
+//!
+//! Non-goal: NetShield level is a per-session feature REQUEST carried
+//! to the tunnel (PRD §11.4), never a server filter — this module has
+//! no NetShield constraint variant by design; the requested-vs-applied
+//! reconciliation is the connection surface's (U6).
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -78,10 +83,10 @@ use protonwire_store::catalog::LogicalServer;
 /// FR-18 forbids full-catalog scans, so keys cover at most a shortlist).
 pub type LatencyTable = BTreeMap<String, Duration>;
 
-/// The forbidden throughput ranking signals (the catalog contract's
-/// `forbidden_ranking_signals`, plus `speed` itself — FR-19's named
-/// offender). Rejecting these is T-1's "every input schema" clause for
-/// this module's schema.
+/// The forbidden throughput ranking signals (the connection-groups
+/// yaml contract's `forbidden_ranking_signals`, plus `speed` itself —
+/// FR-19's named offender). Rejecting these is T-1's "every input
+/// schema" clause for this module's schema.
 pub const FORBIDDEN_RANKING_SIGNALS: &[&str] =
     &["speed", "estimated-speed", "estimated-throughput"];
 
@@ -1210,6 +1215,19 @@ mod tests {
                 "the refusal must cite the rule: {err}"
             );
         }
+    }
+
+    /// The intermediate state (M3 U1 review nit): `latency` is PR-3's
+    /// mode (the bounded on-demand prober); until then it must parse as
+    /// an ordinary INVALID mode — never silently accepted, never the
+    /// unsupported-SIGNAL class.
+    #[test]
+    fn latency_mode_is_invalid_until_pr3_wires_the_prober() {
+        let err = RankingPolicy::parse("latency").unwrap_err();
+        assert_eq!(
+            err,
+            SelectionError::InvalidRankingMode("latency".to_owned())
+        );
     }
 
     #[test]
