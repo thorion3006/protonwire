@@ -1384,3 +1384,195 @@ behavior-preserving scope, so they are recorded, not dispositioned:
    round-2 tightening (`80e815a`) restricted the exemption to the
    Official policy so it cannot bypass Balanced's weight validation or
    Random's entropy requirement.)*
+
+## 2026-08-25 — M3 PR-2 close (refactorer + doc-writer, pre-merge)
+
+The owed close pass on `m3/group-registry` (PR #6, U2/U3, 8 commits
+over `m3/selection-core`@db2b7cf) before the owner's merge call. The
+implementation and its verdicts were complete; this entry records the
+verdict chain, the rebase story, the close-pass work, and the items
+open at the merge call.
+
+### U2/U3's verdict chain (as it stands on the PR)
+
+- **RUST PASS + QA CONFIRMED** — the mutation table: the resolver's
+  four named mutations each killed exactly their pin (FR-23Q
+  precedence inversion → the precedence pin; proton-override-ban
+  deletion → the T-33 pin; signal-check/permission-check swap → the
+  speed-class pin; region-membership bypass → both regional pins);
+  the random policy's country-shuffle deletion → the uniformity pin
+  ("country A led 1000 of 1000 draws"); plus the VERDICT's own
+  generation-side pair — a dropped yaml group → the golden gate
+  refuses, and taxonomy drift → passed both gates pre-fix (the
+  finding), refused inline by gate 1b after (the fix's own kill
+  test, run live by the verdict session). **sec dispositioned
+  not-matching**: no runtime ingress — build-time generation from
+  the committed, golden-validated yaml; the gates are the control
+  and were verified live.
+- **P2-1 — fixed @ 33024b6** (the rebase riders): groups-gen's own
+  gates now include the S13 taxonomy pin (gate 1b) — a drifted
+  `regional_taxonomy` is refused by standalone groups-gen, not only
+  by groups-validate elsewhere in `xtask all`. This closed THE
+  PLAN'S GAP: m3-plan U2 names S13's golden-document equality as the
+  validation gate but never required generation-side self-gating,
+  and the golden table covers only `groups` — the taxonomy half of
+  the contract had no generation-side refusal until the verdict
+  caught it.
+- **P2-2 — GAP (disclosed)**: no artifact in the repo, the PR, or
+  the branch's commit messages records what P2-2 was or how it was
+  dispositioned; the coordinator confirmed it is not recoverable and
+  directed an honest gap record here. P2-1 and P3 are
+  commit-evidenced (33024b6's message carries both); P2-2 is the one
+  verdict item this entry cannot trace — the owner should treat any
+  unposted P2-2 as unresolved at the merge call.
+- **P3 — folded @ 33024b6**: rank_random adopted the parent
+  close-pass's `catalog_only` constructor (the third copy be97c68's
+  message anticipated).
+- **CI 8/8 at `58174cd`**: audit, clippy, doc, fmt, gui, msrv, test,
+  xtask — all green.
+
+### The rebase story (and the bisect hazard it left)
+
+PR-2 was rebased twice as PR-1's tip moved (first onto `6567324` —
+be97c68's consolidations plus 61e54db's thread fixes; then onto
+`db2b7cf`). The select() conflict — 61e54db's exact-single-candidate
+if/else and be97c68's match restructuring against the resolver's
+added Random arm — was hand-repaired, and the repair left the Random
+arm stranded OUTSIDE the policy match: on the pushed branch,
+**46b4f79, 663ebae, and 7bea298 are individually red**
+(`cargo check --locked -p protonwire-core` at 7bea298 in a detached
+worktree: E0308, raw exit 101, "consider using a semicolon here" at
+the stranded arm). The riders commit 33024b6 moved the arm back
+inside the match, but its message names only gate 1b, check_taxonomy,
+and catalog_only — the structural repair rode undisclosed. Disclosed
+here; the history is pushed and stays (the F3 precedent). `git
+bisect` across 46b4f79..33024b6 will stop on the three red
+intermediates.
+
+### The doc-gate private-link fixes (and one mangle)
+
+The rustdoc gate caught intra-doc links to the private `registry`
+submodule in the new module docs: `b238eba` de-linked the first
+(`[`registry`]` → "the private `registry` submodule"), `58174cd` the
+two `[`registry::COUNTRY_REGIONS`]` forms — and 58174cd's own edit
+mangled the regional-membership paragraph ("the generated the
+generated … table table": the replacement collided with the
+sentence's existing framing; its message claimed "complete"). This
+pass fixed the sentence, and the triple-gate story is now stated
+everywhere it is asserted: groups_gen's module header still said
+"Two gates" after 1b landed (now three: 1, 1b, 2), and the GENERATED
+registry header named only the golden-table and m49 gates — the
+emitted header now names the taxonomy pin too (regenerated through
+the generator; only the header bytes changed, re-verified by
+`groups-gen --check`).
+
+### The refactorer's pass (behavior-gated; suite identity proven)
+
+Survey-then-act over the PR diff; two restructures landed, three
+candidates rejected with reasons. Landed:
+
+1. **The one mixer @ `85034d6`**: the benchmark's `Lcg` and the
+   production `SeededDraw` were byte-identical `next_u64` twins
+   (same LCG constants, same splitmix64 output mix) in one file —
+   the exact fold the PR-1 close pass deferred ("folding THAT is
+   PR-2's close pass"; the single-consumer rejection flipped with
+   two consumers). `SeededDraw` is the crate's single draw device,
+   gains `below()` (the bounded roll fisher_yates did inline), the
+   20k benchmark draws from it directly, and the low-bit-trap
+   history comment moved onto the shared device where both
+   consumers read it.
+2. **THE pin, not a mirror @ `1b794b4`**: groups-gen's test
+   `CANONICAL_IDS` was a hand-copied mirror of
+   `groups::EXPECTED_GROUP_IDS` (the S13 pin) — drift-prone in
+   exactly the way this codebase's pin families have bled before.
+   The test now imports the pin (`pub(crate)`, the same widening
+   the riders gave check_taxonomy/check_golden_groups_table). The
+   core-side `CANONICAL_IDS` stays a deliberate independent copy:
+   cross-crate, and an independent consumer-side list gives T-28
+   independent teeth — the pin cannot vouch for itself.
+
+Rejected, with reasons (the negative results are the deliverable):
+
+- **The fixture-builder fold**: the PR-1 close pass's premise ("PR-2's
+  tests reuse THIS module's builder in place") was false — PR-2 built
+  its own minimal `fixture_catalog`. Re-derived and still rejected:
+  the builders are not twins (selection's 16-field `Spec` exercises
+  every pipeline knob; groups's 4-tuple is a minimal envelope with a
+  protocol-map flag — different disciplines), and only the ~8-line
+  catalog envelope is genuinely shared. Flip trigger recorded: a
+  third synthetic-catalog consumer (PR-3's U4/U5 test modules)
+  hoists `Spec`/`build_catalog` into a `#[cfg(test)]` crate module
+  then.
+- **The override-check ladder**: arm-shaped, and its ORDER is pinned
+  behavior (signal-before-permission is mutation-tested); a
+  permission table cannot express the ordering. Each rung's refusal
+  class has its own kill test — the ladder is the design.
+- **groups_gen emitter internals**: the width-budget helpers already
+  share (`emit_struct_literal`/`emit_raw_list`); the 14-entry
+  repetition lives in the GENERATED file (gate-protected, never
+  hand-refactored); the yaml→variant token maps are arm-shaped
+  matches with per-field refusal contexts.
+
+Proof of behavior identity: temp-worktree `--locked` runs at
+`58174cd` vs `1b794b4` — identical per-target counts (29 targets,
+800 passed, 0 failed; core 163, xtask 104; durations differ).
+
+### The doc-writer's audit
+
+- **m3-plan U2/U3 vs delivery**: every U2 clause traced to code (the
+  five target kinds → the GroupTarget match incl. the
+  SecureCoreRoutingPending delegation; the four override classes;
+  PolicyProvenance; FR-23Q's three-source precedence; NAT/LAN
+  riding the definition as connection-time data), every U3 clause
+  to the generated tables and their pins (six memberships, the
+  60/50/51/41/16/29 distribution, the 021+013+029 composite both
+  ways, unmapped-and-ineligible end-to-end). Plan text is normative
+  and untouched; the P2-1 gap is recorded above.
+- **CONTRIBUTING**: the gates list's "registry freshness" mention
+  (7bea298) is accurate; the adjacent "27 test targets" count was
+  not — written in 93f8254 (M1 era) and stale since the M2 close's
+  own record said 29. Corrected to 29. README audited clean: it
+  claims merged reality only, and M3 remains unmerged.
+- **Module-doc sweep**: the FR-23Q precedence and override-class
+  claims were verdict-verified; §7.3B's "core representation must
+  preserve at least" list (which the GroupEntry doc cites) was
+  verified against the PRD — which surfaced open item 1 below.
+
+### Open at the owner's merge call
+
+1. **Codex P2 (posted after this pass began; reviewed commit
+   `58174cd`) — the registry discards the catalog/source
+   revisions.** Premise verified: the yaml carries a top-level
+   `catalog_revision` and per-source `revision` values; §7.3B's
+   minimum-preservation list explicitly ends with "source revision
+   or taxonomy revision", and T-28 names source/taxonomy revisions
+   as validated content — but `GroupEntry` retains the sources'
+   KEYS only (the generator has no revision fields). FR-23T's
+   "catalog revision" status field is ambiguous between the S6
+   server catalog and the groups catalog (m3-plan's U6 currently
+   reads it as the former). Extending the generator and registry is
+   additive but changes a verdict-complete surface — recorded, not
+   dispositioned. Candidate lanes: a small generator extension in
+   this PR, or PR-4's U6 where the FR-23T fields get composed.
+2. **P2-2's disposition** — the gap above; the owner should weigh it
+   with the merge call.
+3. **The stale base and the recurring select() conflict**: PR-1's
+   tip moved again mid-pass (`80e815a`, the round-2
+   official-only-exemption fix, landed while this pass ran) — PR-2's
+   base remains db2b7cf, one commit behind. The plan's rebase-on-
+   merge will re-touch the exact select() region this pass's rebase
+   story documents: keep the Random arm INSIDE the policy match,
+   immediately after the Balanced arm (the stranded-arm shape is
+   what reddened the three intermediates). Semantically the two
+   changes are aligned — 80e815a's message explicitly accounts for
+   "Random's entropy" as a validation the normal path enforces, and
+   no PR-2 pin contradicts the official-only exemption (every
+   Random pin drives a non-exact target). The PR description's
+   "composes with Random's added policy arm" claim predates
+   80e815a's semantic change and reads differently under it.
+4. PR-1's own open Codex threads (the `--require secure-core` P1;
+   the exact-server missing-Score P2) sit one PR down the stack and
+   remain that entry's items. *(Both were subsequently resolved on
+   PR #5 — see that entry's resolution note — as were its round-3
+   findings: the balanced-overflow refusal and the doc-sync, both at
+   758ffc2.)*
