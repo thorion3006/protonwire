@@ -1232,9 +1232,14 @@ fn rank_random<'a>(candidates: Vec<&'a LogicalServer>, entropy: u64) -> Vec<Rank
     ranked
 }
 
-/// A seeded splitmix64 stream — the deterministic draw device for the
-/// random policy (same mixer as the test fixtures; never product
-/// randomness, which the scheduler takes from the OS CSPRNG).
+/// A seeded splitmix64 stream — the crate's ONE deterministic draw
+/// device: the random policy shuffles through it and the synthetic
+/// test fixtures (the 20k benchmark) draw from the same stream (never
+/// product randomness, which the scheduler takes from the OS CSPRNG).
+/// The output mix matters: a raw LCG's low bits have tiny periods
+/// (bit 0 alternates every call), which bit-biased a first draft of
+/// the benchmark fixture into setting the Secure Core feature on 100%
+/// of "standard" logicals.
 struct SeededDraw(u64);
 
 impl SeededDraw {
@@ -1248,12 +1253,18 @@ impl SeededDraw {
         z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
         z ^ (z >> 31)
     }
+
+    /// A draw below `bound` (the shuffle's index pick; the fixtures'
+    /// bounded rolls).
+    fn below(&mut self, bound: u64) -> u64 {
+        self.next_u64() % bound
+    }
 }
 
 /// In-place uniform shuffle (Fisher-Yates over the seeded stream).
 fn fisher_yates<T>(items: &mut [T], rng: &mut SeededDraw) {
     for index in (1..items.len()).rev() {
-        let swap = (rng.next_u64() % (index as u64 + 1)) as usize;
+        let swap = rng.below(index as u64 + 1) as usize;
         items.swap(index, swap);
     }
 }
@@ -2876,33 +2887,11 @@ mod tests {
     // 20k servers = 5,000 logicals x 4 physicals each, inside the
     // landed S6 caps (16,384 logicals / 262,144 physicals — a 20k
     // LOGICAL fixture is unrepresentable). Deterministic generation:
-    // a fixed-seed LCG, no wall clock, no RNG dependency.
+    // a fixed-seed [`SeededDraw`] (the production mixer this module's
+    // random policy shuffles through — folded here by the PR-2 close
+    // pass; the pair had drifted into byte-identical twins), no wall
+    // clock, no RNG dependency.
     // ------------------------------------------------------------------
-
-    /// A deterministic LCG with a splitmix64 output mix (test fixture
-    /// generation only — never product randomness; the scheduler's
-    /// jitter uses the OS CSPRNG). The mix matters: a raw LCG's low
-    /// bits have tiny periods (bit 0 alternates every call), which
-    /// bit-biased a first draft of this fixture into setting the
-    /// Secure Core feature on 100% of "standard" logicals.
-    struct Lcg(u64);
-
-    impl Lcg {
-        fn next_u64(&mut self) -> u64 {
-            self.0 = self
-                .0
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            let mut z = self.0;
-            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-            z ^ (z >> 31)
-        }
-
-        fn below(&mut self, bound: u64) -> u64 {
-            self.next_u64() % bound
-        }
-    }
 
     const BENCH_COUNTRIES: &[&str] = &[
         "AT", "BE", "BG", "CH", "CZ", "DE", "DK", "EE", "ES", "FI", "FR", "GB", "HR", "HU", "IE",
@@ -2921,7 +2910,7 @@ mod tests {
     /// work), scores on every logical, ~2% gateways and ~5%
     /// Secure-Core-shaped entries.
     fn synthetic_catalog_20k() -> String {
-        let mut rng = Lcg(0x5EED_2026_0825);
+        let mut rng = SeededDraw(0x5EED_2026_0825);
         let mut doc = String::with_capacity(8 << 20);
         doc.push_str(r#"{"Code":1000,"StatusID":"bench","LogicalServers":["#);
         for index in 0..BENCH_LOGICALS {
