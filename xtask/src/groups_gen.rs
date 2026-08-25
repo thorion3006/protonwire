@@ -68,6 +68,10 @@ pub fn run(root: &Path, check: bool) -> Result<bool> {
 struct GenFile {
     groups: Vec<GenGroup>,
     regional_taxonomy: Option<groups::RegionalTaxonomy>,
+    /// The document's own provenance stamp (Codex PR#6, P2: PRD §7.3B
+    /// — the runtime registry must preserve the catalog revision, not
+    /// just the source keys).
+    catalog_revision: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -255,6 +259,39 @@ fn render(doc: &GenFile, rows: &[(String, String, String)]) -> Result<String> {
     // `#[rustfmt::skip]` on each const: the generator owns the file's
     // canonical form (byte-stable, enforced by --check); the formatter
     // never fights it over generated-data layout.
+    // Provenance (Codex PR#6, P2 — PRD §7.3B: the runtime registry
+    // preserves the document's catalog revision and the taxonomy
+    // snapshot's identity, so consumers can report which revision
+    // produced a group): a missing stamp is a hard generation error —
+    // absence is never silently elided.
+    let catalog_revision = doc.catalog_revision.as_deref().ok_or_else(|| {
+        anyhow!("catalog_revision is missing — the registry must carry the document's provenance")
+    })?;
+    anyhow::ensure!(
+        !catalog_revision.trim().is_empty(),
+        "catalog_revision is empty"
+    );
+    let taxonomy = doc
+        .regional_taxonomy
+        .as_ref()
+        .ok_or_else(|| anyhow!("regional_taxonomy is missing"))?;
+    let taxonomy_id = taxonomy.id.as_deref().ok_or_else(|| {
+        anyhow!("regional_taxonomy.id is missing — the taxonomy revision cannot be named")
+    })?;
+    let snapshot_date = taxonomy
+        .vendored_snapshot
+        .as_ref()
+        .and_then(|snapshot| snapshot.source_date.as_deref())
+        .ok_or_else(|| {
+            anyhow!(
+                "vendored_snapshot.source_date is missing — the taxonomy revision cannot be named"
+            )
+        })?;
+    out.push_str(&format!(
+        "#[rustfmt::skip]\npub(crate) const CATALOG_REVISION: &str = {catalog_revision:?};\n\
+         #[rustfmt::skip]\npub(crate) const TAXONOMY_REVISION: &str = \"{taxonomy_id}@{snapshot_date}\";\n\n"
+    ));
+
     out.push_str("#[rustfmt::skip]\npub(crate) const REGISTRY: &[GroupEntry] = &[\n");
     for group in &doc.groups {
         out.push_str(&render_group(group, regions)?);

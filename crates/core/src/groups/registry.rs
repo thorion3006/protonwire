@@ -15,6 +15,11 @@ use super::{
 use crate::selection::ProtocolConstraint;
 
 #[rustfmt::skip]
+pub(crate) const CATALOG_REVISION: &str = "2026-08-14";
+#[rustfmt::skip]
+pub(crate) const TAXONOMY_REVISION: &str = "un-m49-six-continent-view@2026-08-14";
+
+#[rustfmt::skip]
 pub(crate) const REGISTRY: &[GroupEntry] = &[
     // Fastest country — proton / official-client-compat.
     GroupEntry {
