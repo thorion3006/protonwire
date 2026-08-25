@@ -1001,12 +1001,20 @@ pub fn select<'a>(
     context: &SelectionContext,
 ) -> Result<SelectionOutcome<'a>, SelectionError> {
     let (candidates, mut report) = filter_candidates(catalog, request, context)?;
-    let ranked = if request.target.is_exact() && candidates.len() == 1 {
-        // Codex PR#5 (P2): an exact target with ONE surviving candidate
-        // needs no ranking decision — identity is the answer. A missing
-        // optional catalog Score must not make the requested server
-        // unavailable (the FR-19A refusal governs official ORDERING of
-        // a field, not a single match's eligibility).
+    let ranked = if request.target.is_exact()
+        && candidates.len() == 1
+        && matches!(request.policy, RankingPolicy::Official)
+    {
+        // Codex PR#5 (P2): an OFFICIAL exact target with ONE surviving
+        // candidate needs no ranking decision — identity is the answer,
+        // and a missing optional catalog Score must not make the
+        // requested server unavailable (the FR-19A refusal governs
+        // official ORDERING of a field, not a single match's
+        // eligibility). Official-only by construction (round 2): every
+        // other policy carries its own validation or data requirements
+        // the normal path enforces — Balanced's weight validation and
+        // latency-data checks, Random's entropy — and the shortcut
+        // must not bypass them.
         candidates
             .into_iter()
             .map(|server| RankedCandidate {
@@ -1926,6 +1934,30 @@ mod tests {
         .unwrap();
         assert_eq!(outcome.ranked.len(), 1);
         assert_eq!(outcome.ranked[0].server.name, "UK#42");
+    }
+
+    /// Codex PR#5 round 2 (P2): the exact-single-candidate exemption is
+    /// OFFICIAL-only — a Balanced exact request still validates its
+    /// weights and data requirements through the normal path. Pre-fix,
+    /// a single-candidate exact target with hand-built NaN weights
+    /// sailed through the shortcut, violating the documented
+    /// validation guarantee.
+    #[test]
+    fn the_exact_single_candidate_exemption_does_not_bypass_balanced_validation() {
+        let catalog = build_catalog(&[Spec::new("UK#42", "GB"), Spec::new("GB#1", "GB")]);
+        let nan = f32::NAN;
+        let mut request = official(Target::Server("UK#42".into()));
+        request.policy = RankingPolicy::Balanced {
+            weights: WeightedSignals {
+                load: nan,
+                ..WeightedSignals::DEFAULT
+            },
+        };
+        let err = select(&catalog, &request, &SelectionContext::default()).unwrap_err();
+        assert!(
+            matches!(err, SelectionError::InvalidWeights { .. }),
+            "the shortcut must not bypass weight validation: {err}"
+        );
     }
 
     /// Codex PR#5 (P1): a Standard-fleet target plus the
