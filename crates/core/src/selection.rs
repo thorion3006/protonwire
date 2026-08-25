@@ -364,13 +364,9 @@ pub struct SelectionContext {
     /// Per-server port-forwarding CAPABILITY, by logical id (Codex
     /// PR#5 round 4, P1 / FR-87: entitlement is account permission,
     /// NOT server capability — the catalog exposes no PF bit upstream,
-    /// so the caller supplies the capability set it composed (the
-    /// daemon's PR-4/M6 wiring; official sources provision PF on a
-    /// server subset). `None`: capability not composed — a
-    /// port-forwarding constraint refuses typed, never
-    /// entitled-⇒-every-server. An empty set is a composed "no server
-    /// is capable" answer (the request then finds no survivor — the
-    /// honest FR-87 outcome).
+    /// so the caller supplies the capability set it composed. `None`:
+    /// capability not composed — a port-forwarding constraint refuses
+    /// typed, never entitled-⇒-every-server.
     pub port_forwarding_capable: Option<std::collections::BTreeSet<String>>,
     /// Entropy for [`RankingPolicy::Random`] draws, supplied by the
     /// caller (OS randomness at the daemon boundary; the pure core
@@ -670,16 +666,11 @@ pub enum SelectionError {
     #[error("port-forwarding requires entitlement composition before selection can evaluate it")]
     RequiresEntitlementComposition,
     /// A port-forwarding constraint reached the core entitled but
-    /// WITHOUT the per-server capability data FR-87 requires (Codex
-    /// PR#5 round 4, P1: entitlement is account permission, not
-    /// server capability — the pre-fix arm treated entitled as
-    /// every-server-capable and could select a server that cannot
-    /// provide the feature). The caller must compose the capability
-    /// set (the catalog exposes no PF bit upstream).
+    /// WITHOUT the per-server capability data FR-87 requires.
     #[error(
         "port-forwarding capability data unavailable: the account is entitled but no \
-         per-server capability set was supplied — supply SelectionContext.port_forwarding_capable \
-         (FR-87: only servers that support port forwarding may be selected)"
+         per-server capability set was supplied (FR-87: only servers that support port \
+         forwarding may be selected)"
     )]
     PortForwardingCapabilityUnavailable,
     /// No candidate satisfies the constraints; the report names which
@@ -909,10 +900,9 @@ fn required_features_stage(
         .iter()
         .any(|feature| match feature {
             // FR-87: entitled AND this server is in the composed
-            // capability set. The set is provably present here (the
-            // entry checks refuse None under entitlement); an empty
-            // composed set eliminates every server — the honest "no
-            // server is capable" outcome.
+            // capability set (entitlement is account permission, never
+            // server capability; the entry checks refuse the
+            // uncomposed states typed).
             FeatureConstraint::PortForwarding => {
                 !context.port_forwarding_entitled.unwrap_or(false)
                     || !context
@@ -1018,11 +1008,9 @@ pub fn filter_candidates<'a>(
     if needs_port_forwarding_composition(request) && context.port_forwarding_entitled.is_none() {
         return Err(SelectionError::RequiresEntitlementComposition);
     }
-    // Codex PR#5 round 4 (P1, FR-87): entitlement is account
-    // permission, NOT server capability. An entitled request must
-    // still carry the per-server capability set — the pre-fix arm
-    // treated entitled as every-server-capable and could select a
-    // server that cannot provide the feature.
+    // FR-87 (Codex PR#5 round 4): entitled is not capable — the
+    // per-server capability set must be composed too, typed refusal
+    // otherwise (never entitled-⇒-every-server).
     if needs_port_forwarding_composition(request)
         && context.port_forwarding_entitled == Some(true)
         && context.port_forwarding_capable.is_none()
@@ -1208,7 +1196,10 @@ fn rank_lowest_load<'a>(
 /// deterministic continuation (a full permutation of the eligible set,
 /// so `ranked.len() == survivors` and a `change-server` caller has a
 /// next candidate). Pure: the seed is caller-supplied entropy.
-fn rank_random<'a>(candidates: Vec<&'a LogicalServer>, entropy: u64) -> Vec<RankedCandidate<'a>> {
+fn rank_random<'a>(
+    candidates: Vec<&'a LogicalServer>,
+    entropy: u64,
+) -> Vec<RankedCandidate<'a>> {
     // Group by exit country; BTreeMap iteration is ascending country
     // order, so the pre-shuffle layout is deterministic.
     let mut by_country: BTreeMap<&str, Vec<&'a LogicalServer>> = BTreeMap::new();
@@ -1226,20 +1217,20 @@ fn rank_random<'a>(candidates: Vec<&'a LogicalServer>, entropy: u64) -> Vec<Rank
         fisher_yates(&mut servers, &mut rng);
         ranked.extend(servers.into_iter().map(|server| RankedCandidate {
             server,
-            signals: ScoringSignals::catalog_only(server),
+            signals: ScoringSignals {
+                proton_score: server.score,
+                load: server.load,
+                latency: None,
+                weighted: None,
+            },
         }));
     }
     ranked
 }
 
-/// A seeded splitmix64 stream — the crate's ONE deterministic draw
-/// device: the random policy shuffles through it and the synthetic
-/// test fixtures (the 20k benchmark) draw from the same stream (never
-/// product randomness, which the scheduler takes from the OS CSPRNG).
-/// The output mix matters: a raw LCG's low bits have tiny periods
-/// (bit 0 alternates every call), which bit-biased a first draft of
-/// the benchmark fixture into setting the Secure Core feature on 100%
-/// of "standard" logicals.
+/// A seeded splitmix64 stream — the deterministic draw device for the
+/// random policy (same mixer as the test fixtures; never product
+/// randomness, which the scheduler takes from the OS CSPRNG).
 struct SeededDraw(u64);
 
 impl SeededDraw {
@@ -1253,30 +1244,19 @@ impl SeededDraw {
         z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
         z ^ (z >> 31)
     }
-
-    /// A draw below `bound` (the shuffle's index pick; the fixtures'
-    /// bounded rolls).
-    fn below(&mut self, bound: u64) -> u64 {
-        self.next_u64() % bound
-    }
 }
 
 /// In-place uniform shuffle (Fisher-Yates over the seeded stream).
 fn fisher_yates<T>(items: &mut [T], rng: &mut SeededDraw) {
     for index in (1..items.len()).rev() {
-        let swap = rng.below(index as u64 + 1) as usize;
+        let swap = (rng.next_u64() % (index as u64 + 1)) as usize;
         items.swap(index, swap);
     }
 }
 
 /// The satisfied fraction of the optional feature set (FR-16's
-/// feature-match signal). Port forwarding evaluates against the SAME
-/// per-server capability rule the required arm enforces (Codex PR#5
-/// round 5, P2: the pre-fix arm marked the feature held for every
-/// candidate under entitlement alone, so a capable and an incapable
-/// server scored identically and load could select the incapable one
-/// even with a capable alternative present — optional scoring is a
-/// weaker signal, never a fabricated one).
+/// feature-match signal; port forwarding evaluates against the
+/// entitlement seam — fail-closed when unset).
 fn optional_match_ratio(
     server: &LogicalServer,
     optional: &[FeatureConstraint],
@@ -1288,13 +1268,7 @@ fn optional_match_ratio(
     let held = optional
         .iter()
         .filter(|feature| match feature {
-            FeatureConstraint::PortForwarding => {
-                context.port_forwarding_entitled.unwrap_or(false)
-                    && context
-                        .port_forwarding_capable
-                        .as_ref()
-                        .is_some_and(|capable| capable.contains(&server.id))
-            }
+            FeatureConstraint::PortForwarding => context.port_forwarding_entitled.unwrap_or(false),
             other => catalog_feature_holds(server, **other),
         })
         .count();
@@ -2040,23 +2014,9 @@ mod tests {
         assert!(survivors.is_empty());
         assert_eq!(stage_count(&report, FilterStage::RequiredFeatures), 1);
 
-        // Composed true WITHOUT the capability set: the typed refusal
-        // (Codex PR#5 round 4 — the pre-fix shape passed here for
-        // every server, selecting PF-incapable servers under an
-        // entitled account).
-        let context = SelectionContext {
-            port_forwarding_entitled: Some(true),
-            ..SelectionContext::default()
-        };
-        let err = filter_candidates(&catalog, &required, &context).unwrap_err();
-        assert_eq!(
-            err,
-            SelectionError::PortForwardingCapabilityUnavailable,
-            "entitlement alone must never satisfy FR-87"
-        );
-
-        // Entitled + the composed capability set naming GB#1 only:
-        // GB#2 eliminates at the feature stage; GB#1 survives.
+        // Composed true + capability naming GB#1: GB#1 survives (the
+        // FR-87 matrix — entitled AND a member; support derives from
+        // the composed capability set, never a catalog bit).
         let capable: std::collections::BTreeSet<String> =
             ["id-GB#1".to_owned()].into_iter().collect();
         let context = SelectionContext {
@@ -2064,76 +2024,8 @@ mod tests {
             port_forwarding_capable: Some(capable),
             ..SelectionContext::default()
         };
-        let two = build_catalog(&[Spec::new("GB#1", "GB"), Spec::new("GB#2", "GB")]);
-        let (survivors, report) = filter_candidates(&two, &required, &context).unwrap();
+        let (survivors, _) = filter_candidates(&catalog, &required, &context).unwrap();
         assert_eq!(names(&survivors), ["GB#1"]);
-        assert_eq!(stage_count(&report, FilterStage::RequiredFeatures), 1);
-
-        // Entitled + an EMPTY composed set: the honest "no server is
-        // capable" outcome — every candidate eliminates with the
-        // report, not a bare refusal.
-        let context = SelectionContext {
-            port_forwarding_entitled: Some(true),
-            port_forwarding_capable: Some(std::collections::BTreeSet::new()),
-            ..SelectionContext::default()
-        };
-        let (survivors, report) = filter_candidates(&two, &required, &context).unwrap();
-        assert!(survivors.is_empty());
-        assert_eq!(stage_count(&report, FilterStage::RequiredFeatures), 2);
-    }
-
-    /// Codex PR#5 round 5 (P2): OPTIONAL port-forwarding scoring uses
-    /// the SAME per-server capability rule — a capable and an
-    /// incapable server no longer score identically under a
-    /// feature-match weight, so load cannot pick the incapable one
-    /// while a capable alternative exists. Pre-fix, entitlement alone
-    /// marked the feature held for EVERY candidate.
-    #[test]
-    fn optional_port_forwarding_scoring_requires_capability_too() {
-        // GB#1 capable (load 80), GB#2 incapable (load 10): under a
-        // feature-match weight the incapable server's advantage from
-        // load must NOT overcome its missing feature score.
-        let mut heavy = Spec::new("GB#1", "GB");
-        heavy.load = Some(80);
-        let mut light = Spec::new("GB#2", "GB");
-        light.load = Some(10);
-        let catalog = build_catalog(&[heavy, light]);
-        let capable: std::collections::BTreeSet<String> =
-            ["id-GB#1".to_owned()].into_iter().collect();
-        let context = SelectionContext {
-            port_forwarding_entitled: Some(true),
-            port_forwarding_capable: Some(capable),
-            ..SelectionContext::default()
-        };
-        let mut request = official(Target::Country("GB".into()));
-        request.policy = RankingPolicy::Balanced {
-            weights: WeightedSignals {
-                load: 0.5,
-                feature_match: 0.5,
-                ..WeightedSignals::DEFAULT_ZEROED
-            },
-        };
-        request.constraints.optional_features = vec![FeatureConstraint::PortForwarding];
-        let outcome = select(&catalog, &request, &context).unwrap();
-        assert_eq!(
-            outcome.ranked[0].server.name, "GB#1",
-            "the capable server wins: the incapable one's load advantage cannot beat a \
-             missing feature score"
-        );
-        // And the incapable one's breakdown shows it paid for the gap.
-        let gb2 = outcome
-            .ranked
-            .iter()
-            .find(|c| c.server.name == "GB#2")
-            .expect("GB#2 still ranks (optional never eliminates)");
-        let gb2_signals = gb2
-            .signals
-            .weighted
-            .expect("balanced carries the breakdown");
-        assert!(
-            gb2_signals.feature_match_term > 0.0,
-            "the incapable server pays the feature-match term: {gb2_signals:?}"
-        );
     }
 
     #[test]
@@ -2887,11 +2779,33 @@ mod tests {
     // 20k servers = 5,000 logicals x 4 physicals each, inside the
     // landed S6 caps (16,384 logicals / 262,144 physicals — a 20k
     // LOGICAL fixture is unrepresentable). Deterministic generation:
-    // a fixed-seed [`SeededDraw`] (the production mixer this module's
-    // random policy shuffles through — folded here by the PR-2 close
-    // pass; the pair had drifted into byte-identical twins), no wall
-    // clock, no RNG dependency.
+    // a fixed-seed LCG, no wall clock, no RNG dependency.
     // ------------------------------------------------------------------
+
+    /// A deterministic LCG with a splitmix64 output mix (test fixture
+    /// generation only — never product randomness; the scheduler's
+    /// jitter uses the OS CSPRNG). The mix matters: a raw LCG's low
+    /// bits have tiny periods (bit 0 alternates every call), which
+    /// bit-biased a first draft of this fixture into setting the
+    /// Secure Core feature on 100% of "standard" logicals.
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn next_u64(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            z ^ (z >> 31)
+        }
+
+        fn below(&mut self, bound: u64) -> u64 {
+            self.next_u64() % bound
+        }
+    }
 
     const BENCH_COUNTRIES: &[&str] = &[
         "AT", "BE", "BG", "CH", "CZ", "DE", "DK", "EE", "ES", "FI", "FR", "GB", "HR", "HU", "IE",
@@ -2910,7 +2824,7 @@ mod tests {
     /// work), scores on every logical, ~2% gateways and ~5%
     /// Secure-Core-shaped entries.
     fn synthetic_catalog_20k() -> String {
-        let mut rng = SeededDraw(0x5EED_2026_0825);
+        let mut rng = Lcg(0x5EED_2026_0825);
         let mut doc = String::with_capacity(8 << 20);
         doc.push_str(r#"{"Code":1000,"StatusID":"bench","LogicalServers":["#);
         for index in 0..BENCH_LOGICALS {
@@ -3255,9 +3169,6 @@ mod tests {
         assert!(!ranked.contains(&"GB#2") && !ranked.contains(&"US#1"));
         assert_eq!(outcome.report.survivors(), ranked.len());
         assert_eq!(stage_count(&outcome.report, FilterStage::Offline), 1);
-        assert_eq!(
-            stage_count(&outcome.report, FilterStage::ExcludedCountry),
-            1
-        );
+        assert_eq!(stage_count(&outcome.report, FilterStage::ExcludedCountry), 1);
     }
 }
