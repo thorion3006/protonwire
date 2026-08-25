@@ -9,12 +9,12 @@
 //! 1. the document must pass the golden groups table
 //!    ([`crate::groups::check_golden_groups_table`]): generation from
 //!    a drifted catalog is refused outright;
-//! 1b. the document's `regional_taxonomy` must pass the S13 taxonomy
-//!    pin ([`crate::groups::check_taxonomy`]) — the verdict round's
-//!    P2-1: the golden table covers only `groups`, so a drifted
-//!    taxonomy passed both other gates and rewrote the registry until
-//!    this gate refused it too;
-//! 2. the vendored CSV must pass `m49-verify`'s row contract against
+//! 2. the document's `regional_taxonomy` must pass the S13 taxonomy
+//!    pin ([`crate::groups::check_taxonomy`]) — "gate 1b" in the
+//!    review record, the verdict round's P2-1: the golden table
+//!    covers only `groups`, so a drifted taxonomy passed both other
+//!    gates and rewrote the registry until this gate refused it too;
+//! 3. the vendored CSV must pass `m49-verify`'s row contract against
 //!    the document's own taxonomy before its country→region rows are
 //!    embedded (FR-23O: runtime reads generated code, never the CSV).
 //!
