@@ -393,54 +393,49 @@ impl fmt::Display for FilterStage {
 }
 
 impl FilterStage {
-    /// The stages in evaluation order (FR-23P's hard-filter prefix,
-    /// then the policy stages). A candidate is charged to the FIRST
-    /// stage that eliminates it; the report renders in this order.
-    const ORDER: [FilterStage; 15] = [
-        FilterStage::UnknownStatus,
-        FilterStage::Offline,
-        FilterStage::AllPhysicalsOffline,
-        FilterStage::AbsentFromCatalog,
-        FilterStage::ServerType,
-        FilterStage::TargetGeography,
-        FilterStage::PhysicalCountryExclusion,
-        FilterStage::ExcludedCountry,
-        FilterStage::ExcludedState,
-        FilterStage::ExcludedCity,
-        FilterStage::ExcludedServer,
-        FilterStage::RequiredFeatures,
-        FilterStage::ProtocolCompatibility,
-        FilterStage::LoadNotExposed,
-        FilterStage::NoLatencyObservation,
+    /// Every stage paired with its report label, in evaluation order
+    /// (FR-23P's hard-filter prefix, then the policy stages). The one
+    /// table [`Self::ordinal`], [`Self::label`], and the report's
+    /// stage list all derive from, so a stage is added in exactly one
+    /// place and the order/label pairings can never drift apart. A
+    /// candidate is charged to the FIRST stage that eliminates it; the
+    /// report renders in this order.
+    const STAGES: &[(FilterStage, &'static str)] = &[
+        (FilterStage::UnknownStatus, "unknown-status"),
+        (FilterStage::Offline, "offline"),
+        (FilterStage::AllPhysicalsOffline, "all-physicals-offline"),
+        (FilterStage::AbsentFromCatalog, "absent-from-catalog"),
+        (FilterStage::ServerType, "server-type"),
+        (FilterStage::TargetGeography, "target-geography"),
+        (
+            FilterStage::PhysicalCountryExclusion,
+            "physical-country-exclusion",
+        ),
+        (FilterStage::ExcludedCountry, "excluded-country"),
+        (FilterStage::ExcludedState, "excluded-state"),
+        (FilterStage::ExcludedCity, "excluded-city"),
+        (FilterStage::ExcludedServer, "excluded-server"),
+        (FilterStage::RequiredFeatures, "required-features"),
+        (FilterStage::ProtocolCompatibility, "protocol-compatibility"),
+        (FilterStage::LoadNotExposed, "load-not-exposed"),
+        (FilterStage::NoLatencyObservation, "no-latency-observation"),
     ];
 
-    /// The stage's position in [`Self::ORDER`].
+    /// The stage's position in the evaluation order.
     fn ordinal(self) -> usize {
-        Self::ORDER
+        Self::STAGES
             .iter()
-            .position(|s| *s == self)
-            .expect("every stage is in ORDER")
+            .position(|(stage, _)| *stage == self)
+            .expect("every stage is in STAGES")
     }
 
     /// The stage's report label.
     fn label(self) -> &'static str {
-        match self {
-            FilterStage::UnknownStatus => "unknown-status",
-            FilterStage::Offline => "offline",
-            FilterStage::AllPhysicalsOffline => "all-physicals-offline",
-            FilterStage::AbsentFromCatalog => "absent-from-catalog",
-            FilterStage::ServerType => "server-type",
-            FilterStage::TargetGeography => "target-geography",
-            FilterStage::PhysicalCountryExclusion => "physical-country-exclusion",
-            FilterStage::ExcludedCountry => "excluded-country",
-            FilterStage::ExcludedState => "excluded-state",
-            FilterStage::ExcludedCity => "excluded-city",
-            FilterStage::ExcludedServer => "excluded-server",
-            FilterStage::RequiredFeatures => "required-features",
-            FilterStage::ProtocolCompatibility => "protocol-compatibility",
-            FilterStage::LoadNotExposed => "load-not-exposed",
-            FilterStage::NoLatencyObservation => "no-latency-observation",
-        }
+        Self::STAGES
+            .iter()
+            .find(|(stage, _)| *stage == self)
+            .map(|(_, label)| *label)
+            .expect("every stage is in STAGES")
     }
 }
 
@@ -518,6 +513,21 @@ pub struct ScoringSignals {
     /// The weighted breakdown, when the balanced policy ranked this
     /// candidate.
     pub weighted: Option<WeightedBreakdown>,
+}
+
+impl ScoringSignals {
+    /// The provenance a non-balanced policy reports: what the catalog
+    /// exposed and nothing else — no observed latency (only `balanced`
+    /// consumes the latency table today) and no weighted breakdown
+    /// (only `balanced` carries one).
+    fn catalog_only(server: &LogicalServer) -> Self {
+        Self {
+            proton_score: server.score,
+            load: server.load,
+            latency: None,
+            weighted: None,
+        }
+    }
 }
 
 /// The per-term decomposition of a balanced score (FR-16's formula,
@@ -652,6 +662,20 @@ impl Target {
             _ => None,
         }
     }
+
+    /// Whether `server` is this target's exact match — the ONE
+    /// predicate behind both the type-geography filter
+    /// ([`target_stage`]) and the exact-refusal diagnosis
+    /// ([`filter_candidates`]), so the filter and the error it reports
+    /// can never disagree about what the request named (the drift the
+    /// M3 U1 review's P2 fix introduced the second copy of).
+    fn matches_exact(&self, server: &LogicalServer) -> bool {
+        match self {
+            Target::Server(name) => server.name == *name,
+            Target::Gateway(name) => server.gateway_name.as_deref() == Some(name.as_str()),
+            _ => false,
+        }
+    }
 }
 
 /// ISO 3166-1 alpha-2, uppercase. Canonicalizing user input is the
@@ -719,12 +743,8 @@ fn online_stage(server: &LogicalServer) -> Option<FilterStage> {
 /// (FR-23L/FR-20). Host-country (smart routing) is reported metadata,
 /// never a match key — the exit country is the canonical selector.
 fn target_stage(server: &LogicalServer, target: &Target) -> Option<FilterStage> {
-    if let Target::Server(name) = target {
-        return (server.name != *name).then_some(FilterStage::TargetGeography);
-    }
-    if let Target::Gateway(name) = target {
-        return (server.gateway_name.as_deref() != Some(name.as_str()))
-            .then_some(FilterStage::TargetGeography);
+    if target.is_exact() {
+        return (!target.matches_exact(server)).then_some(FilterStage::TargetGeography);
     }
     if !is_standard_fleet(server) {
         return Some(FilterStage::ServerType);
@@ -897,7 +917,7 @@ pub fn filter_candidates<'a>(
         return Err(SelectionError::RequiresEntitlementComposition);
     }
 
-    let mut counts = [0usize; FilterStage::ORDER.len()];
+    let mut counts = [0usize; FilterStage::STAGES.len()];
     let mut survivors = Vec::new();
     for server in &catalog.logical_servers {
         match eliminating_stage(server, request, context) {
@@ -915,15 +935,10 @@ pub fn filter_candidates<'a>(
         // `offline` because some other server in any real catalog is
         // offline; the diagnosis must describe the matched server).
         let name = request.target.exact_name().unwrap_or_default().to_owned();
-        let matched = |server: &LogicalServer| match &request.target {
-            Target::Server(wanted) => server.name == *wanted,
-            Target::Gateway(wanted) => server.gateway_name.as_deref() == Some(wanted.as_str()),
-            _ => false,
-        };
         let stage = match catalog
             .logical_servers
             .iter()
-            .find(|server| matched(server))
+            .find(|server| request.target.matches_exact(server))
         {
             None => FilterStage::AbsentFromCatalog,
             // Under an exact target the matched server cannot be the
@@ -939,10 +954,10 @@ pub fn filter_candidates<'a>(
     let report = EliminationReport {
         considered: catalog.logical_servers.len(),
         survivors: survivors.len(),
-        stages: FilterStage::ORDER
+        stages: FilterStage::STAGES
             .iter()
             .zip(counts)
-            .map(|(s, c)| (*s, c))
+            .map(|((stage, _), count)| (*stage, count))
             .collect(),
     };
     Ok((survivors, report))
@@ -992,14 +1007,9 @@ fn rank_official<'a>(
     }
     let mut ranked: Vec<RankedCandidate> = candidates
         .into_iter()
-        .map(|server| {
-            let signals = ScoringSignals {
-                proton_score: server.score,
-                load: server.load,
-                latency: None,
-                weighted: None,
-            };
-            RankedCandidate { server, signals }
+        .map(|server| RankedCandidate {
+            server,
+            signals: ScoringSignals::catalog_only(server),
         })
         .collect();
     ranked.sort_by(|a, b| {
@@ -1031,12 +1041,7 @@ fn rank_lowest_load<'a>(
         match server.load {
             Some(_) => ranked.push(RankedCandidate {
                 server,
-                signals: ScoringSignals {
-                    proton_score: server.score,
-                    load: server.load,
-                    latency: None,
-                    weighted: None,
-                },
+                signals: ScoringSignals::catalog_only(server),
             }),
             None => missing += 1,
         }
