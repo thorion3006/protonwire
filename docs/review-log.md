@@ -1231,3 +1231,150 @@ must cover the paths your commit touches, not your crate only.
   neither counting — 17 verdict rows (S0-S14, S5 as three slices); the
   cb33bd2/d44396e/ad51356/89bc163 hashes in the incident trilogy now
   name their commits.
+
+## 2026-08-25 — M3 PR-1 close (refactorer + doc-writer, pre-merge)
+
+The owed close pass on `m3/selection-core` (PR #5, U1, 7 commits over
+master `5fd53d7`) before the owner's merge call. The implementation
+and its verdicts were complete; this entry records the verdict chain,
+the close-pass work, and the items open at the merge call.
+
+### U1's verdict chain (as it stands on the PR)
+
+- **RUST PASS + QA CONFIRMED** — the qa round killed 4/4 named
+  mutations (per the PR record; the mutation table itself was never
+  posted in-thread — the one independently commit-evidenced mutation
+  is the P2's pre-fix shape below). **sec dispositioned
+  not-matching**: a pure-function unit with no ingress surface — no
+  I/O, no network, no trust boundary; every refusal typed at the
+  input schema.
+- **The verdict round's P2** — fixed @ `485cbaa`: the exact-refusal's
+  stage diagnosis took the first catalog-wide nonzero stage count, so
+  an online exact target eliminated by the user's own exclusion
+  misreported `offline` whenever any unrelated server was offline
+  (real catalogs always have some). The diagnosis now runs
+  `eliminating_stage` on the matched server itself; red-first pinned
+  as `exact_server_elimination_names_the_matched_servers_own_stage`.
+- **The nit follow-up** — `c0233c6`, with an honest self-correction
+  disclosure: `485cbaa`'s message claimed three review nits were
+  folded in, but the edits had not been made; `c0233c6` landed them
+  and said so in the open (the disclosure class this log polices).
+  The nits: the forbidden-signals attribution (the connection-groups
+  yaml contract, not the S6 catalog module), the NetShield non-goal
+  stated in the module docs, and `parse("latency")`'s intermediate
+  InvalidRankingMode state pinned until PR-3.
+- **Benchmark evidence**: `1aa5876` measured parse 120.1 ms / select
+  3.6 ms / total 123.7 ms against the 500 ms bar (~4x headroom); this
+  pass re-ran it at the refactored tree — parse 101.1 / select 3.6 /
+  total 104.7 ms (the PR description's 94-124 ms range reproduced).
+- **CI 8/8 at `c0233c6`**: audit, clippy, doc, fmt, gui, msrv, test,
+  xtask — all green.
+
+### The refactorer's pass (behavior-gated; suite identity proven)
+
+Survey-then-act over the PR diff; three restructures landed at
+`be97c68`, three candidates rejected with reasons. Landed:
+
+1. **`Target::matches_exact`** — the exact-match predicate existed
+   twice since the P2 fix (`target_stage`'s Server/Gateway arms and
+   `filter_candidates`' matched closure); one predicate now serves
+   the filter and the refusal diagnosis, so they cannot disagree
+   about what the request named.
+2. **`FilterStage::STAGES`** — the 15 stages were enumerated three
+   times (the enum, the `ORDER` array, `label`'s match arms); order
+   and label now pair in one table that `ordinal`, `label`, and the
+   report's stage list all derive from — a new stage lands in exactly
+   one place.
+3. **`ScoringSignals::catalog_only`** — the identical non-balanced
+   provenance construction in `rank_official` and `rank_lowest_load`
+   lifted to one constructor. PR-2's in-flight `rank_random` carries
+   a third copy of the same literal and can adopt it on rebase.
+
+Rejected, with reasons (the negative results are the deliverable):
+
+- **Sharing the Spec/build_catalog test builders**: no second
+  consumer — the S6 store fixtures are a recorded static document at
+  a different discipline (parse-contract testing, not synthetic
+  catalogs), and PR-2's in-flight tests reuse THIS module's builder
+  in place, so test-locality held. A feature-gated `test_util`
+  (the M1 `protonwire-ipc::test_util` precedent — PRD 6.1 fixes the
+  member list, so no crate) is the recorded shape if a second crate
+  ever needs synthetic catalogs.
+- **Extracting the benchmark LCG/splitmix mixer as a test-util**:
+  single test-local consumer; the mixer arithmetic is disclosed in
+  place with its low-bit-trap history. PR-2's production
+  `SeededDraw` duplicates the mixer constants — folding THAT is
+  PR-2's close pass (not preempted here).
+- **The SelectionError Display family**: the thiserror `#[error]`
+  attributes are already single-site per variant with distinct
+  wording per refusal; consolidating them would invent duplication
+  where none exists.
+
+Proof of behavior identity: temp-worktree `--locked` runs at
+`c0233c6` vs `be97c68` — identical per-target counts (29 targets,
+759 passed; core 127 + 1; durations differ). Gates re-run raw-exit
+in a temp worktree at `be97c68`: fmt, clippy `-D warnings`, test,
+xtask all, doc — every exit 0.
+
+### The doc-writer's audit
+
+- **m3-plan.md**: the stack mapping is consistent with what PR-1
+  delivered (U1 = the pure core; "zero new wire/CLI surface" is true
+  of the diff: selection.rs, one lib.rs line, the plan itself).
+  Frozen decisions 1-6 each traced to code (1 → the 20k fixture
+  shape and its pins; 2 → rank_official's sort and the ties test;
+  3 → OfficialScoreUnavailable; 4 → the LoadNotExposed charges under
+  both `load` and `balanced`; 5 → LatencyDataUnavailable and the
+  uniformly-zero stability/history terms; 6 → no NetShield variant
+  plus the port-forwarding entitlement seam); 7-8 are later-PR
+  lanes, unlanded by design. One wording ambiguity noted, plan text
+  left as normative: U1's `balanced` bullet says "missing-score
+  refusal per signal below" — the missing-SCORE refusal is
+  official-only (decision 3); balanced's missing-data dispositions
+  are decisions 4/5.
+- **selection.rs module-doc sweep** (the NetShield and
+  forbidden-signals claims were verified in the verdict round): one
+  completeness fix landed — the matching-discipline paragraph named
+  only CITY names as ASCII-case-insensitive; STATE names fold
+  identically (both via eq_fold). The "scoring-signal report marks
+  them absent" phrasing audited defensible (WeightedBreakdown's
+  field docs say "zero until data exists") and left. Cross-
+  references verified: the S6 caps 16,384/262,144;
+  `forbidden_ranking_signals` in the connection-groups yaml plus
+  FR-19's `speed`; `connection_groups.physical_country` in the
+  config authority table; the S6 catalog module docs do record the
+  port-forwarding field absence.
+- **README.md** (rode this pass; a stale merge-state claim of the
+  class the M2 doc audit policed): M2 is merged at `5fd53d7`
+  (master's tip) but the status line still said "awaiting the
+  owner's merge call" — corrected to the merged state.
+- **PR description vs branch**: verified accurate — the three
+  fail-closed online substages, the value-independent forbidden-key
+  check, 44 selection tests, and the timing range all reproduce; the
+  branch carried 7 commits over master (the work order's "8" was a
+  miscount; the PR API confirms 7). The description cannot be edited
+  from here; two things postdate it — this pass's commits, and the
+  open Codex findings below.
+
+### Open at the owner's merge call
+
+Two Codex threads on the PR remain UNRESOLVED (posted after open,
+reviewed commit `c0233c6`). Both premises verified against the code;
+both are behavior/design changes, outside this pass's
+behavior-preserving scope, so they are recorded, not dispositioned:
+
+1. **P1 — `--require secure-core` is unusable on filtered targets**:
+   `required_features = [SecureCore]` under Fastest/Country/etc. can
+   never succeed — the Standard-fleet type stage eliminates every
+   Secure Core logical first, then the feature stage eliminates
+   every Standard logical. The constraint works only through an
+   exact server name today. Candidate lane: PR-3's routed Secure
+   Core target (U4) or a type-filter carve-out — a design decision,
+   not a close-pass fix.
+2. **P2 — an exact server under the official policy refuses on a
+   missing Score**: a single matched candidate needs no ranking
+   decision, but `rank_official` refuses when ANY eligible candidate
+   lacks `Score`. Frozen decision 3 says "ANY eligible candidate" —
+   the current behavior IS the decision as written; the finding
+   argues an exact-target exemption. A carve-out changes a frozen
+   decision and is the owner's call to make or decline.

@@ -9,9 +9,8 @@ clients (CLI, Ratatui TUI, Tauri GUI) speaking one versioned Unix-socket
 frontend API.
 
 Status: **Milestones 1 (Foundation) and 2 (Muon auth + server cache)
-complete** — M1 merged to `master` via PR #3 (5baa12a); M2 on
-`feat/m2-muon-auth` (PR #4), based on the merged M1, awaiting the
-owner's merge call. What builds and runs today:
+complete** — M1 merged to `master` via PR #3 (5baa12a); M2 merged via
+PR #4 (5fd53d7, the current `master` tip). What builds and runs today:
 
 - the M1 surface: the daemon, the versioned Unix-socket frontend API,
   CLI/TUI/GUI clients over the shared SDK, validated system
