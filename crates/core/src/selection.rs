@@ -646,6 +646,20 @@ pub enum SelectionError {
         /// Why it cannot be selected.
         stage: FilterStage,
     },
+    /// A Standard-fleet target combined with the `secure-core` FEATURE
+    /// constraint — unsatisfiable BY CONSTRUCTION (Codex PR#5, P1: the
+    /// type stage removes every Secure Core logical, the feature stage
+    /// then removes every Standard one). Secure Core connectivity is a
+    /// TARGET (the routed form, milestone 3 PR-3), never a
+    /// Standard-fleet feature filter; the contradiction is refused at
+    /// validation with this error rather than the pipeline's
+    /// all-stages-empty report.
+    #[error(
+        "unsatisfiable request: a Standard-fleet target cannot require the `secure-core` \
+         feature — Secure Core connectivity is a routed TARGET (milestone 3 PR-3), \
+         not a Standard-fleet feature filter"
+    )]
+    StandardFleetFeatureContradiction,
 }
 
 impl Target {
@@ -908,6 +922,21 @@ pub fn filter_candidates<'a>(
     context: &SelectionContext,
 ) -> Result<(Vec<&'a LogicalServer>, EliminationReport), SelectionError> {
     validate_request_countries(request)?;
+    // Codex PR#5 (P1): a Standard-fleet target plus the secure-core
+    // feature constraint is unsatisfiable BY CONSTRUCTION — refuse at
+    // validation with the typed contradiction instead of letting the
+    // pipeline produce its baffling all-stages-empty report. (Exact
+    // targets match identity before any fleet filtering, so an exact
+    // SC server name remains the working spelling until PR-3's
+    // routed target lands.)
+    if !request.target.is_exact()
+        && request
+            .constraints
+            .required_features
+            .contains(&FeatureConstraint::SecureCore)
+    {
+        return Err(SelectionError::StandardFleetFeatureContradiction);
+    }
     if request.constraints.exclude_physical_country
         && request.constraints.physical_country.is_none()
     {
@@ -972,11 +1001,26 @@ pub fn select<'a>(
     context: &SelectionContext,
 ) -> Result<SelectionOutcome<'a>, SelectionError> {
     let (candidates, mut report) = filter_candidates(catalog, request, context)?;
-    let ranked = match &request.policy {
-        RankingPolicy::Official => rank_official(candidates)?,
-        RankingPolicy::LowestLoad => rank_lowest_load(candidates, &mut report)?,
-        RankingPolicy::Balanced { weights } => {
-            rank_balanced(candidates, *weights, request, context, &mut report)?
+    let ranked = if request.target.is_exact() && candidates.len() == 1 {
+        // Codex PR#5 (P2): an exact target with ONE surviving candidate
+        // needs no ranking decision — identity is the answer. A missing
+        // optional catalog Score must not make the requested server
+        // unavailable (the FR-19A refusal governs official ORDERING of
+        // a field, not a single match's eligibility).
+        candidates
+            .into_iter()
+            .map(|server| RankedCandidate {
+                server,
+                signals: ScoringSignals::catalog_only(server),
+            })
+            .collect()
+    } else {
+        match &request.policy {
+            RankingPolicy::Official => rank_official(candidates)?,
+            RankingPolicy::LowestLoad => rank_lowest_load(candidates, &mut report)?,
+            RankingPolicy::Balanced { weights } => {
+                rank_balanced(candidates, *weights, request, context, &mut report)?
+            }
         }
     };
     if ranked.is_empty() {
@@ -1862,6 +1906,57 @@ mod tests {
         .unwrap();
         assert_eq!(names(&survivors), ["UK#42"]);
         assert_eq!(stage_count(&report, FilterStage::TargetGeography), 2);
+    }
+
+    /// Codex PR#5 (P2): an exact target with ONE surviving candidate
+    /// needs no ranking decision — a missing optional catalog Score
+    /// must not make the requested server unavailable. The
+    /// missing-score refusal (FR-19A) governs official ORDERING of a
+    /// field, not the identity of a single match.
+    #[test]
+    fn an_exact_server_without_a_score_still_selects() {
+        let mut unscored = Spec::new("UK#42", "GB");
+        unscored.score = None;
+        let catalog = build_catalog(&[unscored, Spec::new("GB#1", "GB")]);
+        let outcome = select(
+            &catalog,
+            &official(Target::Server("UK#42".into())),
+            &SelectionContext::default(),
+        )
+        .unwrap();
+        assert_eq!(outcome.ranked.len(), 1);
+        assert_eq!(outcome.ranked[0].server.name, "UK#42");
+    }
+
+    /// Codex PR#5 (P1): a Standard-fleet target plus the
+    /// `secure-core` FEATURE constraint is unsatisfiable BY
+    /// CONSTRUCTION (the type stage removes every SC logical; the
+    /// feature stage then removes every Standard one). The
+    /// contradiction is detectable at validation time and refuses with
+    /// a typed error naming it and the routed target that lands in
+    /// PR-3 — never the pipeline's baffling all-stages-empty report.
+    #[test]
+    fn a_standard_fleet_target_with_the_secure_core_feature_refuses_at_validation() {
+        let catalog = build_catalog(&[Spec::new("UK#1", "GB"), Spec::new("GB#1", "GB")]);
+        let mut request = official(Target::Fastest);
+        request.constraints.required_features = vec![FeatureConstraint::SecureCore];
+        let err = select(&catalog, &request, &SelectionContext::default()).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                SelectionError::StandardFleetFeatureContradiction { .. }
+            ),
+            "the typed contradiction, got: {err}"
+        );
+        let message = err.to_string();
+        assert!(
+            message.contains("secure-core"),
+            "names the feature: {message}"
+        );
+        assert!(
+            message.contains("routed"),
+            "points at the routed Secure Core target: {message}"
+        );
     }
 
     #[test]
