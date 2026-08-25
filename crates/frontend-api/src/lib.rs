@@ -20,10 +20,15 @@ pub mod proto;
 pub mod schema;
 pub mod state;
 
-pub use event::{EVENT_SEQ_RESYNC_NOW, Event, EventEnvelope, NoticeLevel};
+pub use event::{
+    CatalogRefreshResult, EVENT_SEQ_RESYNC_NOW, Event, EventEnvelope, NoticeLevel,
+    RESYNC_MARKER_INTRODUCED_IN, event_reaches, resync_marker_reaches,
+};
 pub use proto::{
-    ClientInfo, ClientMessage, ClientSurface, ConnectTarget, HelloAck, HelloError,
-    PROTOCOL_VERSION, Request, RequestResult, Response, RpcError, RpcErrorCode, ServerMessage,
-    SpecialClass,
+    AccountStatus, ClientInfo, ClientMessage, ClientSurface, ConfirmationRequirement,
+    ConnectTarget, CredentialSourceStatus, CredentialStartupRead, Fido2ChallengeParams, HelloAck,
+    HelloError, LoginBlockedReason, LoginOutcome, PROTOCOL_VERSION, PersistenceHealth, Request,
+    RequestResult, Response, RpcError, RpcErrorCode, SecretParam, ServerMessage,
+    ServersRefreshOutcome, ServersRefreshReport, SessionStatus, SpecialClass, WritableStoreStatus,
 };
 pub use state::{DaemonState, NetworkIntegration, VpnState};

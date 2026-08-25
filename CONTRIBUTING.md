@@ -54,9 +54,12 @@ storage (tracked with the M8 packaging work).
 Concurrent lanes share one working tree; these rules keep them out of
 each other's commits and test runs.
 
-1. **Stage by explicit paths, never `git add -A`** — the shared tree
-   carries siblings' in-flight edits, and `-A` absorbs them into your
-   commit (the round-4 staging incident).
+1. **Commit by pathspec, never through the shared index** — `git
+   commit -m … -- <paths>` commits exactly those paths. Do NOT `git
+   add -A`, and do NOT `git add <paths> && git commit` either: `git
+   add` stages into the SHARED index and a plain `git commit` commits
+   the entire index, so a sibling's staged hunk rides along (the round-4
+   `-A` incident; the M2 index-sweep incident cb33bd2).
 2. **A red test ships in the SAME commit as its fix**, never in an
    unrelated lane's commit — split staging leaves commits that are
    individually red and breaks `git bisect` (three such commits in
@@ -83,6 +86,12 @@ each other's commits and test runs.
    collaborators as `&dyn Fn` parameters (`bind_with_resolved`,
    `serve_observed`, the daemon's `run`) or extract a pure function
    (`checks_for`) rather than inventing per-site variants.
+8. **No `git commit --amend` while lanes are active** — history is
+   append-only while any concurrent lane may hold a ref to it. Twice
+   in M2 an amend landed on a commit another lane had already built
+   on; both repairs needed hash-pinned rewrites of everything
+   downstream. If a commit must change, revert-and-recommit (or wait
+   for the lane to land) — never rewrite.
 
 ## Local gates (must be green before push; run inside the devshell)
 

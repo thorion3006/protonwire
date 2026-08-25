@@ -11,12 +11,40 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
+# The freedesktop Secret Service backend of the `keyring` writable
+# session store (M2 S5c): keyring-core entries over the pure-Rust zbus
+# store (RustCrypto session crypto). Audit, lockfile delta (36 new
+# packages, all pure Rust, no C, no tokio), and the no-facade decision:
+# docs/spike-2026-08.md §S5c. The mock store for the D-Bus-free tests
+# ships in keyring-core itself (no extra dev-dependency).
+keyring-core = { workspace = true }
+zbus-secret-service-keyring-store = { workspace = true }
+# Typed open(2) flags / errno for the fd-pinned credential read (M2 S5b,
+# S5a sec P3): O_NOFOLLOW/O_NONBLOCK and ELOOP, which std's custom_flags
+# API takes only as raw bits. Already the workspace pin (ipc, tui), so
+# no new lockfile package (lockfile hunk: one edge on protonwire-store).
+nix = { workspace = true }
 protonwire-frontend-api = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_norway = { workspace = true }
+# Session-envelope source digest (M2 S4): RustCrypto SHA-256 — no
+# hand-rolled hashing per the stdlib-first policy; already the workspace
+# xtask pin, so no new lockfile package.
+sha2 = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+# Credential-read value transit (M2 S5b, S5a sec P2): zeroizing storage
+# for credential bytes from the read to the peer-secret ingress seam —
+# the same workspace pin core/api already use, so no new lockfile
+# package (lockfile hunk: one edge on protonwire-store).
+zeroize = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
+# (The former test-only `protonwire-core` dev edge is GONE: the seam's
+# production impl landed in core (`redact.rs`) with its proof tests
+# (`boundary_seam_tests`) — under cargo's dev-cycle handling this
+# crate's test build saw two store instances and the impl resolved only
+# against core's dependency instance, E0599 for the local view. The
+# lockfile hunk was removed with it.)

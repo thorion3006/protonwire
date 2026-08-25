@@ -45,6 +45,14 @@ pub enum FrameError {
     /// The peer sent a length prefix above [`MAX_FRAME_LEN`].
     #[error("frame of {0} bytes exceeds the {MAX_FRAME_LEN}-byte limit")]
     TooLarge(usize),
+    /// The connection closed at a FRAME BOUNDARY (M2 S12): every frame
+    /// the peer sent was complete, and the reader had consumed no byte
+    /// of the next one. Informational — the ordinary way a well-behaved
+    /// peer hangs up — and deliberately distinct from [`FrameError::Truncated`]
+    /// so session teardowns stop logging clean hangups as protocol
+    /// violations.
+    #[error("connection closed at a frame boundary")]
+    Closed,
     /// The connection closed mid-frame or mid-prefix.
     #[error("connection closed mid-frame")]
     Truncated,
@@ -186,25 +194,41 @@ pub fn read_msg<R: Read, T: DeserializeOwned>(r: &mut R) -> Result<T, FrameError
 ///
 /// Stateless: a mid-frame timeout/error discards the bytes read so far.
 /// Polling readers must use [`FrameReader`] instead.
+///
+/// EOF classification (M2 S12): EOF before the FIRST byte of the length
+/// prefix is [`FrameError::Closed`] (the peer hung up at a boundary);
+/// any EOF after frame bytes were consumed is [`FrameError::Truncated`].
 pub fn read_frame<R: Read>(r: &mut R) -> Result<Vec<u8>, FrameError> {
     let mut prefix = [0u8; 4];
-    read_exact_or_truncated(r, &mut prefix)?;
+    read_exact_or_truncated(r, &mut prefix, true)?;
     let len = u32::from_be_bytes(prefix) as usize;
     if len > MAX_FRAME_LEN {
         return Err(FrameError::TooLarge(len));
     }
     let mut payload = vec![0u8; len];
-    read_exact_or_truncated(r, &mut payload)?;
+    read_exact_or_truncated(r, &mut payload, false)?;
     Ok(payload)
 }
 
 /// `Read::read_exact` that maps EOF mid-buffer to [`FrameError::Truncated`]
-/// and propagates timeouts as `WouldBlock` so callers can poll.
-fn read_exact_or_truncated<R: Read>(r: &mut R, buf: &mut [u8]) -> Result<(), FrameError> {
+/// (or [`FrameError::Closed`] when `at_boundary` is set and not one byte
+/// of the buffer had arrived) and propagates timeouts as `WouldBlock` so
+/// callers can poll.
+fn read_exact_or_truncated<R: Read>(
+    r: &mut R,
+    buf: &mut [u8],
+    at_boundary: bool,
+) -> Result<(), FrameError> {
     let mut filled = 0;
     while filled < buf.len() {
         match r.read(&mut buf[filled..]) {
-            Ok(0) => return Err(FrameError::Truncated),
+            Ok(0) => {
+                return Err(if at_boundary && filled == 0 {
+                    FrameError::Closed
+                } else {
+                    FrameError::Truncated
+                });
+            }
             Ok(n) => filled += n,
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(e) => return Err(e.into()),
@@ -267,7 +291,10 @@ impl<R: Read> FrameReader<R> {
         loop {
             match &mut self.stage {
                 Stage::Prefix { buf, filled } => {
-                    fill(&mut self.inner, buf, filled, deadline)?;
+                    // EOF before the first prefix byte is the boundary
+                    // case (M2 S12); anything later in the frame is a
+                    // truncation.
+                    fill(&mut self.inner, buf, filled, deadline, *filled == 0)?;
                     let len = u32::from_be_bytes(*buf) as usize;
                     if len > MAX_FRAME_LEN {
                         // The stream is untrustworthy past this point;
@@ -285,7 +312,7 @@ impl<R: Read> FrameReader<R> {
                     };
                 }
                 Stage::Payload { buf, filled } => {
-                    fill(&mut self.inner, buf, filled, deadline)?;
+                    fill(&mut self.inner, buf, filled, deadline, false)?;
                     // Stage completed: hand over the payload and stand at
                     // the next frame boundary.
                     return match std::mem::replace(
@@ -331,12 +358,15 @@ impl<R: Read> FrameReader<R> {
 /// With `deadline` set, the loop also fails with `TimedOut` once the
 /// deadline passes — checked before every `read`, so a steady dribble of
 /// successfully arriving bytes cannot outlive it (Codex PR review round 2,
-/// finding 2).
+/// finding 2). EOF maps to [`FrameError::Closed`] when `at_boundary` is
+/// set and nothing had arrived, [`FrameError::Truncated`] otherwise
+/// (M2 S12).
 fn fill<R: Read>(
     r: &mut R,
     buf: &mut [u8],
     filled: &mut usize,
     deadline: Option<Instant>,
+    at_boundary: bool,
 ) -> Result<(), FrameError> {
     while *filled < buf.len() {
         if let Some(deadline) = deadline
@@ -348,7 +378,13 @@ fn fill<R: Read>(
             )));
         }
         match r.read(&mut buf[*filled..]) {
-            Ok(0) => return Err(FrameError::Truncated),
+            Ok(0) => {
+                return Err(if at_boundary && *filled == 0 {
+                    FrameError::Closed
+                } else {
+                    FrameError::Truncated
+                });
+            }
             Ok(n) => *filled += n,
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(e) => return Err(e.into()),
@@ -392,6 +428,66 @@ mod tests {
         buf.truncate(buf.len() - 10);
         let err = read_frame(&mut buf.as_slice()).unwrap_err();
         assert!(matches!(err, FrameError::Truncated));
+    }
+
+    /// M2 S12: a CLEAN EOF at a frame boundary — the peer finished its
+    /// frames and hung up — is not a truncation. The codec mapped every
+    /// EOF to `Truncated` ("connection closed mid-frame"), so the
+    /// session teardown logged ordinary client hangups as protocol
+    /// violations. A reader standing at a boundary (no byte of the next
+    /// frame consumed) must get a distinguishable, informational
+    /// variant. Red (trivial, behavioral, observed): both readers
+    /// returned `Truncated` pre-fix.
+    #[test]
+    fn clean_eof_at_a_frame_boundary_is_closed_not_truncated() {
+        // The stateful reader: built at a boundary, EOF before any byte.
+        let mut reader = FrameReader::new(std::io::empty());
+        let err = reader.read_frame().unwrap_err();
+        assert!(
+            matches!(err, FrameError::Closed),
+            "a boundary EOF is informational, got {err:?}"
+        );
+        // The free function: same position, same answer.
+        let mut empty = std::io::empty();
+        let err = read_frame(&mut empty).unwrap_err();
+        assert!(
+            matches!(err, FrameError::Closed),
+            "the free reader must agree, got {err:?}"
+        );
+    }
+
+    /// M2 S12, the other half of the distinction: EOF with frame bytes
+    /// already consumed is STILL a truncation — prefix started, payload
+    /// started, anything. The same reader must classify by POSITION,
+    /// not by mood.
+    #[test]
+    fn mid_frame_eof_stays_truncated_at_every_stage() {
+        // Cut mid-payload: one full frame, then a frame missing its tail.
+        let mut wire = Vec::new();
+        write_msg(&mut wire, &serde_json::json!({ "a": 1 })).unwrap();
+        let mut cut = Vec::new();
+        write_msg(&mut cut, &serde_json::json!(vec![1u8; 64])).unwrap();
+        cut.truncate(cut.len() - 10);
+        wire.extend_from_slice(&cut);
+
+        let mut reader = FrameReader::new(wire.as_slice());
+        assert!(reader.read_frame().is_ok(), "the intact frame reads");
+        let err = reader.read_frame().unwrap_err();
+        assert!(
+            matches!(err, FrameError::Truncated),
+            "a frame cut mid-payload is a truncation, got {err:?}"
+        );
+
+        // Cut mid-PREFIX: three bytes of the length prefix, then EOF.
+        let mut three = Vec::new();
+        write_msg(&mut three, &serde_json::json!(vec![1u8; 64])).unwrap();
+        three.truncate(3);
+        let mut reader = FrameReader::new(three.as_slice());
+        let err = reader.read_frame().unwrap_err();
+        assert!(
+            matches!(err, FrameError::Truncated),
+            "a prefix cut after its first byte is a truncation, got {err:?}"
+        );
     }
 
     #[test]
@@ -596,11 +692,32 @@ mod tests {
         write_msg(&mut expected, &serde_json::json!(&big)).unwrap();
         let expected = expected.len();
 
+        // No-hang gate (the WO-R4 precedent): every peer read below is
+        // bounded, so a regression that stalls the writer mid-drain fails
+        // fast with WouldBlock instead of hanging the suite — the unfixed
+        // fixture's other failure mode (see the boundary note below).
+        b.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .expect("read timeout applies");
+
         let reader = std::thread::spawn(move || {
             let mut got = 0;
             let mut chunk = [0u8; 16_384];
             while got < expected {
-                got += b.read(&mut chunk).expect("peer keeps draining");
+                // NEVER read past the big frame's boundary. The writer
+                // queues the follow-up frame the instant the big one is
+                // done, so while the big frame's tail is still unread a
+                // single read returns tail PLUS follow-up bytes — they are
+                // contiguous in the receive queue — and `got` overshoots
+                // `expected`. The over-consumed bytes then desynchronize
+                // read_msg: eating the follow-up's 4-byte prefix makes it
+                // parse `{"do` as a length (reproduced under pinned-CPU
+                // stress: TooLarge(2065851503) = 0x7B22646F); eating 1-3
+                // prefix bytes, or all 17, leaves it blocked forever.
+                // Bounding each read to `expected - got` keeps the drain
+                // exact whatever the scheduler does — the follow-up frame
+                // stays wholly unread for read_msg.
+                let room = (expected - got).min(chunk.len());
+                got += b.read(&mut chunk[..room]).expect("peer keeps draining");
             }
             let follow_up: serde_json::Value =
                 read_msg(&mut b).expect("the follow-up frame arrives");

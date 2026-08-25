@@ -6,13 +6,14 @@ use std::io;
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use protonwire_frontend_api::{
     ClientMessage, EVENT_SEQ_RESYNC_NOW, Event, EventEnvelope, HelloAck, HelloError, NoticeLevel,
-    PROTOCOL_VERSION, Request, RequestResult, Response, RpcError, ServerMessage,
+    PROTOCOL_VERSION, Request, RequestResult, Response, RpcError, ServerMessage, event_reaches,
+    resync_marker_reaches,
 };
 use tracing::{debug, info, warn};
 
@@ -33,9 +34,11 @@ use crate::server::{
 /// DEBUG builds of a pre-signal SDK panicked on the cursor+1 overflow —
 /// current SDKs intercept the envelope before any cursor arithmetic, and
 /// the arithmetic itself is checked_add since rust-review round 8, so no
-/// build sits one add from a panic. Fully gating the marker behind the
-/// hello handshake remains a TRACK ITEM with sec's hard trigger:
-/// must-fix before any separately-shipped client artifact.
+/// build sits one add from a panic. The marker is GATED on the hello
+/// handshake's negotiated version (S2): the forwarder emits it only for
+/// versions the marker reaches (see [`resync_marker_reaches`]); a peer
+/// below the introduction version never sees the reserved seq and
+/// recovers through the ordinary sequence-gap resynchronization.
 fn resync_marker() -> ServerMessage {
     ServerMessage::Event(EventEnvelope {
         seq: EVENT_SEQ_RESYNC_NOW,
@@ -46,6 +49,87 @@ fn resync_marker() -> ServerMessage {
     })
 }
 
+/// The session's event forwarder: after the hello gate opens, forwards
+/// bus events onto the writer channel and answers an end-of-burst
+/// overflow with the reserved resync marker — but only when the
+/// session's NEGOTIATED protocol version is one the marker reaches
+/// (X4 gating, S2).
+///
+/// The gate channel carries the negotiated version (a `u32`) instead of
+/// a bare open signal: the gate still opens only after the ack is
+/// queued (WO-5), and the version it hands the forwarder drives the
+/// per-version filtering of reserved outbound markers for the rest of
+/// the session — the version cannot change after hello, because a
+/// duplicate hello ends the session. A session that ends pre-hello
+/// drops the gate sender and the forwarder leaves without forwarding.
+fn forward_events(
+    gate_rx: mpsc::Receiver<u32>,
+    event_rx: mpsc::Receiver<ServerMessage>,
+    forward_tx: mpsc::SyncSender<ServerMessage>,
+    forward_window: Arc<WriteWindow>,
+    overflowed: Arc<AtomicBool>,
+) {
+    let Ok(negotiated_version) = gate_rx.recv() else {
+        return; // session ended before hello; nothing to forward
+    };
+    for message in event_rx {
+        // S9 (the S2/S7-sec tracked obligation): the per-version
+        // outbound filter for real events. A session negotiated below
+        // an event family's DECLARED introduction version must not
+        // receive it — a peer that predates the shape recovers through
+        // the ordinary sequence-gap resynchronization on the next event
+        // that does reach it (the withheld event is dropped, never
+        // downgraded: there is no encoding of an unknown-variant tagged
+        // enum such a peer could parse). The M1 shapes and everything
+        // introduced at the session's version pass untouched, so today
+        // (every family introduced inside the unshipped version 1) no
+        // negotiable session is filtered — the gate is the registration
+        // discipline that keeps the NEXT family honest.
+        let deliverable = match &message {
+            ServerMessage::Event(envelope) => event_reaches(negotiated_version, &envelope.event),
+            _ => true,
+        };
+        if !deliverable {
+            continue;
+        }
+        if forward_window.send_through(&forward_tx, message).is_err() {
+            break;
+        }
+        // X4 (round 8): answer an end-of-burst overflow without a
+        // later publish. A full session queue dropped events (the bus
+        // marked this session) and the burst may have ENDED there — no
+        // later seq will ever arrive to make the gap observable, so the
+        // client would hold stale state indefinitely. The drop
+        // necessarily left events queued (the queue was full when it
+        // happened), so this check runs after forwarding one of them:
+        // clear the mark ATOMICALLY (one marker per observed episode)
+        // and send the reserved resync marker straight down the writer
+        // channel — the bus queue may still be full, so the marker must
+        // bypass it. The send blocks under the writer's own
+        // backpressure, exactly like a real event, and the marker rides
+        // the existing Event wire shape, so every client parses it.
+        // (R9-2: events and the marker reserve window slots — they
+        // occupy the same memory the window exists to bound — but the
+        // forwarder never WAITS on the window; see
+        // MAX_UNWRITTEN_MESSAGES.)
+        //
+        // S2 gating: the marker reaches only versions at or above its
+        // DECLARED introduction version. The swap above consumes the
+        // episode either way — a withheld marker must not leave the
+        // episode armed to fire later — and a pre-marker peer recovers
+        // through the ordinary sequence-gap resynchronization on the
+        // next real event instead of a signal it cannot interpret.
+        if overflowed.swap(false, Ordering::SeqCst)
+            && resync_marker_reaches(negotiated_version)
+            && forward_window
+                .send_through(&forward_tx, resync_marker())
+                .is_err()
+        {
+            break;
+        }
+    }
+}
+
 /// Serves one client connection until EOF, error, or daemon shutdown.
 pub(super) fn handle_session<H: RequestHandler>(
     stream: Arc<UnixStream>,
@@ -53,6 +137,7 @@ pub(super) fn handle_session<H: RequestHandler>(
     stop: Arc<AtomicBool>,
     hello_deadline: Duration,
     write_timeout: Duration,
+    idle_ceiling: Duration,
 ) {
     // The session slot the accept loop reserved is released on EVERY exit
     // path — early rejects below, dispatcher panics (the serve loop's
@@ -155,48 +240,19 @@ pub(super) fn handle_session<H: RequestHandler>(
     // handshake on purpose (events published mid-handshake must not be
     // lost), but unguarded the forwarder raced them onto the socket ahead
     // of HelloAck — and a client rejects any non-ack frame while
-    // handshaking. The gate opens only after the ack is queued; a session
-    // that ends pre-hello drops `gate_tx`, which unblocks (and ends) the
-    // forwarder instead of stranding it on the closed gate.
-    let (gate_tx, gate_rx) = mpsc::sync_channel::<()>(1);
+    // handshaking. The gate opens only after the ack is queued, and it
+    // carries the session's NEGOTIATED protocol version (S2): the
+    // forwarder's per-version filtering of reserved outbound markers (X4
+    // gating) is driven by that value. A session that ends pre-hello
+    // drops `gate_tx`, which unblocks (and ends) the forwarder instead of
+    // stranding it on the closed gate.
+    let (gate_tx, gate_rx) = mpsc::sync_channel::<u32>(1);
     let event_forward = {
         let forward_tx = writer_tx.clone();
         let forward_window = Arc::clone(&window);
         let overflowed = Arc::clone(&overflowed);
         std::thread::spawn(move || {
-            if gate_rx.recv().is_err() {
-                return; // session ended before hello; nothing to forward
-            }
-            for message in event_rx {
-                if forward_window.send_through(&forward_tx, message).is_err() {
-                    break;
-                }
-                // X4 (round 8): answer an end-of-burst overflow without a
-                // later publish. A full session queue dropped events (the
-                // bus marked this session) and the burst may have ENDED
-                // there — no later seq will ever arrive to make the gap
-                // observable, so the client would hold stale state
-                // indefinitely. The drop necessarily left events queued
-                // (the queue was full when it happened), so this check runs
-                // after forwarding one of them: clear the mark ATOMICALLY
-                // (one marker per observed episode) and send the reserved
-                // resync marker straight down the writer channel — the bus
-                // queue may still be full, so the marker must bypass it.
-                // The send blocks under the writer's own backpressure,
-                // exactly like a real event, and the marker rides the
-                // existing Event wire shape, so every client parses it.
-                // (R9-2: events and the marker reserve window slots — they
-                // occupy the same memory the window exists to bound — but
-                // the forwarder never WAITS on the window; see
-                // MAX_UNWRITTEN_MESSAGES.)
-                if overflowed.swap(false, Ordering::SeqCst)
-                    && forward_window
-                        .send_through(&forward_tx, resync_marker())
-                        .is_err()
-                {
-                    break;
-                }
-            }
+            forward_events(gate_rx, event_rx, forward_tx, forward_window, overflowed)
         })
     };
 
@@ -211,6 +267,7 @@ pub(super) fn handle_session<H: RequestHandler>(
         &peer,
         &stop,
         hello_deadline,
+        idle_ceiling,
     );
     // Teardown order is load-bearing: dropping our sender alone is not
     // enough — the forwarder holds a clone — so we must unsubscribe BEFORE
@@ -246,16 +303,31 @@ fn serve_messages(
     peer: &PeerCredentials,
     stop: &AtomicBool,
     hello_deadline: Duration,
+    idle_ceiling: Duration,
 ) -> Result<(), FrameError> {
     let SessionOutputs {
         writer_tx,
         gate_tx,
         window,
     } = outputs;
-    let mut reader = FrameReader::new(read_half);
+    // The idle ceiling (M2 S12) is byte-accurate on purpose: "no ANY
+    // readable byte", not "no complete frame". The counting wrapper
+    // observes every byte the kernel hands the reader — a peer that
+    // DRIBBLES bytes without ever completing a frame keeps resetting
+    // the clock (it is making the session live), while a peer that
+    // goes fully silent expires it.
+    let read_bytes = Arc::new(AtomicU64::new(0));
+    let mut reader = FrameReader::new(CountingRead {
+        inner: read_half,
+        counter: Arc::clone(&read_bytes),
+    });
     let connected_at = Instant::now();
     let mut hello_done = false;
     let mut client_info = None;
+    // The idle clock starts at the handshake (the budget covers
+    // HANDSHAKEN peers; the pre-hello phase is the hello deadline's).
+    let mut last_byte_at = connected_at;
+    let mut last_byte_count = 0u64;
     while !stop.load(Ordering::SeqCst) {
         if !hello_done && connected_at.elapsed() > hello_deadline {
             let _ = writer_tx.send(ServerMessage::HelloError(HelloError {
@@ -264,15 +336,34 @@ fn serve_messages(
             }));
             return Ok(());
         }
+        if hello_done {
+            let seen = read_bytes.load(Ordering::Relaxed);
+            if seen != last_byte_count {
+                last_byte_count = seen;
+                last_byte_at = Instant::now();
+            } else if last_byte_at.elapsed() > idle_ceiling {
+                info!(
+                    uid = peer.uid,
+                    idle_ms = last_byte_at.elapsed().as_millis() as u64,
+                    "session idle ceiling exceeded; releasing its slot (the \
+                     client reconnects through its existing recovery path)"
+                );
+                return Ok(());
+            }
+        }
         // R9-2: the request-credit window. While K responses (or events)
         // remain unwritten, reading another request would only park more
         // client-amplified output: the loop pauses INSTEAD of reading, so
         // a pipelining client beyond the window waits rather than
         // buffers. Exit paths from the pause: the window reopens (the
         // writer put messages on the wire), the stop flag (checked at the
-        // loop top after `continue`), or the writer's death — a parked
-        // loop never sends, so only the window's exit note can tell it
-        // the session is over.
+        // loop top after `continue`), the writer's death — a parked loop
+        // never sends, so only the window's exit note can tell it the
+        // session is over — and now the idle ceiling too: a peer parked
+        // on the window is by construction not draining, so expiring it
+        // at the ceiling is the reclaim this budget exists for (its
+        // unread-bytes requests, if any, cannot be read while parked and
+        // do not count as activity).
         if hello_done && window.is_exhausted() {
             if window.writer_is_gone() {
                 return Ok(());
@@ -323,12 +414,15 @@ fn serve_messages(
                 }
                 let client = client.sanitized();
                 info!(uid = peer.uid, name = %client.name, "client connected");
+                // Speak the highest version both sides support; the
+                // session's outbound paths (the forwarder's reserved
+                // markers, S2) filter on this value from here on.
+                let negotiated_version = protocol_version.min(PROTOCOL_VERSION);
                 if window
                     .send_through(
                         &writer_tx,
                         ServerMessage::HelloAck(HelloAck {
-                            // Speak the highest version both sides support.
-                            protocol_version: protocol_version.min(PROTOCOL_VERSION),
+                            protocol_version: negotiated_version,
                             daemon_version: handler.daemon_version().to_owned(),
                             latest_event_seq: handler.latest_event_seq(),
                         }),
@@ -343,9 +437,11 @@ fn serve_messages(
                 // The ack is queued ahead of anything the gated forwarder
                 // holds, and the writer drains its channel in FIFO order —
                 // so the ack is the first frame the client reads. Open the
-                // gate; buffered pre-hello events follow the ack onto the
-                // wire instead of beating it (pr-champion WO-5).
-                let _ = gate_tx.send(());
+                // gate WITH the negotiated version: buffered pre-hello
+                // events follow the ack onto the wire instead of beating
+                // it (pr-champion WO-5), and the forwarder's per-version
+                // marker filtering is armed for the session (S2).
+                let _ = gate_tx.send(negotiated_version);
                 client_info = Some(client);
                 hello_done = true;
             }
@@ -451,6 +547,14 @@ impl WriteWindow {
     /// A failed send leaks the reservation deliberately — a failed send
     /// means the writer channel's receiver is gone, so the session is
     /// ending and the window will never be consulted again.
+    ///
+    /// `result_large_err` allow: the M2 S9 wire growth pushed
+    /// `ServerMessage` past the lint's Err-size threshold. The error
+    /// value exists only on the writer-death path (never constructed in
+    /// steady state), boxing the wire enum would ripple through every
+    /// Clone and match, and the SendError payload is never inspected —
+    /// every caller matches `is_err()`.
+    #[allow(clippy::result_large_err)]
     fn send_through(
         &self,
         tx: &mpsc::SyncSender<ServerMessage>,
@@ -465,14 +569,36 @@ impl WriteWindow {
 /// dropping `gate_tx` on every exit path is what ends a forwarder still
 /// waiting on the hello gate, and the writer sender clone gives the loop
 /// its queue handle while `handle_session` keeps its own for teardown.
-/// The window is the R9-2 bound both senders share with the writer.
+/// The window is the R9-2 bound both senders share with the writer. The
+/// gate carries the hello-negotiated protocol version (S2) so the
+/// forwarder filters reserved outbound markers per version.
 struct SessionOutputs {
     /// The dispatcher's clone of the session writer channel.
     writer_tx: mpsc::SyncSender<ServerMessage>,
-    /// Opens the event gate after the hello ack is queued.
-    gate_tx: mpsc::SyncSender<()>,
+    /// Opens the event gate (with the negotiated version) after the
+    /// hello ack is queued.
+    gate_tx: mpsc::SyncSender<u32>,
     /// The shared request-credit window (R9-2).
     window: Arc<WriteWindow>,
+}
+
+/// Read-through byte counter backing the idle ceiling (M2 S12): wraps
+/// the session's read half so the dispatch loop can distinguish "the
+/// peer went fully silent" (expire) from "bytes keep arriving" (reset
+/// the clock, whatever the frame-completion state).
+struct CountingRead<'a> {
+    inner: &'a mut UnixStream,
+    counter: Arc<AtomicU64>,
+}
+
+impl std::io::Read for CountingRead<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        if n > 0 {
+            self.counter.fetch_add(n as u64, Ordering::Relaxed);
+        }
+        Ok(n)
+    }
 }
 
 /// Authorization plus handler execution for one request.
@@ -615,10 +741,12 @@ mod tests {
             ServerMessage::HelloError(err) => assert_eq!(err.reason, "duplicate-hello"),
             other => panic!("expected HelloError for duplicate hello, got {other:?}"),
         }
-        // The session ends: the next read hits EOF.
+        // The session ends: the next read hits EOF — at a FRAME BOUNDARY
+        // (the refusal was a complete frame), so the M2 S12 codec class
+        // it Closed, the informational hangup, not Truncated.
         assert!(matches!(
             read_msg::<_, ServerMessage>(&mut stream),
-            Err(crate::frame::FrameError::Truncated)
+            Err(crate::frame::FrameError::Closed)
         ));
     }
 
@@ -643,9 +771,10 @@ mod tests {
             ServerMessage::HelloError(err) => assert_eq!(err.reason, "request-before-hello"),
             other => panic!("expected HelloError for early request, got {other:?}"),
         }
+        // Boundary EOF after the complete refusal frame: Closed (M2 S12).
         assert!(matches!(
             read_msg::<_, ServerMessage>(&mut stream),
-            Err(crate::frame::FrameError::Truncated)
+            Err(crate::frame::FrameError::Closed)
         ));
     }
 
@@ -814,10 +943,11 @@ mod tests {
             }
             other => panic!("expected a hello-timeout refusal, got {other:?}"),
         }
-        // The session ends after the refusal.
+        // The session ends after the refusal — a boundary EOF, so the
+        // codec class it Closed (M2 S12), not mid-frame.
         assert!(matches!(
             read_msg::<_, ServerMessage>(&mut read_half),
-            Err(crate::frame::FrameError::Truncated)
+            Err(crate::frame::FrameError::Closed)
         ));
         dribbler.join().unwrap();
         stop.store(true, Ordering::SeqCst);
@@ -1026,6 +1156,152 @@ mod tests {
             1,
             "retain-on-Full: the overflowed session must stay subscribed"
         );
+    }
+
+    /// X4 gating (M2 S2): the reserved resync marker reaches only
+    /// sessions negotiated at or above the marker's DECLARED
+    /// introduction version. The forwarder is driven directly with a
+    /// FORCED negotiated version — the handshake refuses anything below
+    /// the oldest supported version (1), so the pre-marker peer is
+    /// simulated exactly where production carries the decision: the
+    /// hello gate hands the forwarder the negotiated version, and the
+    /// outbound path filters the marker per version.
+    #[test]
+    fn resync_marker_is_withheld_below_its_introduction_version() {
+        /// One forwarded episode at `negotiated`: returns
+        /// `(delivered, marker_seen)` — what crossed the writer channel.
+        fn episode_at(negotiated: u32) -> (ServerMessage, bool) {
+            let (event_tx, event_rx) = mpsc::channel::<ServerMessage>();
+            let (writer_tx, writer_rx) = mpsc::sync_channel::<ServerMessage>(16);
+            let (gate_tx, gate_rx) = mpsc::sync_channel::<u32>(1);
+            let overflowed = Arc::new(AtomicBool::new(true));
+            let forwarder = {
+                let writer_tx = writer_tx.clone();
+                let overflowed = Arc::clone(&overflowed);
+                let window = Arc::new(WriteWindow::new());
+                std::thread::spawn(move || {
+                    forward_events(gate_rx, event_rx, writer_tx, window, overflowed)
+                })
+            };
+            // The overflow mark is already set (the drop necessarily
+            // left events queued), one event is queued, and the gate
+            // opens at the forced version.
+            event_tx
+                .send(ServerMessage::Event(EventEnvelope {
+                    seq: 7,
+                    event: Event::Notice {
+                        level: NoticeLevel::Info,
+                        message: "last delivered of the burst".into(),
+                    },
+                }))
+                .unwrap();
+            gate_tx.send(negotiated).unwrap();
+            let delivered = writer_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("the queued event is forwarded");
+            // Bounded silence probe: whatever is NOT the forwarded event
+            // within the window is the marker's absence.
+            let marker_seen = match writer_rx.recv_timeout(Duration::from_millis(300)) {
+                Ok(ServerMessage::Event(envelope)) => envelope.seq == EVENT_SEQ_RESYNC_NOW,
+                Ok(other) => panic!("unexpected frame after the event: {other:?}"),
+                Err(mpsc::RecvTimeoutError::Timeout) => false,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    panic!("the forwarder died mid-episode")
+                }
+            };
+            // End the episode regardless of outcome, then prove the
+            // overflow mark was consumed either way: a withheld marker
+            // must not leave the episode armed to fire later.
+            drop(event_tx);
+            drop(writer_tx);
+            let _ = forwarder.join();
+            assert!(
+                !overflowed.load(Ordering::SeqCst),
+                "the overflow episode must be consumed exactly once, marker or not"
+            );
+            (delivered, marker_seen)
+        }
+
+        let (delivered, marker_at_one) = episode_at(1);
+        assert!(
+            matches!(delivered, ServerMessage::Event(envelope) if envelope.seq == 7),
+            "the queued event must deliver before any marker"
+        );
+        assert!(
+            marker_at_one,
+            "version 1 (the introduction version) receives the marker"
+        );
+
+        let (_, marker_at_zero) = episode_at(0);
+        assert!(
+            !marker_at_zero,
+            "a forced pre-marker version must NOT receive the reserved seq — it \
+             recovers through the ordinary sequence-gap resynchronization instead"
+        );
+    }
+
+    /// S9 (the S2/S7-sec tracked obligation), forwarder-level pin: the
+    /// per-version outbound filter runs where production carries the
+    /// decision — the hello gate hands the forwarder the negotiated
+    /// version and the forwarder drops events below their DECLARED
+    /// introduction version. Same forced-version shape as the marker
+    /// test above (the handshake refuses real versions below 1, which
+    /// is why the whole M2 family landing inside the unshipped
+    /// version 1 is free). Red (behavioral, recorded): with the
+    /// `event_reaches` filter removed from the forwarder, the
+    /// forced-zero episode delivers the M2 event and this fails.
+    #[test]
+    fn m2_events_are_withheld_below_their_introduction_version_by_the_forwarder() {
+        /// One forwarded episode at `negotiated` over `event`: whether
+        /// the event crossed the writer channel.
+        fn delivers_at(negotiated: u32, event: Event) -> bool {
+            let (event_tx, event_rx) = mpsc::channel::<ServerMessage>();
+            let (writer_tx, writer_rx) = mpsc::sync_channel::<ServerMessage>(16);
+            let (gate_tx, gate_rx) = mpsc::sync_channel::<u32>(1);
+            let overflowed = Arc::new(AtomicBool::new(false));
+            let forwarder = {
+                let writer_tx = writer_tx.clone();
+                let window = Arc::new(WriteWindow::new());
+                std::thread::spawn(move || {
+                    forward_events(gate_rx, event_rx, writer_tx, window, overflowed)
+                })
+            };
+            event_tx
+                .send(ServerMessage::Event(EventEnvelope { seq: 3, event }))
+                .unwrap();
+            gate_tx.send(negotiated).unwrap();
+            let seen = match writer_rx.recv_timeout(Duration::from_millis(300)) {
+                Ok(ServerMessage::Event(_)) => true,
+                Ok(other) => panic!("unexpected frame: {other:?}"),
+                Err(mpsc::RecvTimeoutError::Timeout) => false,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    panic!("the forwarder died mid-episode")
+                }
+            };
+            drop(event_tx);
+            drop(writer_tx);
+            let _ = forwarder.join();
+            seen
+        }
+
+        let m2_event = Event::AccountChanged;
+        assert!(
+            delivers_at(1, m2_event.clone()),
+            "the introduction version receives the M2 event"
+        );
+        assert!(
+            !delivers_at(0, m2_event),
+            "a forced pre-family version must NOT receive the M2 event — it \
+             recovers through the ordinary sequence-gap resynchronization instead"
+        );
+        // The M1 shapes are version-free: every negotiable (and the
+        // forced pre-family) version receives them.
+        let m1_event = Event::Notice {
+            level: NoticeLevel::Info,
+            message: "m1 shape".into(),
+        };
+        assert!(delivers_at(0, m1_event.clone()));
+        assert!(delivers_at(1, m1_event));
     }
 
     /// Codex round 5 (P1): the writer thread exiting on a write timeout
@@ -1412,6 +1688,162 @@ mod tests {
         // for exactly as long as the test needs it.
         hurry.store(true, Ordering::SeqCst);
         let _ = drainer.join();
+        stop.store(true, Ordering::SeqCst);
+        let _ = served.join();
+    }
+
+    /// S12 item 3 — the per-session idle ceiling. Post-hello reads are
+    /// unbounded by design ("a live session may take as long as its
+    /// client needs between requests", the loop's own comment), so a
+    /// peer that HANDSHAKES and then holds its socket open silently — a
+    /// crashed TUI, a suspended laptop, a hostile slot-squatter — kept
+    /// its reserved session slot FOREVER: the hello deadline governs
+    /// only the pre-hello phase, and nothing post-hello ever expires.
+    /// 64 such connections wedge the daemon at MAX_SESSIONS. The idle
+    /// ceiling (a [`ServeBudgets`] knob, minutes-scale by default)
+    /// releases the slot through the normal teardown after a budget with
+    /// ZERO readable bytes. Red (behavioral, observed with the budget
+    /// plumbed but unenforced): the watchdog below fired with the slot
+    /// still held 1.6 s into a 400 ms ceiling — the pre-fix shape,
+    /// held indefinitely.
+    #[test]
+    fn handshaken_silent_peer_releases_its_slot_at_the_idle_ceiling() {
+        let dir = tempfile::tempdir().unwrap();
+        let handler = Arc::new(NullHandler {
+            version: "test".into(),
+            bus: EventBus::new(),
+        });
+        let server = IpcServer::bind(dir.path(), "idle.sock").unwrap();
+        let path = server.socket_path().to_owned();
+        let stop = Arc::new(AtomicBool::new(false));
+        let idle_ceiling = Duration::from_millis(400);
+        let served = {
+            let handler = Arc::clone(&handler);
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                server.serve_with(
+                    handler,
+                    stop,
+                    ServeBudgets {
+                        idle_timeout: idle_ceiling,
+                        ..ServeBudgets::default()
+                    },
+                )
+            })
+        };
+
+        // Handshake normally, then go SILENT while holding the socket
+        // open — neither EOF nor a byte ever arrives from here on.
+        let _silent = connect_and_hello(&path);
+        // Let the session fully establish (the accept loop polls at
+        // 250 ms), past which the hello deadline no longer governs it.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while handler.event_bus().active_sessions() != 1 {
+            assert!(Instant::now() < deadline, "the session never established");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        // Wall-clock watchdog: the reserved slot must be back inside the
+        // ceiling plus polling slack. Pre-enforcement this ran out the
+        // full 5 s with the slot held (the recorded red).
+        let started = Instant::now();
+        while handler.event_bus().active_sessions() != 0 {
+            assert!(
+                Instant::now() < started + idle_ceiling + Duration::from_secs(2),
+                "the session outlived its idle ceiling — a handshaken-then-silent \
+                 peer is holding its slot {} ms into a {} ms ceiling",
+                started.elapsed().as_millis(),
+                idle_ceiling.as_millis()
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        // The teardown guards ran: the subscription went with the slot.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while handler.event_bus().session_count() != 0 {
+            assert!(
+                Instant::now() < deadline,
+                "subscription leaked after the idle-ceiling teardown"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        stop.store(true, Ordering::SeqCst);
+        let _ = served.join();
+    }
+
+    /// S12 item 3, the byte-accuracy pin: the ceiling is "no ANY
+    /// readable byte", NOT "no complete frame". A peer that dribbles
+    /// one byte every 100 ms never completes a frame — a
+    /// frame-completion clock would expire it — but every byte is the
+    /// peer making the session live, so the slot must SURVIVE well past
+    /// a 400 ms ceiling. (Mutation killer for a complete-frame-based
+    /// idle clock; the silent-peer expiry is the test above.)
+    #[test]
+    fn a_dribbling_peer_resets_the_idle_clock_byte_by_byte() {
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().unwrap();
+        let handler = Arc::new(NullHandler {
+            version: "test".into(),
+            bus: EventBus::new(),
+        });
+        let server = IpcServer::bind(dir.path(), "dribble-idle.sock").unwrap();
+        let path = server.socket_path().to_owned();
+        let stop = Arc::new(AtomicBool::new(false));
+        let idle_ceiling = Duration::from_millis(400);
+        let served = {
+            let handler = Arc::clone(&handler);
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                server.serve_with(
+                    handler,
+                    stop,
+                    ServeBudgets {
+                        idle_timeout: idle_ceiling,
+                        ..ServeBudgets::default()
+                    },
+                )
+            })
+        };
+
+        let mut stream = connect_and_hello(&path);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while handler.event_bus().active_sessions() != 1 {
+            assert!(Instant::now() < deadline, "the session never established");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        // Dribble for 4x the ceiling, one byte each 100 ms: a LEGAL frame
+        // length is announced up front (60_000 bytes, well under
+        // MAX_FRAME_LEN — announcing garbage would rightly end the
+        // session as TooLarge), then the payload arrives one byte at a
+        // time. The frame never completes, but every byte is activity.
+        let mut prefix = [0u8; 4];
+        prefix.copy_from_slice(&(60_000u32).to_be_bytes());
+        stream.write_all(&prefix[..3]).unwrap();
+        let _ = stream.flush();
+        let dribble_for = idle_ceiling * 4;
+        let started = Instant::now();
+        let mut byte = 0x78u8;
+        while started.elapsed() < dribble_for {
+            if stream.write_all(&[byte]).is_err() {
+                panic!(
+                    "the server hung up on a DRIBBLING peer {} ms into a {} ms \
+                     ceiling — the clock must reset byte-by-byte, not per frame",
+                    started.elapsed().as_millis(),
+                    idle_ceiling.as_millis()
+                );
+            }
+            let _ = stream.flush();
+            byte = byte.wrapping_add(1);
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert_eq!(
+            handler.event_bus().active_sessions(),
+            1,
+            "a peer that keeps sending bytes must hold its slot — the ceiling \
+             expires SILENCE, not slowness"
+        );
+        drop(stream);
         stop.store(true, Ordering::SeqCst);
         let _ = served.join();
     }

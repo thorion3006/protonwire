@@ -10,7 +10,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use clap::Parser;
 use protonwire_core::redact::init_tracing_filtered;
@@ -41,10 +41,82 @@ struct Args {
 
 fn main() {
     let args = Args::parse();
-    let code = run(args, &init_tracing_filtered, Some(Path::new("/")));
+    let code = run(args, &init_tracing_filtered, Some(Path::new("/")), None);
     if code != 0 {
         std::process::exit(code);
     }
+}
+
+/// Set by the SIGTERM/SIGINT/SIGHUP/SIGQUIT handler (M2 S12, the TUI's
+/// R7-4 pattern); polled by the serve-loop watcher in [`run`].
+static TERMINATE_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// Terminating-signal landing pad (SIGTERM, SIGINT, SIGHUP, SIGQUIT).
+///
+/// ASYNC-SIGNAL-SAFETY CONSTRAINT (the TUI's R7-4 rule, verbatim in
+/// spirit): this runs on an arbitrary thread, interrupted from arbitrary
+/// code. The ENTIRE body is one store to a static atomic — no locks, no
+/// allocation, no I/O, and above all no daemon teardown, any of which
+/// could deadlock or corrupt state. The serve-loop watcher polls the
+/// flag at a 50 ms cadence and performs the graceful drain on the main
+/// thread: the daemon has no terminal to restore (the TUI's reason for
+/// the pattern), so "restore on the main thread" is here "set the serve
+/// stop flag and let `serve()`'s existing drain path finish" — sessions
+/// flush their final responses, the drain ceiling still bounds
+/// stragglers, and `run` returns 0.
+extern "C" fn record_termination(_signal: nix::libc::c_int) {
+    TERMINATE_REQUESTED.store(true, Ordering::Relaxed);
+}
+
+/// Installs the flag handler for SIGTERM, SIGINT, SIGHUP, and SIGQUIT
+/// (the TUI's signal set: SIGTERM is the systemd stop signal, Ctrl-C and
+/// Ctrl-\ bypass any CLI path, SIGHUP is the service manager's reload-
+/// and-stop habit; the handler body is signal-agnostic, so one flag
+/// store serves them all).
+///
+/// The workspace denies `unsafe_code`; this is the daemon's one audited
+/// unsafe block (the Tauri shell and the TUI's R7-4 handler are the
+/// other documented exceptions in kind), sound because the installed
+/// handler writes only a static atomic — see [`record_termination`].
+/// `SaFlags::empty()` — no SA_RESTART: the watcher must notice the
+/// flag, not have syscalls paper over the signal.
+#[allow(unsafe_code)]
+fn install_terminate_handler() -> nix::Result<()> {
+    use nix::sys::signal::{SaFlags, SigAction, SigHandler, Signal, sigaction};
+    let action = SigAction::new(
+        SigHandler::Handler(record_termination),
+        SaFlags::empty(),
+        nix::sys::signal::SigSet::empty(),
+    );
+    unsafe {
+        sigaction(Signal::SIGTERM, &action)?;
+        sigaction(Signal::SIGINT, &action)?;
+        sigaction(Signal::SIGHUP, &action)?;
+        sigaction(Signal::SIGQUIT, &action)?;
+    }
+    Ok(())
+}
+
+/// Bridges the signal flag to the serve loop's stop flag: polls
+/// [`TERMINATE_REQUESTED`] at a 50 ms cadence until either a signal
+/// lands (sets `stop`, so `serve()` drains and returns through the
+/// existing graceful path) or the stop flag is set by something else
+/// (an administrator's Shutdown request — the watcher then just
+/// leaves).
+fn watch_for_termination(stop: Arc<AtomicBool>) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        while !stop.load(Ordering::SeqCst) {
+            if TERMINATE_REQUESTED.load(Ordering::Relaxed) {
+                info!(
+                    "termination signal received; draining sessions through the \
+                     serve stop path"
+                );
+                stop.store(true, Ordering::SeqCst);
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    })
 }
 
 /// The daemon body with the tracing factory injectable — the same seam
@@ -63,17 +135,47 @@ fn main() {
 /// runner cannot make root-owned (parameterized, not blanket-applied —
 /// the per-UID overlay and ordinary test paths are unchanged).
 ///
+/// `cache_dir` is the S9 (a) seam, same shape: production passes `None`
+/// (the `ConfigPaths` cache location stands and the scheduler's strict
+/// loads walk to `/`); tests pass a directory to plant the scheduler's
+/// persisted documents under, which ALSO narrows the scheduler's walk
+/// root to that directory — the hermetic-test opt-in (an unprivileged
+/// runner cannot construct a root-owned tree anywhere, and the default
+/// tree's existing ancestors — e.g. a world-writable /tmp — would
+/// otherwise refuse every hermetic construction before the arm under
+/// test). The seam moves WHERE the documents live and how deep the
+/// walk goes; it never relaxes HOW existing components are judged, and
+/// production (main) never takes it.
+///
 /// Configuration is loaded before tracing initializes so that
 /// `daemon.log_level` from the config applies (rust-review finding 7);
 /// a `--log-level` flag wins over the config, and RUST_LOG wins over
 /// both. Load failures predate the logger and go to stderr.
-fn run(args: Args, init_tracing: &dyn Fn(&str), trust_root: Option<&Path>) -> i32 {
+fn run(
+    args: Args,
+    init_tracing: &dyn Fn(&str),
+    trust_root: Option<&Path>,
+    cache_dir: Option<&Path>,
+) -> i32 {
+    // M2 S12: the terminating-signal handler goes in FIRST — a signal
+    // arriving during config load or bind is recorded in the flag, and
+    // the serve-loop watcher (spawned before serve) converts it into
+    // the stop flag the moment the loop exists, so a stop request can
+    // never be lost to a startup window. Failure only costs the
+    // signal-driven stop (the default disposition returns), so it is
+    // reported, not fatal.
+    if let Err(e) = install_terminate_handler() {
+        eprintln!("protonwire-daemon: cannot install SIGTERM/SIGINT/SIGHUP/SIGQUIT handlers: {e}");
+    }
     let mut paths = ConfigPaths::system();
     if let Some(config) = &args.config {
         paths.system_config = config.clone();
     }
     if let Some(socket_dir) = &args.socket_dir {
         paths.socket_dir = socket_dir.clone();
+    }
+    if let Some(cache_dir) = cache_dir {
+        paths.cache_dir = cache_dir.to_path_buf();
     }
 
     // Round-8 X5 [ZkI1F]: the system document is root-daemon policy, so
@@ -124,6 +226,9 @@ fn run(args: Args, init_tracing: &dyn Fn(&str), trust_root: Option<&Path>) -> i3
     let config_socket_path = config.daemon.socket_path.clone();
     let config_socket_group = config.daemon.socket_group.clone();
     let bus = Arc::new(protonwire_ipc::EventBus::new());
+    // The S9 service construction below needs the validated policy too;
+    // both holders share one Arc.
+    let config_for_services = Arc::clone(&config);
     let core = Arc::new(protonwire_core::DaemonCore::new(
         env!("CARGO_PKG_VERSION"),
         config,
@@ -135,6 +240,31 @@ fn run(args: Args, init_tracing: &dyn Fn(&str), trust_root: Option<&Path>) -> i3
         &paths.socket_dir,
         &paths.socket_name,
     );
+    // M2 S9 (a): the scheduler constructs STRICTLY, and any refusal —
+    // a malformed, oversized, or fs-trust-refused persisted deadlines
+    // or cache document — ABORTS startup (exit 15, the PRD 9.8
+    // config-class code). Never a default-fallback scheduler: silently
+    // re-deriving deadlines from defaults would forget the persisted
+    // high-water mark and re-arm the FR-13H restart refetch storm the
+    // strict load exists to prevent. Production walks to `/`; the
+    // `cache_dir` seam (tests) additionally narrows the walk root to
+    // the injected directory — the hermetic-test opt-in, since an
+    // unprivileged runner cannot construct a root-owned tree anywhere.
+    let services = match &cache_dir {
+        None => protonwire_daemon::DaemonServices::build(Arc::clone(&config_for_services), &paths),
+        Some(dir) => protonwire_daemon::DaemonServices::build_with_trust_root(
+            Arc::clone(&config_for_services),
+            &paths,
+            dir,
+        ),
+    };
+    let services = match services {
+        Ok(services) => Arc::new(services),
+        Err(e) => {
+            eprintln!("protonwire-daemon: {e}");
+            return 15;
+        }
+    };
     let server = match protonwire_ipc::server::IpcServer::bind_with_group(
         &socket_dir,
         &socket_name,
@@ -159,6 +289,7 @@ fn run(args: Args, init_tracing: &dyn Fn(&str), trust_root: Option<&Path>) -> i3
         core: Arc::clone(&core),
         stop: Arc::clone(&stop),
         bus,
+        services,
     });
 
     info!(
@@ -166,7 +297,27 @@ fn run(args: Args, init_tracing: &dyn Fn(&str), trust_root: Option<&Path>) -> i3
         version = env!("CARGO_PKG_VERSION"),
         "protonwire-daemon serving"
     );
+    // M2 S12: the signal flag's bridge into the serve loop. Joined after
+    // serve returns — the watcher leaves on the stop flag whichever way
+    // it was set (signal or administrator Shutdown), so the join is
+    // prompt and never outlives the drain it may itself have started.
+    let terminate_watcher = watch_for_termination(Arc::clone(&stop));
+    // Codex PR#4 P1 (M2 S9 completion): the scheduler's AUTOMATIC door
+    // needs a driver — constructing the scheduler services no window.
+    // FR-12/FR-13C: this loop fetches the first-boot due window and
+    // every persisted deadline that becomes due, independent of any
+    // user issuing ServersRefresh. Until the session lane installs the
+    // catalog adapter, its windows fail with the empty cell's typed
+    // transport refusal (logged once per window); the loop itself is
+    // the missing production wiring. Joined after serve returns so a
+    // stop never races a live refresh.
+    let refresh_driver = protonwire_daemon::spawn_automatic_refresh_driver(
+        Arc::clone(&handler.services.scheduler),
+        Arc::clone(&stop),
+    );
     server.serve(handler, stop);
+    let _ = terminate_watcher.join();
+    let _ = refresh_driver.join();
     info!("protonwire-daemon stopped");
     0
 }
@@ -257,6 +408,9 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let blocker = dir.join("not-a-directory");
         std::fs::write(&blocker, b"").unwrap();
+        // Hermetic scheduler cache (S9 a): all-absent, so the strict
+        // construction is the clean first boot on every runner.
+        let cache_dir = dir.join("var/cache/protonwire");
 
         let args = Args {
             config: Some(dir.join("missing-config.yaml")),
@@ -276,7 +430,7 @@ mod tests {
             }
         };
 
-        let code = run(args, &init, None);
+        let code = run(args, &init, None, Some(&cache_dir));
         assert_eq!(code, 1, "the blocked socket directory must fail the bind");
 
         let entries = log.snapshot();
@@ -297,6 +451,245 @@ mod tests {
             warning > 0,
             "the warning must follow the init marker: {entries:?}"
         );
+    }
+
+    /// M2 S12: the signal path end to end — delivery, flag, bridge, and
+    /// clean stop — with ONE signal. kill(getpid(), ...) from a spawned
+    /// thread must land in the handler (whose entire effect is a flag
+    /// store — async-signal-safe, benign for every other test in this
+    /// process), the flag must be observable by polling, and the serve
+    /// loop's watcher must convert it into the stop flag so `run`
+    /// returns the clean-shutdown code 0 after the graceful drain. A
+    /// handshaken client is connected before the signal so the drain
+    /// path is exercised for real (its session must be torn down by the
+    /// stop, not by us).
+    ///
+    /// Red (behavioral, observed at stage A — handler and flag present,
+    /// the serve loop not yet watching): SIGTERM landed, the flag was
+    /// observed set, and `run` kept serving until the watchdog fired —
+    /// nothing bridged the flag to the stop flag. (Without the handler
+    /// at all the signal would have killed the whole test process; the
+    /// flag handler ships first, the bridge second.)
+    ///
+    /// No separate delivery test: two tests signalling the process in
+    /// parallel reset each other's shared flag mid-observation (the
+    /// TUI's R7-4 suite runs its signals one at a time for exactly this
+    /// reason) — the first draft's standalone delivery test raced THIS
+    /// test's handshake with its own SIGTERM.
+    #[test]
+    fn delivered_sigterm_sets_the_flag_and_stops_the_serving_daemon_cleanly() {
+        use protonwire_frontend_api::{ClientMessage, ClientSurface, ServerMessage};
+        use std::os::unix::net::UnixStream;
+
+        install_terminate_handler().expect("handler installs");
+        TERMINATE_REQUESTED.store(false, Ordering::Relaxed);
+
+        let dir =
+            std::env::temp_dir().join(format!("protonwire-daemon-sigterm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Hermetic scheduler cache (S9 a): all-absent, so the strict
+        // construction is the clean first boot on every runner.
+        let cache_dir = dir.join("var/cache/protonwire");
+        let args = Args {
+            config: Some(dir.join("missing-config.yaml")),
+            socket_dir: Some(dir.clone()),
+            log_level: None,
+        };
+
+        let (exit_tx, exit_rx) = std::sync::mpsc::channel::<i32>();
+        std::thread::spawn(move || {
+            // No subscriber install (the FU-A test owns the process's
+            // single global install); trust_root None keeps the loader
+            // on its plain semantics for the scratch-tree path.
+            let _ = exit_tx.send(run(args, &|_level: &str| {}, None, Some(&cache_dir)));
+        });
+
+        // Wait for the socket, then handshake a live session through it.
+        let socket = dir.join("protonwire.sock");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !socket.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the daemon never bound its socket"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        let mut stream = UnixStream::connect(&socket).expect("client connects");
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        protonwire_ipc::frame::write_msg(
+            &mut stream,
+            &ClientMessage::Hello {
+                protocol_version: 1,
+                client: protonwire_frontend_api::ClientInfo {
+                    name: "sigterm-test".into(),
+                    version: "0".into(),
+                    surface: ClientSurface::Other,
+                },
+            },
+        )
+        .unwrap();
+        match protonwire_ipc::frame::read_msg::<_, ServerMessage>(&mut stream).unwrap() {
+            ServerMessage::HelloAck(_) => {} // a live, handshaken session
+            other => panic!("expected the hello ack, got {other:?}"),
+        }
+
+        // SIGTERM to self from a helper — ONLY after the handshake: the
+        // accept loop polls at 250 ms, so a signal sent earlier can beat
+        // the accept entirely and the drain has nothing to drain (the
+        // un-accepted connect is reset with the listener instead).
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            nix::sys::signal::kill(nix::unistd::Pid::this(), nix::sys::signal::Signal::SIGTERM)
+                .unwrap();
+        });
+        // The flag half of the contract: the delivered signal was
+        // recorded, observable by polling (bounded by the same watchdog
+        // that expects run() to return).
+        let started = std::time::Instant::now();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !TERMINATE_REQUESTED.load(Ordering::Relaxed) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(
+            TERMINATE_REQUESTED.load(Ordering::Relaxed),
+            "delivered SIGTERM was not observed"
+        );
+        // And the stop half: the watcher bridged the flag to the serve
+        // loop, which drained and returned the clean-shutdown code.
+        let code = exit_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("run() must return after SIGTERM — pre-fix it served forever");
+        assert_eq!(code, 0, "a signalled stop is a clean shutdown");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "the signal-driven stop took {:?} — the drain must stay inside its ceiling",
+            started.elapsed()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// S9 (a): the scheduler constructs through the STRICT production
+    /// path, and a corrupted persisted-deadlines document REFUSES
+    /// STARTUP — exit 15, before the bind — never a default-fallback
+    /// scheduler. Silently re-deriving deadlines from defaults would
+    /// re-arm exactly the FR-13H refetch storm the persisted high-water
+    /// mark exists to prevent (a rollback-forgetting daemon hammering
+    /// Proton on every restart). Pre-fix red: `run` had no scheduler
+    /// construction at all — this test drove straight past the planted
+    /// deadlines document and died at the blocked socket directory with
+    /// exit 1, not 15.
+    ///
+    /// Arm disclosure (the honest red-evidence nuance): on an
+    /// unprivileged runner the walk's ownership pass refuses the
+    /// test-planted (necessarily non-root-owned) document before the
+    /// parse arm is reached — the refusal class is FsTrust; a
+    /// root-owned tree reaches the Malformed arm (each store-arm class
+    /// is pinned by the deadlines/catalog suites). Both are the
+    /// prescribed abort classes (Malformed/TooLarge/FsTrust), and both
+    /// exit 15 here — the pinned contract is the REFUSAL.
+    #[test]
+    fn corrupted_deadlines_document_refuses_startup_before_bind() {
+        let dir =
+            std::env::temp_dir().join(format!("protonwire-daemon-s9a-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cache_dir = dir.join("var/cache/protonwire");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        // Corrupted persisted deadlines: unparseable bytes.
+        std::fs::write(cache_dir.join("deadlines.json"), b"{not json").unwrap();
+        // The bind blocker makes the PRE-fix outcome deterministic: with
+        // no scheduler construction, `run` reaches the bind and exits 1.
+        let blocker = dir.join("not-a-directory");
+        std::fs::write(&blocker, b"").unwrap();
+
+        let args = Args {
+            config: Some(dir.join("missing-config.yaml")),
+            socket_dir: Some(blocker),
+            log_level: None,
+        };
+        let code = run(args, &|_level: &str| {}, None, Some(&cache_dir));
+        assert_eq!(
+            code, 15,
+            "a corrupted deadlines document must refuse startup with the \
+             config-class exit code, never serve (and never fall back to \
+             default deadlines)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// S9 (a), no-fallback control arm: an all-ABSENT cache tree is the
+    /// legitimate first boot (the FR-13F bootstrap) and must not abort
+    /// anything — the daemon proceeds to the bind (exit 1 here, only
+    /// because of the blocker). This kills the inverse mutation ("abort
+    /// whenever the scheduler looks at the cache directory"). The cache
+    /// directory is deliberately NOT created: absent components are
+    /// soft (MissingLeaf::Allow), so the walk passes on every runner.
+    #[test]
+    fn absent_deadlines_document_is_a_normal_first_boot() {
+        let dir =
+            std::env::temp_dir().join(format!("protonwire-daemon-s9a-ctrl-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // The cache tree itself is deliberately NOT created: absent
+        // components are soft, so the strict construction passes.
+        let cache_dir = dir.join("var/cache/protonwire");
+        let blocker = dir.join("not-a-directory");
+        std::fs::write(&blocker, b"").unwrap();
+
+        let args = Args {
+            config: Some(dir.join("missing-config.yaml")),
+            socket_dir: Some(blocker),
+            log_level: None,
+        };
+        let code = run(args, &|_level: &str| {}, None, Some(&cache_dir));
+        assert_eq!(
+            code, 1,
+            "first boot with no persisted deadlines must reach the bind \
+             (exit 1 is the blocker, not a scheduler refusal)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// S9 (d), FR-7J at the startup boundary: a config naming the
+    /// systemd credential source with no systemd credentials directory
+    /// behind it ($CREDENTIALS_DIRECTORY absent — asserted as the
+    /// test's precondition) is a misdeployment that REFUSES STARTUP
+    /// (exit 15), never a silently-blank source. Toggle-red (the
+    /// credential resolution removed from the service construction):
+    /// `run` sailed past resolution to the blocked socket dir, exit 1.
+    #[test]
+    fn systemd_credential_source_without_systemd_refuses_startup() {
+        assert!(
+            std::env::var_os("CREDENTIALS_DIRECTORY").is_none(),
+            "this test's premise is a systemd-free environment"
+        );
+        let dir =
+            std::env::temp_dir().join(format!("protonwire-daemon-s9d-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = dir.join("config.yaml");
+        std::fs::write(
+            &config,
+            "schema_version: 2\naccount:\n  credential_input_source: systemd\n",
+        )
+        .unwrap();
+        let blocker = dir.join("not-a-directory");
+        std::fs::write(&blocker, b"").unwrap();
+
+        let args = Args {
+            config: Some(config),
+            socket_dir: Some(blocker),
+            log_level: None,
+        };
+        let code = run(args, &|_level: &str| {}, None, Some(&dir.join("cache")));
+        assert_eq!(
+            code, 15,
+            "a systemd source with no credentials directory must refuse startup \
+             (FR-7J), never serve with a silently-blank source"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Round-8 X5 [ZkI1F]: the daemon applies the system configuration as
@@ -337,7 +730,7 @@ mod tests {
         // single global install; this test pins only the exit code (the
         // defect naming is pinned by the store suite).
         let init = |_level: &str| {};
-        let code = run(args, &init, Some(Path::new("/")));
+        let code = run(args, &init, Some(Path::new("/")), None);
         assert_eq!(
             code, 15,
             "a group-writable system configuration must fail the strict load with \

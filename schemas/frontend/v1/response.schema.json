@@ -53,6 +53,148 @@
     }
   ],
   "$defs": {
+    "AccountStatus": {
+      "description": "The account snapshot behind `account --json` (FR-7H): never a\nsecret, never a fabricated fact — absent fields mean unknown or\nnot-yet-wired, per the S6 discipline.",
+      "type": "object",
+      "properties": {
+        "credential_source": {
+          "description": "The resolved credential INPUT source (FR-7F).",
+          "$ref": "#/$defs/CredentialSourceStatus"
+        },
+        "login_status": {
+          "description": "The daemon account session's login status.",
+          "$ref": "#/$defs/SessionStatus"
+        },
+        "persistence_health": {
+          "description": "Persistence health, when the writable-store half reports one\n(ER-18). Absent until S5b/S5c wires the writable store — never\nfabricated.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PersistenceHealth"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "writable_store": {
+          "description": "The configured WRITABLE store (the S5b/S5c half).",
+          "$ref": "#/$defs/WritableStoreStatus"
+        }
+      },
+      "required": [
+        "login_status",
+        "credential_source",
+        "writable_store"
+      ]
+    },
+    "CredentialSourceStatus": {
+      "description": "The resolved credential input source (S5a's two arms).",
+      "oneOf": [
+        {
+          "description": "Values arrive over the IPC surface (the S9 interactive\nprovider).",
+          "type": "object",
+          "properties": {
+            "source": {
+              "type": "string",
+              "const": "interactive"
+            }
+          },
+          "required": [
+            "source"
+          ]
+        },
+        {
+          "description": "Read-only import from the systemd credentials directory\n(FR-7F/FR-7J).",
+          "type": "object",
+          "properties": {
+            "data": {
+              "type": "object",
+              "properties": {
+                "directory": {
+                  "description": "The resolved `$CREDENTIALS_DIRECTORY`.",
+                  "type": "string"
+                },
+                "startup_read": {
+                  "description": "What the daemon's startup read of the preferred `session`\ncredential found (recorded once, never re-read mid-run).",
+                  "$ref": "#/$defs/CredentialStartupRead"
+                }
+              },
+              "required": [
+                "directory",
+                "startup_read"
+              ]
+            },
+            "source": {
+              "type": "string",
+              "const": "systemd"
+            }
+          },
+          "required": [
+            "source",
+            "data"
+          ]
+        }
+      ]
+    },
+    "CredentialStartupRead": {
+      "description": "The recorded outcome of the daemon's startup read of the systemd\n`session` credential — facts only, never value bytes.",
+      "oneOf": [
+        {
+          "description": "A current, integral FR-7C envelope was readable (the\ntransactional import into the writable store is S5b's; this is\nthe input-half fact).",
+          "type": "object",
+          "properties": {
+            "data": {
+              "type": "object",
+              "properties": {
+                "schema_version": {
+                  "description": "The envelope's schema version.",
+                  "type": "integer",
+                  "format": "uint32",
+                  "minimum": 0
+                }
+              },
+              "required": [
+                "schema_version"
+              ]
+            },
+            "read": {
+              "type": "string",
+              "const": "read"
+            }
+          },
+          "required": [
+            "read",
+            "data"
+          ]
+        },
+        {
+          "description": "The read refused; `reason` is the typed refusal's value-free\nsummary (the recorded skip reason).",
+          "type": "object",
+          "properties": {
+            "data": {
+              "type": "object",
+              "properties": {
+                "reason": {
+                  "description": "Value-free refusal summary.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "reason"
+              ]
+            },
+            "read": {
+              "type": "string",
+              "const": "refused"
+            }
+          },
+          "required": [
+            "read",
+            "data"
+          ]
+        }
+      ]
+    },
     "DaemonState": {
       "description": "Full daemon state snapshot — the authoritative view clients resynchronize\nagainst (PRD FR-127D). Connection details (server, tunnel statistics,\nrequested-vs-applied features) join this struct in Milestone 4+ as\nadditive-optional fields, which are wire-compatible WITHOUT a protocol\nversion bump (old and new documents round-trip — see\n`snapshot_sequence_is_optional_on_the_wire` for the same rule on\n`latest_event_seq`). A version bump is reserved for representation\nchanges that break older readers: renaming or repurposing fields,\nchanging a field's type or semantics, or making a previously-optional\nfield mandatory.",
       "type": "object",
@@ -101,6 +243,168 @@
         "network_integration"
       ]
     },
+    "Fido2ChallengeParams": {
+      "description": "The WebAuthn ceremony parameters of a FIDO2 challenge (the wire\nmirror of the adapter's reduced challenge).",
+      "type": "object",
+      "properties": {
+        "allow_credentials": {
+          "description": "Allowed credential IDs (the account's registered FIDO2 keys).",
+          "type": "array",
+          "items": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "format": "uint8",
+              "maximum": 255,
+              "minimum": 0
+            }
+          }
+        },
+        "challenge": {
+          "description": "The ceremony challenge bytes.",
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "format": "uint8",
+            "maximum": 255,
+            "minimum": 0
+          }
+        }
+      },
+      "required": [
+        "challenge",
+        "allow_credentials"
+      ]
+    },
+    "LoginBlockedReason": {
+      "description": "Stable reasons a login flow stops without a session (ER-17; the\nstrings are recorded in `docs/official-parity.yaml`).",
+      "oneOf": [
+        {
+          "description": "Human verification: no authorized public surface.",
+          "type": "string",
+          "const": "human-verification"
+        },
+        {
+          "description": "Organization SSO: no authorized public surface.",
+          "type": "string",
+          "const": "organization-sso"
+        },
+        {
+          "description": "Guest login: not exposed by the pinned adapter on Linux.",
+          "type": "string",
+          "const": "guest-login"
+        },
+        {
+          "description": "Connection feedback: out of scope for the required flows.",
+          "type": "string",
+          "const": "feedback"
+        },
+        {
+          "description": "A challenge shape the pinned adapter cannot continue (for\nexample recovery codes).",
+          "type": "string",
+          "const": "unsupported-challenge"
+        }
+      ]
+    },
+    "LoginOutcome": {
+      "description": "One step of a login-family flow on the wire (the S0/S4 adapter's\n`LoginStep`): a completed session, a continuation challenge, or a\nfail-closed stop with a stable reason.",
+      "oneOf": [
+        {
+          "description": "The session is authenticated; login is complete.",
+          "type": "object",
+          "properties": {
+            "data": {
+              "type": "object",
+              "properties": {
+                "session_id": {
+                  "description": "The auth session ID.",
+                  "type": "string"
+                },
+                "user_id": {
+                  "description": "The Proton user ID.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "user_id",
+                "session_id"
+              ]
+            },
+            "step": {
+              "type": "string",
+              "const": "session"
+            }
+          },
+          "required": [
+            "step",
+            "data"
+          ]
+        },
+        {
+          "description": "A second factor is required before the session is usable.",
+          "type": "object",
+          "properties": {
+            "data": {
+              "type": "object",
+              "properties": {
+                "fido2": {
+                  "description": "FIDO2 ceremony parameters when the account has registered\nkeys.",
+                  "anyOf": [
+                    {
+                      "$ref": "#/$defs/Fido2ChallengeParams"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "totp_enabled": {
+                  "description": "TOTP is enabled for the account.",
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "totp_enabled"
+              ]
+            },
+            "step": {
+              "type": "string",
+              "const": "challenge"
+            }
+          },
+          "required": [
+            "step",
+            "data"
+          ]
+        },
+        {
+          "description": "The flow has no authorized public continuation; the stable\nreason is carried for the client surfaces (ER-17).",
+          "type": "object",
+          "properties": {
+            "data": {
+              "type": "object",
+              "properties": {
+                "reason": {
+                  "description": "The stable refusal reason.",
+                  "$ref": "#/$defs/LoginBlockedReason"
+                }
+              },
+              "required": [
+                "reason"
+              ]
+            },
+            "step": {
+              "type": "string",
+              "const": "blocked"
+            }
+          },
+          "required": [
+            "step",
+            "data"
+          ]
+        }
+      ]
+    },
     "NetworkIntegration": {
       "description": "Host network integration mode (PRD 6.6). ProtonWire always owns the tunnel\nand privacy policy; the mode only controls uplink observation and DNS\ncooperation.",
       "oneOf": [
@@ -123,6 +427,38 @@
           "description": "Cooperate with systemd-networkd.",
           "type": "string",
           "const": "networkd"
+        }
+      ]
+    },
+    "PersistenceHealth": {
+      "description": "Writable-store persistence health (ER-18). Carried only when the\nwritable-store half is wired and reporting.",
+      "oneOf": [
+        {
+          "description": "Restart persistence is intact.",
+          "type": "string",
+          "const": "healthy"
+        },
+        {
+          "description": "Restart persistence is at risk; operations requiring durable\nlogin must fail. The reason is value-free.",
+          "type": "object",
+          "properties": {
+            "unhealthy": {
+              "type": "object",
+              "properties": {
+                "reason": {
+                  "description": "Value-free failure summary.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "reason"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "unhealthy"
+          ]
         }
       ]
     },
@@ -180,7 +516,7 @@
           ]
         },
         {
-          "description": "Reply to [`Request::Disconnect`] / [`Request::Shutdown`].",
+          "description": "Reply to [`Request::Disconnect`] / [`Request::Shutdown`] /\n[`Request::Logout`] / [`Request::SubmitCredential`].",
           "type": "object",
           "properties": {
             "result": {
@@ -190,6 +526,152 @@
           },
           "required": [
             "result"
+          ]
+        },
+        {
+          "description": "Reply to [`Request::ServersList`]: the cached catalog revision,\nserved verbatim (FR-10 — the raw upstream body, never\nrewritten), or all-`None` fields when nothing is cached yet.",
+          "type": "object",
+          "properties": {
+            "data": {
+              "type": "object",
+              "properties": {
+                "body": {
+                  "description": "The raw catalog JSON body, byte-for-byte as cached.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "etag": {
+                  "description": "The cached revision's `ETag`, for diagnostics.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "fetched_unix": {
+                  "description": "When this revision was fetched (Unix seconds); absent when\nno catalog is cached.",
+                  "type": [
+                    "integer",
+                    "null"
+                  ],
+                  "format": "uint64",
+                  "minimum": 0
+                }
+              }
+            },
+            "result": {
+              "type": "string",
+              "const": "servers"
+            }
+          },
+          "required": [
+            "result",
+            "data"
+          ]
+        },
+        {
+          "description": "Reply to [`Request::ServersRefresh`]: the scheduler's report.",
+          "type": "object",
+          "properties": {
+            "data": {
+              "type": "object",
+              "properties": {
+                "report": {
+                  "description": "What the refresh did and what follows.",
+                  "$ref": "#/$defs/ServersRefreshReport"
+                }
+              },
+              "required": [
+                "report"
+              ]
+            },
+            "result": {
+              "type": "string",
+              "const": "servers-refreshed"
+            }
+          },
+          "required": [
+            "result",
+            "data"
+          ]
+        },
+        {
+          "description": "Reply to the login family ([`Request::BeginLogin`],\n[`Request::SubmitTwoFactor`], [`Request::SubmitFidoPayload`]):\nthe next step of the flow, never a silent retry.",
+          "type": "object",
+          "properties": {
+            "data": {
+              "type": "object",
+              "properties": {
+                "step": {
+                  "description": "The step's outcome.",
+                  "$ref": "#/$defs/LoginOutcome"
+                }
+              },
+              "required": [
+                "step"
+              ]
+            },
+            "result": {
+              "type": "string",
+              "const": "login-step"
+            }
+          },
+          "required": [
+            "result",
+            "data"
+          ]
+        },
+        {
+          "description": "Reply to [`Request::RefreshSession`]: the post-refresh status.",
+          "type": "object",
+          "properties": {
+            "data": {
+              "type": "object",
+              "properties": {
+                "status": {
+                  "description": "The session's login status after the refresh.",
+                  "$ref": "#/$defs/SessionStatus"
+                }
+              },
+              "required": [
+                "status"
+              ]
+            },
+            "result": {
+              "type": "string",
+              "const": "login-status"
+            }
+          },
+          "required": [
+            "result",
+            "data"
+          ]
+        },
+        {
+          "description": "Reply to [`Request::GetAccount`]: the account snapshot.",
+          "type": "object",
+          "properties": {
+            "data": {
+              "type": "object",
+              "properties": {
+                "account": {
+                  "description": "The account facts.",
+                  "$ref": "#/$defs/AccountStatus"
+                }
+              },
+              "required": [
+                "account"
+              ]
+            },
+            "result": {
+              "type": "string",
+              "const": "account"
+            }
+          },
+          "required": [
+            "result",
+            "data"
           ]
         }
       ]
@@ -314,9 +796,186 @@
           "const": "protocol-unavailable"
         },
         {
+          "description": "The requested capability has no verified public upstream flow\n(human verification, organization SSO, guest mode, feedback):\nfail closed with a stable code and remediation, never an\nautomatic retry or an undocumented endpoint (ER-17).",
+          "type": "string",
+          "const": "upstream-capability-blocked"
+        },
+        {
+          "description": "The upstream presented an authentication challenge this daemon\ncannot continue — an unknown 2FA or verification shape (PRD §7).\nFail closed: no retry, no untrusted URL, no approximation.",
+          "type": "string",
+          "const": "unsupported-challenge"
+        },
+        {
+          "description": "The request requires explicit user confirmation before it may\nproceed — the FR-11 early manual catalog refresh now, the FR-7D\nraw-password-storage and FR-7EA none-store confirmations later.\n`details` carries the typed [`ConfirmationRequirement`]\nenvelope; a confirmed retry echoes its single-use token.",
+          "type": "string",
+          "const": "confirmation-required"
+        },
+        {
+          "description": "The request was refused by a local suppression deadline or an\nupstream rate limit; the carried eligibility time governs the\nnext attempt and no path may bypass it (ER-16).",
+          "type": "string",
+          "const": "rate-limited"
+        },
+        {
+          "description": "The writable credential store failed its health check: restart\npersistence is at risk and operations that require durable\nlogin must fail (ER-18).",
+          "type": "string",
+          "const": "credential-persistence-unhealthy"
+        },
+        {
           "description": "An internal daemon error without a more specific code.",
           "type": "string",
           "const": "internal"
+        }
+      ]
+    },
+    "ServersRefreshOutcome": {
+      "description": "What one catalog refresh did.",
+      "oneOf": [
+        {
+          "description": "A new catalog revision was fetched and committed.",
+          "type": "object",
+          "properties": {
+            "data": {
+              "type": "object",
+              "properties": {
+                "etag": {
+                  "description": "The new revision's `ETag`, when the API sent one.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              }
+            },
+            "outcome": {
+              "type": "string",
+              "const": "changed"
+            }
+          },
+          "required": [
+            "outcome",
+            "data"
+          ]
+        },
+        {
+          "description": "The stored revision was still current (an ETag match).",
+          "type": "object",
+          "properties": {
+            "outcome": {
+              "type": "string",
+              "const": "not-modified"
+            }
+          },
+          "required": [
+            "outcome"
+          ]
+        },
+        {
+          "description": "The upstream rate-limited the refresh; the suppression\ndeadline in the report governs the next attempt.",
+          "type": "object",
+          "properties": {
+            "data": {
+              "type": "object",
+              "properties": {
+                "retry_after_seconds": {
+                  "description": "The `Retry-After` delay the API supplied, if any\n(already clamped at the adapter's parse seam).",
+                  "type": [
+                    "integer",
+                    "null"
+                  ],
+                  "format": "uint64",
+                  "minimum": 0
+                }
+              }
+            },
+            "outcome": {
+              "type": "string",
+              "const": "rate-limited"
+            }
+          },
+          "required": [
+            "outcome",
+            "data"
+          ]
+        },
+        {
+          "description": "The refresh failed; `reason` is a stable, never-secret\ndescription.",
+          "type": "object",
+          "properties": {
+            "data": {
+              "type": "object",
+              "properties": {
+                "reason": {
+                  "description": "Stable failure description.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "reason"
+              ]
+            },
+            "outcome": {
+              "type": "string",
+              "const": "failed"
+            }
+          },
+          "required": [
+            "outcome",
+            "data"
+          ]
+        }
+      ]
+    },
+    "ServersRefreshReport": {
+      "description": "The scheduler's report for one manual refresh (FR-11/FR-13I): what\nthe refresh did, whether this caller joined an in-flight refresh,\nand the pacing facts that follow.",
+      "type": "object",
+      "properties": {
+        "coalesced": {
+          "description": "`true` when this caller joined an already in-flight refresh\n(T-25 single-flight coalescing).",
+          "type": "boolean"
+        },
+        "next_eligible_unix": {
+          "description": "The next automatic eligibility the refresh set (Unix seconds).",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "outcome": {
+          "description": "What the refresh did.",
+          "$ref": "#/$defs/ServersRefreshOutcome"
+        },
+        "suppression_until_unix": {
+          "description": "The active suppression deadline after the refresh, if any\n(ER-16: no path may bypass it).",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "outcome",
+        "coalesced",
+        "next_eligible_unix"
+      ]
+    },
+    "SessionStatus": {
+      "description": "Login status of the daemon's account session (the wire mirror of\nthe adapter's status).",
+      "oneOf": [
+        {
+          "description": "No session exists.",
+          "type": "string",
+          "const": "logged-out"
+        },
+        {
+          "description": "A session exists and is usable.",
+          "type": "string",
+          "const": "logged-in"
+        },
+        {
+          "description": "A session exists but must be refreshed before use.",
+          "type": "string",
+          "const": "needs-refresh"
         }
       ]
     },
@@ -343,6 +1002,27 @@
           "type": "string",
           "const": "disconnecting"
         }
+      ]
+    },
+    "WritableStoreStatus": {
+      "description": "The configured writable-store facts (S5b/S5c own the resolution).",
+      "type": "object",
+      "properties": {
+        "declared": {
+          "description": "The declared `account.writable_session_store` vocabulary value.",
+          "type": "string"
+        },
+        "priority": {
+          "description": "The configured `account.writable_store_priority` order.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "declared",
+        "priority"
       ]
     }
   }

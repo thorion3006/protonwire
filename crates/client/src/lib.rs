@@ -76,6 +76,15 @@ pub fn rpc_exit_code(code: RpcErrorCode) -> u8 {
         C::CredentialBackendUnavailable => 16,
         C::SecureCoreUnavailable => 17,
         C::ProtocolUnavailable => 18,
+        // M2 S2 additions: PRD 9.8 has no dedicated slots for the
+        // auth/refresh failure modes, so they map to the general error
+        // until the S9 client surface assigns any it owns; persistence
+        // unhealthy IS the credential-backend slot's semantics.
+        C::UpstreamCapabilityBlocked
+        | C::UnsupportedChallenge
+        | C::ConfirmationRequired
+        | C::RateLimited => 1,
+        C::CredentialPersistenceUnhealthy => 16,
     }
 }
 
@@ -96,10 +105,38 @@ pub enum ClientEvent {
     },
 }
 
+/// The cached server catalog as served by
+/// [`ProtonwireClient::servers_list`] (FR-10: the raw upstream body
+/// byte-for-byte, never rewritten). Every field is `None` when nothing
+/// is cached yet — the daemon never fabricates a catalog.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServersSnapshot {
+    /// The cached revision's `ETag`, for diagnostics.
+    pub etag: Option<String>,
+    /// When this revision was fetched (Unix seconds).
+    pub fetched_unix: Option<u64>,
+    /// The raw catalog JSON body, byte-for-byte as cached.
+    pub body: Option<String>,
+}
+
 /// A connected client session with the daemon.
 pub struct ProtonwireClient {
     ipc: IpcClient,
+    /// The cursor: the seq of the last event actually DELIVERED to the
+    /// client's stream (or, after a resync, the seq the snapshot covers).
+    /// `None` until the first delivery — the hello stamp is NOT a
+    /// delivery, so it never seeds this (S14, FR-127D: the session
+    /// subscribes before the stamp is read, and events buffered in that
+    /// window sit at or below the stamp; a stamp-seeded cursor classified
+    /// them stale and silently dropped them).
     last_seq: Option<u64>,
+    /// The hello ack's `latest_event_seq` — the daemon's newest seq at
+    /// handshake time. Not a delivery; it is the FLOOR for gap detection
+    /// until the first delivery initializes the cursor: a first forwarded
+    /// seq already beyond `stamp + 1` means events between the stamp and
+    /// it were lost before this client subscribed, which is the same
+    /// miss the stamp exists to detect.
+    hello_seq: u64,
     surface: ClientSurface,
     name: &'static str,
     version: &'static str,
@@ -112,6 +149,26 @@ fn transport_failure(message: String) -> ClientError {
     ClientError::Io(std::io::Error::new(
         std::io::ErrorKind::ConnectionAborted,
         message,
+    ))
+}
+
+/// The M2 SDK surface's shared mapping: a request-level failure is
+/// either the daemon's structured RPC refusal (surfaced verbatim) or a
+/// transport failure (exit 13).
+fn map_request_error(error: RequestError) -> ClientError {
+    match error {
+        RequestError::Rpc(rpc) => ClientError::Rpc(rpc),
+        RequestError::Transport(message) => transport_failure(message),
+    }
+}
+
+/// The M2 SDK surface's shared "the daemon answered the wrong shape"
+/// refusal — the SDK's method contracts are typed; a mismatched reply
+/// is an internal daemon error, never a guess.
+fn unexpected_result(what: &str, result: RequestResult) -> ClientError {
+    ClientError::Rpc(RpcError::new(
+        RpcErrorCode::Internal,
+        format!("unexpected {what} result: {result:?}"),
     ))
 }
 
@@ -143,10 +200,19 @@ impl ProtonwireClient {
             surface,
         };
         let ipc = IpcClient::connect(path, &info, checks)?;
-        let last_seq = Some(ipc.hello().latest_event_seq);
+        // S14 (FR-127D): the cursor does NOT seed from the ack stamp.
+        // The daemon's session subscribes to the event bus BEFORE the
+        // stamp is read, so events buffered in that window are forwarded
+        // at or below the stamp — a stamp-seeded cursor classified them
+        // stale on arrival and silently dropped them. Deliver-then-
+        // advance instead: the cursor stays uninitialized until the first
+        // delivery; the stamp is kept only as the gap-detection floor
+        // (see [`ProtonwireClient::next_event`]).
+        let hello_seq = ipc.hello().latest_event_seq;
         Ok(Self {
             ipc,
-            last_seq,
+            last_seq: None,
+            hello_seq,
             surface,
             name,
             version,
@@ -213,6 +279,146 @@ impl ProtonwireClient {
         self.ack(Request::Shutdown)
     }
 
+    // --- The M2 servers/account/credential surface (S9's wire family,
+    // exposed through the SDK — the one client surface every first-party
+    // frontend consumes) ---------------------------------------------
+
+    /// Serves the cached server catalog (FR-9/FR-10): the revision the
+    /// daemon reads strictly from its cache — no upstream request, no
+    /// fabrication; every field `None` when nothing is cached yet.
+    pub fn servers_list(&mut self) -> Result<ServersSnapshot, ClientError> {
+        match self.ipc.request(Request::ServersList) {
+            Ok(RequestResult::Servers {
+                etag,
+                fetched_unix,
+                body,
+            }) => Ok(ServersSnapshot {
+                etag,
+                fetched_unix,
+                body,
+            }),
+            Ok(other) => Err(unexpected_result("servers list", other)),
+            Err(error) => Err(map_request_error(error)),
+        }
+    }
+
+    /// Refreshes the server catalog through the single-flight scheduler
+    /// (FR-11/FR-13I). An early refresh is refused with
+    /// [`RpcErrorCode::ConfirmationRequired`]; the caller surfaces the
+    /// carried warning and replays the single-use
+    /// `confirmation_token` (see
+    /// `protonwire_frontend_api::ConfirmationRequirement::from_error`).
+    /// An active suppression refuses even a confirmed request (ER-16).
+    pub fn servers_refresh(
+        &mut self,
+        confirmation_token: Option<&str>,
+    ) -> Result<protonwire_frontend_api::ServersRefreshReport, ClientError> {
+        match self.ipc.request(Request::ServersRefresh {
+            confirmation_token: confirmation_token.map(str::to_owned),
+        }) {
+            Ok(RequestResult::ServersRefreshed { report }) => Ok(report),
+            Ok(other) => Err(unexpected_result("servers refresh", other)),
+            Err(error) => Err(map_request_error(error)),
+        }
+    }
+
+    /// Begins SRP username/password login (PRD 7.1). The daemon
+    /// refuses with `InvalidParams` when a session or pending
+    /// second-factor challenge already exists.
+    pub fn begin_login(
+        &mut self,
+        username: impl Into<String>,
+        password: impl Into<String>,
+    ) -> Result<protonwire_frontend_api::LoginOutcome, ClientError> {
+        self.login_step(Request::BeginLogin {
+            username: protonwire_frontend_api::SecretParam::new(username),
+            password: protonwire_frontend_api::SecretParam::new(password),
+        })
+    }
+
+    /// Continues a login paused at the 2FA step with a TOTP code.
+    pub fn submit_two_factor(
+        &mut self,
+        code: impl Into<String>,
+    ) -> Result<protonwire_frontend_api::LoginOutcome, ClientError> {
+        self.login_step(Request::SubmitTwoFactor {
+            code: protonwire_frontend_api::SecretParam::new(code),
+        })
+    }
+
+    /// Continues a login paused at the 2FA step with an assembled
+    /// WebAuthn/FIDO2 assertion (base64 fields as on the wire).
+    pub fn submit_fido_payload(
+        &mut self,
+        client_data: impl Into<String>,
+        authenticator_data: impl Into<String>,
+        signature: impl Into<String>,
+        credential_id: Vec<u8>,
+    ) -> Result<protonwire_frontend_api::LoginOutcome, ClientError> {
+        self.login_step(Request::SubmitFidoPayload {
+            client_data: protonwire_frontend_api::SecretParam::new(client_data),
+            authenticator_data: protonwire_frontend_api::SecretParam::new(authenticator_data),
+            signature: protonwire_frontend_api::SecretParam::new(signature),
+            credential_id,
+        })
+    }
+
+    /// Forces a session token refresh (FR-3); returns the
+    /// post-refresh status.
+    pub fn refresh_session(
+        &mut self,
+    ) -> Result<protonwire_frontend_api::SessionStatus, ClientError> {
+        match self.ipc.request(Request::RefreshSession) {
+            Ok(RequestResult::LoginStatus { status }) => Ok(status),
+            Ok(other) => Err(unexpected_result("session refresh", other)),
+            Err(error) => Err(map_request_error(error)),
+        }
+    }
+
+    /// Logs out: best-effort remote teardown, guaranteed local
+    /// credential removal (FR-4).
+    pub fn logout(&mut self) -> Result<(), ClientError> {
+        self.ack(Request::Logout)
+    }
+
+    /// Submits one credential value for the INTERACTIVE input source
+    /// (FR-7F): the short-name vocabulary is `session`, `username`,
+    /// `password`; the value lands in the daemon's zeroizing input
+    /// store.
+    pub fn submit_credential(
+        &mut self,
+        name: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Result<(), ClientError> {
+        self.ack(Request::SubmitCredential {
+            name: name.into(),
+            value: protonwire_frontend_api::SecretParam::new(value),
+        })
+    }
+
+    /// The account snapshot behind `account --json` (FR-7H): login
+    /// status, credential input source, writable store, persistence
+    /// health when reported — facts only, never a secret.
+    pub fn get_account(&mut self) -> Result<protonwire_frontend_api::AccountStatus, ClientError> {
+        match self.ipc.request(Request::GetAccount) {
+            Ok(RequestResult::Account { account }) => Ok(account),
+            Ok(other) => Err(unexpected_result("account", other)),
+            Err(error) => Err(map_request_error(error)),
+        }
+    }
+
+    /// The login family's shared result mapping.
+    fn login_step(
+        &mut self,
+        request: Request,
+    ) -> Result<protonwire_frontend_api::LoginOutcome, ClientError> {
+        match self.ipc.request(request) {
+            Ok(RequestResult::LoginStep { step }) => Ok(step),
+            Ok(other) => Err(unexpected_result("login", other)),
+            Err(error) => Err(map_request_error(error)),
+        }
+    }
+
     fn ack(&mut self, request: Request) -> Result<(), ClientError> {
         match self.ipc.request(request) {
             Ok(RequestResult::Acknowledged) => Ok(()),
@@ -231,6 +437,18 @@ impl ProtonwireClient {
     /// numbers (daemon restart, reordering) are skipped without rewinding
     /// the cursor (rust-review finding 9).
     ///
+    /// The cursor advances ONLY on a delivery (or a loud snapshot
+    /// resync) — deliver-then-advance (S14, FR-127D): until the first
+    /// delivery initializes it, the hello stamp acts as the gap-detection
+    /// floor and nothing else. A first forwarded seq at or below
+    /// `stamp + 1` is DELIVERED — the daemon's session subscribes before
+    /// the stamp is read, so pre-hello-buffered events legitimately sit
+    /// at or below the stamp, and the pre-fix stamp-seeded cursor
+    /// silently dropped exactly those. A first seq beyond `stamp + 1`
+    /// means events between the stamp and it were lost before this
+    /// client subscribed — the same miss the stamp exists to detect —
+    /// and resynchronizes.
+    ///
     /// The snapshot is paired with its own sequence (Codex PR review round
     /// 2, finding 1): `GetState` is a separate request, so events published
     /// while it was in flight are already reflected in the returned state.
@@ -238,6 +456,15 @@ impl ProtonwireClient {
     /// to the gap event on daemons that do not stamp), and buffered events
     /// the snapshot covers are dropped — replaying them after the newer
     /// snapshot would regress the client's view.
+    ///
+    /// Ordering caveat for callers composing this with
+    /// [`ProtonwireClient::state`]: pre-hello-window events — delivered
+    /// first by the rule above — may predate a snapshot `state()` fetched
+    /// before the window drained. The snapshot reflects the daemon's
+    /// CURRENT state, so it is strictly newer than those buffered events;
+    /// applying them onto it would regress the view. Callers using both
+    /// surfaces should compare each event's seq against
+    /// `state.latest_event_seq` and skip what the snapshot already covers.
     ///
     /// The daemon's reserved marker envelope (seq
     /// [`EVENT_SEQ_RESYNC_NOW`], X4) is intercepted BEFORE the gap logic
@@ -259,17 +486,35 @@ impl ProtonwireClient {
                 // rewinding it into a spurious-gap state).
                 return self.resynchronize(None);
             }
-            // checked_add (rust-review round 8): a pre-signal SDK that
-            // stored the reserved marker's seq sits at u64::MAX, and the
-            // plain `+ 1` was one add from a debug panic. Overflow now
-            // means resynchronize — no SDK build panics on cursor
-            // arithmetic.
             let expected = match self.last_seq {
                 Some(last) => match last.checked_add(1) {
                     Some(next) => next,
+                    // checked_add (rust-review round 8): a pre-signal SDK
+                    // that stored the reserved marker's seq sits at
+                    // u64::MAX; overflow means resynchronize — no SDK
+                    // build panics on cursor arithmetic.
                     None => return self.resynchronize(None),
                 },
-                None => envelope.seq,
+                None => {
+                    // S14 deliver-then-advance: the first delivery
+                    // initializes the cursor, whatever its seq — the
+                    // hello stamp is a floor, not a delivery, so a
+                    // pre-hello-buffered event at or below it is
+                    // delivered instead of classified stale. Only a
+                    // first seq beyond the floor (stamp + 1, checked —
+                    // a stamp AT the reserved marker value cannot be
+                    // exceeded by any real seq, so overflow means the
+                    // gap branch is vacuously false) resynchronizes.
+                    if self
+                        .hello_seq
+                        .checked_add(1)
+                        .is_some_and(|floor| envelope.seq > floor)
+                    {
+                        return self.resynchronize(Some(envelope.seq));
+                    }
+                    self.last_seq = Some(envelope.seq);
+                    return Ok(ClientEvent::Event(envelope));
+                }
             };
             if envelope.seq > expected {
                 return self.resynchronize(Some(envelope.seq));
@@ -450,6 +695,61 @@ mod tests {
                     }));
                     Ok(RequestResult::Acknowledged)
                 }
+                // The M2 servers/account/credential surface: scripted
+                // replies for the SDK wrapper suite. The refresh arm
+                // REFUSES without a token and answers with the report
+                // when one is replayed — the ceremony's wire shape.
+                Request::ServersList => Ok(RequestResult::Servers {
+                    etag: Some("\"rev-7\"".into()),
+                    fetched_unix: Some(1_771_000_000),
+                    body: Some("{\"Code\":1000}".into()),
+                }),
+                Request::ServersRefresh { confirmation_token } => match confirmation_token {
+                    None => Err(RpcError::confirmation_required(
+                        "the server list is still fresh",
+                        protonwire_frontend_api::ConfirmationRequirement {
+                            catalog_age_seconds: 120,
+                            last_request_unix: Some(1_771_000_000),
+                            next_eligible_unix: 1_771_010_800,
+                            warning: "still fresh".into(),
+                            confirmation_token: "token-1".into(),
+                        },
+                    )),
+                    Some(token) => Ok(RequestResult::ServersRefreshed {
+                        report: protonwire_frontend_api::ServersRefreshReport {
+                            outcome: protonwire_frontend_api::ServersRefreshOutcome::Changed {
+                                etag: Some("\"rev-8\"".into()),
+                            },
+                            coalesced: false,
+                            next_eligible_unix: 1_771_020_000,
+                            suppression_until_unix: None,
+                        },
+                    })
+                    .inspect(|_| {
+                        assert_eq!(token, "token-1", "the replayed token rides the wire");
+                    }),
+                },
+                Request::GetAccount => Ok(RequestResult::Account {
+                    account: protonwire_frontend_api::AccountStatus {
+                        login_status: protonwire_frontend_api::SessionStatus::LoggedOut,
+                        credential_source:
+                            protonwire_frontend_api::CredentialSourceStatus::Interactive,
+                        writable_store: protonwire_frontend_api::WritableStoreStatus {
+                            declared: "auto".into(),
+                            priority: vec![],
+                        },
+                        persistence_health: None,
+                    },
+                }),
+                Request::SubmitCredential { .. } | Request::Logout => {
+                    Ok(RequestResult::Acknowledged)
+                }
+                Request::BeginLogin { username, .. } => Ok(RequestResult::LoginStep {
+                    step: protonwire_frontend_api::LoginOutcome::Session {
+                        user_id: format!("{}-ok", username.expose()),
+                        session_id: "s1".into(),
+                    },
+                }),
                 other => Err(RpcError::new(
                     RpcErrorCode::NotImplemented,
                     format!("{other:?}"),
@@ -496,6 +796,91 @@ mod tests {
         assert_eq!(client.daemon_version(), "test-daemon");
     }
 
+    // --- The M2 SDK wrappers (the S9 wire family, client-side) ---------
+
+    #[test]
+    fn servers_list_round_trips_the_cached_revision() {
+        let dir = tempfile::tempdir().unwrap();
+        let (server, _handler) = spawn_server(&dir);
+        let mut client = dev_client(server.socket_path());
+        let snapshot = client.servers_list().unwrap();
+        assert_eq!(snapshot.etag.as_deref(), Some("\"rev-7\""));
+        assert_eq!(snapshot.fetched_unix, Some(1_771_000_000));
+        assert_eq!(snapshot.body.as_deref(), Some("{\"Code\":1000}"));
+    }
+
+    #[test]
+    fn a_confirmation_required_refusal_carries_its_requirement_and_the_token_replays() {
+        let dir = tempfile::tempdir().unwrap();
+        let (server, _handler) = spawn_server(&dir);
+        let mut client = dev_client(server.socket_path());
+        // The unconfirmed refresh: a typed refusal whose requirement
+        // envelope the SDK surfaces verbatim (the ceremony's input).
+        let err = client.servers_refresh(None).unwrap_err();
+        let ClientError::Rpc(rpc) = &err else {
+            panic!("the early-refresh refusal is an RPC error: {err}");
+        };
+        assert_eq!(rpc.code, RpcErrorCode::ConfirmationRequired);
+        let requirement = protonwire_frontend_api::ConfirmationRequirement::from_error(rpc)
+            .expect("the refusal carries its typed requirement");
+        assert_eq!(requirement.catalog_age_seconds, 120);
+        assert_eq!(requirement.next_eligible_unix, 1_771_010_800);
+        assert_eq!(requirement.confirmation_token, "token-1");
+        // The confirmed replay: the single-use token rides the wire and
+        // the report comes back.
+        let report = client
+            .servers_refresh(Some(&requirement.confirmation_token))
+            .unwrap();
+        assert_eq!(
+            report.outcome,
+            protonwire_frontend_api::ServersRefreshOutcome::Changed {
+                etag: Some("\"rev-8\"".into())
+            }
+        );
+        // A non-ceremony code extracts no requirement (never guesses).
+        let plain = RpcError::new(RpcErrorCode::NotImplemented, "x");
+        assert!(protonwire_frontend_api::ConfirmationRequirement::from_error(&plain).is_none());
+    }
+
+    #[test]
+    fn get_account_returns_the_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let (server, _handler) = spawn_server(&dir);
+        let mut client = dev_client(server.socket_path());
+        let account = client.get_account().unwrap();
+        assert_eq!(
+            account.login_status,
+            protonwire_frontend_api::SessionStatus::LoggedOut
+        );
+        assert_eq!(
+            account.credential_source,
+            protonwire_frontend_api::CredentialSourceStatus::Interactive
+        );
+        assert_eq!(account.persistence_health, None);
+    }
+
+    #[test]
+    fn the_login_family_and_credential_acknowledgements_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let (server, _handler) = spawn_server(&dir);
+        let mut client = dev_client(server.socket_path());
+        // begin_login: the secret params cross and the typed step
+        // returns (the fixture echoes the username — proof the value
+        // arrived, while SecretParam's Debug stays redacted).
+        let step = client.begin_login("user@example", "hunter2").unwrap();
+        assert_eq!(
+            step,
+            protonwire_frontend_api::LoginOutcome::Session {
+                user_id: "user@example-ok".into(),
+                session_id: "s1".into(),
+            }
+        );
+        client.logout().unwrap();
+        client
+            .submit_credential("session", "envelope-bytes")
+            .unwrap();
+    }
+
     #[test]
     fn not_implemented_maps_to_exit_code_one() {
         let dir = tempfile::tempdir().unwrap();
@@ -539,6 +924,92 @@ mod tests {
         match client.next_event().unwrap() {
             ClientEvent::Event(envelope) => assert_eq!(envelope.seq, 3),
             ClientEvent::Resynchronized { .. } => panic!("unexpected resync"),
+        }
+    }
+
+    /// QA S14 round (P2-1, mutation C): the Some-arm mid-stream gap
+    /// branch had zero post-S14 coverage — every gap fixture entered
+    /// through the None arm (a FIRST delivery beyond the hello floor) or
+    /// the reserved overflow marker, so deleting the Some-arm resync
+    /// passed the whole suite. Here the cursor is seeded by contiguous
+    /// deliveries first (1..=3, each exactly the expected next seq), and
+    /// only then does a gap arrive: seq 5 with NO marker after the
+    /// client was left expecting 4. The Some arm must fire — a LOUD
+    /// resync, never a silent delivery of the gap event as contiguous.
+    /// Mutation evidence: deleting the `envelope.seq > expected` resync
+    /// turns the second phase into exactly that silent delivery and this
+    /// test red; recorded in the fix commit's message.
+    #[test]
+    fn mid_stream_gap_after_seeding_resyncs_loudly() {
+        let dir = tempfile::tempdir().unwrap();
+        let (server, handler) = spawn_server(&dir);
+        let path = server.socket_path().to_owned();
+        let mut client = dev_client(&path);
+        // Handshake stamps seq 0, so the client expects event 1 next.
+
+        // Seed the cursor with contiguous deliveries: events 1, 2, 3.
+        for seq in 1..=3u64 {
+            handler.seq.store(seq, Ordering::SeqCst);
+            handler.bus.publish(ServerMessage::Event(EventEnvelope {
+                seq,
+                event: Event::Notice {
+                    level: NoticeLevel::Info,
+                    message: format!("contiguous {seq}"),
+                },
+            }));
+            match client.next_event().unwrap() {
+                ClientEvent::Event(envelope) => assert_eq!(envelope.seq, seq),
+                ClientEvent::Resynchronized { .. } => {
+                    panic!("contiguous event {seq} must deliver, not resync")
+                }
+            }
+        }
+
+        // The mid-stream gap: event 4 is never published; 5 arrives with
+        // no marker while the cursor holds Some(3), so expected = 4 and
+        // 5 > expected — the Some arm.
+        handler.seq.store(5, Ordering::SeqCst);
+        handler.bus.publish(ServerMessage::Event(EventEnvelope {
+            seq: 5,
+            event: Event::Notice {
+                level: NoticeLevel::Info,
+                message: "gap event".into(),
+            },
+        }));
+        match client.next_event().unwrap() {
+            ClientEvent::Resynchronized {
+                state,
+                resumed_at_seq,
+            } => {
+                // The resync snapshot is stamped 5 (the daemon's newest
+                // seq), so the cursor lands ON the gap event's seq: the
+                // client has seen up to 5 through the snapshot.
+                assert_eq!(resumed_at_seq, 5);
+                assert_eq!(state.latest_event_seq, Some(5));
+            }
+            ClientEvent::Event(envelope) => panic!(
+                "the mid-stream gap event {} was delivered as contiguous — \
+                 a lost event vanished silently (Some-arm resync deleted?)",
+                envelope.seq
+            ),
+        }
+
+        // Exactly once per the resync contract: the gap event 5 is
+        // accounted for by the snapshot and never replayed as an Event,
+        // and the next delivery is the first event BEYOND the snapshot —
+        // a cursor left anywhere else would either resync again or
+        // swallow 6 as stale.
+        handler.seq.store(6, Ordering::SeqCst);
+        handler.bus.publish(ServerMessage::Event(EventEnvelope {
+            seq: 6,
+            event: Event::Notice {
+                level: NoticeLevel::Info,
+                message: "after the gap".into(),
+            },
+        }));
+        match client.next_event().unwrap() {
+            ClientEvent::Event(envelope) => assert_eq!(envelope.seq, 6),
+            ClientEvent::Resynchronized { .. } => panic!("unexpected second resync"),
         }
     }
 
@@ -738,6 +1209,235 @@ mod tests {
                 assert_eq!(notice, "fresh after stale");
             }
             ClientEvent::Resynchronized { .. } => panic!("stale event must not trigger resync"),
+        }
+    }
+
+    /// FR-127D / round-9 severity-bar disposition (M2 S14): the session
+    /// subscribes to the event bus at ACCEPT — before the hello ack's
+    /// `latest_event_seq` stamp is read — so events published in that
+    /// window are BOTH buffered for the client AND at or below the stamp.
+    /// The pre-fix cursor seeded itself from the stamp (`Some(stamp)`),
+    /// so every pre-hello-buffered event classified as stale on arrival
+    /// and was silently discarded: the daemon forwarded it, the client's
+    /// event stream never saw it, and `next_event` went on waiting as if
+    /// nothing had happened.
+    ///
+    /// The handler reproduces the window deterministically: the real
+    /// server stamps the ack from `latest_event_seq()` (session.rs), so
+    /// publishing INSIDE that call guarantees the events are queued (the
+    /// session subscribed at accept, long before hello) before the stamp
+    /// is read by the same call. The hello gate holds them until after
+    /// the ack (WO-5), so the wire order is ack first, then the window's
+    /// events — exactly the pre-hello-buffered shape.
+    struct PreHelloWindowHandler {
+        bus: EventBus,
+        /// `(seq, message)` pairs published inside the stamp call, in
+        /// order. The reserved marker seq may appear among them to
+        /// interleave an X4 signal into the window.
+        window: &'static [(u64, &'static str)],
+    }
+
+    impl PreHelloWindowHandler {
+        /// The daemon's newest REAL seq — side-effect free, so GetState
+        /// can stamp without re-publishing. The marker's reserved MAX
+        /// never models the daemon's progress and is excluded.
+        fn stamp(&self) -> u64 {
+            self.window
+                .iter()
+                .map(|&(seq, _)| seq)
+                .filter(|&seq| seq != EVENT_SEQ_RESYNC_NOW)
+                .max()
+                .unwrap_or(0)
+        }
+    }
+
+    impl protonwire_ipc::RequestHandler for PreHelloWindowHandler {
+        fn daemon_version(&self) -> &str {
+            "test-daemon"
+        }
+        fn latest_event_seq(&self) -> u64 {
+            for &(seq, message) in self.window {
+                self.bus.publish(ServerMessage::Event(EventEnvelope {
+                    seq,
+                    event: Event::Notice {
+                        level: NoticeLevel::Info,
+                        message: message.into(),
+                    },
+                }));
+            }
+            self.stamp()
+        }
+        fn handle(
+            &self,
+            _ctx: &protonwire_ipc::SessionContext,
+            request: Request,
+        ) -> Result<RequestResult, RpcError> {
+            match request {
+                Request::Ping { nonce } => Ok(RequestResult::Pong { nonce }),
+                Request::GetState => Ok(RequestResult::State {
+                    state: DaemonState {
+                        protocol_version: PROTOCOL_VERSION,
+                        daemon_version: "test-daemon".into(),
+                        vpn_state: VpnState::Disconnected,
+                        network_integration: NetworkIntegration::Auto,
+                        active_owner_uid: None,
+                        latest_event_seq: Some(self.stamp()),
+                    },
+                }),
+                other => Err(RpcError::new(
+                    RpcErrorCode::NotImplemented,
+                    format!("{other:?}"),
+                )),
+            }
+        }
+        fn event_bus(&self) -> &EventBus {
+            &self.bus
+        }
+    }
+
+    /// S14 deliver-then-advance pin (the exactly-once invariant, part 1 —
+    /// the pre-hello window): EVERY event the daemon forwarded reaches
+    /// the client's event stream exactly once. Here events 1 and 2 are
+    /// forwarded while both sit at or below the ack stamp 2 — the
+    /// pre-fix code silently dropped both and then blocked on an empty
+    /// queue until timeout.
+    #[test]
+    fn pre_hello_buffered_events_are_delivered_not_dropped() {
+        let window: &'static [(u64, &'static str)] = &[(1, "buffered one"), (2, "buffered two")];
+        let dir = tempfile::tempdir().unwrap();
+        let handler = Arc::new(PreHelloWindowHandler {
+            bus: EventBus::new(),
+            window,
+        });
+        let server = protonwire_ipc::test_util::TestServer::start(
+            dir.path(),
+            "pre-hello.sock",
+            Arc::clone(&handler),
+        )
+        .expect("test server binds");
+        let path = server.socket_path().to_owned();
+        let mut client = dev_client(&path);
+        // Short timeout so the pre-fix silent drop fails fast instead of
+        // hanging: both forwarded events are swallowed as "stale" and
+        // `next_event` is left waiting on an empty stream.
+        client.set_request_timeout(std::time::Duration::from_millis(300));
+
+        for (seq, message) in window {
+            match client.next_event().unwrap() {
+                ClientEvent::Event(envelope) => {
+                    assert_eq!(envelope.seq, *seq);
+                    match envelope.event {
+                        Event::Notice { message: got, .. } => assert_eq!(got, *message),
+                        other => panic!("expected notice, got {other:?}"),
+                    }
+                }
+                ClientEvent::Resynchronized { .. } => {
+                    panic!("a pre-hello-buffered event is not a gap: seq {seq}")
+                }
+            }
+        }
+
+        // Beyond the stamp the stream continues gap-free — the seeded
+        // state must not manufacture a spurious resync either.
+        handler.bus.publish(ServerMessage::Event(EventEnvelope {
+            seq: 3,
+            event: Event::Notice {
+                level: NoticeLevel::Info,
+                message: "after the stamp".into(),
+            },
+        }));
+        match client.next_event().unwrap() {
+            ClientEvent::Event(envelope) => assert_eq!(envelope.seq, 3),
+            ClientEvent::Resynchronized { .. } => panic!("unexpected resync"),
+        }
+    }
+
+    /// S14 pin (the exactly-once invariant, part 2 — a marker
+    /// interleaving): the daemon's reserved X4 marker inside the
+    /// pre-hello window must be intercepted BEFORE any cursor
+    /// arithmetic — in the pinned scenario the cursor holds a DELIVERED
+    /// seq (1) below the snapshot stamp (2). The marker never reaches
+    /// the stream as an Event, its unmatchable seq never enters the
+    /// cursor, and the recovery is LOUD: a resync whose snapshot
+    /// accounts for the window's remaining buffered events, so nothing
+    /// the daemon forwarded vanishes silently. (The interception itself
+    /// is cursor-state-independent — the reserved-seq check precedes the
+    /// cursor match — but an earlier draft of this comment claimed the
+    /// pin covered the marker arriving "while the cursor is still
+    /// uninitialized". It does not, and that state is
+    /// production-unreachable: the forwarder emits the marker only
+    /// AFTER forwarding a real event (session.rs `forward_events`), and
+    /// the writer's FIFO hands the SDK that real event — initializing
+    /// the cursor, by delivery or by the floor resync — before the
+    /// marker. Claim corrected in the S14 review round per the round-2
+    /// precedent.)
+    #[test]
+    fn marker_interleaved_in_the_pre_hello_window_resyncs_loudly() {
+        let window: &'static [(u64, &'static str)] = &[
+            (1, "buffered one"),
+            (
+                EVENT_SEQ_RESYNC_NOW,
+                "event queue overflowed; resynchronize",
+            ),
+            (2, "buffered two"),
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        let handler = Arc::new(PreHelloWindowHandler {
+            bus: EventBus::new(),
+            window,
+        });
+        let server = protonwire_ipc::test_util::TestServer::start(
+            dir.path(),
+            "pre-hello-marker.sock",
+            Arc::clone(&handler),
+        )
+        .expect("test server binds");
+        let path = server.socket_path().to_owned();
+        let mut client = dev_client(&path);
+        client.set_request_timeout(std::time::Duration::from_millis(300));
+
+        // The window opens with a real delivery: event 1 initializes the
+        // cursor (deliver-then-advance), even though it sits below the
+        // stamp 2.
+        match client.next_event().unwrap() {
+            ClientEvent::Event(envelope) => assert_eq!(envelope.seq, 1),
+            ClientEvent::Resynchronized { .. } => {
+                panic!("the first forwarded event must be delivered, not resynced past")
+            }
+        }
+
+        // The interleaved marker: a loud resync, never an Event, with the
+        // cursor landing on the snapshot's stamp 2 — the reserved seq
+        // must not poison it.
+        match client.next_event().unwrap() {
+            ClientEvent::Resynchronized {
+                state,
+                resumed_at_seq,
+            } => {
+                assert_eq!(
+                    resumed_at_seq, 2,
+                    "the marker's reserved seq must never enter the cursor"
+                );
+                assert_eq!(state.latest_event_seq, Some(2));
+            }
+            ClientEvent::Event(envelope) => {
+                panic!("the reserved marker surfaced as an event: {envelope:?}")
+            }
+        }
+
+        // Buffered event 2 was discarded as snapshot-covered by the loud
+        // resync above; the first event BEYOND the stamp flows with no
+        // spurious gap — proving the cursor holds the real seq 2, not MAX.
+        handler.bus.publish(ServerMessage::Event(EventEnvelope {
+            seq: 3,
+            event: Event::Notice {
+                level: NoticeLevel::Info,
+                message: "after the marker".into(),
+            },
+        }));
+        match client.next_event().unwrap() {
+            ClientEvent::Event(envelope) => assert_eq!(envelope.seq, 3),
+            ClientEvent::Resynchronized { .. } => panic!("unexpected resync after the marker"),
         }
     }
 
@@ -1180,6 +1880,15 @@ mod tests {
             (C::CredentialBackendUnavailable, 16),
             (C::SecureCoreUnavailable, 17),
             (C::ProtocolUnavailable, 18),
+            // M2 S2 additions: PRD 9.8 has no dedicated slots for the
+            // auth/refresh failure modes, so they map to the general
+            // error until the S9 client surface assigns any it owns;
+            // persistence-unhealthy IS the credential-backend slot.
+            (C::UpstreamCapabilityBlocked, 1),
+            (C::UnsupportedChallenge, 1),
+            (C::ConfirmationRequired, 1),
+            (C::RateLimited, 1),
+            (C::CredentialPersistenceUnhealthy, 16),
             (C::Internal, 1),
             (C::PermissionDenied, 14),
         ];

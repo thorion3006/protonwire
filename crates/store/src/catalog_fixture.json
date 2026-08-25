@@ -1,0 +1,509 @@
+{
+  "Code": 1000,
+  "Error": "",
+  "Details": {},
+  "StatusID": "logicals-status-token-1a2b3c",
+  "ResponseMetadata": {
+    "ListIsTruncated": false
+  },
+  "LogicalServers": [
+    {
+      "ID": "kR0gYQ1tZcSwV2iNq3LpXfUeD8oHb6AyJm5Cn7TvWhEfRdGsHuIkLjMzNqPxCvB1",
+      "Name": "CH#10",
+      "City": "Zurich",
+      "State": null,
+      "EntryCountry": "CH",
+      "ExitCountry": "CH",
+      "Domain": "ch-10.protonvpn.com",
+      "Tier": 2,
+      "Features": 4,
+      "Status": 1,
+      "Load": 42,
+      "Score": 1.4211,
+      "HostCountry": null,
+      "GatewayName": null,
+      "Translations": {
+        "fr": "Zurich",
+        "de": null
+      },
+      "StatusReference": {
+        "Index": 17,
+        "Cost": 3,
+        "Penalty": 0.25
+      },
+      "EntryLocation": {
+        "Latitude": 47.3769,
+        "Longitude": 8.5417
+      },
+      "ExitLocation": {
+        "Latitude": 47.3769,
+        "Longitude": 8.5417
+      },
+      "Location": {
+        "Lat": 47.3769,
+        "Long": 8.5417
+      },
+      "Servers": [
+        {
+          "ID": "PxEwqLmZxAq3Nv8KfTsYdRcUgHbJ5n2MvCeXoPzAaSsDdFfGgHhJjKkLlZzXxC1",
+          "EntryIP": "185.242.4.10",
+          "ExitIP": "185.242.4.10",
+          "Domain": "ch-10a.protonvpn.com",
+          "Status": 1,
+          "Label": "",
+          "X25519PublicKey": "nKx0PQp6lRj8tGeW3FzsXvCuMoAyHbJdSfEgTkLqZi0=",
+          "Signature": "MEUCIQDkR2x8JmN4bTv0PzAqLsXcVbNyMhGfDwErTyUiOpAsBQIgY5vHn2MzQwXcVbNyMhGfDwErTyUiOpAsBkR2x8JmN4bTv0PzAqLsXc",
+          "Generation": "12",
+          "ServicesDownReason": null,
+          "EntryPerProtocol": {
+            "WireGuardUDP": {
+              "IPv4": "185.242.4.10",
+              "Ports": [443, 1194]
+            },
+            "WireGuardTCP": {
+              "IPv4": "185.242.4.10",
+              "Ports": [443]
+            },
+            "WireGuardTLS": null,
+            "OpenVPNUDP": {
+              "IPv4": "185.242.4.10",
+              "Ports": [1194]
+            },
+            "OpenVPNTCP": null
+          }
+        },
+        {
+          "ID": "YhN7cQwReTtYyUuIiOoPpAaSsDdFfGgHhJjKkLlZzXxCcVvBbNnMmQq2",
+          "EntryIP": null,
+          "ExitIP": "185.242.4.11",
+          "Domain": "ch-10b.protonvpn.com",
+          "Status": 1,
+          "Label": "2",
+          "X25519PublicKey": "pLy1QRq7mSk9uHfX4GAtYwDvNpBzIcKeTgFhUlMrAj1=",
+          "Signature": "MEUCIQDxS3y9KnO5cUw1QzBqLsYdVbOzNiHgExFsUzVhJqBtCQIgZ6wIo3NzRzYXWcOzNiHgExFsUzVhJqBtClS4y9KnO5cUw1QzBqLsYd",
+          "Generation": "12",
+          "ServicesDownReason": null,
+          "EntryPerProtocol": {
+            "WireGuardUDP": {
+              "IPv4": "185.242.4.11",
+              "Ports": [51820]
+            },
+            "WireGuardTCP": null,
+            "WireGuardTLS": {
+              "IPv4": "185.242.4.11"
+            },
+            "OpenVPNUDP": null,
+            "OpenVPNTCP": null
+          }
+        }
+      ]
+    },
+    {
+      "ID": "gT5fHwPqRsUvXyZbAcDfGhJkLmNpQrStUvWxYz0123456789AbCdEfGhIjKlMn",
+      "Name": "US-CA#1",
+      "City": "Los Angeles",
+      "State": "California",
+      "EntryCountry": "US",
+      "ExitCountry": "US",
+      "Domain": "us-ca-01.protonvpn.com",
+      "Tier": 2,
+      "Features": 0,
+      "Status": 1,
+      "Load": 63,
+      "Score": 1.1005,
+      "HostCountry": null,
+      "GatewayName": null,
+      "Translations": null,
+      "StatusReference": {
+        "Index": 3,
+        "Cost": 1,
+        "Penalty": 0.0
+      },
+      "EntryLocation": {
+        "Latitude": 34.0522,
+        "Longitude": -118.2437
+      },
+      "ExitLocation": {
+        "Latitude": 34.0522,
+        "Longitude": -118.2437
+      },
+      "Location": {
+        "Lat": 34.0522,
+        "Long": -118.2437
+      },
+      "Servers": [
+        {
+          "ID": "AsDfGhJkLmNpQrStUvWxYz0123456789ZxCvBnMaSdFgHjKlQwErTyUiOp3",
+          "EntryIP": "104.244.42.1",
+          "ExitIP": "104.244.42.1",
+          "Domain": "us-ca-01a.protonvpn.com",
+          "Status": 1,
+          "Label": "",
+          "X25519PublicKey": "qMz2RSs8nTl0vIgY5HbUzXwDwOqCaJdLfEhTmUnVbK2=",
+          "Signature": "MEUCIQCyT4z0LoP6dVx2RaCrMtZeWcPaOjIhFyGtVbWuKrCvDQIga7xJp4OzSbAYXdPaOjIhFyGtVbWuKrCvDmT5z0LoP6dVx2RaCrMtZeW",
+          "Generation": "8",
+          "ServicesDownReason": null,
+          "EntryPerProtocol": {
+            "WireGuardUDP": {
+              "IPv4": "104.244.42.1",
+              "Ports": [443]
+            },
+            "WireGuardTCP": null,
+            "WireGuardTLS": null,
+            "OpenVPNUDP": {
+              "IPv4": "104.244.42.1",
+              "Ports": [1194]
+            },
+            "OpenVPNTCP": {
+              "IPv4": "104.244.42.1",
+              "Ports": [443]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "ID": "sEcUrEcOrE-Ch-Se-01ZzXxCcVvBbNnMmQqWwEeRrTtYyUuIiOoPpAaSdFgHj",
+      "Name": "CH-SE#1",
+      "City": "Stockholm",
+      "State": null,
+      "EntryCountry": "CH",
+      "ExitCountry": "SE",
+      "Domain": "ch-se-01.protonvpn.com",
+      "Tier": 2,
+      "Features": 1,
+      "Status": 1,
+      "Load": 12,
+      "Score": 1.0009,
+      "HostCountry": null,
+      "GatewayName": null,
+      "Translations": null,
+      "StatusReference": {
+        "Index": 0,
+        "Cost": 2,
+        "Penalty": 0.5
+      },
+      "EntryLocation": {
+        "Latitude": 47.3769,
+        "Longitude": 8.5417
+      },
+      "ExitLocation": {
+        "Latitude": 59.3293,
+        "Longitude": 18.0686
+      },
+      "Location": {
+        "Lat": 59.3293,
+        "Long": 18.0686
+      },
+      "Servers": [
+        {
+          "ID": "pHySiCaL-Ch-Se-01aZzXxCcVvBbNnMmQqWwEeRrTtYyUuIiOoPpAaSdF",
+          "EntryIP": "185.159.158.10",
+          "ExitIP": "185.159.159.37",
+          "Domain": "se-01a.protonvpn.com",
+          "Status": 1,
+          "Label": "",
+          "X25519PublicKey": "rNa3STt9oUm1wJhZ6IcVaYxExPrDbKeUgFiVnWoXcL3=",
+          "Signature": "MEUCIQDzU5a1MpQ7eWy3SbDsNuAfXdQbPkJiGzHuWcXvLsDwEQIgb8yKq5PaTcBZYeQbPkJiGzHuWcXvLsDwEnU6b1MpQ7eWy3SbDsNuAfXd",
+          "Generation": "10",
+          "ServicesDownReason": null,
+          "EntryPerProtocol": {
+            "WireGuardUDP": {
+              "IPv4": "185.159.158.10",
+              "Ports": [443, 51820]
+            },
+            "WireGuardTCP": null,
+            "WireGuardTLS": null,
+            "OpenVPNUDP": null,
+            "OpenVPNTCP": {
+              "IPv4": "185.159.158.10",
+              "Ports": [443]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "ID": "tOrSeRvEr-Ch-10TZzXxCcVvBbNnMmQqWwEeRrTtYyUuIiOoPpAaSdFgHj",
+      "Name": "CH#10-T",
+      "City": "Zurich",
+      "State": null,
+      "EntryCountry": "CH",
+      "ExitCountry": "CH",
+      "Domain": "ch-10-tor.protonvpn.com",
+      "Tier": 2,
+      "Features": 2,
+      "Status": 1,
+      "Load": 7,
+      "Score": 1.5678,
+      "HostCountry": null,
+      "GatewayName": null,
+      "Translations": null,
+      "StatusReference": {
+        "Index": 21,
+        "Cost": 4,
+        "Penalty": 1.25
+      },
+      "EntryLocation": {
+        "Latitude": 47.3769,
+        "Longitude": 8.5417
+      },
+      "ExitLocation": {
+        "Latitude": 47.3769,
+        "Longitude": 8.5417
+      },
+      "Location": {
+        "Lat": 47.3769,
+        "Long": 8.5417
+      },
+      "Servers": [
+        {
+          "ID": "pHySiCaL-Ch-10-ToraZzXxCcVvBbNnMmQqWwEeRrTtYyUuIiOoPpAa",
+          "EntryIP": "185.242.5.19",
+          "ExitIP": null,
+          "Domain": "ch-10-tor-a.protonvpn.com",
+          "Status": 1,
+          "Label": "1",
+          "X25519PublicKey": null,
+          "Signature": "MEUCIQCvW7n4LsS9fAz4UbEuNvBgYeRcQlKhIbJvYcWtKrDyDQIgd0zMr6QbUdCZXfRcQlKhIbJvYcWtKrDyoX8n4LsS9fAz4UbEuNvBgYeR",
+          "Generation": "9",
+          "ServicesDownReason": null,
+          "EntryPerProtocol": {
+            "WireGuardUDP": null,
+            "WireGuardTCP": null,
+            "WireGuardTLS": null,
+            "OpenVPNUDP": null,
+            "OpenVPNTCP": {
+              "IPv4": "185.242.5.19",
+              "Ports": [443, 9001, 9030]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "ID": "sMaRtRoUtInG-uS-iS-20ZzXxCcVvBbNnMmQqWwEeRrTtYyUuIiOoPpAaS",
+      "Name": "US#20",
+      "City": "New York City",
+      "State": "New York",
+      "EntryCountry": "US",
+      "ExitCountry": "US",
+      "Domain": "us-20.protonvpn.com",
+      "Tier": 2,
+      "Features": 24,
+      "Status": 1,
+      "Load": 55,
+      "Score": 1.2213,
+      "HostCountry": "IS",
+      "GatewayName": null,
+      "Translations": null,
+      "StatusReference": {
+        "Index": 5,
+        "Cost": 2,
+        "Penalty": 0.75
+      },
+      "EntryLocation": {
+        "Latitude": 64.1466,
+        "Longitude": -21.9426
+      },
+      "ExitLocation": {
+        "Latitude": 40.7128,
+        "Longitude": -74.006
+      },
+      "Location": {
+        "Lat": 40.7128,
+        "Long": -74.006
+      },
+      "Servers": [
+        {
+          "ID": "pHySiCaL-SmartRoutingZzXxCcVvBbNnMmQqWwEeRrTtYyUuIiOo",
+          "EntryIP": "194.24.2.20",
+          "ExitIP": "194.24.2.20",
+          "Domain": "is-20a.protonvpn.com",
+          "Status": 1,
+          "Label": "",
+          "X25519PublicKey": "tOb4UUa0pVn2xKiZ7JdWbZyFyQsEcLdVfHgWmXpYn4=",
+          "Signature": "MEUCIQDbX6c2NrR8fXz4VcFvOwChXfSdQlMiJcKwXdXuLsEvCQIhb8yKq5PaUdCZYXfSdQlMiJcKwXdXuLsEvmY7c2NrR8fXz4VcFvOwCh",
+          "Generation": "3",
+          "ServicesDownReason": null,
+          "EntryPerProtocol": {
+            "WireGuardUDP": {
+              "IPv4": "194.24.2.20",
+              "Ports": [443]
+            },
+            "WireGuardTCP": {
+              "IPv4": "194.24.2.20"
+            },
+            "WireGuardTLS": {
+              "IPv4": "194.24.2.20"
+            },
+            "OpenVPNUDP": null,
+            "OpenVPNTCP": null
+          }
+        }
+      ]
+    },
+    {
+      "ID": "gAtEwAy-Acme-Gw1ZzXxCcVvBbNnMmQqWwEeRrTtYyUuIiOoPpAaSdFg",
+      "Name": "acme-corp#1",
+      "City": null,
+      "State": null,
+      "EntryCountry": "US",
+      "ExitCountry": "US",
+      "Domain": "acme-corp-gw1.protonwire.gateway",
+      "Tier": 2,
+      "Features": 0,
+      "Status": 1,
+      "Load": 31,
+      "Score": 1.841,
+      "HostCountry": null,
+      "GatewayName": "acme-corp",
+      "Translations": null,
+      "StatusReference": {
+        "Index": 1,
+        "Cost": 0,
+        "Penalty": 0.0
+      },
+      "EntryLocation": {
+        "Latitude": 37.7749,
+        "Longitude": -122.4194
+      },
+      "ExitLocation": {
+        "Latitude": 37.7749,
+        "Longitude": -122.4194
+      },
+      "Location": null,
+      "Servers": [
+        {
+          "ID": "pHySiCaL-Gateway-AcmeZzXxCcVvBbNnMmQqWwEeRrTtYyUuIiOoP",
+          "EntryIP": "203.0.113.7",
+          "ExitIP": "203.0.113.7",
+          "Domain": "acme-corp-gw1a.protonwire.gateway",
+          "Status": 1,
+          "Label": "1",
+          "X25519PublicKey": "uPc5VVb1qWo3yLjZ8KeXcAzGzRtFdMeWgHjVnYqZo5=",
+          "Signature": "MEUCIQEcY7d3OsS9gXy5WdGwOxDiYgTeRmNjKdLxYeYvMtEwDQIgfnzLr6QcVeDAZXgTeRmNjKdLxYeYvMtExo9d3OsS9gXy5WdGwOxDiY",
+          "Generation": "2",
+          "ServicesDownReason": null,
+          "EntryPerProtocol": {
+            "WireGuardUDP": {
+              "IPv4": "203.0.113.7",
+              "Ports": [51820]
+            },
+            "WireGuardTCP": null,
+            "WireGuardTLS": null,
+            "OpenVPNUDP": null,
+            "OpenVPNTCP": null
+          }
+        }
+      ]
+    },
+    {
+      "ID": "fReEsErVeR-Nl-01ZzXxCcVvBbNnMmQqWwEeRrTtYyUuIiOoPpAaSdFg",
+      "Name": "NL-FREE#1",
+      "City": null,
+      "State": null,
+      "EntryCountry": "NL",
+      "ExitCountry": "NL",
+      "Domain": "nl-free-01.protonvpn.com",
+      "Tier": 0,
+      "Features": 0,
+      "Status": 1,
+      "Load": 88,
+      "Score": 1.9022,
+      "HostCountry": null,
+      "GatewayName": null,
+      "Translations": null,
+      "StatusReference": {
+        "Index": 9,
+        "Cost": 5,
+        "Penalty": 2.0
+      },
+      "EntryLocation": {
+        "Latitude": 52.3676,
+        "Longitude": 4.9041
+      },
+      "ExitLocation": {
+        "Latitude": 52.3676,
+        "Longitude": 4.9041
+      },
+      "Location": {
+        "Lat": 52.3676,
+        "Long": 4.9041
+      },
+      "Servers": [
+        {
+          "ID": null,
+          "EntryIP": "89.248.171.1",
+          "ExitIP": "89.248.171.1",
+          "Domain": "nl-free-01a.protonvpn.com",
+          "Status": 1,
+          "Label": "",
+          "X25519PublicKey": null,
+          "Signature": null,
+          "Generation": "1",
+          "ServicesDownReason": null,
+          "EntryPerProtocol": null
+        }
+      ]
+    },
+    {
+      "ID": "oFfLiNe-Se-09ZzXxCcVvBbNnMmQqWwEeRrTtYyUuIiOoPpAaSdFgHjK",
+      "Name": "SE#9",
+      "City": "Malmo",
+      "State": null,
+      "EntryCountry": "SE",
+      "ExitCountry": "SE",
+      "Domain": "se-09.protonvpn.com",
+      "Tier": 2,
+      "Features": 16,
+      "Status": 0,
+      "Load": 100,
+      "Score": 2.5,
+      "HostCountry": null,
+      "GatewayName": null,
+      "Translations": null,
+      "StatusReference": {
+        "Index": 44,
+        "Cost": 6,
+        "Penalty": 3.5
+      },
+      "EntryLocation": {
+        "Latitude": 55.605,
+        "Longitude": 13.0038
+      },
+      "ExitLocation": {
+        "Latitude": 55.605,
+        "Longitude": 13.0038
+      },
+      "Location": {
+        "Lat": 55.605,
+        "Long": 13.0038
+      },
+      "Servers": [
+        {
+          "ID": "pHySiCaL-Offline-Se09ZzXxCcVvBbNnMmQqWwEeRrTtYyUuIiOo",
+          "EntryIP": "185.159.157.9",
+          "ExitIP": "185.159.157.9",
+          "Domain": "se-09a.protonvpn.com",
+          "Status": 0,
+          "Label": "",
+          "X25519PublicKey": "vQd6WWc2rXp4zMjA9LfYdBaHaSuGeNfXhIkWlZq0p6=",
+          "Signature": "MEUCIQFdZ8e4PtTa0hYz6XeGwOxEiZhUfRmNjKdLxYeYvMtEwEQIga0Ms7RdWfEBZYhUfRmNjKdLxYeYvMtEwZp9e4PtTa0hYz6XeGw",
+          "Generation": "11",
+          "ServicesDownReason": "Scheduled maintenance window",
+          "EntryPerProtocol": {
+            "WireGuardUDP": {
+              "IPv4": "185.159.157.9",
+              "Ports": [443]
+            },
+            "WireGuardTCP": null,
+            "WireGuardTLS": null,
+            "OpenVPNUDP": null,
+            "OpenVPNTCP": null
+          }
+        }
+      ]
+    }
+  ]
+}

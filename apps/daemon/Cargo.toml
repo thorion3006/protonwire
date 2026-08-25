@@ -14,10 +14,28 @@ path = "src/main.rs"
 [lints]
 workspace = true
 
+[dev-dependencies]
+# Test-only: minting a valid FR-7C session envelope for the systemd
+# startup-read arm (the production envelope lives in store).
+serde_json = { workspace = true }
+
 [dependencies]
+# SIGTERM/SIGINT/SIGHUP/SIGQUIT flag handler (M2 S12) — the TUI's R7-4
+# pattern. The workspace's pinned nix entry already enables the
+# "signal" feature (the reserved feature this unit consumes), so no
+# root Cargo.toml change and no version change.
+nix = { workspace = true }
+# M2 S9: the adapter TRAIT surface only (CatalogApi, AuthenticationApi,
+# ApiError) for the daemon-side bridges — the engine/runtime wiring
+# (constructing MuonAuth/MuonCatalog) belongs to the session lane and
+# installs through the provider cells in `services.rs`. The daemon is a
+# server-side app, so the client-side dep gate (frontends reach the
+# service only through protonwire-client) does not apply to this edge.
+protonwire-api = { workspace = true }
 protonwire-core = { workspace = true }
 protonwire-frontend-api = { workspace = true }
 protonwire-ipc = { workspace = true }
 protonwire-store = { workspace = true }
 clap = { workspace = true }
+thiserror = { workspace = true }
 tracing = { workspace = true }

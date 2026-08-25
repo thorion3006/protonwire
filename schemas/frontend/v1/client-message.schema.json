@@ -36,10 +36,11 @@
       ]
     },
     {
-      "description": "A request expecting exactly one [`ServerMessage::Response`].",
+      "description": "A request expecting exactly one [`ServerMessage::Response`].\n\nThe wire shape is FLAT (recorded decision #1, 2026-08-17): the\n`method`/`params` tags of the inner [`Request`] are flattened\ndirectly into `data` beside the correlation id —\n`data: {id, method, params}` — instead of the M1 nesting\n`data: {id, request: {method, params}}`. Free until a client\nships; deferring past the freeze would cost a major version.",
       "type": "object",
       "properties": {
         "data": {
+          "description": "Requests the daemon accepts (PRD FR-127). Milestone 1 implements\n`Ping`/`GetState` end to end and returns a typed\n[`RpcErrorCode::NotImplemented`] refusal for the connection lifecycle.\nMilestone 2 S9 adds the servers/account/credential surface: the\ncatalog reads and scheduler-paced refresh, the login family over the\nMuon adapter, the interactive credential submissions feeding the S5a\ninput source, and the account snapshot behind `account --json`.",
           "type": "object",
           "properties": {
             "id": {
@@ -47,14 +48,315 @@
               "type": "integer",
               "format": "uint64",
               "minimum": 0
-            },
-            "request": {
-              "$ref": "#/$defs/Request"
             }
           },
+          "oneOf": [
+            {
+              "description": "Liveness probe; the daemon echoes the nonce.",
+              "type": "object",
+              "properties": {
+                "method": {
+                  "type": "string",
+                  "const": "ping"
+                },
+                "params": {
+                  "type": "object",
+                  "properties": {
+                    "nonce": {
+                      "description": "Arbitrary string echoed back in [`RequestResult::Pong`].",
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "nonce"
+                  ]
+                }
+              },
+              "required": [
+                "method",
+                "params"
+              ]
+            },
+            {
+              "description": "Full-state snapshot (the resynchronization primitive).",
+              "type": "object",
+              "properties": {
+                "method": {
+                  "type": "string",
+                  "const": "get-state"
+                }
+              },
+              "required": [
+                "method"
+              ]
+            },
+            {
+              "description": "Begin a connection. Refused until Milestone 4 wires the ProTUN engine.",
+              "type": "object",
+              "properties": {
+                "method": {
+                  "type": "string",
+                  "const": "connect"
+                },
+                "params": {
+                  "type": "object",
+                  "properties": {
+                    "target": {
+                      "$ref": "#/$defs/ConnectTarget"
+                    }
+                  },
+                  "required": [
+                    "target"
+                  ]
+                }
+              },
+              "required": [
+                "method",
+                "params"
+              ]
+            },
+            {
+              "description": "Tear down the active connection. Refused until Milestone 4.",
+              "type": "object",
+              "properties": {
+                "method": {
+                  "type": "string",
+                  "const": "disconnect"
+                }
+              },
+              "required": [
+                "method"
+              ]
+            },
+            {
+              "description": "Stop the daemon. Requires administrator (UID 0) peer credentials.",
+              "type": "object",
+              "properties": {
+                "method": {
+                  "type": "string",
+                  "const": "shutdown"
+                }
+              },
+              "required": [
+                "method"
+              ]
+            },
+            {
+              "description": "Serve the cached server catalog (FR-9/FR-10) — no upstream\nrequest; the daemon answers from the strict-loaded cache and\nreports `None` fields when nothing is cached yet.",
+              "type": "object",
+              "properties": {
+                "method": {
+                  "type": "string",
+                  "const": "servers-list"
+                }
+              },
+              "required": [
+                "method"
+              ]
+            },
+            {
+              "description": "Refresh the server catalog through the single-flight scheduler\n(FR-11/FR-13C). An early refresh is refused with\n[`RpcErrorCode::ConfirmationRequired`] carrying the typed\n[`ConfirmationRequirement`]; the confirmed retry echoes its\nsingle-use token here.",
+              "type": "object",
+              "properties": {
+                "method": {
+                  "type": "string",
+                  "const": "servers-refresh"
+                },
+                "params": {
+                  "type": "object",
+                  "properties": {
+                    "confirmation_token": {
+                      "description": "The single-use confirmation token from a prior\n[`RpcErrorCode::ConfirmationRequired`] refusal, when\nconfirming an early refresh (FR-13I).",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    }
+                  }
+                }
+              },
+              "required": [
+                "method",
+                "params"
+              ]
+            },
+            {
+              "description": "Begin SRP username/password login (PRD 7.1). Refused with\n`invalid state` semantics (see [`RpcErrorCode::InvalidParams`])\nwhen a session already exists or a second-factor challenge is\nin progress — the client surfaces orchestrate the order.",
+              "type": "object",
+              "properties": {
+                "method": {
+                  "type": "string",
+                  "const": "begin-login"
+                },
+                "params": {
+                  "type": "object",
+                  "properties": {
+                    "password": {
+                      "description": "The account password.",
+                      "$ref": "#/$defs/SecretParam"
+                    },
+                    "username": {
+                      "description": "The account username.",
+                      "$ref": "#/$defs/SecretParam"
+                    }
+                  },
+                  "required": [
+                    "username",
+                    "password"
+                  ]
+                }
+              },
+              "required": [
+                "method",
+                "params"
+              ]
+            },
+            {
+              "description": "Continue a login paused at the 2FA step with a TOTP code\n(PRD 7.1). Only the 6–8 digit TOTP shape is submittable;\nrecovery codes fail closed as\n[`RpcErrorCode::UnsupportedChallenge`].",
+              "type": "object",
+              "properties": {
+                "method": {
+                  "type": "string",
+                  "const": "submit-two-factor"
+                },
+                "params": {
+                  "type": "object",
+                  "properties": {
+                    "code": {
+                      "description": "The TOTP code.",
+                      "$ref": "#/$defs/SecretParam"
+                    }
+                  },
+                  "required": [
+                    "code"
+                  ]
+                }
+              },
+              "required": [
+                "method",
+                "params"
+              ]
+            },
+            {
+              "description": "Continue a login paused at the 2FA step with a WebAuthn/FIDO2\nassertion assembled by the client ceremony (PRD 7.1). Base64\nfields as on the wire.",
+              "type": "object",
+              "properties": {
+                "method": {
+                  "type": "string",
+                  "const": "submit-fido-payload"
+                },
+                "params": {
+                  "type": "object",
+                  "properties": {
+                    "authenticator_data": {
+                      "description": "Authenticator data, base64.",
+                      "$ref": "#/$defs/SecretParam"
+                    },
+                    "client_data": {
+                      "description": "`PublicKeyCredential.clientDataJSON`, base64.",
+                      "$ref": "#/$defs/SecretParam"
+                    },
+                    "credential_id": {
+                      "description": "The credential ID used.",
+                      "type": "array",
+                      "items": {
+                        "type": "integer",
+                        "format": "uint8",
+                        "maximum": 255,
+                        "minimum": 0
+                      }
+                    },
+                    "signature": {
+                      "description": "Assertion signature, base64.",
+                      "$ref": "#/$defs/SecretParam"
+                    }
+                  },
+                  "required": [
+                    "client_data",
+                    "authenticator_data",
+                    "signature",
+                    "credential_id"
+                  ]
+                }
+              },
+              "required": [
+                "method",
+                "params"
+              ]
+            },
+            {
+              "description": "Force a session token refresh (FR-3); invalidates any pending\nsecond-factor challenge.",
+              "type": "object",
+              "properties": {
+                "method": {
+                  "type": "string",
+                  "const": "refresh-session"
+                }
+              },
+              "required": [
+                "method"
+              ]
+            },
+            {
+              "description": "Log out: best-effort remote teardown, guaranteed local\ncredential removal (FR-4).",
+              "type": "object",
+              "properties": {
+                "method": {
+                  "type": "string",
+                  "const": "logout"
+                }
+              },
+              "required": [
+                "method"
+              ]
+            },
+            {
+              "description": "Submit one credential value for the INTERACTIVE input source\n(FR-7F, S5a): the value lands in the daemon's in-memory input\nstore keyed by short name (`session`, `username`, `password`)\nand is consumed by the source's read path. Peer-secret\nhandling: the value crosses the daemon boundary into\nzeroizing, never-registry storage.",
+              "type": "object",
+              "properties": {
+                "method": {
+                  "type": "string",
+                  "const": "submit-credential"
+                },
+                "params": {
+                  "type": "object",
+                  "properties": {
+                    "name": {
+                      "description": "The credential short name.",
+                      "type": "string"
+                    },
+                    "value": {
+                      "description": "The credential value.",
+                      "$ref": "#/$defs/SecretParam"
+                    }
+                  },
+                  "required": [
+                    "name",
+                    "value"
+                  ]
+                }
+              },
+              "required": [
+                "method",
+                "params"
+              ]
+            },
+            {
+              "description": "The account snapshot behind `account --json` (FR-7H): login\nstatus, credential input source and its startup read, the\nconfigured writable store, and persistence health when the\nwritable-store half reports one.",
+              "type": "object",
+              "properties": {
+                "method": {
+                  "type": "string",
+                  "const": "get-account"
+                }
+              },
+              "required": [
+                "method"
+              ]
+            }
+          ],
           "required": [
-            "id",
-            "request"
+            "id"
           ]
         },
         "type": {
@@ -379,100 +681,9 @@
         }
       ]
     },
-    "Request": {
-      "description": "Requests the daemon accepts (PRD FR-127). Milestone 1 implements\n`Ping`/`GetState` end to end and returns a typed\n[`RpcErrorCode::NotImplemented`] refusal for the connection lifecycle.",
-      "oneOf": [
-        {
-          "description": "Liveness probe; the daemon echoes the nonce.",
-          "type": "object",
-          "properties": {
-            "method": {
-              "type": "string",
-              "const": "ping"
-            },
-            "params": {
-              "type": "object",
-              "properties": {
-                "nonce": {
-                  "description": "Arbitrary string echoed back in [`RequestResult::Pong`].",
-                  "type": "string"
-                }
-              },
-              "required": [
-                "nonce"
-              ]
-            }
-          },
-          "required": [
-            "method",
-            "params"
-          ]
-        },
-        {
-          "description": "Full-state snapshot (the resynchronization primitive).",
-          "type": "object",
-          "properties": {
-            "method": {
-              "type": "string",
-              "const": "get-state"
-            }
-          },
-          "required": [
-            "method"
-          ]
-        },
-        {
-          "description": "Begin a connection. Refused until Milestone 4 wires the ProTUN engine.",
-          "type": "object",
-          "properties": {
-            "method": {
-              "type": "string",
-              "const": "connect"
-            },
-            "params": {
-              "type": "object",
-              "properties": {
-                "target": {
-                  "$ref": "#/$defs/ConnectTarget"
-                }
-              },
-              "required": [
-                "target"
-              ]
-            }
-          },
-          "required": [
-            "method",
-            "params"
-          ]
-        },
-        {
-          "description": "Tear down the active connection. Refused until Milestone 4.",
-          "type": "object",
-          "properties": {
-            "method": {
-              "type": "string",
-              "const": "disconnect"
-            }
-          },
-          "required": [
-            "method"
-          ]
-        },
-        {
-          "description": "Stop the daemon. Requires administrator (UID 0) peer credentials.",
-          "type": "object",
-          "properties": {
-            "method": {
-              "type": "string",
-              "const": "shutdown"
-            }
-          },
-          "required": [
-            "method"
-          ]
-        }
-      ]
+    "SecretParam": {
+      "description": "A secret value crossing the request boundary (a password, a TOTP\ncode, a credential value, a FIDO2 assertion field): serializes as a\nplain JSON string — the local socket is the trusted transport — but\nits `Debug` renders `[redacted]` so no log line, panic message, or\nerror formatter derived from a `{:?}` of a request ever carries it\n(the S0/S4 `Fido2Payload` precedent, applied at the wire layer).",
+      "type": "string"
     },
     "SpecialClass": {
       "description": "Special server classes addressed without a name (PRD 9.2).",

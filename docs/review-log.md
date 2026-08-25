@@ -1004,3 +1004,230 @@ that it has reached its usage limit — no further automated review
 rounds will arrive. At termination: 71/71 threads resolved, zero
 unresolved, CI green on bea8f4d. The PR stands at the owner's merge
 call.
+
+## 2026-08-23 — M2 close: Muon auth + server cache (feat/m2-muon-auth)
+
+M2 executed docs/m2-plan.md in full: S0-S14 with S5 delivered as its
+three slices — 17 per-unit verdict rows below (the earlier draft of
+this entry said "16 units", which matched neither counting; corrected
+at the doc audit). Every unit landed through the standing per-unit SDLC
+(implementation + the full matching reviewer set; FAIL = hard blocker;
+P1s verified dead with git evidence). Unit verdicts:
+
+| Unit | Verdicts | Notes |
+|------|----------|-------|
+| S0 muon spike | recorded | the Q9 leak inventory + the two-layer seam design; docs/spike-2026-08.md |
+| S1 suppression + canaries | sec PASS, qa teeth CONFIRMED | SecretSuppressFilter before-formatting; MODULE_CAPS; 12 secret classes × 5 levels; peer_secret() guard |
+| S2 RPC surface | rust PASS + Lows closed | five new error codes; ConfirmationRequirement; FLATTEN; the X4 resync marker |
+| S3 config vocabularies | rust PASS (92ffc32 after a FAIL chain on the scanner, below) | 11 vocabularies; authority_report 77 paths |
+| S4 Muon adapter | sec FAIL→fixed, rust PASS, qa GAPS→fixed | real-SRP hermetic seam (21 wire tests); session envelope; the canary arm shipped with the first real call sites and caught 2 live transport leaks |
+| S5a credential input | sec PASS, rust FAIL→fixed, qa CONFIRMED→gaps closed | CredentialSource; systemd LoadCredential read-only; the P1 parse-Display leak killed in both files |
+| S5b writable stores | sec PASS, rust PASS, qa CONFIRMED | encrypted-local; auto-resolution fail-closed; fd-pinned zeroizing reads; envelope redacted Debug |
+| S5c keyring | sec PASS, rust PASS, qa CONFIRMED; compliance PASS-WITH-CONDITIONS→completed | keyring-core accepted (36 pure-Rust pkgs); the v4 facade rejected on a live probe (wrote a REAL secret despite mock-first); h2 advisory caught + fixed |
+| S6 catalog | sec PASS, rust PASS, qa GAPS→fixed | send_with_sdk fetch + ETag; hardened cache; fixture grounded in 3 pinned clients |
+| S7 scheduler | rust PASS, sec PASS, qa GAPS(2×P1)→fixed | single-flight, rollback guard, jitter, suppression; virtual-clock suite normative; the RateLimited{None} and manual-join P1s closed |
+| S8 entitlements | triple PASS, clean | provenance locators from the start (the S6 lesson applied) |
+| S9 client-surface wiring | sec PASS, rust PASS, qa CONFIRMED + P2s fixed | 429/503→RateLimited (30d clamp); fail-closed scheduler load (exit 15 pre-bind); credential wiring; GetState redaction; version-gated events |
+| S10 user-location | triple PASS + literal-pin P2 fixed | IP/ISP redaction pinned; the 0600 cache decision (SEC-16-class at rest) |
+| S11 overlay loader | sec PASS, rust PASS, qa CONFIRMED | two-layer escalation pin lattice (coherence + full-table), both mutation-verified; uid provenance kernel-keyed |
+| S12 IPC hardening | sec PASS, rust PASS | walker duplicated behind T-23 (empirically verified); staging+link(2) bind (the umask guard was process-global racy — reproduced then replaced); idle ceiling; SIGTERM; Closed/Truncated |
+| S13 groups | qa CONFIRMED, compliance PASS | golden-document equality from the yaml itself |
+| S14 SDK cursor | rust PASS, qa GAPS→fixed | deliver-then-advance; the Some-arm gap pinned with mutation teeth |
+
+### The yaml scanner chain (S3's open half): seven rounds, closed
+
+Round 1 FAIL (prev_is_spacing boundary) → round 2 at_node_start →
+round 3 FAIL (line model: LF-only scan vs libyaml's CR/NEL/LS/PS
+breaks — 14 bypass shapes, wide-fanout capstone) → round 4 FAIL
+(mid-plain in-flow colon opens phantom quote state; the round-2
+justifying premise `{k:*x}`-parses-as-alias was FALSE, corrected with
+Value-pinning tests) → round 5 (tags + `---` markers) → round-5 review
+FAIL (glued `?` is a KEY token in flow; verbatim `!<>` makes `,[]` URI
+content) → round 7 (column-0 BOM — found by the EXHAUSTIVE fetch-table
+diff, in scan_to_next_token OUTSIDE the dispatch window everyone had
+diffed) → round-7 review **PASS with a clean-kill report**: the
+closure claim independently confirmed (IS_BOM occurs exactly once in
+the vendored scanner; every dispatch arm, skip, and scalar scanner
+re-derived; ~85 BOM compositions live-probed; all reds re-derived by
+mutation with zero collateral). No input exists with parse=Ok +
+scan=None + a live token. The structural lesson recorded: a hand-modeled
+pre-parse scanner desyncs from libyaml one token rule at a time; seven
+adversarial rounds is what convergence cost here.
+
+### The S4 security chain and its correction
+
+The real-muon canary arm (the S1 gate) caught two transport leaks the
+source-reading pass missed — both fixed-now (29a90b5, muon::transport
+capped ERROR). The sec round then found two MORE sites and FAILed the
+unit: the muon::common::auth UID-at-WARN/ERROR (fixed by the
+MODULE_DROP_ALL arm — a level floor cannot drop ERROR and FR-121 is
+not deviable; 21b6871) and a claimed retry-header leak that the fix
+round's CAPTURED OUTPUT disproved: retry.rs:42 logs via Display
+(status only); the sec review conflated `{}` with `{:?}`. The cap
+stays as an engine-upgrade trap guard; the record was corrected
+everywhere it was written (a14403d). **Lesson: source-citation reviews
+must distinguish Display from Debug before declaring a leak live;
+empirical capture is the tiebreaker.**
+
+### Incidents and the rules they produced
+
+- **Shared-git trilogy**: (1) concurrent `git add -A` (M1, standing
+  rule); (2) `git commit --amend` TOCTOU on shared branches — twice,
+  both repaired hash-pinned, rule: no amend while lanes are active;
+  (3) the index sweep — `git add <paths> && git commit` commits the
+  ENTIRE shared index, so a sibling's staged hunk rides; the carrier
+  was cb33bd2 (the S4 qa peer-secret-pin commit, which absorbed a
+  sibling's staged hunk); rule: PATHSPEC commits
+  (`git commit -- <paths>`). Also: F3-class module-registration races
+  (d44396e, the S6 catalog commit, doesn't compile alone — bisect
+  hazard recorded); a lockfile hunk landing 3 commits late (the qa
+  P1: ad51356, the S4 adapter commit, was not `--locked`-buildable at
+  its own tree; the hunk it needed landed inside 89bc163, the S7
+  scheduler commit).
+- **The dev-cycle lesson**: a test-only store→core dev edge makes
+  cargo build store twice; an impl in core resolves only against the
+  dependency instance (E0599 for the local view). The SecretBoundary
+  production impl therefore lives in core with its proof (d01ebee).
+- **Three agent wipeouts** (a usage limit, a tool interruption, an
+  unknown cause) each killed every in-flight lane silently — detected
+  by bounced SendMessage / the owner's observation. Mitigation after
+  the third: consolidated SEQUENTIAL dispatch. Recovery protocol:
+  git-log autopsy per lane, salvage briefs, red-recreation for
+  salvaged WIP.
+- **Doc gate red since S1** (unobserved: branch unpushed, CI last ran
+  at M1): four private-item intra-doc links — caught by the S7 rust
+  round, fixed (83d0fa0).
+- **Quiet-window history repair (executed at close, nothing pushed)**:
+  the wrong `Signed-off-by: Parthiban <parthiban@localhost>` trailer
+  (amend-incident residue on the S6 fix commit) removed by
+  filter-branch msg-filter + rebase re-sign; verified: tree
+  byte-identical across the rewrite, 66/66 commits re-signed, count
+  unchanged. The peer.rs doc-tag tightening (8dbfe31) was prescribed
+  but empirically NOT gate-firing on this toolchain — disclosed in its
+  message.
+- **Compliance catch**: RUSTSEC-2026-0258 (h2 0.4.15, post-dates M1's
+  audit evidence, linked via muon's transport) would have reddened CI's
+  audit job on push — fixed by the lockfile bump to 0.4.16 (f94fe2a);
+  the advisory column restored to the spike standard; all 36 keyring
+  packages scan clean; license-scan 779 licensed / the recorded 17
+  unchanged.
+
+### Track items for post-M2 (each names its lane)
+
+1. begin_login's real guard belongs inside MuonAuth (the daemon-side
+   precondition is a mandated stopgap; the check-then-call TOCTOU and
+   the store-invisible window ride the same finding) — the api lane,
+   first unit that touches auth.rs.
+2. The overlay WRITE path (IPC submission): pin the read-path trust
+   walk (per-uid ownership/mode + symlink refusal) and route typed
+   submissions through UserOverlay::validate (the generation gate is
+   load-path-only today) — the T-37 wire lane.
+3. The walker drift-pin: a conformance test driving store's fs_trust
+   and ipc's peer.rs copy over one shared defect matrix (S12 sec P2).
+4. AR/DoH + TLS-pinning have NO automated offline coverage — a
+   pre-release networked arm (S4 rust P2, spike Q3's promise).
+5. Poller mutation-kill is probabilistic (~80%/run) — QA note (S12).
+6. peer.rs private-doc HTML tag doesn't fire the CI doc invocation —
+   tighten when private docs join the gate.
+7. packaging/README.md "deferred to M1.1" staleness — M8 packaging.
+8. Deferred with triggers (m2-plan): TPM2/full-store encryption
+   post-M2 (parity-manifest note required); envelope-encryption at
+   rest for encrypted-local; zbus transit buffers (inherent, same
+   class as muon transport buffers).
+
+## 2026-08-24 — Post-M2 close passes (refactorer + doc-writer)
+
+Two consolidated work orders on the closed M2 tree (the parallel
+launches were lost in the third agent wipeout; nothing was salvageable,
+both relaunched sequentially — the standing sequential-dispatch rule).
+
+### The refactorer's M2 pass (behavior-gated; suite-identity proven)
+
+Survey-then-act over the M2 diff; three restructures landed, three
+candidates rejected with reasons. Landed:
+
+1. **The shared loopback wire-seam harness** (750a7a1): the S8
+   entitlements and S10 location wire tests were verbatim twins and the
+   S4 integration test carried a third richer copy of the same
+   keep-alive responder/env plumbing; one `crates/api/src/test_util.rs`
+   now serves all three (compiled as `#[cfg(test)]` for the unit tests
+   and `#[path]`-included into `tests/wire.rs` — deliberately NO
+   feature and NO self dev-dependency, the dev-cycle lesson). The three
+   identical `FetchFuture`/`BlockOn` type twins lifted to crate level.
+   1399d09 is its fmt followup (see the incident note below).
+2. **One strict envelope parse** (d13e3b5): the two parse-error
+   reducers had drifted (`json Data error …` vs `data error …` — the
+   S5a twin-fix half-landed); `SessionEnvelope::from_strict_bytes` is
+   now the one definition of the fail-closed triple, the store loader
+   and `parse_session_envelope` delegate, and `writable_store.rs` keeps
+   its local wrapper untouched (frozen file; delegation is the recorded
+   follow-up when it unfreezes).
+3. **Daemon handler arms** (60efb90): the five login-family arms shared
+   one `with_auth` guard; GetAccount's assembly moved to
+   `DaemonServices::account_status`.
+
+Rejected, with reasons (the negative results are the deliverable):
+
+- **fs_trust/peer.rs walker consolidation**: dep-gate-blocked (T-23
+  forbids ipc→store; frontend-api is wire-types-only), and the
+  conformance drift-pin is post-M2 track item 3 — additive testing,
+  not a behavior-preserving restructure.
+- **The atomic-write/strict-load kit**: the temp-name+fsync+rename
+  mechanics exist 5x (state/session/catalog/location/deadlines), but
+  each copy embeds individually-sec-reviewed parameters (0600+create_new
+  vs 0644+truncate; dir-mode pinning) inside distinct typed error
+  taxonomies; extraction saves ~12 lines per settled unit. Revisit when
+  the next persisted document lands.
+- **redact.rs stub-emitter**: pin-shaped repetition — each `event!`
+  block is a distinct verbatim upstream site with its own field set; a
+  table shape would obscure the verbatim property that gives the canary
+  its teeth. Also rejected within item 1: sharing the S6 catalog
+  harness (different wire discipline) and the S8/S10 adapter builders
+  (the `new<C>` seam is deliberately generic; sharing forces naming
+  muon's concrete context internals).
+
+Proof of behavior identity: temp-worktree test run at 17fd802 vs the
+refactored tree — identical per-target counts (api 49+22, daemon 23+6,
+store 257); full gates green (fmt, clippy -D warnings, 697 tests / 29
+targets, xtask all).
+
+**Incident (the bea8f4d class, again):** 750a7a1 verified fmt with
+`-p protonwire-daemon` — a concurrent-lane habit with no concurrent
+lanes active — and the two api files landed unformatted; caught by the
+next workspace-wide `--check`, fixed in 1399d09. The rule: the fmt gate
+must cover the paths your commit touches, not your crate only.
+
+### The doc-writer's audit
+
+- **CONTRIBUTING.md**: rule 1 now mandates PATHSPEC commits
+  (`git commit -- <paths>`, never `git add … && git commit` — the
+  cb33bd2 index sweep) and new rule 8 forbids amend while lanes are
+  active (the two TOCTOU repairs). Existing rule NUMBERS are unchanged
+  — six code comments cite them (rule 5 ×5, rule 7 ×1).
+- **spike-2026-08.md**: retitled as the standing dependency-decision
+  record (M1 + dated M2 addenda); the Q9 table now carries an explicit
+  "source-reading pass only" forward reference to its two extensions;
+  the S6 responder-discipline bullet records the keep-alive correction
+  (and that the S6 harness's tolerance of close-per-exchange was never
+  re-derived — a scoped fact, not a license); the S5c audit table gains
+  its advisory column (the spike standard the compliance round
+  restored).
+- **m2-plan.md**: completion note added at the top (normative content
+  untouched).
+- **README.md**: status now M1+M2 complete with the M2 capability
+  summary (auth, scheduler, credential handling), both PRs noted as
+  UNMERGED (the initial draft of this edit wrongly said M1 was merged —
+  caught against the refs before landing), and an explicit
+  "no tunneling yet" honesty line; license-gate language untouched.
+- **Module-doc accuracy sweep** (the three-stale-doc-P2 class):
+  scheduler's fetch-seam note described the RateLimited bridge as
+  future work ("landing with the api-wire-fixture lane") — S9 landed
+  it; rewritten to the landed state. overlay's header implied the IPC
+  submission path exists — it is post-M2 track item 2; now says so.
+  credential_input claimed "the ONE expose() site" for
+  `parse_session_envelope` while the module header (correctly) says
+  two — reconciled. writable_store's header audited clean, untouched.
+- **Close-entry corrections** (this file): "16 units" was right under
+  neither counting — 17 verdict rows (S0-S14, S5 as three slices); the
+  cb33bd2/d44396e/ad51356/89bc163 hashes in the incident trilogy now
+  name their commits.

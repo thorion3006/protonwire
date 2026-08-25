@@ -89,6 +89,18 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 nix = { version = "0.31", features = ["socket", "user", "fs", "signal", "poll"] }
 zeroize = "1"
 
+# --- Credential secret storage (M2 S5c spike; docs/spike-2026-08.md §S5c) --
+# The freedesktop Secret Service store, pure Rust end to end: zbus (no
+# libdbus C binding) with RustCrypto session crypto (`crypto-rust`).
+# `keyring-core` is linked directly rather than through the `keyring`
+# facade: the facade installs its platform store via a one-time global
+# that shadows the mock store the tests inject, and PRD 16.2's
+# indicative `keyring = "3"` Secret-Service path is libdbus C
+# (`dbus-secret-service`/`libdbus-sys`) — deviations recorded in the
+# spike. Feature pin mirrors keyring 4.1.6's own declaration.
+keyring-core = "1"
+zbus-secret-service-keyring-store = { version = "1", features = ["crypto-rust"] }
+
 # Clients --------------------------------------------------------------
 clap = { version = "4", features = ["derive"] }
 ratatui = "0.30"

@@ -10,15 +10,23 @@
 //!   are a distinct document from the system configuration and can never
 //!   express system-only fields.
 
+pub mod catalog;
 pub mod config;
+pub mod credential_input;
+pub mod deadlines;
 pub mod fs_trust;
+pub mod location;
 pub mod paths;
+pub mod session;
 pub mod state;
+pub mod writable_store;
 pub mod yaml;
 
 pub use config::{
-    Authority, DnsMode, KillSwitchMode, LanPolicy, NatMode, NetShieldLevel, OutputFormat,
-    SystemConfig, UserOverlay,
+    Authority, ConnectionType, CredentialInputSource, DnsLeakProtection, DnsMode, DnsPolicy,
+    Ipv6Mode, KillSwitchMode, LanPolicy, NatMode, NetShieldLevel, OutputFormat, ProbeTransport,
+    ProfileRanking, ProtocolMode, RegionalRanking, SplitRuleAction, SystemConfig, UserOverlay,
+    WritableSessionStore,
 };
 pub use paths::ConfigPaths;
 pub use state::{StateFile, StateStore};

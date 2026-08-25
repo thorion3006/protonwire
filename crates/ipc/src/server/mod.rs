@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use protonwire_frontend_api::{ClientInfo, Request, RequestResult, RpcError};
-use tracing::{debug, warn};
+use tracing::{debug, trace, warn};
 
 use crate::bus::EventBus;
 use crate::peer::PeerCredentials;
@@ -46,6 +46,22 @@ const HELLO_DEADLINE: Duration = Duration::from_secs(5);
 /// loses its session instead of pinning a writer thread — and a reserved
 /// slot — forever.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Default per-session idle ceiling (M2 S12): the longest a HANDSHAKEN
+/// session may go without a single readable byte from its peer before
+/// the daemon reclaims its slot. Post-hello reads are unbounded BY
+/// DESIGN — a live client may take as long as it needs between requests
+/// — but "as long as it needs" cannot be "forever": a client that
+/// handshakes and then holds its socket open silently (crashed TUI,
+/// suspended laptop, a hostile slot-squatter) pins one of the
+/// MAX_SESSIONS slots indefinitely, and 64 of them wedge the daemon.
+/// The ceiling is on the order of minutes — far past any legitimate
+/// inter-request gap of the current clients (the TUI re-polls in
+/// seconds), and reconnect is the client's existing recovery path. A
+/// DRIBBLING peer (bytes arriving, frame never completing) resets the
+/// clock byte-for-byte, matching the budget's wording: no ANY readable
+/// byte, not no complete frame.
+const IDLE_CEILING: Duration = Duration::from_secs(600);
 
 /// Overall ceiling on post-stop draining. `SO_SNDTIMEO` bounds each WRITE
 /// syscall, not the shutdown join: a session that keeps dribbling reads (or
@@ -112,6 +128,11 @@ pub(crate) struct ServeBudgets {
     /// it, and under steady drain it never expires at all (sec round-7
     /// probe).
     pub(crate) write_timeout: Duration,
+    /// Per-session idle ceiling (M2 S12): the longest a handshaken
+    /// session may go without ANY readable byte from its peer before
+    /// its slot is reclaimed through the normal teardown. Tests inject
+    /// shrunk values; production keeps the minutes-scale default.
+    pub(crate) idle_timeout: Duration,
 }
 
 impl Default for ServeBudgets {
@@ -120,6 +141,7 @@ impl Default for ServeBudgets {
             hello_deadline: HELLO_DEADLINE,
             drain_ceiling: DRAIN_CEILING,
             write_timeout: WRITE_TIMEOUT,
+            idle_timeout: IDLE_CEILING,
         }
     }
 }
@@ -210,7 +232,7 @@ impl IpcServer {
         stop: Arc<AtomicBool>,
         budgets: ServeBudgets,
     ) {
-        self.serve_observed(handler, stop, budgets, &|_| {});
+        self.serve_observed(handler, stop, budgets, &trace_reap_stats);
     }
 
     /// [`IpcServer::serve_with`] with an observer fired after EVERY
@@ -285,6 +307,7 @@ impl IpcServer {
                                 stop,
                                 budgets.hello_deadline,
                                 budgets.write_timeout,
+                                budgets.idle_timeout,
                             )
                         })) {
                             warn!("IPC session panicked and was dropped: {e:?}");
@@ -364,16 +387,31 @@ struct SessionWorker {
 /// ever connected, so only a monotonically growing reaped count can pin
 /// that ended workers actually leave the list (pr-champion WO-R3).
 ///
-/// The fields are read by the recording observers tests install through
-/// the seam; production's observer is a no-op, so only the lib build sees
-/// them constructed-but-unread.
-#[cfg_attr(not(test), allow(dead_code))]
+/// S12 item 4: the fields are LIVE in every profile — the production
+/// observer ([`trace_reap_stats`], installed by `serve`/`serve_with`)
+/// consumes them as a `trace!` event, so a long-running daemon running
+/// with trace-level logging records its reap cadence (115k/day of dead
+/// handle bookkeeping was the WO-4 finding; the trace makes a regression
+/// observable in production profiles, not only in test observers).
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ReapStats {
     /// Workers reaped since the accept loop started (cumulative).
     pub(crate) reaped: usize,
     /// Workers still in the list after this reap pass.
     pub(crate) remaining: usize,
+}
+
+/// The production reap observer (M2 S12): turns each [`ReapStats`]
+/// snapshot into a trace event so the accept loop's reap cadence is
+/// observable wherever trace-level logging is enabled. The fields are
+/// recorded as structured `reaped`/`remaining` values, matching the
+/// test observers' shape.
+fn trace_reap_stats(stats: ReapStats) {
+    trace!(
+        reaped = stats.reaped,
+        remaining = stats.remaining,
+        "accept-loop reap pass"
+    );
 }
 
 /// Joins and removes session workers whose threads have finished, and
@@ -1039,5 +1077,172 @@ mod tests {
 
         stop.store(true, Ordering::SeqCst);
         let _ = served.join();
+    }
+
+    /// S12 item 4 — ReapStats must be LIVE in every profile, not just
+    /// the test observers: `serve` (and `serve_with`, the production
+    /// path) passed a no-op observer, so `reaped`/`remaining` were
+    /// constructed-but-unread outside tests and the struct carried a
+    /// `cfg_attr(not(test), allow(dead_code))` to stay quiet. The
+    /// production observer now consumes them as a `trace!` event.
+    ///
+    /// Red (behavioral, observed pre-fix): the capture below saw ZERO
+    /// reap trace events — `serve_with` passed `&|_| {}`.
+    ///
+    /// Threading note: `tracing::subscriber::with_default` is
+    /// thread-local, and the observer fires on the SERVING thread — so
+    /// the test runs `serve_with` on the test thread (inside
+    /// `with_default`) and stops it from a helper thread, which watches
+    /// the shared capture until the reaped>=1 event lands before setting
+    /// the stop flag (setting it earlier could end the accept loop
+    /// before the reap pass that must be traced).
+    #[test]
+    fn serve_with_emits_reap_stats_as_trace_events() {
+        use std::sync::mpsc;
+
+        let capture = CaptureReaps::default();
+        let seen = capture.shared();
+        let dir = tempfile::tempdir().unwrap();
+        let handler = Arc::new(NullHandler {
+            version: "test".into(),
+            bus: EventBus::new(),
+        });
+        let server = IpcServer::bind(dir.path(), "reap-trace.sock").unwrap();
+        let path = server.socket_path().to_owned();
+        let stop = Arc::new(AtomicBool::new(false));
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+
+        let stopper = {
+            let stop = Arc::clone(&stop);
+            let seen = Arc::clone(&seen);
+            std::thread::spawn(move || {
+                // Wait for the client, then for the trace to prove the
+                // reap was OBSERVED, then stop the loop. The stop is
+                // UNCONDITIONAL after the deadline: pre-fix (a no-op
+                // observer) no event can ever land, and the loop must
+                // still end so the assertion below reports the red
+                // instead of hanging the suite.
+                let _ = release_rx.recv();
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while Instant::now() < deadline
+                    && !seen.lock().unwrap().iter().any(|(reaped, _)| *reaped >= 1)
+                {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                stop.store(true, Ordering::SeqCst);
+            })
+        };
+
+        tracing::subscriber::with_default(capture.subscriber(), || {
+            // The client and the stopper run on helper threads: the
+            // SERVING must happen on THIS thread for the thread-local
+            // subscriber to capture the observer's events (and serving
+            // blocks, so a same-thread client could never handshake).
+            let client = {
+                let path = path.clone();
+                let release_tx = release_tx.clone();
+                std::thread::spawn(move || {
+                    // One short-lived client: its worker ends and is
+                    // reaped by the accept loop.
+                    drop(connect_and_hello(&path));
+                    let _ = release_tx.send(());
+                })
+            };
+            server.serve_with(handler, stop, ServeBudgets::default());
+            let _ = client.join();
+        });
+        let _ = stopper.join();
+
+        let reaps = seen.lock().unwrap().clone();
+        assert!(
+            reaps.iter().any(|(reaped, _)| *reaped >= 1),
+            "serve_with must consume ReapStats as trace events — captured \
+             {reaps:?}; pre-fix the production observer was a no-op and the \
+             fields were dead outside tests"
+        );
+        // Every snapshot is consistent: the reaped count never exceeds
+        // the one session that ever existed, and the trailing snapshot
+        // has the worker gone from the list.
+        for (reaped, remaining) in &reaps {
+            assert!(*reaped <= 1, "impossible reap count: {reaps:?}");
+            assert!(*remaining <= 1, "impossible remainder: {reaps:?}");
+        }
+    }
+
+    /// FU-C-style capture for the reap trace event (the crate keeps
+    /// tracing-subscriber out of its dependencies; this implements the
+    /// three trait methods the synchronous transport needs and records
+    /// only the event's `reaped`/`remaining` fields).
+    #[derive(Debug, Default)]
+    struct CaptureReaps {
+        events: Arc<Mutex<Vec<(u64, u64)>>>,
+    }
+
+    impl CaptureReaps {
+        fn subscriber(&self) -> ReapSubscriber {
+            ReapSubscriber {
+                events: Arc::clone(&self.events),
+            }
+        }
+
+        fn shared(&self) -> Arc<Mutex<Vec<(u64, u64)>>> {
+            Arc::clone(&self.events)
+        }
+    }
+
+    struct ReapSubscriber {
+        events: Arc<Mutex<Vec<(u64, u64)>>>,
+    }
+
+    impl tracing::Subscriber for ReapSubscriber {
+        fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _attrs: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+        fn enter(&self, _span: &tracing::span::Id) {}
+
+        fn exit(&self, _span: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut fields = ReapFields::default();
+            event.record(&mut fields);
+            if fields.is_reap {
+                self.events
+                    .lock()
+                    .unwrap()
+                    .push((fields.reaped, fields.remaining));
+            }
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct ReapFields {
+        is_reap: bool,
+        reaped: u64,
+        remaining: u64,
+    }
+
+    impl tracing::field::Visit for ReapFields {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" && format!("{value:?}").contains("accept-loop reap pass") {
+                self.is_reap = true;
+            }
+        }
+
+        fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+            match field.name() {
+                "reaped" => self.reaped = value,
+                "remaining" => self.remaining = value,
+                _ => {}
+            }
+        }
     }
 }

@@ -1,5 +1,6 @@
 //! Command tree (PRD 9.1–9.7) and dispatch.
 
+use std::io::IsTerminal as _;
 use std::path::Path;
 
 use clap::Subcommand;
@@ -18,7 +19,12 @@ pub enum Command {
     /// Sign out and clear the session (Milestone 2).
     Logout,
     /// Show account, plan, and entitlement (Milestone 2).
-    Account,
+    Account {
+        /// Machine-readable JSON — the typed FR-7H snapshot
+        /// serialized verbatim (PRD 9.1 automation surface).
+        #[arg(long)]
+        json: bool,
+    },
     /// Credential storage management (Milestone 2).
     Credentials {
         #[command(subcommand)]
@@ -197,16 +203,271 @@ pub fn run(command: &Command, socket: Option<&Path>, no_input: bool) -> RunResul
             let mut client = connect(socket)?;
             client.disconnect_vpn()
         }
+        // The M2 account/servers surface (Codex PR#4 round 2, P1: the
+        // SDK methods existed but no first-party client dispatched to
+        // them — `planned()` caught these commands first).
+        Command::Servers { sub } => servers_command(socket, sub, no_input),
+        Command::Account { json } => account_command(socket, *json),
+        Command::Logout => {
+            let mut client = connect(socket)?;
+            client.logout()
+        }
+        Command::Login => {
+            let is_tty = std::io::stdin().is_terminal();
+            login_with_inputs(socket, is_tty, &mut read_stdin_line)
+        }
+        Command::Credentials { sub } => match sub {
+            None | Some(CredentialsSub::Status) => credentials_status(socket),
+            // The writable-store operations are the S5c/post-M2 lane's.
+            Some(_) => planned_refusal(command),
+        },
         // Everything else is declared surface with an honest refusal.
-        cmd if planned(cmd) => Err(ClientError::Rpc(RpcError::new(
-            RpcErrorCode::NotImplemented,
-            format!(
-                "`{}` is not implemented in milestone 1 (planned: {})",
-                command_name(cmd),
-                planned_milestone(cmd),
-            ),
-        ))),
+        cmd if planned(cmd) => planned_refusal(cmd),
         _ => unreachable!("all commands are either implemented or planned"),
+    }
+}
+
+/// One line from real stdin (the login/confirmation input seam; tests
+/// inject their own reader).
+fn read_stdin_line() -> std::io::Result<String> {
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line)?;
+    Ok(line.trim_end_matches(['\r', '\n']).to_owned())
+}
+
+/// The declared-surface refusal in the module's house style.
+fn planned_refusal(command: &Command) -> RunResult {
+    Err(ClientError::Rpc(RpcError::new(
+        RpcErrorCode::NotImplemented,
+        format!(
+            "`{}` is not implemented yet (planned: {})",
+            command_name(command),
+            planned_milestone(command),
+        ),
+    )))
+}
+
+/// `protonwire servers [refresh --yes]` — the cached catalog, and the
+/// manual refresh with its warned+confirmed ceremony (FR-11/FR-13I).
+fn servers_command(socket: Option<&Path>, sub: &Option<ServersSub>, no_input: bool) -> RunResult {
+    use protonwire_frontend_api::{ConfirmationRequirement, RpcErrorCode};
+    let mut client = connect(socket)?;
+    match sub {
+        None => {
+            let protonwire_client::ServersSnapshot {
+                etag,
+                fetched_unix,
+                body,
+            } = client.servers_list()?;
+            let document: serde_json::Value = body
+                .as_deref()
+                .and_then(|text| serde_json::from_str(text).ok())
+                .unwrap_or(serde_json::Value::Null);
+            let logicals = document
+                .get("LogicalServers")
+                .and_then(|v| v.as_array())
+                .map(|a| a.len())
+                .unwrap_or(0);
+            println!("Servers:            {logicals} (cached catalog)");
+            println!("ETag:               {}", etag.as_deref().unwrap_or("—"));
+            println!(
+                "Fetched (unix):     {}",
+                fetched_unix.map_or("—".to_owned(), |t| t.to_string())
+            );
+            Ok(())
+        }
+        Some(ServersSub::Refresh { yes }) => match client.servers_refresh(None) {
+            Ok(report) => refresh_report_result(&report),
+            Err(ClientError::Rpc(rpc)) if rpc.code == RpcErrorCode::ConfirmationRequired => {
+                let Some(requirement) = ConfirmationRequirement::from_error(&rpc) else {
+                    return Err(ClientError::Rpc(rpc));
+                };
+                eprintln!("warning: {}", requirement.warning);
+                eprintln!(
+                    "  catalog age: {}s; next eligible at unix {}",
+                    requirement.catalog_age_seconds, requirement.next_eligible_unix,
+                );
+                if !*yes {
+                    if no_input {
+                        return Err(ClientError::Rpc(RpcError::new(
+                            RpcErrorCode::InvalidParams,
+                            "an early refresh needs --yes (or an interactive confirm); \
+                                 --no-input refuses the prompt",
+                        )));
+                    }
+                    print!("Refresh now? [y/N] ");
+                    use std::io::Write as _;
+                    std::io::stdout().flush().ok();
+                    let answer = read_stdin_line().unwrap_or_default();
+                    if !answer.eq_ignore_ascii_case("y") {
+                        println!("refresh declined");
+                        return Ok(());
+                    }
+                }
+                let report = client.servers_refresh(Some(&requirement.confirmation_token))?;
+                refresh_report_result(&report)
+            }
+            Err(other) => Err(other),
+        },
+    }
+}
+
+/// Renders the report; an unsuccessful refresh (rate-limited or
+/// failed) renders AND returns a typed error — scripts must distinguish
+/// a refreshed catalog from an unsuccessful attempt by exit code
+/// (Codex PR#4 round 3).
+fn refresh_report_result(report: &protonwire_frontend_api::ServersRefreshReport) -> RunResult {
+    use protonwire_frontend_api::ServersRefreshOutcome;
+    print_refresh_report(report);
+    match &report.outcome {
+        ServersRefreshOutcome::Changed { .. } | ServersRefreshOutcome::NotModified => Ok(()),
+        ServersRefreshOutcome::RateLimited { .. } => Err(ClientError::Rpc(RpcError::new(
+            RpcErrorCode::RateLimited,
+            "the upstream rate-limited the refresh; the suppression deadline governs the \
+             next attempt",
+        ))),
+        ServersRefreshOutcome::Failed { reason } => Err(ClientError::Rpc(RpcError::new(
+            RpcErrorCode::Internal,
+            format!("the refresh failed: {reason}"),
+        ))),
+    }
+}
+
+fn print_refresh_report(report: &protonwire_frontend_api::ServersRefreshReport) {
+    use protonwire_frontend_api::ServersRefreshOutcome;
+    match &report.outcome {
+        ServersRefreshOutcome::Changed { etag } => println!(
+            "Refreshed:          new revision ({})",
+            etag.as_deref().unwrap_or("no etag")
+        ),
+        ServersRefreshOutcome::NotModified => {
+            println!("Refreshed:          catalog unchanged (304)")
+        }
+        ServersRefreshOutcome::RateLimited {
+            retry_after_seconds,
+        } => println!(
+            "Refreshed:          rate-limited (Retry-After {:?}); suppressed until unix {:?}",
+            retry_after_seconds, report.suppression_until_unix
+        ),
+        ServersRefreshOutcome::Failed { reason } => {
+            println!("Refreshed:          FAILED — {reason}")
+        }
+    }
+    println!("Next eligible:      {}", report.next_eligible_unix);
+}
+
+/// `protonwire account [--json]` — the FR-7H snapshot, human-rendered
+/// or serialized verbatim (the automation contract: `--json` prints
+/// the TYPED document, never a human rendering re-parsed).
+fn account_command(socket: Option<&Path>, json: bool) -> RunResult {
+    let mut client = connect(socket)?;
+    let account = client.get_account()?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&account).expect("the typed snapshot serializes")
+        );
+        return Ok(());
+    }
+    // The serde kebab/string forms are the display contract; the Debug
+    // fallback covers a non-string serialization shape.
+    let login_status = &account.login_status;
+    println!(
+        "Login status:       {}",
+        serde_json::to_value(login_status)
+            .ok()
+            .and_then(|v| v.as_str().map(str::to_owned))
+            .unwrap_or_else(|| format!("{login_status:?}"))
+    );
+    let credential_source = &account.credential_source;
+    println!(
+        "Credential source:  {}",
+        serde_json::to_value(credential_source)
+            .ok()
+            .and_then(|v| v.as_str().map(str::to_owned))
+            .unwrap_or_else(|| format!("{credential_source:?}"))
+    );
+    println!(
+        "Writable store:     declared {}, priority {:?}",
+        account.writable_store.declared, account.writable_store.priority
+    );
+    // Absence is the wire contract's UNKNOWN (not-yet-wired) — never
+    // fabricated into a verdict (Codex PR#4 round 3).
+    println!(
+        "Persistence health: {}",
+        account.persistence_health.as_ref().map_or_else(
+            || "unknown (no writable store reporting)".to_owned(),
+            |h| serde_json::to_string(h).unwrap_or_else(|_| format!("{h:?}"))
+        )
+    );
+    Ok(())
+}
+
+/// `protonwire credentials` (status view): the credential facts of the
+/// FR-7H snapshot.
+fn credentials_status(socket: Option<&Path>) -> RunResult {
+    account_command(socket, false)
+}
+
+/// `protonwire login` — interactive-source login over the SDK.
+///
+/// Credentials arrive on NON-TTY stdin only (piped/scripted use): a
+/// terminal prompt would echo the password (no echo control in std,
+/// and the rpassword dependency waits for the M8 frontend polish with
+/// its own audit). On a TTY the command refuses with guidance —
+/// fail-closed, never an echoed secret.
+fn login_with_inputs(
+    socket: Option<&Path>,
+    is_tty: bool,
+    read_line: &mut dyn FnMut() -> std::io::Result<String>,
+) -> RunResult {
+    use protonwire_frontend_api::LoginOutcome;
+    if is_tty {
+        return Err(ClientError::Rpc(RpcError::new(
+            RpcErrorCode::InvalidParams,
+            "login reads credentials from stdin (username, then password) when piped; a \
+             terminal prompt would echo the password — pipe them, or use the credential \
+             stores",
+        )));
+    }
+    let read_err = |e: std::io::Error| {
+        ClientError::Rpc(RpcError::new(RpcErrorCode::InvalidParams, e.to_string()))
+    };
+    let username = read_line().map_err(read_err)?;
+    let password = read_line().map_err(read_err)?;
+    let mut client = connect(socket)?;
+    match client.begin_login(username, password)? {
+        LoginOutcome::Session { user_id, .. } => {
+            println!("Signed in as {user_id}.");
+            Ok(())
+        }
+        LoginOutcome::Challenge { totp_enabled, .. } => {
+            if !totp_enabled {
+                return Err(ClientError::Rpc(RpcError::new(
+                    RpcErrorCode::UnsupportedChallenge,
+                    "the account requires a second factor this build cannot supply \
+                     non-interactively",
+                )));
+            }
+            print!("Two-factor code: ");
+            use std::io::Write as _;
+            std::io::stdout().flush().ok();
+            let code = read_line().map_err(read_err)?;
+            match client.submit_two_factor(code)? {
+                LoginOutcome::Session { user_id, .. } => {
+                    println!("Signed in as {user_id}.");
+                    Ok(())
+                }
+                other => Err(ClientError::Rpc(RpcError::new(
+                    RpcErrorCode::InvalidParams,
+                    format!("login did not complete: {other:?}"),
+                ))),
+            }
+        }
+        LoginOutcome::Blocked { reason } => Err(ClientError::Rpc(RpcError::new(
+            RpcErrorCode::UpstreamCapabilityBlocked,
+            format!("{reason:?}"),
+        ))),
     }
 }
 
@@ -310,12 +571,30 @@ fn connect_modifier_refusal(
 
 /// Commands with declared-but-unimplemented surfaces.
 fn planned(command: &Command) -> bool {
-    !matches!(
+    matches!(
         command,
-        Command::Status { .. }
-            | Command::Daemon { .. }
-            | Command::Connect { .. }
-            | Command::Disconnect
+        Command::Protocols
+            | Command::Integration
+            | Command::ChangeServer
+            | Command::Reconnect
+            | Command::Group
+            | Command::Select { .. }
+            | Command::Config
+            | Command::Profile
+            | Command::Split
+            | Command::Dns
+            | Command::Port
+            | Command::Killswitch
+            | Command::Lan
+            | Command::Debug { .. }
+            // The writable-store operations (S5c's brokered lane).
+            | Command::Credentials {
+                sub: Some(
+                    CredentialsSub::Migrate { .. }
+                    | CredentialsSub::ImportProvisionedSession { .. }
+                    | CredentialsSub::ForgetPassword
+                ),
+            }
     )
 }
 
@@ -323,7 +602,7 @@ fn command_name(command: &Command) -> String {
     match command {
         Command::Login => "login".into(),
         Command::Logout => "logout".into(),
-        Command::Account => "account".into(),
+        Command::Account { .. } => "account".into(),
         Command::Credentials { .. } => "credentials".into(),
         Command::Protocols => "protocols".into(),
         Command::Integration => "integration".into(),
@@ -349,11 +628,8 @@ fn command_name(command: &Command) -> String {
 
 fn planned_milestone(command: &Command) -> &'static str {
     match command {
-        Command::Login | Command::Logout | Command::Account | Command::Credentials { .. } => {
-            "milestone 2 — Muon authentication and credential stores"
-        }
-        Command::Servers { .. } | Command::Config => {
-            "milestone 2 — server catalog and configuration overlays"
+        Command::Credentials { .. } | Command::Config => {
+            "the post-M2 writable-store and overlay lanes"
         }
         Command::Group | Command::Select { .. } => "milestone 3 — selection and groups",
         Command::Protocols | Command::Reconnect => "milestone 4 — ProTUN engine",
@@ -416,9 +692,69 @@ mod tests {
 
     #[test]
     fn planned_commands_return_typed_refusals() {
-        let err = run(&Command::Login, None, true).expect_err("refusal");
+        // Login/Logout/Account/Servers dispatch for real now (the M2
+        // surface); the refusal contract is pinned on a still-planned
+        // command.
+        let err = run(&Command::Protocols, None, true).expect_err("refusal");
         assert_eq!(err.exit_code(), 1);
-        assert!(err.to_string().contains("milestone 2"));
+        assert!(err.to_string().contains("milestone 4"));
+    }
+
+    /// The M2 dispatch (Codex PR#4 round 2, P1): login/logout/account/
+    /// servers reach the CLIENT, not the planned-refusal catch-all.
+    /// Without a daemon the dispatch ends in the SDK's typed
+    /// connection error — proving the arm routes to the client
+    /// machinery instead of the declared-surface refusal.
+    #[test]
+    fn the_m2_commands_dispatch_to_the_client_not_the_refusal() {
+        for command in [
+            Command::Logout,
+            Command::Account { json: false },
+            Command::Servers { sub: None },
+            Command::Servers {
+                sub: Some(ServersSub::Refresh { yes: true }),
+            },
+            Command::Credentials { sub: None },
+        ] {
+            let err = run(&command, None, true).expect_err("no daemon is listening");
+            assert_ne!(
+                err.exit_code(),
+                1,
+                "`{err}` must not be the planned-refusal exit; the dispatch reaches the client",
+            );
+            assert!(
+                !err.to_string().contains("planned"),
+                "the M2 commands are implemented, not planned: {err}"
+            );
+        }
+    }
+
+    /// Login on a TTY refuses BEFORE any connection or credential
+    /// reading: a terminal prompt would echo the password (no echo
+    /// control in std; the rpassword dependency rides the M8 audit) —
+    /// fail-closed with piped-credential guidance.
+    #[test]
+    fn login_on_a_tty_refuses_rather_than_echo_the_password() {
+        let err = login_with_inputs(None, true, &mut || unimplemented!("never read on a tty"))
+            .expect_err("the tty gate refuses before reading");
+        assert!(err.to_string().contains("pipe"), "guidance: {err}");
+        assert!(err.to_string().contains("echo"), "names the hazard: {err}");
+    }
+
+    /// Login with piped inputs drives the full SDK flow (the reader
+    /// seam): username, password, and — on a TOTP challenge — the
+    /// code line. Without a daemon the flow ends in the typed
+    /// connection error, AFTER the inputs were consumed.
+    #[test]
+    fn login_with_piped_inputs_consumes_credentials_and_reaches_the_client() {
+        let lines = std::cell::Cell::new(0u32);
+        let mut reader = || {
+            lines.set(lines.get() + 1);
+            Ok::<_, std::io::Error>("value".to_owned())
+        };
+        let err = login_with_inputs(None, false, &mut reader).expect_err("no daemon");
+        assert_eq!(lines.get(), 2, "username and password were read");
+        assert_ne!(err.exit_code(), 1, "not the planned refusal: {err}");
     }
 
     /// Review-fix V2: the Connect arm used to discard `--by`/`--protocol`/
@@ -520,11 +856,13 @@ mod tests {
         }
     }
 
-    /// The documented `protonwire servers refresh [--yes]` (PRD ~789-790)
-    /// must reach the milestone-2 refusal — before the subcommand fix it
-    /// panicked in clap's debug asserts and never dispatched at all.
+    /// The `protonwire servers [refresh --yes]` dispatch reaches the
+    /// CLIENT now (the M2 surface; Codex PR#4 round 2): without a
+    /// daemon, the typed connection error — never the planned refusal,
+    /// and never a clap panic (the subcommand fix this test's ancestor
+    /// guarded).
     #[test]
-    fn servers_refresh_returns_milestone2_refusal() {
+    fn servers_commands_dispatch_to_the_client() {
         for yes in [false, true] {
             let err = run(
                 &Command::Servers {
@@ -533,16 +871,14 @@ mod tests {
                 None,
                 true,
             )
-            .expect_err("servers refresh must refuse in milestone 1");
-            assert_eq!(err.exit_code(), 1);
-            let message = err.to_string();
-            assert!(message.contains("`servers refresh`"), "in: {message}");
-            assert!(message.contains("milestone 2"), "in: {message}");
+            .expect_err("no daemon is listening");
+            assert_ne!(err.exit_code(), 1, "not the planned refusal: {err}");
+            assert!(!err.to_string().contains("planned"), "dispatched: {err}");
         }
 
-        let err = run(&Command::Servers { sub: None }, None, true)
-            .expect_err("bare servers must refuse in milestone 1");
-        assert!(err.to_string().contains("milestone 2"));
+        let err =
+            run(&Command::Servers { sub: None }, None, true).expect_err("no daemon is listening");
+        assert!(!err.to_string().contains("planned"), "dispatched: {err}");
     }
 
     /// Round 7 (Zj_QN) — the class killer: EVERY `Command` variant must
@@ -567,7 +903,7 @@ mod tests {
             match command {
                 Command::Login
                 | Command::Logout
-                | Command::Account
+                | Command::Account { .. }
                 | Command::Credentials { .. }
                 | Command::Protocols
                 | Command::Integration
@@ -598,7 +934,7 @@ mod tests {
         let cases: Vec<(&str, Command)> = vec![
             ("login", Command::Login),
             ("logout", Command::Logout),
-            ("account", Command::Account),
+            ("account", Command::Account { json: false }),
             ("credentials", Command::Credentials { sub: None }),
             ("protocols", Command::Protocols),
             ("integration", Command::Integration),

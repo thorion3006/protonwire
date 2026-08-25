@@ -1,21 +1,48 @@
 //! Typed configuration schema with authority classes (PRD section 10).
 //!
+//! The module family: this module owns the system document —
+//! [`SystemConfig`], the load paths (`load`, `load_strict`), cross-field
+//! `validate`, the [`Authority`] table, and [`ConfigLoadError`];
+//! `sections` owns the section and enum types the document is composed
+//! of; `overlay` owns the per-UID [`UserOverlay`] document, its S11
+//! loader ([`overlay_path`], [`UserOverlay::load_for_uid`]) and merge
+//! ([`UserOverlay::merged_over`], [`effective_config`]).
+//!
 //! The system document is root-owned and host-global. The per-UID overlay is
 //! a separate document restricted to presentation preferences and per-user
 //! selectors; it uses `deny_unknown_fields`, so any attempt to express a
-//! system-only setting in an overlay is a parse error (the daemon revalidates
-//! on its side as well — T-37 lands with the overlay IPC in Milestone 2).
+//! system-only setting in an overlay is a parse error (the daemon
+//! revalidates at its consult seam — the client-submitted typed-overlay
+//! wire surface is the remaining T-37 half).
 //!
 //! `lan.policy` is the single global LAN setting; there is deliberately no
 //! `features.lan_access` configuration field (PRD section 10 closing rule).
 
-use std::collections::BTreeMap;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
 use crate::fs_trust::{FsTrustError, MissingLeaf, verify_trusted_path};
 use crate::yaml;
+
+mod overlay;
+mod sections;
+
+pub use overlay::{
+    OutputFormat, OverlayError, OverlayFeatures, OverlayProfileDefault, OverlayProfileSelection,
+    OverlayProfiles, PRODUCTION_OVERLAY_BASE, UserOverlay, UserPresentation, effective_config,
+    overlay_path,
+};
+pub use sections::{
+    AccountSection, AutoConnectRetry, AutoConnectSection, BalancedWeights, ConnectionGroupsSection,
+    ConnectionSection, ConnectionType, CredentialInputSource, DaemonSection, DnsLeakProtection,
+    DnsMode, DnsPolicy, DnsSection, FeaturesSection, Ipv6Mode, Ipv6Section, KillSwitchMode,
+    LanPolicy, LanSection, LatencyProbeSection, MetadataCacheSection, NatMode, NetShieldLevel,
+    NetworkIntegrationMode, ProbeTransport, ProfileDefault, ProfileRanking, ProfileSelection,
+    ProfilesSection, ProtocolMode, ProtunSection, RegionalRanking, SecureCoreSection,
+    ServerSelectionSection, SplitRuleAction, SplitTunnelDomainRule, SplitTunnelDomains,
+    SplitTunnelMode, SplitTunnelSection, WritableSessionStore,
+};
 
 /// Who may set a field (PRD section 10).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -25,647 +52,6 @@ pub enum Authority {
     System,
     /// The per-UID user overlay, within administrator ceilings.
     PerUser,
-}
-
-/// Daemon section.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, default)]
-pub struct DaemonSection {
-    /// IPC socket path override (system authority).
-    pub socket_path: Option<String>,
-    /// Group the IPC socket is chowned to so unprivileged clients can
-    /// reach it (system authority). Defaults to `Some("protonwire")` — the
-    /// group the shipped package provisions (R9-1): with the old `None`
-    /// default a standard root launch left the socket root:root 0660 and
-    /// every unprivileged client ate EACCES while PRD 433 requires clients
-    /// to run unprivileged. An explicit `null` opts out (no chown); the
-    /// daemon's bind path applies the chown only when running as root, so
-    /// non-root dev launches are unaffected (see `IpcServer::bind_with_group`).
-    pub socket_group: Option<String>,
-    /// TUN interface name.
-    pub interface_name: String,
-    /// Log verbosity.
-    pub log_level: String,
-    /// Uplink integration mode.
-    pub network_integration: NetworkIntegrationMode,
-}
-
-impl Default for DaemonSection {
-    fn default() -> Self {
-        Self {
-            socket_path: None,
-            socket_group: Some("protonwire".into()),
-            interface_name: "protonwire0".into(),
-            log_level: "info".into(),
-            network_integration: NetworkIntegrationMode::Auto,
-        }
-    }
-}
-
-/// Integration modes (PRD 6.6).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "kebab-case")]
-pub enum NetworkIntegrationMode {
-    /// NetworkManager or networkd when either owns the uplink, else native.
-    #[default]
-    Auto,
-    /// Direct netlink observation.
-    Native,
-    /// Cooperate with NetworkManager.
-    NetworkManager,
-    /// Cooperate with systemd-networkd.
-    Networkd,
-}
-
-impl From<NetworkIntegrationMode> for protonwire_frontend_api::NetworkIntegration {
-    fn from(mode: NetworkIntegrationMode) -> Self {
-        use protonwire_frontend_api::NetworkIntegration as N;
-        match mode {
-            NetworkIntegrationMode::Auto => N::Auto,
-            NetworkIntegrationMode::Native => N::Native,
-            NetworkIntegrationMode::NetworkManager => N::NetworkManager,
-            NetworkIntegrationMode::Networkd => N::Networkd,
-        }
-    }
-}
-
-/// Account credential section.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, default)]
-pub struct AccountSection {
-    /// Writable session store: `auto`, `keyring`, `tpm2`,
-    /// `encrypted-local`, or `none`.
-    pub writable_session_store: String,
-    /// Priority order of writable stores.
-    pub writable_store_priority: Vec<String>,
-    /// Credential input source: `interactive` or `systemd`.
-    pub credential_input_source: String,
-    /// Whether to import a provisioned session at boot.
-    pub import_provisioned_session: bool,
-    /// Whether a password may be stored at all.
-    pub allow_password_storage: bool,
-    /// Prefer token over password storage.
-    pub prefer_token_storage: bool,
-    /// Explicitly-enabled encrypted local fallback.
-    pub encrypted_local_fallback: bool,
-    /// systemd credential names.
-    pub systemd_credential_names: BTreeMap<String, String>,
-}
-
-impl Default for AccountSection {
-    fn default() -> Self {
-        let mut systemd_credential_names = BTreeMap::new();
-        systemd_credential_names.insert("session".to_owned(), "protonwire-session".to_owned());
-        systemd_credential_names.insert("username".to_owned(), "protonwire-username".to_owned());
-        systemd_credential_names.insert("password".to_owned(), "protonwire-password".to_owned());
-        Self {
-            writable_session_store: "auto".into(),
-            writable_store_priority: vec![
-                "keyring".into(),
-                "tpm2".into(),
-                "encrypted-local".into(),
-            ],
-            credential_input_source: "interactive".into(),
-            import_provisioned_session: false,
-            allow_password_storage: false,
-            prefer_token_storage: true,
-            encrypted_local_fallback: false,
-            systemd_credential_names,
-        }
-    }
-}
-
-/// Server-selection section.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, default)]
-pub struct ServerSelectionSection {
-    /// Metadata cache policy.
-    pub metadata_cache: MetadataCacheSection,
-    /// Latency probing policy.
-    pub latency_probe: LatencyProbeSection,
-    /// `balanced` policy weights.
-    pub balanced_weights: BalancedWeights,
-    /// Secure Core defaults.
-    pub secure_core: SecureCoreSection,
-}
-
-/// Metadata cache policy. The refresh interval floor is a hard product rule:
-/// three hours (PRD FR-10..FR-13).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, default)]
-pub struct MetadataCacheSection {
-    /// Minimum automatic refresh interval in hours.
-    pub refresh_interval_hours: u32,
-    /// Maximum positive jitter in minutes.
-    pub max_positive_jitter_minutes: u32,
-    /// ETag/If-None-Match usage.
-    pub conditional_requests: bool,
-    /// Age beyond which the cache is treated as an emergency.
-    pub emergency_max_age_hours: u32,
-}
-
-impl Default for MetadataCacheSection {
-    fn default() -> Self {
-        Self {
-            refresh_interval_hours: 3,
-            max_positive_jitter_minutes: 10,
-            conditional_requests: true,
-            emergency_max_age_hours: 24,
-        }
-    }
-}
-
-/// Latency probing policy.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, default)]
-pub struct LatencyProbeSection {
-    /// Whether on-demand probing may run at all.
-    pub enabled: bool,
-    /// Shortlist size.
-    pub max_candidates: u32,
-    /// Per-probe timeout.
-    pub timeout_ms: u32,
-    /// Concurrency bound.
-    pub parallelism: u32,
-    /// Minimum age before a cached result is reused.
-    pub result_min_age_minutes: u32,
-    /// Background scanning is forbidden by contract.
-    pub background_scan: bool,
-    /// `tcp-udp` (default) or `icmp` (opt-in, CAP_NET_RAW).
-    pub transport: String,
-}
-
-impl Default for LatencyProbeSection {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            max_candidates: 20,
-            timeout_ms: 750,
-            parallelism: 4,
-            result_min_age_minutes: 15,
-            background_scan: false,
-            transport: "tcp-udp".into(),
-        }
-    }
-}
-
-/// Weights of the ProtonWire `balanced` policy (PRD 7.3).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, default)]
-pub struct BalancedWeights {
-    /// Weight of Proton-exposed load.
-    pub load: f32,
-    /// Weight of measured latency.
-    pub latency: f32,
-    /// Weight of stability history.
-    pub stability: f32,
-    /// Weight of feature match.
-    pub feature_match: f32,
-}
-
-impl Default for BalancedWeights {
-    fn default() -> Self {
-        Self {
-            load: 0.40,
-            latency: 0.40,
-            stability: 0.15,
-            feature_match: 0.05,
-        }
-    }
-}
-
-/// Secure Core selection defaults.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, default)]
-pub struct SecureCoreSection {
-    /// Secure Core on by default.
-    pub enabled_by_default: bool,
-    /// Preferred entry countries.
-    pub preferred_entry_countries: Vec<String>,
-    /// Excluded entry countries.
-    pub excluded_entry_countries: Vec<String>,
-    /// Excluded exit countries.
-    pub excluded_exit_countries: Vec<String>,
-}
-
-/// Connection-group section.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, default)]
-pub struct ConnectionGroupsSection {
-    /// Explicit physical-country override (ISO 3166-1 alpha-2), else the
-    /// cached Muon user location is used.
-    pub physical_country: Option<String>,
-    /// Region taxonomy id; must match the catalog.
-    pub region_taxonomy: String,
-    /// Default ranking of regional groups.
-    pub regional_default_ranking: String,
-}
-
-impl Default for ConnectionGroupsSection {
-    fn default() -> Self {
-        Self {
-            physical_country: None,
-            region_taxonomy: "un-m49-six-continent-view".into(),
-            regional_default_ranking: "proton-score".into(),
-        }
-    }
-}
-
-/// Connection defaults.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, default)]
-pub struct ConnectionSection {
-    /// Default connect target.
-    pub default: String,
-    /// Default protocol.
-    pub protocol: String,
-    /// ProTUN tuning.
-    pub protun: ProtunSection,
-    /// IPv6 handling.
-    pub ipv6: Ipv6Section,
-}
-
-impl Default for ConnectionSection {
-    fn default() -> Self {
-        Self {
-            default: "fastest".into(),
-            protocol: "smart".into(),
-            protun: ProtunSection::default(),
-            ipv6: Ipv6Section::default(),
-        }
-    }
-}
-
-/// ProTUN tuning.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, default)]
-pub struct ProtunSection {
-    /// MTU: `auto` or a number.
-    pub mtu: String,
-    /// SNI strategy for TLS-based transports.
-    pub sni_strategy: String,
-}
-
-impl Default for ProtunSection {
-    fn default() -> Self {
-        Self {
-            mtu: "auto".into(),
-            sni_strategy: "random".into(),
-        }
-    }
-}
-
-/// IPv6 handling.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, default)]
-pub struct Ipv6Section {
-    /// `auto`, `enabled`, or `disabled`.
-    pub mode: String,
-}
-
-impl Default for Ipv6Section {
-    fn default() -> Self {
-        Self {
-            mode: "auto".into(),
-        }
-    }
-}
-
-/// Feature defaults.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, default)]
-pub struct FeaturesSection {
-    /// Secure Core requested.
-    pub secure_core: bool,
-    /// Kill switch mode.
-    pub kill_switch: KillSwitchMode,
-    /// Split tunnel mode.
-    pub split_tunnel: SplitTunnelMode,
-    /// NetShield level.
-    pub netshield: NetShieldLevel,
-    /// Port forwarding requested.
-    pub port_forwarding: bool,
-    /// NAT mode.
-    pub nat: NatMode,
-    /// VPN Accelerator requested.
-    pub vpn_accelerator: bool,
-}
-
-impl Default for FeaturesSection {
-    fn default() -> Self {
-        Self {
-            secure_core: false,
-            kill_switch: KillSwitchMode::On,
-            split_tunnel: SplitTunnelMode::Off,
-            netshield: NetShieldLevel::AdsTrackersMalware,
-            port_forwarding: false,
-            nat: NatMode::Strict,
-            vpn_accelerator: true,
-        }
-    }
-}
-
-/// Kill switch modes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "kebab-case")]
-pub enum KillSwitchMode {
-    /// No kill switch.
-    Off,
-    /// Kill switch while the daemon runs.
-    #[default]
-    On,
-    /// Survives daemon stop/crash until explicit disable.
-    Permanent,
-}
-
-/// Split tunnel modes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "kebab-case")]
-pub enum SplitTunnelMode {
-    /// Disabled.
-    #[default]
-    Off,
-    /// Listed traffic bypasses the tunnel.
-    Exclude,
-    /// Only listed traffic uses the tunnel.
-    Include,
-}
-
-/// NetShield levels.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "kebab-case")]
-pub enum NetShieldLevel {
-    /// No filtering.
-    Off,
-    /// Malware only.
-    Malware,
-    /// Ads, trackers, malware.
-    #[default]
-    AdsTrackersMalware,
-    /// Adult content plus ads, trackers, malware.
-    AdultAdsTrackersMalware,
-}
-
-/// NAT modes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "kebab-case")]
-pub enum NatMode {
-    /// Strict (symmetric) NAT.
-    #[default]
-    Strict,
-    /// Moderate NAT; incompatible with port forwarding.
-    Moderate,
-}
-
-/// DNS section.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, default)]
-pub struct DnsSection {
-    /// DNS mode.
-    pub mode: DnsMode,
-    /// Custom resolvers for `custom` mode.
-    pub custom_servers: Vec<String>,
-    /// Whether DNS is routed through the tunnel.
-    pub policy: String,
-    /// Leak protection strictness.
-    pub leak_protection: String,
-    /// Resolvers owned by other software that ProtonWire must not touch.
-    pub externally_managed_resolvers: Vec<String>,
-}
-
-impl Default for DnsSection {
-    fn default() -> Self {
-        Self {
-            mode: DnsMode::Proton,
-            custom_servers: Vec::new(),
-            policy: "through-vpn".into(),
-            leak_protection: "strict".into(),
-            externally_managed_resolvers: Vec::new(),
-        }
-    }
-}
-
-/// DNS modes (PRD 7.6).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "kebab-case")]
-pub enum DnsMode {
-    /// Proton's DNS through the tunnel.
-    #[default]
-    Proton,
-    /// User-supplied resolvers through the tunnel.
-    Custom,
-    /// Host resolver untouched (requires leak acknowledgment).
-    System,
-    /// No DNS configuration at all.
-    None,
-}
-
-/// LAN policy section. `policy` is the sole global LAN setting.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, default)]
-pub struct LanSection {
-    /// Whether LAN traffic may bypass the tunnel.
-    pub policy: LanPolicy,
-    /// CIDRs considered LAN.
-    pub allowed_cidrs: Vec<String>,
-}
-
-impl Default for LanSection {
-    fn default() -> Self {
-        Self {
-            policy: LanPolicy::Allow,
-            allowed_cidrs: vec![
-                "10.0.0.0/8".into(),
-                "172.16.0.0/12".into(),
-                "192.168.0.0/16".into(),
-                "fd00::/8".into(),
-                "fe80::/10".into(),
-            ],
-        }
-    }
-}
-
-/// LAN policy values.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "kebab-case")]
-pub enum LanPolicy {
-    /// LAN traffic bypasses the tunnel.
-    #[default]
-    Allow,
-    /// LAN traffic is blocked (group presets like Max security use this).
-    Block,
-}
-
-/// Split tunnel configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, default)]
-pub struct SplitTunnelSection {
-    /// Split tunnel mode.
-    pub mode: SplitTunnelMode,
-    /// Whether running processes may be attached best-effort.
-    pub attach_existing_processes: bool,
-    /// Domain rule policy.
-    pub domains: SplitTunnelDomains,
-}
-
-impl Default for SplitTunnelSection {
-    fn default() -> Self {
-        Self {
-            mode: SplitTunnelMode::Off,
-            attach_existing_processes: false,
-            domains: SplitTunnelDomains::default(),
-        }
-    }
-}
-
-/// Domain split tunneling policy.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, default)]
-pub struct SplitTunnelDomains {
-    /// Domain rules enabled.
-    pub enabled: bool,
-    /// Resolve via DNS observation.
-    pub resolver_observation: bool,
-    /// Refresh IP sets on TTL expiry.
-    pub refresh_on_ttl: bool,
-    /// Domain rules.
-    pub rules: Vec<SplitTunnelDomainRule>,
-}
-
-impl Default for SplitTunnelDomains {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            resolver_observation: true,
-            refresh_on_ttl: true,
-            rules: Vec::new(),
-        }
-    }
-}
-
-/// One domain split tunnel rule.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, default)]
-pub struct SplitTunnelDomainRule {
-    /// Domain pattern (`*.example.com` supported).
-    pub domain: String,
-    /// `bypass` or `vpn`.
-    pub action: String,
-    /// TTL handling policy.
-    pub ttl_policy: String,
-}
-
-impl Default for SplitTunnelDomainRule {
-    fn default() -> Self {
-        Self {
-            domain: String::new(),
-            action: "bypass".into(),
-            ttl_policy: "respect_dns_ttl".into(),
-        }
-    }
-}
-
-/// Auto-connect policy.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, default)]
-pub struct AutoConnectSection {
-    /// Auto-connect at boot.
-    pub enabled: bool,
-    /// Target for auto-connect.
-    pub target: String,
-    /// Retry policy.
-    pub retry: AutoConnectRetry,
-}
-
-impl Default for AutoConnectSection {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            target: "fastest".into(),
-            retry: AutoConnectRetry::default(),
-        }
-    }
-}
-
-/// Auto-connect retry policy.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, default)]
-pub struct AutoConnectRetry {
-    /// Maximum attempts (0 = unlimited).
-    pub max_attempts: u32,
-    /// First backoff delay.
-    pub initial_delay_seconds: u32,
-    /// Backoff ceiling.
-    pub max_delay_seconds: u32,
-    /// Whether jitter is applied.
-    pub jitter: bool,
-}
-
-impl Default for AutoConnectRetry {
-    fn default() -> Self {
-        Self {
-            max_attempts: 0,
-            initial_delay_seconds: 2,
-            max_delay_seconds: 300,
-            jitter: true,
-        }
-    }
-}
-
-/// Default profile.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, default)]
-pub struct ProfileDefault {
-    /// `standard`, `secure-core`, `p2p`, `tor`, or `gateway`.
-    pub connection_type: String,
-    /// Protocol.
-    pub protocol: String,
-    /// Selection defaults.
-    pub selection: ProfileSelection,
-}
-
-impl Default for ProfileDefault {
-    fn default() -> Self {
-        Self {
-            connection_type: "standard".into(),
-            protocol: "smart".into(),
-            selection: ProfileSelection::default(),
-        }
-    }
-}
-
-/// Default profile selection.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, default)]
-pub struct ProfileSelection {
-    /// Selection mode.
-    pub mode: String,
-    /// Ranking policy.
-    pub by: String,
-    /// Excluded countries.
-    pub exclude_countries: Vec<String>,
-    /// Required features.
-    pub require: Vec<String>,
-}
-
-impl Default for ProfileSelection {
-    fn default() -> Self {
-        Self {
-            mode: "fastest".into(),
-            by: "official".into(),
-            exclude_countries: Vec::new(),
-            require: Vec::new(),
-        }
-    }
-}
-
-/// Profiles section (system-side defaults; per-UID profiles arrive with
-/// Milestone 6 profile storage).
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, default)]
-pub struct ProfilesSection {
-    /// The default profile template.
-    pub default: ProfileDefault,
 }
 
 /// The root system configuration document.
@@ -882,22 +268,84 @@ impl SystemConfig {
             violations
                 .push("dns.mode=custom requires at least one dns.custom_servers entry".to_owned());
         }
-        if !matches!(
-            self.account.credential_input_source.as_str(),
-            "interactive" | "systemd"
-        ) {
+        // FR-49: the off-tunnel DNS policies are deliberate leak
+        // exceptions and are only expressible with leak protection off.
+        if matches!(
+            self.dns.policy,
+            sections::DnsPolicy::BypassVpn | sections::DnsPolicy::SystemDefault
+        ) && self.dns.leak_protection != sections::DnsLeakProtection::Off
+        {
+            violations.push(
+                "dns.policy=bypass-vpn and dns.policy=system-default are leak exceptions \
+                 requiring dns.leak_protection=off (FR-49)"
+                    .to_owned(),
+            );
+        }
+        // `auto` and `none` name resolution policy for
+        // `writable_session_store`; a priority list drives that resolution
+        // (S5a) and must name concrete stores (PRD section 10 example and
+        // section 9.6 migrate targets).
+        if self.account.writable_store_priority.iter().any(|store| {
+            !matches!(
+                store,
+                sections::WritableSessionStore::Keyring
+                    | sections::WritableSessionStore::Tpm2
+                    | sections::WritableSessionStore::EncryptedLocal
+            )
+        }) {
             violations.push(format!(
-                "account.credential_input_source must be interactive or systemd (found {})",
-                self.account.credential_input_source
+                "account.writable_store_priority entries must be concrete stores \
+                 (`keyring`, `tpm2`, `encrypted-local`), not `auto` or `none` (found {})",
+                self.account
+                    .writable_store_priority
+                    .iter()
+                    .map(|store| store.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ));
         }
-        if !matches!(
-            self.server_selection.latency_probe.transport.as_str(),
-            "tcp-udp" | "icmp"
-        ) {
+        // Rust-review S3 fix 2: the three PRD-attested selector shapes
+        // deliberately left as `String` (their vocabularies are a single
+        // attested value or open suffixes an enum would over-pin) are
+        // checked here, at validate.
+        //
+        // `ttl_policy`: section 10's example attests exactly one spelling.
+        for (index, rule) in self.split_tunnel.domains.rules.iter().enumerate() {
+            if rule.ttl_policy != "respect_dns_ttl" {
+                violations.push(format!(
+                    "split_tunnel.domains.rules[{index}].ttl_policy must be \
+                     `respect_dns_ttl` (found `{}`)",
+                    rule.ttl_policy
+                ));
+            }
+        }
+        // `mtu`: section 10 attests `auto`; the numeric arm accepts any
+        // realistic tunnel MTU. 128..=9000 is a sanity bound, not a
+        // product rule (disclosed in the message).
+        let mtu = &self.connection.protun.mtu;
+        let mtu_valid = mtu == "auto"
+            || mtu
+                .parse::<u16>()
+                .is_ok_and(|value| (128..=9000).contains(&value));
+        if !mtu_valid {
             violations.push(format!(
-                "server_selection.latency_probe.transport must be tcp-udp or icmp (found {})",
-                self.server_selection.latency_probe.transport
+                "connection.protun.mtu must be `auto` or an integer between \
+                 128 and 9000 (found `{mtu}`)"
+            ));
+        }
+        // `default`: section 10's literal comment enumerates the accepted
+        // prefixes `fastest|random|last|group:<namespaced-id>|profile:<name>`.
+        // The prefix check accepts the open suffixes; the full selector
+        // grammar (country/state/city/server arms) is the CLI's, and S9's
+        // CLI grammar will be the stricter validator.
+        let default = &self.connection.default;
+        if !["fastest", "random", "last", "group:", "profile:"]
+            .iter()
+            .any(|prefix| default.starts_with(prefix))
+        {
+            violations.push(format!(
+                "connection.default must be one of `fastest`, `random`, `last`, \
+                 `group:<namespaced-id>`, `profile:<name>` (found `{default}`)"
             ));
         }
         if violations.is_empty() {
@@ -908,23 +356,158 @@ impl SystemConfig {
     }
 
     /// Field-level authority report used by tests and diagnostics. Paths use
-    /// dotted notation against the document root.
+    /// dotted notation against the document root. CONTRACT (T-37
+    /// groundwork, PRD section 10: "the versioned schema must tag every
+    /// field with its authority class"): the table carries exactly one
+    /// entry per FIELD of the typed surface — the
+    /// `authority_report_covers_every_typed_field` test walks a
+    /// fully-populated document and fails if any field is missing or any
+    /// entry is stale. Sequence-of-structure fields list both the field
+    /// itself (the `rules: []` form) and each element field
+    /// (`rules[].action`). Classification mirrors the pre-S3 section-level
+    /// table (features/profiles per-user, everything else system);
+    /// per-field refinements land with T-37's overlay ceilings.
     pub fn authority_report(&self) -> Vec<(&'static str, Authority)> {
         vec![
-            ("daemon", Authority::System),
-            ("account", Authority::System),
-            ("server_selection.metadata_cache", Authority::System),
-            ("server_selection.latency_probe", Authority::System),
-            ("server_selection.balanced_weights", Authority::System),
-            ("server_selection.secure_core", Authority::System),
-            ("connection_groups", Authority::System),
-            ("connection", Authority::System),
-            ("dns", Authority::System),
-            ("lan", Authority::System),
-            ("split_tunnel", Authority::System),
-            ("auto_connect", Authority::System),
-            ("features", Authority::PerUser),
-            ("profiles", Authority::PerUser),
+            ("schema_version", Authority::System),
+            ("daemon.socket_path", Authority::System),
+            ("daemon.socket_group", Authority::System),
+            ("daemon.interface_name", Authority::System),
+            ("daemon.log_level", Authority::System),
+            ("daemon.network_integration", Authority::System),
+            ("account.writable_session_store", Authority::System),
+            ("account.writable_store_priority", Authority::System),
+            ("account.credential_input_source", Authority::System),
+            ("account.import_provisioned_session", Authority::System),
+            ("account.allow_password_storage", Authority::System),
+            ("account.prefer_token_storage", Authority::System),
+            ("account.encrypted_local_fallback", Authority::System),
+            ("account.systemd_credential_names", Authority::System),
+            (
+                "server_selection.metadata_cache.refresh_interval_hours",
+                Authority::System,
+            ),
+            (
+                "server_selection.metadata_cache.max_positive_jitter_minutes",
+                Authority::System,
+            ),
+            (
+                "server_selection.metadata_cache.conditional_requests",
+                Authority::System,
+            ),
+            (
+                "server_selection.metadata_cache.emergency_max_age_hours",
+                Authority::System,
+            ),
+            ("server_selection.latency_probe.enabled", Authority::System),
+            (
+                "server_selection.latency_probe.max_candidates",
+                Authority::System,
+            ),
+            (
+                "server_selection.latency_probe.timeout_ms",
+                Authority::System,
+            ),
+            (
+                "server_selection.latency_probe.parallelism",
+                Authority::System,
+            ),
+            (
+                "server_selection.latency_probe.result_min_age_minutes",
+                Authority::System,
+            ),
+            (
+                "server_selection.latency_probe.background_scan",
+                Authority::System,
+            ),
+            (
+                "server_selection.latency_probe.transport",
+                Authority::System,
+            ),
+            ("server_selection.balanced_weights.load", Authority::System),
+            (
+                "server_selection.balanced_weights.latency",
+                Authority::System,
+            ),
+            (
+                "server_selection.balanced_weights.stability",
+                Authority::System,
+            ),
+            (
+                "server_selection.balanced_weights.feature_match",
+                Authority::System,
+            ),
+            (
+                "server_selection.secure_core.enabled_by_default",
+                Authority::System,
+            ),
+            (
+                "server_selection.secure_core.preferred_entry_countries",
+                Authority::System,
+            ),
+            (
+                "server_selection.secure_core.excluded_entry_countries",
+                Authority::System,
+            ),
+            (
+                "server_selection.secure_core.excluded_exit_countries",
+                Authority::System,
+            ),
+            ("connection_groups.physical_country", Authority::System),
+            ("connection_groups.region_taxonomy", Authority::System),
+            (
+                "connection_groups.regional_default_ranking",
+                Authority::System,
+            ),
+            ("connection.default", Authority::System),
+            ("connection.protocol", Authority::System),
+            ("connection.protun.mtu", Authority::System),
+            ("connection.protun.sni_strategy", Authority::System),
+            ("connection.ipv6.mode", Authority::System),
+            ("dns.mode", Authority::System),
+            ("dns.custom_servers", Authority::System),
+            ("dns.policy", Authority::System),
+            ("dns.leak_protection", Authority::System),
+            ("dns.externally_managed_resolvers", Authority::System),
+            ("lan.policy", Authority::System),
+            ("lan.allowed_cidrs", Authority::System),
+            ("split_tunnel.mode", Authority::System),
+            ("split_tunnel.attach_existing_processes", Authority::System),
+            ("split_tunnel.domains.enabled", Authority::System),
+            (
+                "split_tunnel.domains.resolver_observation",
+                Authority::System,
+            ),
+            ("split_tunnel.domains.refresh_on_ttl", Authority::System),
+            ("split_tunnel.domains.rules", Authority::System),
+            ("split_tunnel.domains.rules[].domain", Authority::System),
+            ("split_tunnel.domains.rules[].action", Authority::System),
+            ("split_tunnel.domains.rules[].ttl_policy", Authority::System),
+            ("auto_connect.enabled", Authority::System),
+            ("auto_connect.target", Authority::System),
+            ("auto_connect.retry.max_attempts", Authority::System),
+            (
+                "auto_connect.retry.initial_delay_seconds",
+                Authority::System,
+            ),
+            ("auto_connect.retry.max_delay_seconds", Authority::System),
+            ("auto_connect.retry.jitter", Authority::System),
+            ("features.secure_core", Authority::PerUser),
+            ("features.kill_switch", Authority::PerUser),
+            ("features.split_tunnel", Authority::PerUser),
+            ("features.netshield", Authority::PerUser),
+            ("features.port_forwarding", Authority::PerUser),
+            ("features.nat", Authority::PerUser),
+            ("features.vpn_accelerator", Authority::PerUser),
+            ("profiles.default.connection_type", Authority::PerUser),
+            ("profiles.default.protocol", Authority::PerUser),
+            ("profiles.default.selection.mode", Authority::PerUser),
+            ("profiles.default.selection.by", Authority::PerUser),
+            (
+                "profiles.default.selection.exclude_countries",
+                Authority::PerUser,
+            ),
+            ("profiles.default.selection.require", Authority::PerUser),
         ]
     }
 }
@@ -961,36 +544,6 @@ pub enum ConfigLoadError {
     },
 }
 
-/// Client output format preference (per-UID overlay field).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "kebab-case")]
-pub enum OutputFormat {
-    /// Human-readable output.
-    #[default]
-    Human,
-    /// Machine-readable JSON output.
-    Json,
-}
-
-/// Per-UID user overlay: presentation preferences and per-user selectors
-/// only. Any system-only key here is a parse error by construction.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, default)]
-pub struct UserOverlay {
-    /// Schema version (same generation as the system document).
-    pub schema_version: u32,
-    /// Presentation preferences.
-    pub presentation: UserPresentation,
-}
-
-/// Presentation preferences.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, default)]
-pub struct UserPresentation {
-    /// Default CLI output format.
-    pub default_output: Option<OutputFormat>,
-}
-
 #[cfg(test)]
 mod tests {
     // Tests mutate single fields of defaulted documents; struct-update
@@ -999,7 +552,7 @@ mod tests {
 
     use super::*;
 
-    const PRD_EXAMPLE: &str = include_str!("../../../docs/PRD-proton-wire.md");
+    const PRD_EXAMPLE: &str = include_str!("../../../../docs/PRD-proton-wire.md");
 
     fn example_config_yaml() -> String {
         // Extract the fenced YAML example from PRD section 10 so the typed
@@ -1043,6 +596,16 @@ mod tests {
         assert_eq!(config.features.kill_switch, KillSwitchMode::On);
         assert_eq!(config.features.nat, NatMode::Strict);
         assert_eq!(config.dns.mode, DnsMode::Proton);
+        // M2 S3: the example's vocabulary values must land on the typed
+        // enums with their exact spellings.
+        assert_eq!(config.dns.policy, DnsPolicy::ThroughVpn);
+        assert_eq!(config.dns.leak_protection, DnsLeakProtection::Strict);
+        assert_eq!(config.connection.protocol, ProtocolMode::Smart);
+        assert_eq!(config.connection.ipv6.mode, Ipv6Mode::Auto);
+        assert_eq!(
+            config.server_selection.latency_probe.transport,
+            ProbeTransport::TcpUdp
+        );
         assert_eq!(config.lan.policy, LanPolicy::Allow);
         assert_eq!(config.lan.allowed_cidrs.len(), 5);
     }
@@ -1430,71 +993,6 @@ mod tests {
         assert_eq!(config.daemon.interface_name, "protonwire0");
     }
 
-    /// pr-champion WO-7 (PRD 6.3): `daemon.socket_group` names the group
-    /// the daemon chowns its socket to so unprivileged clients can reach
-    /// it. It sits beside `socket_path` and is system authority like its
-    /// neighbor. R9-1: the DEFAULT is `Some("protonwire")` — with `None`
-    /// a standard root launch left the socket root:root 0660 and every
-    /// unprivileged client ate EACCES (PRD 433 requires unprivileged
-    /// clients). An explicit `null` remains the documented opt-out.
-    #[test]
-    fn daemon_socket_group_parses_and_defaults_to_protonwire() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.yaml");
-        std::fs::write(
-            &path,
-            "schema_version: 2\ndaemon:\n  socket_group: protonwire-clients\n",
-        )
-        .unwrap();
-        let config = SystemConfig::load(&path).unwrap().config;
-        config.validate().unwrap();
-        assert_eq!(
-            config.daemon.socket_group.as_deref(),
-            Some("protonwire-clients")
-        );
-        assert_eq!(
-            DaemonSection::default().socket_group.as_deref(),
-            Some("protonwire"),
-            "the built-in default must name the packaged protonwire group"
-        );
-        assert_eq!(
-            SystemConfig::default().daemon.socket_group.as_deref(),
-            Some("protonwire"),
-            "the whole-document default must carry the section default"
-        );
-    }
-
-    /// R9-1: the missing-file soft path hands the built-in defaults to the
-    /// daemon, so the defaulted document must carry the group through a
-    /// serialize/parse round trip exactly like one read from disk.
-    #[test]
-    fn config_defaults_round_trip_the_socket_group() {
-        let rendered = serde_norway::to_string(&SystemConfig::default()).unwrap();
-        let reloaded: SystemConfig = crate::yaml::from_str(&rendered).unwrap();
-        reloaded.validate().unwrap();
-        assert_eq!(
-            reloaded.daemon.socket_group.as_deref(),
-            Some("protonwire"),
-            "the default group must survive a YAML round trip"
-        );
-    }
-
-    /// R9-1: an explicit `socket_group: null` is the documented opt-out —
-    /// a deployment that manages socket permissions itself (or admits only
-    /// root clients) must be able to say "no chown" and get exactly `None`.
-    #[test]
-    fn explicit_null_socket_group_opts_out_of_the_default() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.yaml");
-        std::fs::write(&path, "schema_version: 2\ndaemon:\n  socket_group: null\n").unwrap();
-        let config = SystemConfig::load(&path).unwrap().config;
-        config.validate().unwrap();
-        assert_eq!(
-            config.daemon.socket_group, None,
-            "an explicit null must override the Some(protonwire) default"
-        );
-    }
-
     #[test]
     fn refresh_interval_floor_enforced() {
         let mut config = SystemConfig::default();
@@ -1531,14 +1029,33 @@ mod tests {
         assert!(err.contains("custom_servers"), "got: {err}");
     }
 
+    /// M2 S3: `credential_input_source` and latency-probe `transport` are
+    /// typed vocabularies now — an invalid value is a PARSE error naming
+    /// the field and the accepted spellings (the sections suite carries
+    /// the per-field vocabulary tests; this pins the load path).
     #[test]
-    fn bad_credential_source_and_transport_rejected() {
-        let mut config = SystemConfig::default();
-        config.account.credential_input_source = "telepathy".into();
-        config.server_selection.latency_probe.transport = "carrier-pigeon".into();
-        let err = config.validate().unwrap_err().to_string();
+    fn bad_credential_source_and_transport_rejected_at_parse() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        std::fs::write(
+            &path,
+            "schema_version: 2\naccount:\n  credential_input_source: telepathy\n",
+        )
+        .unwrap();
+        let err = SystemConfig::load(&path).unwrap_err().to_string();
         assert!(err.contains("credential_input_source"), "got: {err}");
-        assert!(err.contains("tcp-udp or icmp"), "got: {err}");
+        assert!(err.contains("interactive"), "got: {err}");
+        assert!(err.contains("systemd"), "got: {err}");
+
+        std::fs::write(
+            &path,
+            "schema_version: 2\nserver_selection:\n  latency_probe:\n    transport: carrier-pigeon\n",
+        )
+        .unwrap();
+        let err = SystemConfig::load(&path).unwrap_err().to_string();
+        assert!(err.contains("transport"), "got: {err}");
+        assert!(err.contains("tcp-udp"), "got: {err}");
+        assert!(err.contains("icmp"), "got: {err}");
     }
 
     #[test]
@@ -1599,47 +1116,145 @@ mod tests {
         assert!(config.validate().is_err());
     }
 
-    #[test]
-    fn user_overlay_rejects_system_only_fields() {
-        let overlay = "schema_version: 2\ndaemon:\n  log_level: debug\n";
-        let err = crate::yaml::from_str::<UserOverlay>(overlay).unwrap_err();
-        assert!(err.to_string().contains("daemon"), "got: {err}");
-    }
-
-    #[test]
-    fn user_overlay_parses_presentation() {
-        let overlay = "schema_version: 2\npresentation:\n  default_output: json\n";
-        let parsed: UserOverlay = crate::yaml::from_str(overlay).unwrap();
-        assert_eq!(parsed.presentation.default_output, Some(OutputFormat::Json));
-    }
-
-    #[test]
-    fn network_integration_mode_maps_to_frontend_enum() {
-        use protonwire_frontend_api::NetworkIntegration as N;
-        let cases: [(NetworkIntegrationMode, N); 4] = [
-            (NetworkIntegrationMode::Auto, N::Auto),
-            (NetworkIntegrationMode::Native, N::Native),
-            (NetworkIntegrationMode::NetworkManager, N::NetworkManager),
-            (NetworkIntegrationMode::Networkd, N::Networkd),
-        ];
-        for (mode, expected) in cases {
-            let mapped: N = mode.into();
-            assert_eq!(mapped, expected);
-        }
-    }
-
+    /// PRD section 10 closing rule: `lan.policy` is the sole global LAN
+    /// setting — no `features.lan_access` alias may exist. At field
+    /// granularity: `lan.policy` carries exactly one entry, every `lan.*`
+    /// entry is system authority, and no `features.lan_*` field appears.
     #[test]
     fn authority_report_has_single_lan_authority() {
         let config = SystemConfig::default();
         let report = config.authority_report();
-        assert!(report.contains(&("lan", Authority::System)));
-        // No second LAN field exists anywhere in the authority table; match
-        // the exact segment so unrelated words containing "lan" (as in
-        // "balanced_weights") do not false-positive.
-        let lan_entries = report
+        let lan_entries: Vec<_> = report
             .iter()
             .filter(|(path, _)| *path == "lan" || path.starts_with("lan."))
-            .count();
-        assert_eq!(lan_entries, 1);
+            .collect();
+        assert!(
+            !lan_entries.is_empty(),
+            "the lan fields must be in the table"
+        );
+        assert!(
+            lan_entries
+                .iter()
+                .all(|(_, authority)| *authority == Authority::System)
+        );
+        assert_eq!(
+            report
+                .iter()
+                .filter(|(path, _)| *path == "lan.policy")
+                .count(),
+            1,
+            "lan.policy must appear exactly once"
+        );
+        assert!(
+            !report
+                .iter()
+                .any(|(path, _)| path.starts_with("features.lan")),
+            "no features.lan_access alias may exist in the table"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // M2 S3 / T-37 groundwork: field-level authority coverage.
+    // ------------------------------------------------------------------
+
+    /// Walks every leaf field path of a serialized document. Sequences of
+    /// mappings contribute their element fields with an index-erased `[]`
+    /// segment; scalar (or empty) sequences are leaves at the field
+    /// itself. A mapping at a path that already carries an authority
+    /// entry is TERMINAL — the one such field
+    /// (`account.systemd_credential_names`) is a free-form map whose keys
+    /// are data (credential names), not schema, so its sub-keys must not
+    /// be walked as fields.
+    fn walk_leaf_paths(
+        value: &serde_norway::Value,
+        prefix: &str,
+        report: &[(&'static str, Authority)],
+        out: &mut Vec<String>,
+    ) {
+        match value {
+            serde_norway::Value::Mapping(mapping) => {
+                if !prefix.is_empty() && report.iter().any(|(path, _)| *path == prefix) {
+                    out.push(prefix.to_owned());
+                    return;
+                }
+                for (key, val) in mapping {
+                    let key = key.as_str().expect("config keys serialize as strings");
+                    let path = if prefix.is_empty() {
+                        key.to_owned()
+                    } else {
+                        format!("{prefix}.{key}")
+                    };
+                    walk_leaf_paths(val, &path, report, out);
+                }
+            }
+            serde_norway::Value::Sequence(sequence) => {
+                let of_mappings = !sequence.is_empty()
+                    && sequence
+                        .iter()
+                        .all(|element| matches!(element, serde_norway::Value::Mapping(_)));
+                if of_mappings {
+                    for element in sequence {
+                        walk_leaf_paths(element, &format!("{prefix}[]"), report, out);
+                    }
+                } else {
+                    out.push(prefix.to_owned());
+                }
+            }
+            _ => out.push(prefix.to_owned()),
+        }
+    }
+
+    /// A document with every repeated field populated, so the walk sees
+    /// element fields (`rules[].action`) and not just their empty lists.
+    fn maximal_config() -> SystemConfig {
+        let mut config = SystemConfig::default();
+        config
+            .split_tunnel
+            .domains
+            .rules
+            .push(SplitTunnelDomainRule::default());
+        config.dns.custom_servers.push("9.9.9.9".into());
+        config
+    }
+
+    /// T-37 groundwork contract (PRD section 10: "the versioned schema
+    /// must tag every field with its authority class"): every field of
+    /// the typed surface carries EXACTLY ONE authority entry, and no
+    /// entry is stale. Red evidence: against the section-level table the
+    /// walk finds `daemon.socket_path` with no entry, and section entries
+    /// like `daemon` match no walked leaf.
+    #[test]
+    fn authority_report_covers_every_typed_field() {
+        let config = maximal_config();
+        let rendered = serde_norway::to_value(&config).unwrap();
+        let report = config.authority_report();
+        let mut leaves = Vec::new();
+        walk_leaf_paths(&rendered, "", &report, &mut leaves);
+        assert!(!leaves.is_empty(), "the walk must find the document fields");
+
+        for leaf in &leaves {
+            let entries: Vec<_> = report
+                .iter()
+                .filter(|(path, _)| *path == leaf.as_str())
+                .collect();
+            assert_eq!(
+                entries.len(),
+                1,
+                "field {leaf} must carry exactly one authority entry (found {})",
+                entries.len()
+            );
+        }
+        for (path, _) in &report {
+            // An entry is justified only as a walked leaf, or as the
+            // list-field form of walked element fields (`rules` for
+            // `rules[].action`) — bare section entries must be gone.
+            let walked = leaves
+                .iter()
+                .any(|leaf| leaf == path || leaf.starts_with(&format!("{path}[]")));
+            assert!(
+                walked,
+                "authority entry {path} matches no typed field (stale?)"
+            );
+        }
     }
 }
