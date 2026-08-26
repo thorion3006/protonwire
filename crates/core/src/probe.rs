@@ -57,8 +57,15 @@ impl Default for ProbeBudget {
 pub struct EndpointState {
     /// The last observation, when one exists.
     pub observation: Option<Observation>,
+    /// When that observation was ANSWERED, in milliseconds on the
+    /// caller's clock — the reuse window measures from here (Codex
+    /// PR#8, P2: a stale RTT whose refresh attempt timed out must not
+    /// read as fresh merely because the attempt is recent; repeated
+    /// failed refreshes must not keep an arbitrarily old RTT alive).
+    pub observed_at_ms: u64,
     /// When the last PROBE attempt (answered or not) started, in
-    /// milliseconds on the caller's clock.
+    /// milliseconds on the caller's clock — the per-endpoint rate
+    /// limit (the hammering guard) measures from here.
     pub last_attempt_ms: u64,
 }
 
@@ -110,9 +117,13 @@ pub fn plan_run(
         let decision = match state.get(endpoint) {
             Some(EndpointState {
                 observation: Some(obs),
-                last_attempt_ms,
+                observed_at_ms,
+                ..
             }) => {
-                let age = Duration::from_millis(now_ms.saturating_sub(*last_attempt_ms));
+                // The reuse window measures from the OBSERVATION time
+                // (Codex PR#8, P2): a stale RTT whose refresh attempt
+                // timed out ages out regardless of attempt recency.
+                let age = Duration::from_millis(now_ms.saturating_sub(*observed_at_ms));
                 if age < budget.min_reuse_age {
                     ProbeDecision::Reuse(*obs)
                 } else {
@@ -124,6 +135,7 @@ pub fn plan_run(
             Some(EndpointState {
                 observation: None,
                 last_attempt_ms,
+                ..
             }) => {
                 let age = Duration::from_millis(now_ms.saturating_sub(*last_attempt_ms));
                 if age < budget.min_probe_interval {
@@ -191,10 +203,22 @@ pub fn run_planned(
 mod tests {
     use super::*;
 
+    #[allow(clippy::too_many_arguments)]
     fn endpoint(
         id: &str,
         observation_ms: Option<u64>,
         last_attempt_ms: u64,
+    ) -> (String, EndpointState) {
+        endpoint_full(id, observation_ms, last_attempt_ms, last_attempt_ms)
+    }
+
+    /// The full state: observation time distinct from attempt time
+    /// (the PR-8 review's stale-refresh shape).
+    fn endpoint_full(
+        id: &str,
+        observation_ms: Option<u64>,
+        last_attempt_ms: u64,
+        observed_at_ms: u64,
     ) -> (String, EndpointState) {
         (
             id.to_owned(),
@@ -202,6 +226,7 @@ mod tests {
                 observation: observation_ms.map(|ms| Observation {
                     rtt: Duration::from_millis(ms),
                 }),
+                observed_at_ms,
                 last_attempt_ms,
             },
         )
@@ -287,6 +312,29 @@ mod tests {
                 rtt: Duration::from_millis(42)
             }),
             "the with-obs arm uses the STRICTER reuse window, not the interval"
+        );
+    }
+
+    /// Codex PR#8 (P2): the reuse window measures from the
+    /// OBSERVATION time, not the attempt time — a stale RTT whose
+    /// refresh attempt is RECENT (timed out, clock written back) must
+    /// not read as fresh. Pre-fix, the age came from last_attempt_ms,
+    /// so repeated failed refreshes kept an arbitrarily old RTT alive
+    /// indefinitely.
+    #[test]
+    fn a_stale_observation_with_a_recent_failed_refresh_is_not_fresh() {
+        let shortlist = vec!["a".to_owned()];
+        // Observed 400s ago (stale), last attempted 10s ago (a failed
+        // refresh wrote the clock). The pre-fix code computed age from
+        // the attempt: 10s < 300s → Reuse — the dead RTT read fresh.
+        let state: BTreeMap<_, _> = [endpoint_full("a", Some(42), 10_000, 1_000)].into();
+        let now = 401_000;
+        let decisions = plan_run(&shortlist, &state, &ProbeBudget::default(), now);
+        assert_eq!(
+            decisions["a"],
+            ProbeDecision::Probe,
+            "the reuse window measures from the OBSERVATION (400s old = stale), not the \
+             recent failed attempt"
         );
     }
 
