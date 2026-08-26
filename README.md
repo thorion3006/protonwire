@@ -8,9 +8,14 @@ transport. ProtonWire is a local VPN control plane — not a wrapper around
 clients (CLI, Ratatui TUI, Tauri GUI) speaking one versioned Unix-socket
 frontend API.
 
-Status: **Milestones 1 (Foundation) and 2 (Muon auth + server cache)
-complete** — M1 merged to `master` via PR #3 (5baa12a); M2 merged via
-PR #4 (5fd53d7, the current `master` tip). What builds and runs today:
+Status: **Milestones 1 (Foundation), 2 (Muon auth + server cache), and
+3 (server selection) complete in code** — M1 merged to `master` via
+PR #3 (5baa12a); M2 merged via PR #4 (5fd53d7, the current `master`
+tip); M3 is delivered as a four-PR stack awaiting the owner's merge
+calls, bottom-up: PR #5 (`m3/selection-core`), PR #6
+(`m3/group-registry`), PR #8 (`m3/secure-core-latency`), and
+`m3/select-surface` (the top — selection IPC/daemon wiring plus the
+CLI surface). What builds and runs today:
 
 - the M1 surface: the daemon, the versioned Unix-socket frontend API,
   CLI/TUI/GUI clients over the shared SDK, validated system
@@ -27,11 +32,20 @@ PR #4 (5fd53d7, the current `master` tip). What builds and runs today:
   persisted rate-limit suppression and warned manual-override
   confirmation; entitlement and user-location models over the same
   transport; per-UID configuration overlays; hardened IPC socket trust
+- M3 selection: the pure selection core (hard filters with a
+  structured elimination report, official/balanced/load/latency/random
+  policies — no speed sorting), the generated connection-group
+  registry with UN M49 regional groups, routed Secure Core targets,
+  and a bounded on-demand latency prober; over the wire as
+  `select`/`groups-list`/`group-show` with the FR-23T provenance set,
+  and in the CLI as `protonwire select <target> [--dry-run --json]`,
+  `group list|show`, and `connect <target> --dry-run`
 
-Next per the PRD: Milestone 3 (server selection). Not present yet: any
-tunneling (M4 ProTUN core is the first engine milestone) — connecting
-is not possible in this tree today. The authoritative specification
-set is:
+Next per the PRD: Milestone 4 (the ProTUN tunnel — the first engine
+milestone). Not present yet: any tunneling — `select` resolves and
+prints, `connect` without `--dry-run` is a typed refusal, and
+connecting is not possible in this tree today. The authoritative
+specification set is:
 
 - `docs/PRD-proton-wire.md` — the product requirements (normative)
 - `docs/ADR-0001-monorepo-core-and-clients.md` — the architecture decision
@@ -40,6 +54,7 @@ set is:
 - `docs/spike-2026-08.md` — dependency spike decisions (M1) and the
   M2 addenda (Muon surface memo, wire-seam records, keyring audit)
 - `docs/m2-plan.md` — the M2 unit plan (completed; see its header note)
+- `docs/m3-plan.md` — the M3 unit plan (completed; see its header note)
 
 ## ⚠ Development builds only — no distribution
 
