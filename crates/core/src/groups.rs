@@ -486,8 +486,8 @@ fn declared_overrides(group: &GroupEntry) -> String {
 /// `physical` carries FR-23Q's three sources — the resolver composes
 /// the precedence and the selection core enforces the rest.
 /// `balanced_weights` is the composed weight set any `balanced` policy
-/// (catalog default or declared override) runs under — see
-/// [`to_selection_policy`]'s precedence record.
+/// (catalog default or declared override) runs under — the precedence
+/// is recorded on the private `to_selection_policy` helper's docs.
 pub fn resolve_group(
     id: &str,
     ranking_override: Option<&str>,
