@@ -5,7 +5,10 @@ use std::path::Path;
 
 use clap::Subcommand;
 use protonwire_client::ClientError;
-use protonwire_frontend_api::{DaemonState, RpcError, RpcErrorCode};
+use protonwire_frontend_api::{
+    DaemonState, PhysicalCountrySource, RpcError, RpcErrorCode, SelectionFeature,
+    SelectionModifiers, SelectionProtocol,
+};
 
 use crate::{connect, target::ConnectTargetArgs};
 
@@ -34,7 +37,8 @@ pub enum Command {
     Protocols,
     /// Show or set the network integration adapter (Milestone 5).
     Integration,
-    /// Connect to a server or group (Milestone 4 for the tunnel).
+    /// Connect to a server or group (Milestone 4 for the tunnel;
+    /// `--dry-run` resolves and prints the selection now — Milestone 3).
     Connect {
         /// Target words, for example: fastest | country GB | server UK#42 |
         /// group proton:fastest-country (PRD 9.2).
@@ -74,12 +78,64 @@ pub enum Command {
         #[command(subcommand)]
         sub: Option<ServersSub>,
     },
-    /// List connection groups (Milestone 3).
-    Group,
-    /// Resolve a target without connecting (Milestone 3).
+    /// Connection groups: list and inspect the built-in catalog
+    /// (Milestone 3; PRD 9.1/§7.3B).
+    Group {
+        #[command(subcommand)]
+        sub: Option<GroupSub>,
+    },
+    /// Resolve a target without connecting (Milestone 3, PRD §7.3:
+    /// `protonwire select fastest --dry-run --json`) — a pure read of
+    /// the daemon's selection surface; never establishes a tunnel.
     Select {
+        /// Target words, as on `connect` (fastest | country GB |
+        /// server UK#42 | group proton:fastest-country | ...).
         #[arg(value_name = "TARGET", required = true)]
         target: Vec<String>,
+
+        /// Ranking policy (official|balanced|load|latency; PRD 9.3).
+        #[arg(long)]
+        by: Option<String>,
+
+        /// Explicit physical country (FR-23Q's first source).
+        #[arg(long, value_name = "COUNTRY_CODE")]
+        physical_country: Option<String>,
+
+        /// Excluded country (repeatable; FR-21).
+        #[arg(long = "exclude-country", value_name = "COUNTRY_CODE")]
+        exclude_countries: Vec<String>,
+
+        /// Excluded state or region (repeatable; FR-21A).
+        #[arg(long = "exclude-state", value_name = "STATE_OR_REGION")]
+        exclude_states: Vec<String>,
+
+        /// Excluded city (repeatable; FR-21A).
+        #[arg(long = "exclude-city", value_name = "CITY_NAME")]
+        exclude_cities: Vec<String>,
+
+        /// Excluded server name (repeatable; FR-21A).
+        #[arg(long = "exclude-server", value_name = "SERVER_NAME")]
+        exclude_servers: Vec<String>,
+
+        /// Required feature (repeatable: p2p|tor|secure-core|streaming|
+        /// ipv6|port-forwarding; T-4/FR-23H).
+        #[arg(long, value_name = "FEATURE")]
+        require: Vec<String>,
+
+        /// Protocol constraint (wireguard-udp|wireguard-tcp|stealth;
+        /// `smart` is the connection plane's, Milestone 4).
+        #[arg(long)]
+        protocol: Option<String>,
+
+        /// Accepted and implied — `select` never connects (declared for
+        /// script compatibility with `connect --dry-run`).
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Machine-readable output: the typed FR-23T result document
+        /// serialized verbatim.
+        #[arg(long)]
+        json: bool,
     },
     /// Show or set configuration (Milestone 2 for overlays).
     Config,
@@ -140,6 +196,29 @@ pub enum ServersSub {
     },
 }
 
+/// `protonwire group` subcommands (PRD §7.3B examples).
+#[derive(Debug, Subcommand)]
+pub enum GroupSub {
+    /// List the built-in connection groups with availability
+    /// (FR-23S/U). No network request (FR-23R).
+    List {
+        /// Filter by origin (proton|protonwire).
+        #[arg(long)]
+        origin: Option<String>,
+        /// Machine-readable output: the typed catalog verbatim.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show one group's full definition.
+    Show {
+        /// The stable namespaced group id.
+        id: String,
+        /// Machine-readable output.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
 /// `protonwire daemon` subcommands.
 #[derive(Debug, Subcommand)]
 pub enum DaemonSub {
@@ -182,13 +261,29 @@ pub fn run(command: &Command, socket: Option<&Path>, no_input: bool) -> RunResul
             dry_run,
             json,
         } => {
-            // Presentation-only; honored wherever output is rendered.
-            let _ = json;
-            // Declared-but-unhonored modifiers must refuse rather than be
-            // discarded: sending the unmodified target would silently ignore
-            // `--by`/`--protocol`, and once Connect lands (M4) a `--dry-run`
-            // invocation would establish a REAL tunnel.
-            if let Some((flag, milestone)) = connect_modifier_refusal(by, protocol, *dry_run) {
+            // `--dry-run` is the M3 selection surface: resolve and
+            // print, never connect. The remaining modifiers ride it
+            // as selection constraints (--by ranks; --protocol
+            // filters — with no tunnel, both are pure selection).
+            if *dry_run {
+                let target = ConnectTargetArgs::parse(target)?;
+                let modifiers = SelectionModifiers {
+                    by: by.clone(),
+                    physical_country: None,
+                    excluded_countries: Vec::new(),
+                    excluded_states: Vec::new(),
+                    excluded_cities: Vec::new(),
+                    excluded_servers: Vec::new(),
+                    required_features: Vec::new(),
+                    optional_features: Vec::new(),
+                    required_protocol: parse_protocol(protocol.as_deref())?,
+                };
+                return select_command(socket, target, modifiers, *json);
+            }
+            // Declared-but-unhonored modifiers must refuse rather than
+            // be discarded: sending the unmodified target would
+            // silently ignore them once Connect lands (M4).
+            if let Some((flag, milestone)) = connect_modifier_refusal(by, protocol) {
                 return Err(ClientError::Rpc(RpcError::new(
                     RpcErrorCode::NotImplemented,
                     format!(
@@ -208,6 +303,36 @@ pub fn run(command: &Command, socket: Option<&Path>, no_input: bool) -> RunResul
         // them — `planned()` caught these commands first).
         Command::Servers { sub } => servers_command(socket, sub, no_input),
         Command::Account { json } => account_command(socket, *json),
+        // The M3 U7 selection/groups surface: dispatched to the client
+        // machinery, never the planned-refusal catch-all.
+        Command::Select {
+            target,
+            by,
+            physical_country,
+            exclude_countries,
+            exclude_states,
+            exclude_cities,
+            exclude_servers,
+            require,
+            protocol,
+            dry_run: _,
+            json,
+        } => {
+            let target = ConnectTargetArgs::parse(target)?;
+            let modifiers = SelectionModifiers {
+                by: by.clone(),
+                physical_country: physical_country.clone(),
+                excluded_countries: exclude_countries.clone(),
+                excluded_states: exclude_states.clone(),
+                excluded_cities: exclude_cities.clone(),
+                excluded_servers: exclude_servers.clone(),
+                required_features: parse_features(require)?,
+                optional_features: Vec::new(),
+                required_protocol: parse_protocol(protocol.as_deref())?,
+            };
+            select_command(socket, target, modifiers, *json)
+        }
+        Command::Group { sub } => group_command(socket, sub),
         Command::Logout => {
             let mut client = connect(socket)?;
             client.logout()
@@ -409,6 +534,257 @@ fn credentials_status(socket: Option<&Path>) -> RunResult {
     account_command(socket, false)
 }
 
+// --- The M3 U7 selection/groups surface (§9.2/9.3/9.5, FR-23U) -------
+
+/// Parses the `--require` feature vocabulary (T-4). Unknown values are
+/// the typed InvalidParams refusal naming the vocabulary — never a
+/// silent skip.
+fn parse_features(values: &[String]) -> Result<Vec<SelectionFeature>, ClientError> {
+    values
+        .iter()
+        .map(|value| match value.as_str() {
+            "p2p" => Ok(SelectionFeature::P2p),
+            "tor" => Ok(SelectionFeature::Tor),
+            "secure-core" => Ok(SelectionFeature::SecureCore),
+            "streaming" => Ok(SelectionFeature::Streaming),
+            "ipv6" => Ok(SelectionFeature::Ipv6),
+            "port-forwarding" => Ok(SelectionFeature::PortForwarding),
+            other => Err(ClientError::Rpc(RpcError::new(
+                RpcErrorCode::InvalidParams,
+                format!(
+                    "unknown feature `{other}`: expected p2p, tor, secure-core, streaming, \
+                     ipv6, or port-forwarding"
+                ),
+            ))),
+        })
+        .collect()
+}
+
+/// Parses the `--protocol` selection constraint (§9.4's wireguard
+/// family; `smart` is refused with guidance — smart-protocol resolution
+/// is the connection plane's, Milestone 4).
+fn parse_protocol(value: Option<&str>) -> Result<Option<SelectionProtocol>, ClientError> {
+    match value {
+        None => Ok(None),
+        Some("wireguard-udp") => Ok(Some(SelectionProtocol::WireguardUdp)),
+        Some("wireguard-tcp") => Ok(Some(SelectionProtocol::WireguardTcp)),
+        Some("stealth") => Ok(Some(SelectionProtocol::Stealth)),
+        Some("smart") => Err(ClientError::Rpc(RpcError::new(
+            RpcErrorCode::InvalidParams,
+            "`--protocol smart` resolves at connection time (milestone 4's smart-protocol \
+             engine); a dry-run selection takes an explicit transport",
+        ))),
+        Some(other) => Err(ClientError::Rpc(RpcError::new(
+            RpcErrorCode::InvalidParams,
+            format!(
+                "unknown protocol `{other}`: expected wireguard-udp, wireguard-tcp, or stealth"
+            ),
+        ))),
+    }
+}
+
+/// `protonwire select <target> [modifiers]` and `connect --dry-run`:
+/// the pure read of the daemon's selection surface (never a tunnel).
+/// `--json` prints the TYPED FR-23T document verbatim (the automation
+/// contract — a human rendering is never re-parsed).
+fn select_command(
+    socket: Option<&Path>,
+    target: protonwire_frontend_api::ConnectTarget,
+    modifiers: SelectionModifiers,
+    json: bool,
+) -> RunResult {
+    let mut client = connect(socket)?;
+    let result = client.select(target, modifiers)?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&*result).expect("the typed result serializes")
+        );
+        return Ok(());
+    }
+    print_selection_human(&result);
+    Ok(())
+}
+
+/// The human rendering: the winner first, then the FR-23T facts a
+/// terminal user needs (policy + provenance, group identity, the
+/// physical-country composition, and where every other candidate
+/// went).
+fn print_selection_human(result: &protonwire_frontend_api::SelectionResult) {
+    println!(
+        "Selected:           {} ({}, tier {})",
+        result.winner.name, result.winner.exit_country, result.winner.tier
+    );
+    println!(
+        "Policy:             {} ({})",
+        result.selector.policy, result.winner.signals.provenance
+    );
+    match (
+        result.winner.signals.proton_score,
+        result.winner.signals.load,
+    ) {
+        (Some(score), Some(load)) => println!("Signals:            score {score:.2}, load {load}%"),
+        (Some(score), None) => println!("Signals:            score {score:.2}"),
+        (None, Some(load)) => println!("Signals:            load {load}%"),
+        (None, None) => {}
+    }
+    if let Some(latency) = result.winner.signals.latency_ms {
+        println!("Latency:            {latency} ms (bounded on-demand probe)");
+    }
+    if let Some(group) = &result.group {
+        println!(
+            "Group:              {} ({}, {})",
+            group.group_id, group.origin, group.policy_provenance
+        );
+    }
+    if let Some(physical) = &result.physical_country {
+        println!(
+            "Physical country:   {} ({})",
+            physical.country,
+            match physical.source {
+                PhysicalCountrySource::ExplicitRequest => "explicit request",
+                PhysicalCountrySource::Config => "config",
+                PhysicalCountrySource::CachedLocation => "cached location",
+            }
+        );
+    }
+    let stages = result
+        .hard_filters
+        .stages
+        .iter()
+        .map(|stage| format!("{} {}", stage.eliminated, stage.stage))
+        .collect::<Vec<_>>()
+        .join(", ");
+    println!(
+        "Considered:         {} candidates, {} survivor(s){}",
+        result.hard_filters.considered,
+        result.hard_filters.survivors,
+        if stages.is_empty() {
+            String::new()
+        } else {
+            format!("; eliminated: {stages}")
+        }
+    );
+    if !result.requested_features.is_empty() {
+        println!(
+            "Features:           [{}]",
+            result.requested_features.join(", ")
+        );
+    }
+    if !result.feature_difference.is_empty() {
+        println!(
+            "Feature difference: {}",
+            result.feature_difference.join(", ")
+        );
+    }
+}
+
+/// `protonwire group [list|show]` (FR-23U): the registry-served
+/// catalog with availability (FR-23S), or one group's definition.
+fn group_command(socket: Option<&Path>, sub: &Option<GroupSub>) -> RunResult {
+    let mut client = connect(socket)?;
+    match sub {
+        // The bare `protonwire group` is the list (PRD 9.1).
+        None | Some(GroupSub::List { .. }) => {
+            let (origin, json) = match sub {
+                Some(GroupSub::List { origin, json }) => (origin.clone(), *json),
+                _ => (None, false),
+            };
+            let catalog = client.groups_list()?;
+            let groups: Vec<_> = catalog
+                .groups
+                .iter()
+                .filter(|group| origin.as_ref().is_none_or(|wanted| &group.origin == wanted))
+                .collect();
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&catalog).expect("the typed catalog serializes")
+                );
+                return Ok(());
+            }
+            println!(
+                "Groups:             {} built-in (registry {}, taxonomy {})",
+                catalog.groups.len(),
+                catalog.catalog_revision,
+                catalog.taxonomy_revision
+            );
+            if let Some(wanted) = origin {
+                println!("Origin filter:      {wanted}");
+            }
+            for group in groups {
+                println!(
+                    "  {:<38} {:<12} {:<28} {}",
+                    group.id,
+                    group.origin,
+                    group.ranking_policy,
+                    match (&group.availability.available, &group.availability.reason) {
+                        (true, _) => "available".to_owned(),
+                        (false, Some(reason)) => format!("unavailable ({reason})"),
+                        (false, None) => "unavailable".to_owned(),
+                    }
+                );
+            }
+            Ok(())
+        }
+        Some(GroupSub::Show { id, json }) => {
+            let details = client.group_show(id)?;
+            if *json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&*details).expect("the typed details serialize")
+                );
+                return Ok(());
+            }
+            println!("Group:              {}", details.summary.id);
+            println!("Label:              {}", details.summary.label);
+            println!(
+                "Origin:             {} (defined by {})",
+                details.summary.origin, details.summary.definition_source
+            );
+            println!(
+                "Policy:             {}{}",
+                details.summary.ranking_policy,
+                if details.summary.allowed_ranking_overrides.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        " (overrides: {})",
+                        details.summary.allowed_ranking_overrides.join(", ")
+                    )
+                }
+            );
+            println!(
+                "Target:             {}{}",
+                details.target,
+                details
+                    .target_detail
+                    .as_ref()
+                    .map_or_else(String::new, |detail| format!(" {detail}"))
+            );
+            if let Some(protocol) = &details.protocol_override {
+                println!("Protocol override:  {protocol}");
+            }
+            for [key, value] in &details.connection_overrides {
+                println!("Override:           {key} = {value} (composed at connect time)");
+            }
+            println!(
+                "Availability:       {}",
+                match (
+                    &details.summary.availability.available,
+                    &details.summary.availability.reason
+                ) {
+                    (true, _) => "available".to_owned(),
+                    (false, Some(reason)) => format!("unavailable ({reason})"),
+                    (false, None) => "unavailable".to_owned(),
+                }
+            );
+            println!("Sources:            {}", details.sources.join(", "));
+            Ok(())
+        }
+    }
+}
+
 /// `protonwire login` — interactive-source login over the SDK.
 ///
 /// Credentials arrive on NON-TTY stdin only (piped/scripted use): a
@@ -550,20 +926,21 @@ fn connect_command(
     client.connect_vpn(target)
 }
 
-/// The first unimplemented connect modifier, with its planned milestone in
-/// the module's refusal style (`--by`/`--dry-run` are selection modifiers
-/// (M3); `--protocol` constrains the tunnel's transports (M4)).
+/// The first unimplemented connect modifier, with its planned milestone
+/// in the module's refusal style (`--dry-run` no longer appears — the
+/// M3 surface resolves it; `--by` without `--dry-run` waits for the M4
+/// tunnel's connect-time composition, as does `--protocol`).
 fn connect_modifier_refusal(
     by: &Option<String>,
     protocol: &Option<String>,
-    dry_run: bool,
 ) -> Option<(&'static str, &'static str)> {
     if by.is_some() {
-        Some(("--by", "milestone 3 — selection and groups"))
+        Some((
+            "--by",
+            "milestone 4 — selection composes at connect time with the ProTUN engine",
+        ))
     } else if protocol.is_some() {
         Some(("--protocol", "milestone 4 — ProTUN engine"))
-    } else if dry_run {
-        Some(("--dry-run", "milestone 3 — selection and groups"))
     } else {
         None
     }
@@ -577,8 +954,6 @@ fn planned(command: &Command) -> bool {
             | Command::Integration
             | Command::ChangeServer
             | Command::Reconnect
-            | Command::Group
-            | Command::Select { .. }
             | Command::Config
             | Command::Profile
             | Command::Split
@@ -612,7 +987,13 @@ fn command_name(command: &Command) -> String {
         Command::Servers {
             sub: Some(ServersSub::Refresh { .. }),
         } => "servers refresh".into(),
-        Command::Group => "group".into(),
+        Command::Group { sub: None }
+        | Command::Group {
+            sub: Some(GroupSub::List { .. }),
+        } => "group list".into(),
+        Command::Group {
+            sub: Some(GroupSub::Show { .. }),
+        } => "group show".into(),
         Command::Select { .. } => "select".into(),
         Command::Config => "config".into(),
         Command::Profile => "profile".into(),
@@ -631,7 +1012,6 @@ fn planned_milestone(command: &Command) -> &'static str {
         Command::Credentials { .. } | Command::Config => {
             "the post-M2 writable-store and overlay lanes"
         }
-        Command::Group | Command::Select { .. } => "milestone 3 — selection and groups",
         Command::Protocols | Command::Reconnect => "milestone 4 — ProTUN engine",
         Command::Integration | Command::Killswitch | Command::Lan | Command::Dns => {
             "milestone 5 — Linux network control"
@@ -757,11 +1137,11 @@ mod tests {
         assert_ne!(err.exit_code(), 1, "not the planned refusal: {err}");
     }
 
-    /// Review-fix V2: the Connect arm used to discard `--by`/`--protocol`/
-    /// `--dry-run` (`let _ = ...`) and send the unmodified target, so once
-    /// the daemon implements Connect (M4) a `--dry-run` invocation would
-    /// establish a REAL tunnel. Until each modifier is honored it must be
-    /// refused with its planned milestone, in the module's refusal style.
+    /// Review-fix V2's discipline, post-M3: `--by`/`--protocol` WITHOUT
+    /// `--dry-run` still refuse with their planned milestone (the M4
+    /// tunnel composes them at connect time) — a modifier may never be
+    /// silently discarded. `--dry-run` no longer appears here: it IS
+    /// the M3 surface (see connect_dry_run_dispatches_to_the_selection).
     #[test]
     fn connect_modifier_flags_are_refused_with_their_milestones() {
         let fastest = || vec!["fastest".to_string()];
@@ -775,7 +1155,7 @@ mod tests {
                     json: false,
                 },
                 "--by",
-                "milestone 3",
+                "milestone 4",
             ),
             (
                 Command::Connect {
@@ -788,17 +1168,6 @@ mod tests {
                 "--protocol",
                 "milestone 4",
             ),
-            (
-                Command::Connect {
-                    target: fastest(),
-                    by: None,
-                    protocol: None,
-                    dry_run: true,
-                    json: false,
-                },
-                "--dry-run",
-                "milestone 3",
-            ),
         ];
         for (command, flag, milestone) in cases {
             let err = run(&command, None, true)
@@ -810,6 +1179,103 @@ mod tests {
                 message.contains(milestone),
                 "must name the planned milestone: {message}"
             );
+        }
+    }
+
+    /// The M3 U7 dispatch: `select`, `group`, and `connect --dry-run`
+    /// reach the CLIENT machinery (the SDK's select/groups wrappers),
+    /// never the planned-refusal catch-all. Without a daemon the
+    /// dispatch ends in the typed connection error — the proof the arm
+    /// routed past every gate (the FU-4 hermetic-socket idiom).
+    #[test]
+    fn the_u7_surface_dispatches_to_the_client() {
+        let socket =
+            std::env::temp_dir().join(format!("protonwire-cli-u7-{}.sock", std::process::id()));
+        let cases = vec![
+            Command::Select {
+                target: vec!["country".to_string(), "GB".to_string()],
+                by: Some("latency".into()),
+                physical_country: Some("DE".into()),
+                exclude_countries: vec!["US".into()],
+                exclude_states: Vec::new(),
+                exclude_cities: Vec::new(),
+                exclude_servers: Vec::new(),
+                require: vec!["port-forwarding".into()],
+                protocol: Some("stealth".into()),
+                dry_run: true,
+                json: true,
+            },
+            Command::Group { sub: None },
+            Command::Group {
+                sub: Some(GroupSub::List {
+                    origin: Some("proton".into()),
+                    json: false,
+                }),
+            },
+            Command::Group {
+                sub: Some(GroupSub::Show {
+                    id: "proton:fastest-country".into(),
+                    json: true,
+                }),
+            },
+            Command::Connect {
+                target: vec!["fastest".to_string()],
+                by: Some("load".into()),
+                protocol: None,
+                dry_run: true,
+                json: false,
+            },
+        ];
+        for command in cases {
+            match run(&command, Some(&socket), true) {
+                // The socket cannot exist: DaemonUnavailable IS the
+                // dispatch proof — the request got past every refusal
+                // gate and attempted the daemon.
+                Err(ClientError::DaemonUnavailable(_)) => {}
+                other => panic!(
+                    "the U7 commands must dispatch to the client, got {other:?} \
+                     for {command:?}"
+                ),
+            }
+        }
+    }
+
+    /// The vocabulary gates: unknown `--require` features and unknown
+    /// or `smart` `--protocol` values are typed InvalidParams (2)
+    /// refusals naming the vocabulary — never a silent skip, and
+    /// BEFORE any daemon connection is attempted.
+    #[test]
+    fn u7_vocabulary_refusals_are_typed_and_pre_connection() {
+        let socket = std::env::temp_dir().join(format!(
+            "protonwire-cli-u7-vocab-{}.sock",
+            std::process::id()
+        ));
+        for (require, protocol, needle) in [
+            (vec!["wifi".to_string()], None, "unknown feature `wifi`"),
+            (
+                Vec::new(),
+                Some("quic".to_string()),
+                "unknown protocol `quic`",
+            ),
+            (Vec::new(), Some("smart".to_string()), "connection time"),
+        ] {
+            let command = Command::Select {
+                target: vec!["fastest".to_string()],
+                by: None,
+                physical_country: None,
+                exclude_countries: Vec::new(),
+                exclude_states: Vec::new(),
+                exclude_cities: Vec::new(),
+                exclude_servers: Vec::new(),
+                require,
+                protocol,
+                dry_run: false,
+                json: false,
+            };
+            let err =
+                run(&command, Some(&socket), true).expect_err("the vocabulary gate must refuse");
+            assert_eq!(err.exit_code(), 2, "InvalidParams exit code: {err}");
+            assert!(err.to_string().contains(needle), "{err}");
         }
     }
 
@@ -913,7 +1379,7 @@ mod tests {
                 | Command::Reconnect
                 | Command::Status { .. }
                 | Command::Servers { .. }
-                | Command::Group
+                | Command::Group { .. }
                 | Command::Select { .. }
                 | Command::Config
                 | Command::Profile
@@ -953,11 +1419,39 @@ mod tests {
             ("reconnect", Command::Reconnect),
             ("status", Command::Status { json: false }),
             ("servers", Command::Servers { sub: None }),
-            ("group", Command::Group),
+            ("group list (bare)", Command::Group { sub: None }),
+            (
+                "group list",
+                Command::Group {
+                    sub: Some(GroupSub::List {
+                        origin: None,
+                        json: false,
+                    }),
+                },
+            ),
+            (
+                "group show",
+                Command::Group {
+                    sub: Some(GroupSub::Show {
+                        id: "proton:fastest-country".into(),
+                        json: false,
+                    }),
+                },
+            ),
             (
                 "select",
                 Command::Select {
                     target: vec!["fastest".to_string()],
+                    by: None,
+                    physical_country: None,
+                    exclude_countries: Vec::new(),
+                    exclude_states: Vec::new(),
+                    exclude_cities: Vec::new(),
+                    exclude_servers: Vec::new(),
+                    require: Vec::new(),
+                    protocol: None,
+                    dry_run: false,
+                    json: false,
                 },
             ),
             ("config", Command::Config),

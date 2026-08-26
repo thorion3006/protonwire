@@ -154,17 +154,128 @@ mod parse_tests {
         }
     }
 
-    /// Select keeps the same target grammar; a future option must not be
-    /// swallowed by it either.
+    /// Select keeps the same target grammar; an unknown option must not
+    /// be swallowed by it. (`--json` is a REAL option since M3 — the
+    /// pin's original arm — so the unknown-option shape carries it.)
     #[test]
     fn select_target_stops_at_flags() {
-        // `select` has no options today; the positional must still stop at
-        // one so the error is clap's "unexpected argument", not silent
-        // capture into the target words.
-        let err = Cli::try_parse_from(["protonwire", "select", "fastest", "--json"]);
+        let err = Cli::try_parse_from(["protonwire", "select", "fastest", "--nonsense"]);
         assert!(
             err.is_err(),
             "unknown select options must not become target words"
         );
+    }
+
+    /// The M3 U7 grammar (PRD §7.3: `protonwire select fastest
+    /// --dry-run --json`, plus §9.3's selection-plane modifiers and the
+    /// §7.3B group subcommands): everything the work order's surface
+    /// names must parse.
+    #[test]
+    fn the_u7_grammar_parses() {
+        let cli = Cli::try_parse_from(["protonwire", "select", "fastest", "--dry-run", "--json"])
+            .expect("the PRD's documented invocation must parse");
+        match cli.command {
+            Command::Select {
+                target,
+                dry_run,
+                json,
+                ..
+            } => {
+                assert_eq!(target, ["fastest"]);
+                assert!(dry_run && json);
+            }
+            other => panic!("expected Select, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "protonwire",
+            "select",
+            "country",
+            "GB",
+            "--by",
+            "latency",
+            "--physical-country",
+            "DE",
+            "--exclude-country",
+            "US",
+            "--exclude-city",
+            "London",
+            "--require",
+            "p2p",
+            "--protocol",
+            "wireguard-udp",
+        ])
+        .expect("the full selection-plane modifier family parses");
+        match cli.command {
+            Command::Select {
+                target,
+                by,
+                physical_country,
+                exclude_countries,
+                exclude_cities,
+                require,
+                protocol,
+                ..
+            } => {
+                assert_eq!(target, ["country", "GB"]);
+                assert_eq!(by.as_deref(), Some("latency"));
+                assert_eq!(physical_country.as_deref(), Some("DE"));
+                assert_eq!(exclude_countries, ["US"]);
+                assert_eq!(exclude_cities, ["London"]);
+                assert_eq!(require, ["p2p"]);
+                assert_eq!(protocol.as_deref(), Some("wireguard-udp"));
+            }
+            other => panic!("expected Select, got {other:?}"),
+        }
+
+        // The group subcommands (§7.3B): list with an origin filter,
+        // show with an id; the bare `group` is the list.
+        let cli = Cli::try_parse_from(["protonwire", "group", "list", "--origin", "proton"])
+            .expect("`group list --origin proton` must parse (PRD §7.3B)");
+        match cli.command {
+            Command::Group {
+                sub: Some(commands::GroupSub::List { origin, .. }),
+            } => assert_eq!(origin.as_deref(), Some("proton")),
+            other => panic!("expected Group list, got {other:?}"),
+        }
+        let cli = Cli::try_parse_from(["protonwire", "group", "show", "proton:anti-censorship"])
+            .expect("`group show <id>` must parse (PRD §7.3B)");
+        match cli.command {
+            Command::Group {
+                sub: Some(commands::GroupSub::Show { id, .. }),
+            } => assert_eq!(id, "proton:anti-censorship"),
+            other => panic!("expected Group show, got {other:?}"),
+        }
+        let cli = Cli::try_parse_from(["protonwire", "group"])
+            .expect("bare `group` is the list (PRD 9.1)");
+        match cli.command {
+            Command::Group { sub: None } => {}
+            other => panic!("expected bare Group, got {other:?}"),
+        }
+
+        // `connect <target> --dry-run [--by ...]` shares the surface.
+        let cli = Cli::try_parse_from([
+            "protonwire",
+            "connect",
+            "country",
+            "GB",
+            "--by",
+            "latency",
+            "--dry-run",
+        ])
+        .expect("`connect ... --dry-run` must parse");
+        match cli.command {
+            Command::Connect {
+                target,
+                by,
+                dry_run,
+                ..
+            } => {
+                assert_eq!(target, ["country", "GB"]);
+                assert_eq!(by.as_deref(), Some("latency"));
+                assert!(dry_run);
+            }
+            other => panic!("expected Connect, got {other:?}"),
+        }
     }
 }
