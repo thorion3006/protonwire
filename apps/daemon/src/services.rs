@@ -410,6 +410,10 @@ pub struct DaemonServices {
     /// production, the hermetic root in tests (the same opt-in the
     /// construction takes).
     trust_root: std::path::PathBuf,
+    /// The U6 selection engine (the `Select`/`GroupsList`/`GroupShow`
+    /// body): the cached-catalog read, the FR-23Q composition, the S8
+    /// entitlement cell, and the bounded on-demand prober.
+    pub selection: crate::selection::SelectionEngine,
 }
 
 impl DaemonServices {
@@ -489,9 +493,10 @@ impl DaemonServices {
             auth: AuthProvider::default(),
             credentials,
             credential_input,
-            config,
+            config: Arc::clone(&config),
             cache_file: paths.cache_dir.join("servers.json"),
             trust_root: trust_root.to_path_buf(),
+            selection: crate::selection::SelectionEngine::new(config, &paths.cache_dir, trust_root),
         })
     }
 
