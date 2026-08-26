@@ -407,6 +407,54 @@ impl ProtonwireClient {
         }
     }
 
+    // --- The M3 selection/groups surface (U6's wire family, exposed
+    // through the SDK — the surface every first-party frontend
+    // consumes for `select` and `group`; U7's CLI is the first
+    // consumer) -----------------------------------------------------
+
+    /// Resolves a selection WITHOUT connecting (FR-23U's resolution
+    /// results through the shared client contract): the daemon
+    /// composes the cached catalog, the entitlement seams, FR-23Q's
+    /// physical-country sources, and the bounded prober, and answers
+    /// with the full FR-23T provenance set. Refusals arrive as the
+    /// typed RPC errors (exit 5's no-eligible-server family carries
+    /// the FR-22 report in `details`).
+    pub fn select(
+        &mut self,
+        target: ConnectTarget,
+        modifiers: protonwire_frontend_api::SelectionModifiers,
+    ) -> Result<Box<protonwire_frontend_api::SelectionResult>, ClientError> {
+        match self.ipc.request(Request::Select { target, modifiers }) {
+            Ok(RequestResult::Selected { result }) => Ok(result),
+            Ok(other) => Err(unexpected_result("select", other)),
+            Err(error) => Err(map_request_error(error)),
+        }
+    }
+
+    /// The built-in connection-group catalog (FR-23I/U): the registry
+    /// over the wire with per-group FR-23S availability — no network
+    /// request, no client-side preset lists.
+    pub fn groups_list(&mut self) -> Result<protonwire_frontend_api::GroupsCatalog, ClientError> {
+        match self.ipc.request(Request::GroupsList) {
+            Ok(RequestResult::Groups { catalog }) => Ok(catalog),
+            Ok(other) => Err(unexpected_result("groups list", other)),
+            Err(error) => Err(map_request_error(error)),
+        }
+    }
+
+    /// One group's full definition (`group show`); unknown ids are the
+    /// typed InvalidParams refusal.
+    pub fn group_show(
+        &mut self,
+        id: &str,
+    ) -> Result<Box<protonwire_frontend_api::GroupDetails>, ClientError> {
+        match self.ipc.request(Request::GroupShow { id: id.to_owned() }) {
+            Ok(RequestResult::Group { group }) => Ok(group),
+            Ok(other) => Err(unexpected_result("group show", other)),
+            Err(error) => Err(map_request_error(error)),
+        }
+    }
+
     /// The login family's shared result mapping.
     fn login_step(
         &mut self,
@@ -744,6 +792,108 @@ mod tests {
                 Request::SubmitCredential { .. } | Request::Logout => {
                     Ok(RequestResult::Acknowledged)
                 }
+                // The M3 selection/groups surface: scripted replies for
+                // the SDK wrapper suite — one group-bearing Selected
+                // result (the FR-23T shape), the registry catalog, and
+                // the show arm's typed unknown-group refusal.
+                Request::Select { .. } => Ok(RequestResult::Selected {
+                    result: Box::new(protonwire_frontend_api::SelectionResult {
+                        catalog: protonwire_frontend_api::SelectionCatalogProvenance {
+                            server_catalog_etag: Some("\"rev-9\"".into()),
+                            server_catalog_fetched_unix: Some(1_771_000_000),
+                            group_catalog_revision: Some("groups-rev-1".into()),
+                        },
+                        group: Some(protonwire_frontend_api::GroupProvenance {
+                            group_id: "protonwire:fastest-europe".into(),
+                            origin: "protonwire".into(),
+                            policy_provenance: "catalog-default".into(),
+                        }),
+                        selector: protonwire_frontend_api::ResolvedSelector {
+                            target: "group".into(),
+                            detail: Some("protonwire:fastest-europe".into()),
+                            policy: "official".into(),
+                        },
+                        hard_filters: protonwire_frontend_api::HardFiltersReport {
+                            considered: 20,
+                            survivors: 1,
+                            stages: vec![protonwire_frontend_api::StageReport {
+                                stage: "target-geography".into(),
+                                eliminated: 19,
+                            }],
+                        },
+                        physical_country: None,
+                        winner: protonwire_frontend_api::SelectedServer {
+                            id: "id-CH#10".into(),
+                            name: "CH#10".into(),
+                            entry_country: "CH".into(),
+                            exit_country: "CH".into(),
+                            city: Some("Zurich".into()),
+                            tier: 2,
+                            signals: protonwire_frontend_api::WinnerSignals {
+                                provenance: "catalog-only".into(),
+                                proton_score: Some(1.42),
+                                load: Some(42),
+                                latency_ms: None,
+                                weighted: None,
+                            },
+                        },
+                        requested_features: Vec::new(),
+                        feature_difference: Vec::new(),
+                    }),
+                }),
+                Request::GroupsList => Ok(RequestResult::Groups {
+                    catalog: protonwire_frontend_api::GroupsCatalog {
+                        catalog_revision: "groups-rev-1".into(),
+                        taxonomy_revision: "un-m49-six-continent-view".into(),
+                        groups: vec![protonwire_frontend_api::GroupSummary {
+                            id: "proton:fastest-country".into(),
+                            label: "Fastest country".into(),
+                            origin: "proton".into(),
+                            definition_source: "proton-api".into(),
+                            entitlement: "plan-dependent".into(),
+                            ranking_policy: "proton-score".into(),
+                            allowed_ranking_overrides: Vec::new(),
+                            availability: protonwire_frontend_api::GroupAvailability {
+                                available: true,
+                                reason: None,
+                            },
+                        }],
+                    },
+                }),
+                Request::GroupShow { id } => {
+                    if id == "proton:fastest-country" {
+                        Ok(RequestResult::Group {
+                            group: Box::new(protonwire_frontend_api::GroupDetails {
+                                summary: protonwire_frontend_api::GroupSummary {
+                                    id: "proton:fastest-country".into(),
+                                    label: "Fastest country".into(),
+                                    origin: "proton".into(),
+                                    definition_source: "proton-api".into(),
+                                    entitlement: "plan-dependent".into(),
+                                    ranking_policy: "proton-score".into(),
+                                    allowed_ranking_overrides: Vec::new(),
+                                    availability: protonwire_frontend_api::GroupAvailability {
+                                        available: true,
+                                        reason: None,
+                                    },
+                                },
+                                immutable: true,
+                                connection_type: Some("standard".into()),
+                                target: "fastest".into(),
+                                target_detail: None,
+                                protocol_override: None,
+                                connection_overrides: Vec::new(),
+                                selection_authority: None,
+                                sources: vec!["proton-api".into()],
+                            }),
+                        })
+                    } else {
+                        Err(RpcError::new(
+                            RpcErrorCode::InvalidParams,
+                            format!("unknown group `{id}`: not part of the canonical catalog"),
+                        ))
+                    }
+                }
                 Request::BeginLogin { username, .. } => Ok(RequestResult::LoginStep {
                     step: protonwire_frontend_api::LoginOutcome::Session {
                         user_id: format!("{}-ok", username.expose()),
@@ -879,6 +1029,75 @@ mod tests {
         client
             .submit_credential("session", "envelope-bytes")
             .unwrap();
+    }
+
+    /// The M3 selection/groups wrappers: the typed results round-trip
+    /// through the SDK (the FR-23T provenance set verbatim, the
+    /// registry catalog, the show arm's typed refusal), and a
+    /// no-eligible-server refusal surfaces as the RPC error whose
+    /// exit code is 5 (PRD 9.8).
+    #[test]
+    fn the_selection_and_groups_wrappers_round_trip() {
+        use protonwire_frontend_api::{
+            ConnectTarget, SelectionFeature, SelectionModifiers, SelectionProtocol,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let (server, _handler) = spawn_server(&dir);
+        let mut client = dev_client(server.socket_path());
+
+        let result = client
+            .select(
+                ConnectTarget::Group {
+                    group_id: "protonwire:fastest-europe".into(),
+                },
+                SelectionModifiers {
+                    by: Some("latency".into()),
+                    physical_country: Some("GB".into()),
+                    excluded_countries: vec!["US".into()],
+                    excluded_states: Vec::new(),
+                    excluded_cities: Vec::new(),
+                    excluded_servers: Vec::new(),
+                    required_features: vec![SelectionFeature::PortForwarding],
+                    optional_features: vec![SelectionFeature::P2p],
+                    required_protocol: Some(SelectionProtocol::Stealth),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            result.catalog.server_catalog_etag.as_deref(),
+            Some("\"rev-9\"")
+        );
+        assert_eq!(
+            result.catalog.group_catalog_revision.as_deref(),
+            Some("groups-rev-1")
+        );
+        assert_eq!(
+            result.group.as_ref().unwrap().group_id,
+            "protonwire:fastest-europe"
+        );
+        assert_eq!(result.winner.name, "CH#10");
+        assert_eq!(result.winner.signals.provenance, "catalog-only");
+
+        let catalog = client.groups_list().unwrap();
+        assert_eq!(catalog.catalog_revision, "groups-rev-1");
+        assert_eq!(catalog.groups.len(), 1);
+        assert_eq!(catalog.groups[0].id, "proton:fastest-country");
+        assert!(catalog.groups[0].availability.available);
+
+        let details = client.group_show("proton:fastest-country").unwrap();
+        assert_eq!(details.summary.id, "proton:fastest-country");
+        assert!(details.immutable);
+
+        let err = client.group_show("nope").unwrap_err();
+        let ClientError::Rpc(rpc) = &err else {
+            panic!("the unknown group is an RPC refusal: {err}")
+        };
+        assert_eq!(rpc.code, RpcErrorCode::InvalidParams);
+
+        // The no-eligible-server family maps to exit 5 (the fixture's
+        // wildcard NotImplemented arm proves the mapping direction).
+        let err = client.disconnect_vpn().unwrap_err();
+        assert_eq!(err.exit_code(), 1);
     }
 
     #[test]
