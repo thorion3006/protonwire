@@ -37,14 +37,19 @@
 //!   model.
 //! * [`RankingPolicy::Balanced`] — ProtonWire's weighted policy (FR-16;
 //!   lower is better) over caller-supplied weights. A positive latency
-//!   weight requires caller-supplied latency observations (probing is
-//!   PR-3 of this milestone's stack); stability and history have no
-//!   data source until connection statistics exist (post-M4), so their
-//!   terms contribute uniformly zero and the scoring-signal report
-//!   marks them absent.
+//!   weight requires caller-supplied latency observations (the bounded
+//!   on-demand prober is [`crate::probe`]); stability and history have
+//!   no data source until connection statistics exist (post-M4), so
+//!   their terms contribute uniformly zero and the scoring-signal
+//!   report marks them absent.
 //! * [`RankingPolicy::LowestLoad`] — lowest Proton-exposed load
 //!   (FR-17); a server without an exposed load is excluded WITH a
 //!   structured report entry, never approximated.
+//! * [`RankingPolicy::Latency`] — lowest locally measured latency
+//!   (FR-18): the caller-supplied observations ascending (the bounded
+//!   on-demand prober, [`crate::probe`], fills the table); an
+//!   unobserved candidate is excluded WITH a report entry (the
+//!   shortlist boundary), never guessed, never an offline verdict.
 //! * [`RankingPolicy::Random`] — the connection-groups contract's
 //!   `random-country-then-server` (M3 U2): a uniform eligible country,
 //!   then a uniform eligible server within it. The core is pure, so
@@ -103,8 +108,9 @@ use std::time::Duration;
 use protonwire_store::catalog::LogicalServer;
 
 /// Latency observations keyed by logical server ID — the caller-supplied
-/// probe results (milestone 3 PR-3 wires the bounded on-demand prober;
-/// FR-18 forbids full-catalog scans, so keys cover at most a shortlist).
+/// probe results (the bounded on-demand prober, [`crate::probe`], fills
+/// the table; FR-18 forbids full-catalog scans, so keys cover at most a
+/// shortlist).
 pub type LatencyTable = BTreeMap<String, Duration>;
 
 /// The forbidden throughput ranking signals (the connection-groups
@@ -170,6 +176,14 @@ pub enum RankingPolicy {
     },
     /// Lowest Proton-exposed load (FR-17).
     LowestLoad,
+    /// Lowest locally measured latency (FR-18): the caller-supplied
+    /// probe observations ascending. Pure — no probing happens here;
+    /// the bounded on-demand prober ([`crate::probe`]) fills
+    /// [`SelectionContext::latency`], a candidate without an
+    /// observation is excluded WITH a report entry (the FR-18
+    /// shortlist boundary), and an empty table is a typed refusal —
+    /// never a fabricated ordering, never an offline verdict.
+    Latency,
     /// The connection-groups contract's `random-country-then-server`
     /// (M3 U2): a uniform eligible country, then a uniform eligible
     /// server within it. The draw is pure — entropy comes from
@@ -180,13 +194,12 @@ pub enum RankingPolicy {
 impl RankingPolicy {
     /// Parses the ranking-mode vocabulary shared by `--by`, profile
     /// `selection.by`, and the wire `selection_policy`: `official`,
-    /// `balanced`, `load`. `speed` — and the other forbidden throughput
-    /// signals — is rejected with the typed T-1 error, never silently
-    /// ignored (FR-19); unknown strings are invalid modes naming the
-    /// input. (`latency` lands with this milestone's PR-3 probing;
-    /// `random` is NOT a mode — it is the random group's catalog
-    /// policy, assembled by the group resolver, not requestable as a
-    /// `--by` value.)
+    /// `balanced`, `load`, `latency`. `speed` — and the other forbidden
+    /// throughput signals — is rejected with the typed T-1 error,
+    /// never silently ignored (FR-19); unknown strings are invalid
+    /// modes naming the input. (`random` is NOT a mode — it is the
+    /// random group's catalog policy, assembled by the group resolver,
+    /// not requestable as a `--by` value.)
     pub fn parse(mode: &str) -> Result<Self, SelectionError> {
         match mode {
             "official" => Ok(RankingPolicy::Official),
@@ -194,6 +207,7 @@ impl RankingPolicy {
                 weights: WeightedSignals::DEFAULT,
             }),
             "load" => Ok(RankingPolicy::LowestLoad),
+            "latency" => Ok(RankingPolicy::Latency),
             forbidden if FORBIDDEN_RANKING_SIGNALS.contains(&forbidden) => {
                 Err(SelectionError::UnsupportedRankingSignal {
                     key: forbidden.to_owned(),
@@ -397,9 +411,10 @@ pub struct SelectionRequest {
 /// fetches or fabricates any of it.
 #[derive(Debug, Clone, Default)]
 pub struct SelectionContext {
-    /// Latency observations by logical id (PR-3 of this milestone wires
-    /// the bounded prober; an empty table with a positive latency
-    /// weight is a typed refusal — no fabricated latencies).
+    /// Latency observations by logical id (the bounded on-demand
+    /// prober, [`crate::probe`], supplies them; an empty table under a
+    /// latency-dependent ranking is a typed refusal — no fabricated
+    /// latencies).
     pub latency: LatencyTable,
     /// Whether the account is entitled to port forwarding (`None`:
     /// entitlement not composed yet — a port-forwarding constraint then
@@ -597,10 +612,10 @@ pub struct ScoringSignals {
 }
 
 impl ScoringSignals {
-    /// The provenance a non-balanced policy reports: what the catalog
-    /// exposed and nothing else — no observed latency (only `balanced`
-    /// consumes the latency table today) and no weighted breakdown
-    /// (only `balanced` carries one).
+    /// The provenance a policy that consumes no latency table reports:
+    /// what the catalog exposed and nothing else — no observed latency
+    /// (only `balanced` and `latency` consume the table) and no
+    /// weighted breakdown (only `balanced` carries one).
     fn catalog_only(server: &LogicalServer) -> Self {
         Self {
             proton_score: server.score,
@@ -664,7 +679,7 @@ pub enum SelectionError {
         key: String,
     },
     /// An unrecognized ranking mode.
-    #[error("invalid ranking mode `{0}`: expected `official`, `balanced`, or `load`")]
+    #[error("invalid ranking mode `{0}`: expected `official`, `balanced`, `load`, or `latency`")]
     InvalidRankingMode(String),
     /// Invalid weights: duplicates, unknown keys, or non-finite /
     /// negative values.
@@ -694,14 +709,19 @@ pub enum SelectionError {
         "physical-country-required: the target excludes the physical country but none is known — pass it explicitly per request or set connection_groups.physical_country"
     )]
     PhysicalCountryRequired,
-    /// A balanced request with a positive latency weight and no latency
-    /// observations supplied (probing is this milestone's PR-3; no
-    /// fabricated latencies in the meantime).
+    /// A latency-dependent ranking (the `latency` policy, or a balanced
+    /// weight set with a positive latency weight) with no latency
+    /// observations supplied — the bounded on-demand prober
+    /// ([`crate::probe`]) must run first; latencies are never
+    /// fabricated.
     #[error(
-        "latency data unavailable: balanced weights assign {weight} to latency but no observations were supplied"
+        "latency data unavailable: the ranking weights latency at {weight} but no observations \
+         were supplied — the bounded on-demand prober must run first; latencies are never \
+         fabricated"
     )]
     LatencyDataUnavailable {
-        /// The latency weight that could not be satisfied.
+        /// The latency weight that could not be satisfied (1.0 under
+        /// the pure `latency` policy — latency IS the ranking).
         weight: f32,
     },
     /// A random-policy request with no caller-supplied entropy: the
@@ -1285,6 +1305,7 @@ pub fn select<'a>(
     } else {
         match &request.policy {
             RankingPolicy::Official => rank_official(candidates)?,
+            RankingPolicy::Latency => rank_lowest_latency(candidates, context, &mut report)?,
             RankingPolicy::LowestLoad => rank_lowest_load(candidates, &mut report)?,
             RankingPolicy::Balanced { weights } => {
                 rank_balanced(candidates, *weights, request, context, &mut report)?
@@ -1341,6 +1362,49 @@ fn rank_official<'a>(
                     .unwrap_or(i8::MAX)
                     .cmp(&b.server.load.unwrap_or(i8::MAX))
             })
+            .then_with(|| a.server.id.cmp(&b.server.id))
+    });
+    Ok(ranked)
+}
+
+/// The `latency` policy (FR-18): lowest locally measured latency — the
+/// caller-supplied observations ascending, ties by logical id. A
+/// candidate without an observation is excluded WITH a report entry
+/// (the FR-18 shortlist boundary: the bounded prober
+/// ([`crate::probe`]) decides what was measured — an unobserved
+/// candidate is absent data, never an offline verdict); an empty table
+/// is the typed data refusal (weight 1.0: latency IS the ranking).
+fn rank_lowest_latency<'a>(
+    candidates: Vec<&'a LogicalServer>,
+    context: &SelectionContext,
+    report: &mut EliminationReport,
+) -> Result<Vec<RankedCandidate<'a>>, SelectionError> {
+    if context.latency.is_empty() {
+        return Err(SelectionError::LatencyDataUnavailable { weight: 1.0 });
+    }
+    let mut ranked = Vec::with_capacity(candidates.len());
+    let mut missing = 0usize;
+    for server in candidates {
+        match context.latency.get(&server.id) {
+            Some(&rtt) => ranked.push(RankedCandidate {
+                server,
+                signals: ScoringSignals {
+                    proton_score: server.score,
+                    load: server.load,
+                    latency: Some(rtt),
+                    weighted: None,
+                },
+            }),
+            None => missing += 1,
+        }
+    }
+    report.charge(FilterStage::NoLatencyObservation, missing);
+    ranked.sort_by(|a, b| {
+        let (Some(a_rtt), Some(b_rtt)) = (a.signals.latency, b.signals.latency) else {
+            unreachable!("only observed candidates are ranked here");
+        };
+        a_rtt
+            .cmp(&b_rtt)
             .then_with(|| a.server.id.cmp(&b.server.id))
     });
     Ok(ranked)
@@ -1623,17 +1687,117 @@ mod tests {
         }
     }
 
-    /// The intermediate state (M3 U1 review nit): `latency` is PR-3's
-    /// mode (the bounded on-demand prober); until then it must parse as
-    /// an ordinary INVALID mode — never silently accepted, never the
-    /// unsupported-SIGNAL class.
+    /// `latency` is the fourth `--by` mode (FR-18): the bounded
+    /// on-demand prober ([`crate::probe`]) supplies the observations
+    /// this policy ranks by. The M3 U1 intermediate state (parse
+    /// refused as an ordinary invalid mode) ended with this unit.
     #[test]
-    fn latency_mode_is_invalid_until_pr3_wires_the_prober() {
-        let err = RankingPolicy::parse("latency").unwrap_err();
+    fn latency_mode_parses() {
         assert_eq!(
-            err,
-            SelectionError::InvalidRankingMode("latency".to_owned())
+            RankingPolicy::parse("latency").unwrap(),
+            RankingPolicy::Latency
         );
+    }
+
+    #[test]
+    fn latency_ranks_by_observed_rtt_and_reports_the_boundary() {
+        // FR-18: lowest measured latency over the candidates that HAVE
+        // observations; a candidate without one is excluded WITH a
+        // report entry (the shortlist boundary — never probed here,
+        // never guessed, never an offline verdict).
+        let catalog = build_catalog(&[
+            spec_with("GB#1", "GB", Some(1.0), Some(50)),
+            spec_with("GB#2", "GB", Some(0.1), Some(50)),
+            spec_with("GB#3", "GB", Some(2.0), Some(50)),
+        ]);
+        let mut request = official(Target::Country("GB".into()));
+        request.policy = RankingPolicy::Latency;
+        let outcome = select(
+            &catalog,
+            &request,
+            &latency_context(&[("id-GB#1", 120), ("id-GB#3", 30)]),
+        )
+        .unwrap();
+        let ranked: Vec<&str> = outcome
+            .ranked
+            .iter()
+            .map(|c| c.server.name.as_str())
+            .collect();
+        assert_eq!(ranked, ["GB#3", "GB#1"], "RTT order, not score order");
+        assert_eq!(
+            outcome.ranked[0].signals.latency,
+            Some(Duration::from_millis(30)),
+            "the winning observation rides the scoring signals"
+        );
+        assert_eq!(outcome.ranked[0].signals.weighted, None);
+        assert_eq!(
+            stage_count(&outcome.report, FilterStage::NoLatencyObservation),
+            1,
+            "GB#2 was never observed: excluded with the report entry"
+        );
+    }
+
+    #[test]
+    fn latency_without_any_observations_refuses() {
+        // The data requirement is the policy's own: an empty probe
+        // table refuses typed (weight 1.0 — latency IS the whole
+        // ranking), never a fabricated ordering.
+        let catalog = build_catalog(&[spec_with("GB#1", "GB", Some(1.0), Some(50))]);
+        let mut request = official(Target::Country("GB".into()));
+        request.policy = RankingPolicy::Latency;
+        let err = select(&catalog, &request, &SelectionContext::default()).unwrap_err();
+        assert_eq!(err, SelectionError::LatencyDataUnavailable { weight: 1.0 });
+        assert!(
+            err.to_string().contains("latency data unavailable"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn latency_ties_break_by_id_for_determinism() {
+        // The fixture's scores INVERT the expected order (B scores
+        // better), so a score-ordering implementation fails this pin —
+        // equal RTTs must fall to the id, not to any catalog signal.
+        let catalog = build_catalog(&[
+            spec_with("GB#B", "GB", Some(0.1), Some(50)),
+            spec_with("GB#A", "GB", Some(2.0), Some(50)),
+        ]);
+        let mut request = official(Target::Country("GB".into()));
+        request.policy = RankingPolicy::Latency;
+        let outcome = select(
+            &catalog,
+            &request,
+            &latency_context(&[("id-GB#A", 50), ("id-GB#B", 50)]),
+        )
+        .unwrap();
+        let ranked: Vec<&str> = outcome
+            .ranked
+            .iter()
+            .map(|c| c.server.name.as_str())
+            .collect();
+        assert_eq!(ranked, ["GB#A", "GB#B"]);
+    }
+
+    /// FR-23C's "lowest latency" arm is the composition of U4 and U5:
+    /// the routed Secure Core target under the latency policy ranks
+    /// the SC fleet by probe observations.
+    #[test]
+    fn secure_core_routes_rank_by_latency() {
+        let catalog = build_catalog(&[route("CH-SE#1", "CH", "SE"), route("IS-SE#1", "IS", "SE")]);
+        let mut request = official(sc(None, Some("SE")));
+        request.policy = RankingPolicy::Latency;
+        let outcome = select(
+            &catalog,
+            &request,
+            &latency_context(&[("id-CH-SE#1", 200), ("id-IS-SE#1", 40)]),
+        )
+        .unwrap();
+        let ranked: Vec<&str> = outcome
+            .ranked
+            .iter()
+            .map(|c| c.server.name.as_str())
+            .collect();
+        assert_eq!(ranked, ["IS-SE#1", "CH-SE#1"]);
     }
 
     #[test]
@@ -2355,8 +2519,8 @@ mod tests {
     /// CONSTRUCTION (the type stage removes every SC logical; the
     /// feature stage then removes every Standard one). The
     /// contradiction is detectable at validation time and refuses with
-    /// a typed error naming it and the routed target that lands in
-    /// PR-3 — never the pipeline's baffling all-stages-empty report.
+    /// a typed error naming it and the routed target — never the
+    /// pipeline's baffling all-stages-empty report.
     #[test]
     fn a_standard_fleet_target_with_the_secure_core_feature_refuses_at_validation() {
         let catalog = build_catalog(&[Spec::new("UK#1", "GB"), Spec::new("GB#1", "GB")]);
@@ -2462,8 +2626,8 @@ mod tests {
     fn exact_matching_covers_special_name_forms() {
         // Secure Core `CH-SE#1` and gateway `acme-corp#1` are logical
         // names: exact matching serves them without the Standard-type
-        // filter (the routed-Secure-Core TARGET is this milestone's
-        // PR-3; the NAME resolves today).
+        // filter (the routed-Secure-Core TARGET is Slice 6; the NAME
+        // has resolved since U1).
         let mut secure_core = Spec::new("CH-SE#1", "SE");
         secure_core.entry = "CH";
         secure_core.features = 1;
@@ -2749,8 +2913,9 @@ mod tests {
 
     #[test]
     fn balanced_latency_weight_without_observations_refuses() {
-        // Decision 5: latency probing is PR-3; no table and a positive
-        // latency weight is a typed refusal — no fabricated latencies.
+        // Decision 5: no table and a positive latency weight is a
+        // typed refusal — no fabricated latencies (the prober is the
+        // only legitimate source of observations).
         let catalog = build_catalog(&[spec_with("GB#1", "GB", Some(1.0), Some(50))]);
         let weights = WeightedSignals {
             latency: 0.4,
