@@ -883,8 +883,11 @@ pub struct GroupAvailability {
     /// over the current cached catalog.
     pub available: bool,
     /// The structured reason when unavailable: `no-catalog` (nothing
-    /// cached yet), `physical-country-required` (FR-23Q), or
-    /// `no-eligible-server` (the FR-22 report eliminated everything).
+    /// cached yet), `physical-country-required` (FR-23Q),
+    /// `entitlement-composition-missing` (a PF-requiring group with
+    /// the entitlement seam uncomposed — none exist in the v1 catalog),
+    /// or `no-eligible-server` (the FR-22 report eliminated
+    /// everything).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
 }

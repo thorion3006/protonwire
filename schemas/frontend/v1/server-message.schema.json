@@ -479,7 +479,7 @@
           "type": "boolean"
         },
         "reason": {
-          "description": "The structured reason when unavailable: `no-catalog` (nothing\ncached yet), `physical-country-required` (FR-23Q), or\n`no-eligible-server` (the FR-22 report eliminated everything).",
+          "description": "The structured reason when unavailable: `no-catalog` (nothing\ncached yet), `physical-country-required` (FR-23Q),\n`entitlement-composition-missing` (a PF-requiring group with\nthe entitlement seam uncomposed — none exist in the v1 catalog),\nor `no-eligible-server` (the FR-22 report eliminated\neverything).",
           "type": [
             "string",
             "null"

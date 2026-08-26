@@ -1,9 +1,14 @@
 //! `protonwire` — the CLI (PRD 9.1, FR-127E).
 //!
-//! Milestone 1 implements `status` (human and JSON), `--version`, and the
-//! `daemon status`/`stop` lifecycle surface against the real daemon
-//! (`daemon start` defers to the systemd unit, which lands in Milestone 8).
-//! Every other command in the tree is present with an honest
+//! Implemented surfaces, by milestone: M1 `status` (human and JSON),
+//! `--version`, and the `daemon status`/`stop` lifecycle against the
+//! real daemon (`daemon start` defers to the systemd unit, Milestone 8);
+//! M2 the login family (`login`/`logout`), `account`, `servers` with
+//! paced refresh, and `credentials status`; M3 the selection plane —
+//! `select <target>` (a pure read with the full §9.3 selection-plane
+//! modifier family), `group [list|show]`, and `connect <target>
+//! --dry-run` (resolve and print, never connect). Every other command
+//! in the tree is present with an honest
 //! not-implemented-in-this-milestone refusal and its planned milestone,
 //! so the command grammar is stable from day one.
 

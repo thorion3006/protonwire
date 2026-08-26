@@ -4,9 +4,11 @@
 //! full catalog — FR-18), prior observations, and the budget state, it
 //! decides WHICH endpoints to probe NOW and which prior results to
 //! reuse. The EXECUTOR is an injected seam (`ProbeExecutor`): the
-//! daemon (PR-4/M4) supplies the real transport — TCP/UDP connect by
-//! default, ICMP only behind an explicit opt-in that requires
-//! CAP_NET_RAW, which the core never assumes. No background scanning:
+//! daemon supplies the real transport — the TCP connect-timing
+//! executor landed with M3 PR-4's U6 (`apps/daemon/src/selection.rs`);
+//! ICMP remains a config VALUE honored fail-closed there (its
+//! raw-socket executor is deliberately unwired, and CAP_NET_RAW is the
+//! daemon's call, never assumed here). No background scanning:
 //! every probe run is caller-initiated. An unanswered probe is NEVER
 //! proof an endpoint is offline — a timeout is simply the absence of
 //! an observation (FR-19B); the planner keeps the prior value.
