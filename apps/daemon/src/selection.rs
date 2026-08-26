@@ -1729,6 +1729,49 @@ mod tests {
         assert_eq!(decisions["id-GB#2"], ProbeDecision::RateLimited);
     }
 
+    /// The verdict round's GAP-2: the daemon's `max_candidates` cap
+    /// bounds the shortlist BEFORE the executor resolves addresses —
+    /// what the planner's own per-run cap cannot bound (address
+    /// resolution is O(catalog) per id). A fixture exceeding the cap
+    /// must probe at most `max_candidates` endpoints, never every
+    /// survivor. Mutation: delete the `.take(cap)` and this fails.
+    #[test]
+    fn the_latency_shortlist_is_capped_at_max_candidates() {
+        fn answers(_addr: SocketAddr, _timeout: Duration) -> Option<Duration> {
+            Some(Duration::from_millis(25))
+        }
+        // All six logicals survive a bare regional target (every
+        // country is a member of some region only under regional
+        // groups; a `fastest` target matches all six).
+        let mut config = SystemConfig::default();
+        config.server_selection.latency_probe.max_candidates = 3;
+        let engine = engine_over(config, 1_000_000, answers as fn(_, _) -> _);
+
+        let result = engine
+            .resolve(
+                &ConnectTarget::Fastest,
+                &SelectionModifiers {
+                    by: Some("latency".into()),
+                    ..modifiers()
+                },
+            )
+            .expect("the probed shortlist serves the ranking");
+        // The unprobed survivors eliminated at the FR-18 shortlist
+        // boundary (no-latency-observation) — the CONTRACT here is the
+        // probe-state population: at most `max_candidates` (3)
+        // endpoints carry an attempt clock, never all six survivors.
+        assert_eq!(result.hard_filters.survivors, 3);
+        let attempted = engine
+            .probe_state()
+            .values()
+            .filter(|endpoint| endpoint.last_attempt_ms > 0)
+            .count();
+        assert_eq!(
+            attempted, 3,
+            "the shortlist cap bounds the probed population, not the survivor count"
+        );
+    }
+
     /// The answered arm: fresh observations serve the ranking, ride
     /// the winner's signals as `probe-observed`, and are REUSED
     /// without re-probing inside the reuse window.
