@@ -268,6 +268,69 @@ mod tests {
         assert_eq!(decisions["a"], ProbeDecision::Probe);
     }
 
+    /// The asymmetry itself (the verdict round's GAP-1): the
+    /// discriminating window — an observation whose last attempt is
+    /// BETWEEN the probe interval and the reuse age — is REUSED. If
+    /// the thresholds are swapped (the pre-fix ordering), this is the
+    /// population that gets hammered every 60s instead of 300s.
+    #[test]
+    fn observed_endpoints_between_the_two_windows_are_reused() {
+        let shortlist = vec!["a".to_owned()];
+        let state: BTreeMap<_, _> = [endpoint("a", Some(42), 1_000)].into();
+        // interval 60s, reuse age 300s: 100s old is past the interval
+        // but inside the reuse age — the with-observation arm reuses.
+        let now = 1_000 + 100_000;
+        let decisions = plan_run(&shortlist, &state, &ProbeBudget::default(), now);
+        assert_eq!(
+            decisions["a"],
+            ProbeDecision::Reuse(Observation {
+                rtt: Duration::from_millis(42)
+            }),
+            "the with-obs arm uses the STRICTER reuse window, not the interval"
+        );
+    }
+
+    /// The RateLimited passthrough (GAP-2): a prior observation
+    /// SURVIVES a budget-rate-limited decision into the run's table —
+    /// deleting the passthrough arm fails here.
+    #[test]
+    fn rate_limited_decisions_carry_prior_observations() {
+        struct AnswerAll;
+        impl ProbeExecutor for AnswerAll {
+            fn probe(&mut self, _endpoint: &str) -> Option<Duration> {
+                Some(Duration::from_millis(5))
+            }
+        }
+        // 8 fresh-endpoint probes exhaust the cap; the 9th (with a
+        // prior observation) is budget-rate-limited — its prior must
+        // survive into the table.
+        let mut shortlist: Vec<String> = (0..8).map(|i| format!("s{i:02}")).collect();
+        shortlist.push("zz".to_owned());
+        let mut state: BTreeMap<_, _> = (0..8)
+            .map(|i| endpoint(&format!("s{i:02}"), None, 0))
+            .collect();
+        // zz's observation is STALE (age 400s > reuse age) so it wants
+        // a probe — and the cap skips it, keeping its prior.
+        state.insert(
+            endpoint("zz", Some(77), 1_000).0,
+            endpoint("zz", Some(77), 1_000).1,
+        );
+        let decisions = plan_run(&shortlist, &state, &ProbeBudget::default(), 1_000 + 400_000);
+        assert_eq!(
+            decisions["zz"],
+            ProbeDecision::RateLimited,
+            "the cap (8 probes budgeted before it) skips the 9th"
+        );
+        let table = run_planned(&decisions, &state, &mut AnswerAll);
+        assert_eq!(
+            table.get("zz"),
+            Some(&Observation {
+                rtt: Duration::from_millis(77)
+            }),
+            "a rate-limited endpoint's PRIOR observation survives into the table"
+        );
+    }
+
     /// An unanswered probe is never an offline verdict: the run
     /// contributes nothing for that endpoint, and the PRIOR
     /// observation (held by the caller) still serves selection.

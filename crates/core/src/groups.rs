@@ -394,12 +394,12 @@ pub enum GroupError {
         /// The declared override list, comma-separated.
         declared: String,
     },
-    /// Declared by the catalog but not yet selectable: `latency` needs
-    /// the bounded on-demand prober (M3 PR-3).
-    #[error(
-        "ranking policy `{requested}` on `{id}` is declared but unavailable until M3 PR-3 wires \
-         the bounded on-demand latency prober"
-    )]
+    /// Declared by the catalog but not selectable on this build:
+    /// reserved for a declared override whose machinery is not yet
+    /// wired. (The latency arm's PR-3 condition is satisfied on this
+    /// branch — the variant remains for a future declared-but-pending
+    /// mode; it currently has no constructor.)
+    #[error("ranking policy `{requested}` on `{id}` is declared but unavailable in this build")]
     RankingOverrideUnavailable {
         /// The group.
         id: &'static str,
@@ -407,7 +407,11 @@ pub enum GroupError {
         requested: String,
     },
 }
-/// regional override must be explicit in status).
+
+/// How a resolved group's effective ranking policy came to be (T-33:
+/// the status surface distinguishes the catalog default from a
+/// request-time override — a regional override must be explicit in
+/// status).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PolicyProvenance {
     /// The catalog's declared default policy.
