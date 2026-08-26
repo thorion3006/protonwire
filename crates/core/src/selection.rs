@@ -1448,10 +1448,7 @@ fn rank_lowest_load<'a>(
 /// deterministic continuation (a full permutation of the eligible set,
 /// so `ranked.len() == survivors` and a `change-server` caller has a
 /// next candidate). Pure: the seed is caller-supplied entropy.
-fn rank_random<'a>(
-    candidates: Vec<&'a LogicalServer>,
-    entropy: u64,
-) -> Vec<RankedCandidate<'a>> {
+fn rank_random<'a>(candidates: Vec<&'a LogicalServer>, entropy: u64) -> Vec<RankedCandidate<'a>> {
     // Group by exit country; BTreeMap iteration is ascending country
     // order, so the pre-shuffle layout is deterministic.
     let mut by_country: BTreeMap<&str, Vec<&'a LogicalServer>> = BTreeMap::new();
@@ -3522,7 +3519,10 @@ mod tests {
         assert!(!ranked.contains(&"GB#2") && !ranked.contains(&"US#1"));
         assert_eq!(outcome.report.survivors(), ranked.len());
         assert_eq!(stage_count(&outcome.report, FilterStage::Offline), 1);
-        assert_eq!(stage_count(&outcome.report, FilterStage::ExcludedCountry), 1);
+        assert_eq!(
+            stage_count(&outcome.report, FilterStage::ExcludedCountry),
+            1
+        );
     }
 
     // ------------------------------------------------------------------
