@@ -666,16 +666,7 @@ impl SelectionEngine {
             hard_filters: HardFiltersReport {
                 considered: outcome.report.considered(),
                 survivors: outcome.report.survivors(),
-                stages: outcome
-                    .report
-                    .stages()
-                    .iter()
-                    .filter(|(_, eliminated)| *eliminated > 0)
-                    .map(|(stage, eliminated)| StageReport {
-                        stage: stage.to_string(),
-                        eliminated: *eliminated,
-                    })
-                    .collect(),
+                stages: stage_reports(&outcome.report),
             },
             physical_country,
             winner: SelectedServer {
@@ -716,23 +707,13 @@ impl SelectionEngine {
         let weights = self.balanced_weights();
         let groups = protonwire_core::groups::all_groups()
             .iter()
-            .map(|entry| GroupSummary {
-                id: entry.id.to_owned(),
-                label: entry.label.to_owned(),
-                origin: entry.origin.as_str().to_owned(),
-                definition_source: entry.definition_source.as_str().to_owned(),
-                entitlement: entry.entitlement.as_str().to_owned(),
-                ranking_policy: entry.ranking_policy.as_str().to_owned(),
-                allowed_ranking_overrides: entry
-                    .allowed_ranking_overrides
-                    .iter()
-                    .map(|policy| policy.as_str().to_owned())
-                    .collect(),
-                availability: self.group_availability(
+            .map(|entry| {
+                let availability = self.group_availability(
                     cached.as_ref().map(|(_, _, document)| document),
                     entry,
                     &weights,
-                ),
+                );
+                group_summary(entry, availability)
             })
             .collect();
         Ok(GroupsCatalog {
@@ -813,20 +794,7 @@ impl SelectionEngine {
         );
         let (target, target_detail) = group_target_render(&entry.target);
         Ok(Box::new(GroupDetails {
-            summary: GroupSummary {
-                id: entry.id.to_owned(),
-                label: entry.label.to_owned(),
-                origin: entry.origin.as_str().to_owned(),
-                definition_source: entry.definition_source.as_str().to_owned(),
-                entitlement: entry.entitlement.as_str().to_owned(),
-                ranking_policy: entry.ranking_policy.as_str().to_owned(),
-                allowed_ranking_overrides: entry
-                    .allowed_ranking_overrides
-                    .iter()
-                    .map(|policy| policy.as_str().to_owned())
-                    .collect(),
-                availability,
-            },
+            summary: group_summary(entry, availability),
             immutable: entry.immutable,
             connection_type: entry.connection_type.map(|kind| kind.as_str().to_owned()),
             target,
@@ -854,6 +822,30 @@ fn unavailable(reason: &str) -> GroupAvailability {
     GroupAvailability {
         available: false,
         reason: Some(reason.to_owned()),
+    }
+}
+
+/// One registry entry's [`GroupSummary`] projection — the one mapping
+/// the `GroupsList` row and the `GroupShow` summary share, so a
+/// registry field lands in exactly one place (the FilterStage::STAGES
+/// precedent).
+fn group_summary(
+    entry: &protonwire_core::groups::GroupEntry,
+    availability: GroupAvailability,
+) -> GroupSummary {
+    GroupSummary {
+        id: entry.id.to_owned(),
+        label: entry.label.to_owned(),
+        origin: entry.origin.as_str().to_owned(),
+        definition_source: entry.definition_source.as_str().to_owned(),
+        entitlement: entry.entitlement.as_str().to_owned(),
+        ranking_policy: entry.ranking_policy.as_str().to_owned(),
+        allowed_ranking_overrides: entry
+            .allowed_ranking_overrides
+            .iter()
+            .map(|policy| policy.as_str().to_owned())
+            .collect(),
+        availability,
     }
 }
 
@@ -1117,23 +1109,31 @@ fn group_error_to_rpc(error: protonwire_core::groups::GroupError) -> RpcError {
     RpcError::new(RpcErrorCode::InvalidParams, error.to_string())
 }
 
+/// The FR-22 report's nonzero stages in evaluation order — the ONE
+/// projection behind both wire forms (the result's typed
+/// [`HardFiltersReport`] and the refusal `details` payload below), so
+/// the two can never disagree about which stages carry what.
+fn stage_reports(report: &protonwire_core::selection::EliminationReport) -> Vec<StageReport> {
+    report
+        .stages()
+        .iter()
+        .filter(|(_, eliminated)| *eliminated > 0)
+        .map(|(stage, eliminated)| StageReport {
+            stage: stage.to_string(),
+            eliminated: *eliminated,
+        })
+        .collect()
+}
+
 /// The FR-22 elimination report as `details` JSON (the structured
 /// no-eligible-server payload).
 fn report_details(
     report: &protonwire_core::selection::EliminationReport,
 ) -> Option<serde_json::Value> {
-    let stages: Vec<serde_json::Value> = report
-        .stages()
-        .iter()
-        .filter(|(_, eliminated)| *eliminated > 0)
-        .map(|(stage, eliminated)| {
-            serde_json::json!({ "stage": stage.to_string(), "eliminated": eliminated })
-        })
-        .collect();
     Some(serde_json::json!({
         "considered": report.considered(),
         "survivors": report.survivors(),
-        "stages": stages,
+        "stages": stage_reports(report),
     }))
 }
 
