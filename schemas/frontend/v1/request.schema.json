@@ -305,6 +305,76 @@
       "required": [
         "method"
       ]
+    },
+    {
+      "description": "Resolve a selection WITHOUT connecting (M3 U6, FR-23T): the\ndaemon composes the cached catalog (strict load), the S8\nentitlement seams, FR-23Q's physical-country sources, and the\nbounded on-demand prober, then answers with the full\nprovenance-carrying result. A pure query — no tunnel state\nchanges, no events (FR-123's connection-group status fields\nride the M4 connection transition, not a query).",
+      "type": "object",
+      "properties": {
+        "method": {
+          "type": "string",
+          "const": "select"
+        },
+        "params": {
+          "type": "object",
+          "properties": {
+            "modifiers": {
+              "description": "The §9.3 selection-plane modifiers.",
+              "$ref": "#/$defs/SelectionModifiers"
+            },
+            "target": {
+              "description": "The connection-target grammar (shared with `connect`).",
+              "$ref": "#/$defs/ConnectTarget"
+            }
+          },
+          "required": [
+            "target",
+            "modifiers"
+          ]
+        }
+      },
+      "required": [
+        "method",
+        "params"
+      ]
+    },
+    {
+      "description": "The built-in connection-group catalog (M3 U6, FR-23I/U): served\nfrom core's generated registry — no network request, no\nhard-coded client lists. Each entry carries its FR-23S\navailability evaluation against the current cached catalog.",
+      "type": "object",
+      "properties": {
+        "method": {
+          "type": "string",
+          "const": "groups-list"
+        }
+      },
+      "required": [
+        "method"
+      ]
+    },
+    {
+      "description": "One group's full definition (FR-23U `group show`).",
+      "type": "object",
+      "properties": {
+        "method": {
+          "type": "string",
+          "const": "group-show"
+        },
+        "params": {
+          "type": "object",
+          "properties": {
+            "id": {
+              "description": "The stable namespaced group id.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "id"
+          ]
+        }
+      },
+      "required": [
+        "method",
+        "params"
+      ]
     }
   ],
   "$defs": {
@@ -573,6 +643,142 @@
     "SecretParam": {
       "description": "A secret value crossing the request boundary (a password, a TOTP\ncode, a credential value, a FIDO2 assertion field): serializes as a\nplain JSON string — the local socket is the trusted transport — but\nits `Debug` renders `[redacted]` so no log line, panic message, or\nerror formatter derived from a `{:?}` of a request ever carries it\n(the S0/S4 `Fido2Payload` precedent, applied at the wire layer).",
       "type": "string"
+    },
+    "SelectionFeature": {
+      "description": "A selection-plane feature constraint (§9.3's `--require` family and\nthe optional slot the balanced feature-match term consumes). The\nforbidden throughput signals do not exist here — `speed` is rejected\nat the ranking-mode vocabulary, never modeled as a feature.",
+      "oneOf": [
+        {
+          "description": "P2P-friendly (catalog bit).",
+          "type": "string",
+          "const": "p2p"
+        },
+        {
+          "description": "Tor over VPN (catalog bit).",
+          "type": "string",
+          "const": "tor"
+        },
+        {
+          "description": "Secure Core (catalog bit; under a Standard-fleet target this is\nthe typed contradiction — Secure Core connectivity is a routed\nTARGET).",
+          "type": "string",
+          "const": "secure-core"
+        },
+        {
+          "description": "Streaming-capable where exposed (catalog bit).",
+          "type": "string",
+          "const": "streaming"
+        },
+        {
+          "description": "IPv6-capable (catalog bit).",
+          "type": "string",
+          "const": "ipv6"
+        },
+        {
+          "description": "Port-forwarding-capable (NO catalog bit: evaluates against the\ndaemon-composed entitlement and per-server capability seams;\nFR-23H/FR-87 refuse typed while either is uncomposed).",
+          "type": "string",
+          "const": "port-forwarding"
+        }
+      ]
+    },
+    "SelectionModifiers": {
+      "description": "The §9.3 selection-plane modifiers a [`Request::Select`] carries.\nConnection-plane modifiers (`--netshield`, `--kill-switch`,\n`--nat`, `--vpn-accelerator`, `--dns`, `--lan-access`) are\ndeliberately NOT here: selection never composes them — the tunnel\ndoes (FR-23E's composition boundary, recorded on\n[`SelectionResult::feature_difference`]).",
+      "type": "object",
+      "properties": {
+        "by": {
+          "description": "The ranking policy (`official`|`balanced`|`load`|`latency`;\n`speed` and the other forbidden throughput signals are rejected\ntyped by the daemon's parse).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "excluded_cities": {
+          "description": "Never select these cities (FR-21A).",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "excluded_countries": {
+          "description": "Never select these countries (FR-21).",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "excluded_servers": {
+          "description": "Never select these logical servers by name (FR-21A).",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "excluded_states": {
+          "description": "Never select these states/regions (FR-21A).",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "optional_features": {
+          "description": "Optional features — never eliminate; feed the balanced\nfeature-match term.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/SelectionFeature"
+          }
+        },
+        "physical_country": {
+          "description": "An explicit per-request physical country (FR-23Q's first\nsource; uppercase ISO 3166-1 alpha-2 — non-canonical input\nrefuses typed, never approximated).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "required_features": {
+          "description": "Required features (T-4/FR-23H).",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/SelectionFeature"
+          }
+        },
+        "required_protocol": {
+          "description": "Required protocol (FR-23P's protocol stage).",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SelectionProtocol"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "excluded_countries",
+        "excluded_states",
+        "excluded_cities",
+        "excluded_servers",
+        "required_features",
+        "optional_features"
+      ]
+    },
+    "SelectionProtocol": {
+      "description": "A required protocol as a selection constraint (§9.4's vocabulary;\nFR-23P's protocol-compatibility stage). `smart` is deliberately\nabsent — smart-protocol resolution is the connection plane's (M4).",
+      "oneOf": [
+        {
+          "description": "WireGuard over UDP.",
+          "type": "string",
+          "const": "wireguard-udp"
+        },
+        {
+          "description": "WireGuard over TCP.",
+          "type": "string",
+          "const": "wireguard-tcp"
+        },
+        {
+          "description": "TLS-based Stealth.",
+          "type": "string",
+          "const": "stealth"
+        }
+      ]
     },
     "SpecialClass": {
       "description": "Special server classes addressed without a name (PRD 9.2).",

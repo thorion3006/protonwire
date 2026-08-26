@@ -276,6 +276,228 @@
         "allow_credentials"
       ]
     },
+    "GroupAvailability": {
+      "description": "A group's FR-23S availability evaluation.",
+      "type": "object",
+      "properties": {
+        "available": {
+          "description": "Whether the group resolves to at least one eligible candidate\nover the current cached catalog.",
+          "type": "boolean"
+        },
+        "reason": {
+          "description": "The structured reason when unavailable: `no-catalog` (nothing\ncached yet), `physical-country-required` (FR-23Q), or\n`no-eligible-server` (the FR-22 report eliminated everything).",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "available"
+      ]
+    },
+    "GroupDetails": {
+      "description": "One group's full definition (`group show`; §7.3B's minimum\npreserved representation, wire form).",
+      "type": "object",
+      "properties": {
+        "connection_overrides": {
+          "description": "The remaining catalog-declared overrides, verbatim pairs\n(connection-time parameters — the M4 tunnel composes them).",
+          "type": "array",
+          "items": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 2,
+            "minItems": 2
+          }
+        },
+        "connection_type": {
+          "description": "The connection type the target addresses, when the kind does\nnot imply it.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "immutable": {
+          "description": "Built-ins are immutable (FR-23M).",
+          "type": "boolean"
+        },
+        "protocol_override": {
+          "description": "The `protocol` override token, when set.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "selection_authority": {
+          "description": "The catalog's selection-authority annotation, when set.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sources": {
+          "description": "The definition's evidence sources.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "summary": {
+          "description": "The summary fields (id, label, origin, entitlement, policy,\noverrides, availability).",
+          "$ref": "#/$defs/GroupSummary"
+        },
+        "target": {
+          "description": "The target kind token (`fastest`, `fastest-in-country`,\n`fastest-in-region`, `random`, `secure-core`).",
+          "type": "string"
+        },
+        "target_detail": {
+          "description": "The target's parameter when it names one (the country, the\nregion; a Secure Core route renders `CH->SE`).",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "summary",
+        "immutable",
+        "target",
+        "connection_overrides",
+        "sources"
+      ]
+    },
+    "GroupProvenance": {
+      "description": "A resolved group's identity and policy provenance (FR-23T's\n`group_id`/`origin`; T-33's status-visible override).",
+      "type": "object",
+      "properties": {
+        "group_id": {
+          "description": "The stable namespaced group id.",
+          "type": "string"
+        },
+        "origin": {
+          "description": "The group's origin (`proton`|`protonwire`).",
+          "type": "string"
+        },
+        "policy_provenance": {
+          "description": "How the effective ranking policy was chosen\n(`catalog-default`|`declared-override`).",
+          "type": "string"
+        }
+      },
+      "required": [
+        "group_id",
+        "origin",
+        "policy_provenance"
+      ]
+    },
+    "GroupSummary": {
+      "description": "One built-in group as the list surface serves it (FR-23U).",
+      "type": "object",
+      "properties": {
+        "allowed_ranking_overrides": {
+          "description": "The request-time ranking overrides the catalog declares.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "availability": {
+          "description": "The FR-23S availability evaluation.",
+          "$ref": "#/$defs/GroupAvailability"
+        },
+        "definition_source": {
+          "description": "The definition's verification source.",
+          "type": "string"
+        },
+        "entitlement": {
+          "description": "What entitlement the group needs.",
+          "type": "string"
+        },
+        "id": {
+          "description": "The stable namespaced id (FR-23J).",
+          "type": "string"
+        },
+        "label": {
+          "description": "The display label.",
+          "type": "string"
+        },
+        "origin": {
+          "description": "`proton` or `protonwire`.",
+          "type": "string"
+        },
+        "ranking_policy": {
+          "description": "The catalog-declared ranking policy token.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "label",
+        "origin",
+        "definition_source",
+        "entitlement",
+        "ranking_policy",
+        "allowed_ranking_overrides",
+        "availability"
+      ]
+    },
+    "GroupsCatalog": {
+      "description": "The full built-in group catalog reply (FR-23I/U).",
+      "type": "object",
+      "properties": {
+        "catalog_revision": {
+          "description": "The group registry's catalog revision stamp.",
+          "type": "string"
+        },
+        "groups": {
+          "description": "Every built-in group, registry order.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/GroupSummary"
+          }
+        },
+        "taxonomy_revision": {
+          "description": "The regional taxonomy's revision identity.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "catalog_revision",
+        "taxonomy_revision",
+        "groups"
+      ]
+    },
+    "HardFiltersReport": {
+      "description": "FR-22's structured account of where every candidate went.",
+      "type": "object",
+      "properties": {
+        "considered": {
+          "description": "Candidates that entered the pipeline.",
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "stages": {
+          "description": "The per-stage counts, in the evaluation order (nonzero stages\nonly).",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/StageReport"
+          }
+        },
+        "survivors": {
+          "description": "Candidates still eligible after every stage.",
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "considered",
+        "survivors",
+        "stages"
+      ]
+    },
     "LoginBlockedReason": {
       "description": "Stable reasons a login flow stops without a session (ER-17; the\nstrings are recorded in `docs/official-parity.yaml`).",
       "oneOf": [
@@ -460,6 +682,44 @@
             "unhealthy"
           ]
         }
+      ]
+    },
+    "PhysicalCountrySource": {
+      "description": "Which FR-23Q source supplied the physical country.",
+      "oneOf": [
+        {
+          "description": "An explicit per-request value (`--physical-country`).",
+          "type": "string",
+          "const": "explicit-request"
+        },
+        {
+          "description": "The configured `connection_groups.physical_country`.",
+          "type": "string",
+          "const": "config"
+        },
+        {
+          "description": "The cached Proton user-location country (obtained through Muon\nwhile disconnected; read from the daemon's cache — this request\nperforms no location fetch).",
+          "type": "string",
+          "const": "cached-location"
+        }
+      ]
+    },
+    "PhysicalCountryValue": {
+      "description": "The resolved physical country with its source (FR-23T carries both;\nthe country code is coarse location, not an IP — the redaction rules\nfor the fine-grained location payload do not apply to it, and\nFR-23T explicitly requires the value on the selection surface).",
+      "type": "object",
+      "properties": {
+        "country": {
+          "description": "The uppercase ISO 3166-1 alpha-2 code.",
+          "type": "string"
+        },
+        "source": {
+          "description": "Which source supplied it.",
+          "$ref": "#/$defs/PhysicalCountrySource"
+        }
+      },
+      "required": [
+        "country",
+        "source"
       ]
     },
     "RequestResult": {
@@ -673,7 +933,110 @@
             "result",
             "data"
           ]
+        },
+        {
+          "description": "Reply to [`Request::Select`]: the resolved selection with\nFR-23T's provenance fields end to end. The winner is the\nbest-ranked candidate; a successful reply always carries one\n(every refusal path is an [`RpcError`]). Boxed: the full\nprovenance set is large, and this result enum travels through\nthe session writer — indirection keeps every other variant\ncheap.",
+          "type": "object",
+          "properties": {
+            "data": {
+              "type": "object",
+              "properties": {
+                "result": {
+                  "description": "The selection result.",
+                  "$ref": "#/$defs/SelectionResult"
+                }
+              },
+              "required": [
+                "result"
+              ]
+            },
+            "result": {
+              "type": "string",
+              "const": "selected"
+            }
+          },
+          "required": [
+            "result",
+            "data"
+          ]
+        },
+        {
+          "description": "Reply to [`Request::GroupsList`]: the built-in catalog with the\nregistry's provenance stamps and per-group availability.",
+          "type": "object",
+          "properties": {
+            "data": {
+              "type": "object",
+              "properties": {
+                "catalog": {
+                  "description": "The full group catalog (every entry, registry order).",
+                  "$ref": "#/$defs/GroupsCatalog"
+                }
+              },
+              "required": [
+                "catalog"
+              ]
+            },
+            "result": {
+              "type": "string",
+              "const": "groups"
+            }
+          },
+          "required": [
+            "result",
+            "data"
+          ]
+        },
+        {
+          "description": "Reply to [`Request::GroupShow`]: one group's full definition.\nBoxed alongside [`RequestResult::Selected`] — the detail\ndocument's string set is large, and this enum travels cloned.",
+          "type": "object",
+          "properties": {
+            "data": {
+              "type": "object",
+              "properties": {
+                "group": {
+                  "description": "The group's details.",
+                  "$ref": "#/$defs/GroupDetails"
+                }
+              },
+              "required": [
+                "group"
+              ]
+            },
+            "result": {
+              "type": "string",
+              "const": "group"
+            }
+          },
+          "required": [
+            "result",
+            "data"
+          ]
         }
+      ]
+    },
+    "ResolvedSelector": {
+      "description": "The selector the request resolved to, after target grammar and\ngroup-definition mapping (FR-23T's \"resolved selector\").",
+      "type": "object",
+      "properties": {
+        "detail": {
+          "description": "The kind's parameter when it names one (the country code, the\nstate/city/server/gateway name, the group id; the pinned\nentry/exit countries for `secure-core` render as `CH->SE`).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "policy": {
+          "description": "The effective ranking policy token\n(`official`|`balanced`|`load`|`latency`|`random`).",
+          "type": "string"
+        },
+        "target": {
+          "description": "The target kind token: `fastest`, `random`, `country`,\n`countries`, `state`, `city`, `server`, `gateway`, `p2p`,\n`tor`, `secure-core`, or `group`.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "target",
+        "policy"
       ]
     },
     "RpcError": {
@@ -825,6 +1188,149 @@
           "type": "string",
           "const": "internal"
         }
+      ]
+    },
+    "SelectedServer": {
+      "description": "The winning server (FR-23T; FR-23D's both-ends rule for Secure Core\nrides `entry_country`/`exit_country`).",
+      "type": "object",
+      "properties": {
+        "city": {
+          "description": "The city, when exposed.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "entry_country": {
+          "description": "The route's entry country (equals the exit outside Secure\nCore).",
+          "type": "string"
+        },
+        "exit_country": {
+          "description": "The exit country — the canonical selector.",
+          "type": "string"
+        },
+        "id": {
+          "description": "The logical server ID.",
+          "type": "string"
+        },
+        "name": {
+          "description": "The display name (`UK#42`, `CH-SE#1`, ...).",
+          "type": "string"
+        },
+        "signals": {
+          "description": "The signals that ranked it.",
+          "$ref": "#/$defs/WinnerSignals"
+        },
+        "tier": {
+          "description": "The minimum plan tier (0 free .. 3 PM).",
+          "type": "integer",
+          "format": "int8",
+          "maximum": 127,
+          "minimum": -128
+        }
+      },
+      "required": [
+        "id",
+        "name",
+        "entry_country",
+        "exit_country",
+        "tier",
+        "signals"
+      ]
+    },
+    "SelectionCatalogProvenance": {
+      "description": "The catalog revisions a selection ran against (FR-23T's \"catalog\nrevision\" — disambiguated per the m3-plan U6 reading: the SERVER\ncatalog is the revision field's primary meaning; a group selection\nadditionally carries the group registry's own revision stamp).",
+      "type": "object",
+      "properties": {
+        "group_catalog_revision": {
+          "description": "The connection-group registry's catalog revision stamp, present\non group selections only.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "server_catalog_etag": {
+          "description": "The cached server catalog revision's `ETag`, when one is cached.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "server_catalog_fetched_unix": {
+          "description": "When the server catalog revision was fetched (Unix seconds);\nabsent when no catalog is cached (a selection then refuses —\nnever fabricates a revision).",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        }
+      }
+    },
+    "SelectionResult": {
+      "description": "The full selection result — FR-23T's field set, end to end.",
+      "type": "object",
+      "properties": {
+        "catalog": {
+          "description": "The catalog revisions the selection ran against.",
+          "$ref": "#/$defs/SelectionCatalogProvenance"
+        },
+        "feature_difference": {
+          "description": "Requested-but-not-applied features. Empty at selection time BY\nCONSTRUCTION for selection-plane features — selection either\nsatisfies them (the winner carries them) or refuses; the\nconnection-plane family (`netshield`, `nat`, `lan-access`,\nprotocol-at-tunnel, the port-forwarding REQUEST) is composed by\nthe M4 tunnel (FR-23E's boundary), and its differences land\nhere from the connection transition, never from a query.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "group": {
+          "description": "The group identity and policy provenance, on group selections\nonly.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GroupProvenance"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "hard_filters": {
+          "description": "The applied hard filters (FR-22's structured report).",
+          "$ref": "#/$defs/HardFiltersReport"
+        },
+        "physical_country": {
+          "description": "The physical country that excluded exits, with its source —\npresent only when the request's semantics used it (FR-23T's\n\"when relevant\").",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PhysicalCountryValue"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "requested_features": {
+          "description": "The selection-plane features the request carried (rendered\ntokens, required then optional).",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "selector": {
+          "description": "The resolved selector (target + effective policy).",
+          "$ref": "#/$defs/ResolvedSelector"
+        },
+        "winner": {
+          "description": "The winning server.",
+          "$ref": "#/$defs/SelectedServer"
+        }
+      },
+      "required": [
+        "catalog",
+        "selector",
+        "hard_filters",
+        "winner",
+        "requested_features",
+        "feature_difference"
       ]
     },
     "ServersRefreshOutcome": {
@@ -979,6 +1485,26 @@
         }
       ]
     },
+    "StageReport": {
+      "description": "One hard-filter stage's accounting (FR-22's structured report, wire\nform; stages with zero eliminations are omitted).",
+      "type": "object",
+      "properties": {
+        "eliminated": {
+          "description": "Candidates this stage eliminated.",
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "stage": {
+          "description": "The stage's stable label (the selection core's evaluation-order\nvocabulary, e.g. `offline`, `target-geography`,\n`physical-country-exclusion`, `required-features`).",
+          "type": "string"
+        }
+      },
+      "required": [
+        "stage",
+        "eliminated"
+      ]
+    },
     "VpnState": {
       "description": "High-level VPN state machine states.",
       "oneOf": [
@@ -1002,6 +1528,101 @@
           "type": "string",
           "const": "disconnecting"
         }
+      ]
+    },
+    "WeightedBreakdownWire": {
+      "description": "The per-term decomposition of a balanced ranking (FR-16's formula,\nwire form; lower is better).",
+      "type": "object",
+      "properties": {
+        "feature_match_term": {
+          "description": "`feature_weight × (1 − match_ratio)`.",
+          "type": "number",
+          "format": "float"
+        },
+        "history_term": {
+          "description": "Zero until connection statistics exist (post-M4).",
+          "type": "number",
+          "format": "float"
+        },
+        "latency_term": {
+          "description": "`latency_weight × normalized_latency`.",
+          "type": "number",
+          "format": "float"
+        },
+        "load_term": {
+          "description": "`load_weight × normalized_load`.",
+          "type": "number",
+          "format": "float"
+        },
+        "stability_term": {
+          "description": "Zero until connection statistics exist (post-M4).",
+          "type": "number",
+          "format": "float"
+        },
+        "total": {
+          "description": "The weighted sum (lower is better).",
+          "type": "number",
+          "format": "float"
+        }
+      },
+      "required": [
+        "load_term",
+        "latency_term",
+        "stability_term",
+        "feature_match_term",
+        "history_term",
+        "total"
+      ]
+    },
+    "WinnerSignals": {
+      "description": "The scoring signals behind the winning candidate (FR-23T/FR-14:\nstatus must identify the policy AND the signal provenance).",
+      "type": "object",
+      "properties": {
+        "latency_ms": {
+          "description": "The latency observation, when one served the ranking\n(milliseconds).",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "load": {
+          "description": "The Proton-exposed load percentage, when present.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int8",
+          "maximum": 127,
+          "minimum": -128
+        },
+        "proton_score": {
+          "description": "The catalog's opaque Proton score, when exposed.",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "float"
+        },
+        "provenance": {
+          "description": "The signal provenance: `catalog-only` (Proton-exposed catalog\nfields alone), `probe-observed` (plus the bounded on-demand\nprober's latency), or `weighted-breakdown` (the balanced\ndecomposition).",
+          "type": "string"
+        },
+        "weighted": {
+          "description": "The balanced decomposition, when the balanced policy ranked the\nwinner.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/WeightedBreakdownWire"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "provenance"
       ]
     },
     "WritableStoreStatus": {
