@@ -718,11 +718,7 @@ fn group_command(socket: Option<&Path>, sub: &Option<GroupSub>) -> RunResult {
                     group.id,
                     group.origin,
                     group.ranking_policy,
-                    match (&group.availability.available, &group.availability.reason) {
-                        (true, _) => "available".to_owned(),
-                        (false, Some(reason)) => format!("unavailable ({reason})"),
-                        (false, None) => "unavailable".to_owned(),
-                    }
+                    availability_line(&group.availability)
                 );
             }
             Ok(())
@@ -770,18 +766,21 @@ fn group_command(socket: Option<&Path>, sub: &Option<GroupSub>) -> RunResult {
             }
             println!(
                 "Availability:       {}",
-                match (
-                    &details.summary.availability.available,
-                    &details.summary.availability.reason
-                ) {
-                    (true, _) => "available".to_owned(),
-                    (false, Some(reason)) => format!("unavailable ({reason})"),
-                    (false, None) => "unavailable".to_owned(),
-                }
+                availability_line(&details.summary.availability)
             );
             println!("Sources:            {}", details.sources.join(", "));
             Ok(())
         }
+    }
+}
+
+/// The availability rendering the list and show surfaces share
+/// (`available`, or `unavailable` with the FR-23S reason token).
+fn availability_line(availability: &protonwire_frontend_api::GroupAvailability) -> String {
+    match (&availability.available, &availability.reason) {
+        (true, _) => "available".to_owned(),
+        (false, Some(reason)) => format!("unavailable ({reason})"),
+        (false, None) => "unavailable".to_owned(),
     }
 }
 
