@@ -19,6 +19,10 @@ pub mod services;
 
 pub use services::DaemonServices;
 
+/// The U6 selection engine (M3 PR-4): the `Select`/`GroupsList`/
+/// `GroupShow` composition surface.
+pub mod selection;
+
 /// Resolves where the IPC server binds (Codex PR review finding 4):
 /// the `--socket-dir` CLI override wins, then the config document's
 /// `daemon.socket_path` (split into directory and name), then the default
@@ -116,6 +120,30 @@ impl RequestHandler for DaemonHandler {
                 let account = self.services.account_status()?;
                 Ok(RequestResult::Account { account })
             }
+            // M3 U6 (FR-23T): the selection query — the cached catalog
+            // strict-load, the S8 entitlement + PF capability
+            // composition, FR-23Q's physical-country sources, the
+            // bounded on-demand prober, and the pure core, composed
+            // into the provenance-carrying result. Read-only: no
+            // tunnel state, no events.
+            Request::Select { target, modifiers } => self
+                .services
+                .selection
+                .resolve(&target, &modifiers)
+                .map(|result| RequestResult::Selected { result }),
+            // M3 U6 (FR-23I/U): the registry-served group catalog with
+            // FR-23S availability — no network, no client-side preset
+            // lists.
+            Request::GroupsList => self
+                .services
+                .selection
+                .groups_catalog()
+                .map(|catalog| RequestResult::Groups { catalog }),
+            Request::GroupShow { id } => self
+                .services
+                .selection
+                .group_details(&id)
+                .map(|group| RequestResult::Group { group }),
             // FR-10: serve the cached revision verbatim — no upstream
             // request. An absent cache is the legitimate nothing-yet
             // state (all-None fields); a PRESENT cache that fails the
@@ -529,6 +557,55 @@ mod tests {
             .handle(&admin_ctx(), Request::Disconnect)
             .unwrap_err();
         assert_eq!(err.code, RpcErrorCode::NotImplemented);
+    }
+
+    /// M3 U6: the selection surface dispatches through the handler
+    /// into the engine — an empty cache is the engine's typed
+    /// no-catalog refusal (never core's NotImplemented wildcard), and
+    /// the groups surface serves the registry (14 entries, revisions
+    /// stamped) with no catalog cached at all.
+    #[test]
+    fn u6_selection_surface_dispatches_into_the_engine() {
+        let (handler, _) = handler();
+        let err = handler
+            .handle(
+                &admin_ctx(),
+                Request::Select {
+                    target: protonwire_frontend_api::ConnectTarget::Fastest,
+                    modifiers: Default::default(),
+                },
+            )
+            .unwrap_err();
+        assert_eq!(
+            err.code,
+            RpcErrorCode::NoEligibleServer,
+            "the engine's no-catalog refusal, not a NotImplemented: {err}"
+        );
+        assert!(err.message.contains("no server catalog is cached"));
+
+        match handler.handle(&admin_ctx(), Request::GroupsList).unwrap() {
+            RequestResult::Groups { catalog } => {
+                assert_eq!(catalog.groups.len(), 14);
+                assert!(!catalog.catalog_revision.is_empty());
+                assert!(
+                    catalog
+                        .groups
+                        .iter()
+                        .all(|group| group.availability.reason.as_deref() == Some("no-catalog"))
+                );
+            }
+            other => panic!("unexpected result: {other:?}"),
+        }
+
+        let err = handler
+            .handle(
+                &admin_ctx(),
+                Request::GroupShow {
+                    id: "proton:no-such-group".into(),
+                },
+            )
+            .unwrap_err();
+        assert_eq!(err.code, RpcErrorCode::InvalidParams);
     }
 
     /// FR-10: `ServersList` on the first boot is the all-None reply — no
