@@ -407,8 +407,6 @@ pub enum GroupError {
         requested: String,
     },
 }
-
-/// How the applied ranking policy was chosen (FR-23P/T-33: a declared
 /// regional override must be explicit in status).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PolicyProvenance {
@@ -432,23 +430,19 @@ pub struct ResolvedGroup {
 }
 
 /// Maps a catalog ranking-policy token onto the executable policy.
-/// `latency` is declared vocabulary but unconstructible until PR-3's
-/// prober exists — a typed refusal, never a silent substitute.
-fn to_selection_policy(
-    id: &'static str,
-    policy: GroupRankingPolicy,
-) -> Result<RankingPolicy, GroupError> {
+/// `latency` maps onto the latency ranking policy — the observations
+/// arrive via [`SelectionContext::latency`] at selection time (the
+/// bounded on-demand prober's table; an empty one refuses typed
+/// THERE, never a silent substitute here).
+fn to_selection_policy(policy: GroupRankingPolicy) -> RankingPolicy {
     match policy {
-        GroupRankingPolicy::ProtonScore => Ok(RankingPolicy::Official),
-        GroupRankingPolicy::Balanced => Ok(RankingPolicy::Balanced {
+        GroupRankingPolicy::ProtonScore => RankingPolicy::Official,
+        GroupRankingPolicy::Balanced => RankingPolicy::Balanced {
             weights: WeightedSignals::DEFAULT,
-        }),
-        GroupRankingPolicy::Load => Ok(RankingPolicy::LowestLoad),
-        GroupRankingPolicy::RandomCountryThenServer => Ok(RankingPolicy::Random),
-        GroupRankingPolicy::Latency => Err(GroupError::RankingOverrideUnavailable {
-            id,
-            requested: "latency".to_owned(),
-        }),
+        },
+        GroupRankingPolicy::Load => RankingPolicy::LowestLoad,
+        GroupRankingPolicy::RandomCountryThenServer => RankingPolicy::Random,
+        GroupRankingPolicy::Latency => RankingPolicy::Latency,
     }
 }
 
@@ -501,7 +495,7 @@ pub fn resolve_group(
 
     let (policy, policy_provenance) = match ranking_override {
         None => (
-            to_selection_policy(group.id, group.ranking_policy)?,
+            to_selection_policy(group.ranking_policy),
             PolicyProvenance::CatalogDefault,
         ),
         Some(mode) => {
@@ -526,7 +520,7 @@ pub fn resolve_group(
                 });
             }
             (
-                to_selection_policy(group.id, requested)?,
+                to_selection_policy(requested),
                 PolicyProvenance::DeclaredOverride,
             )
         }
@@ -1019,7 +1013,7 @@ mod tests {
 
     /// T-33: declared regional overrides apply and are explicit in the
     /// resolution (status-visible); undeclared ones refuse naming the
-    /// declared list; latency is declared but pending PR-3.
+    /// declared list; latency is declared and real since U5.
     #[test]
     fn regional_declared_overrides_apply_and_undeclared_refuse() {
         let load = resolve_group(
@@ -1072,15 +1066,9 @@ mod tests {
             Some("latency"),
             &PhysicalCountrySources::default(),
         )
-        .unwrap_err();
-        assert_eq!(
-            err,
-            GroupError::RankingOverrideUnavailable {
-                id: "protonwire:fastest-europe",
-                requested: "latency".to_owned(),
-            },
-            "declared-but-pending is distinct from not-declared"
-        );
+        .unwrap();
+        assert_eq!(err.request.policy, RankingPolicy::Latency);
+        assert_eq!(err.policy_provenance, PolicyProvenance::DeclaredOverride);
     }
 
     /// FR-23Q: explicit request → explicit config → cached Muon
