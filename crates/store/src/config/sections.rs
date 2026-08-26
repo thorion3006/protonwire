@@ -272,6 +272,14 @@ pub struct LatencyProbeSection {
     pub max_candidates: u32,
     /// Per-probe timeout.
     pub timeout_ms: u32,
+    /// TOTAL wall-clock bound on one probe round — the whole round
+    /// (every endpoint combined) must finish inside this, stopping
+    /// fresh probes at the deadline and keeping the answered prefix.
+    /// Sits deliberately under the 10 s IPC request deadline so a
+    /// `--by latency` request answers within the RPC timeout (the
+    /// Codex PR-9 arithmetic: 20 candidates × 750 ms ≈ 15 s
+    /// serialized would otherwise exceed it).
+    pub round_deadline_ms: u32,
     /// Concurrency bound.
     pub parallelism: u32,
     /// Minimum age before a cached result is reused.
@@ -288,6 +296,7 @@ impl Default for LatencyProbeSection {
             enabled: true,
             max_candidates: 20,
             timeout_ms: 750,
+            round_deadline_ms: 8000,
             parallelism: 4,
             result_min_age_minutes: 15,
             background_scan: false,

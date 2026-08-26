@@ -416,7 +416,12 @@ impl SelectionEngine {
     /// Runs one bounded probe round over `shortlist` (logical ids in
     /// priority order) and returns the merged observation table.
     /// Writes `last_attempt_ms` back for every PROBED endpoint —
-    /// answered or not (the hammering guard's contract).
+    /// answered or not (the hammering guard's contract). The WHOLE
+    /// round is bounded by the configured total deadline (the Codex
+    /// PR-9 arithmetic: a serial worst case of 20 × 750 ms ≈ 15 s must
+    /// never answer `--by latency` with the 10 s RPC transport
+    /// timeout): probing stops at the deadline, the answered prefix
+    /// survives, and the unprobed fall to the FR-18 shortlist boundary.
     fn probe_round(
         &self,
         catalog: &CatalogDocument,
@@ -426,6 +431,8 @@ impl SelectionEngine {
         if !probe_config.enabled || shortlist.is_empty() {
             return BTreeMap::new();
         }
+        let round_deadline =
+            Instant::now() + Duration::from_millis(u64::from(probe_config.round_deadline_ms));
         let now = (self.now_ms)();
         let budget = self.probe_budget();
         let state = self.probes.state.lock().expect("probe table lock").clone();
@@ -446,6 +453,7 @@ impl SelectionEngine {
             timeout,
             endpoints,
             connect,
+            round_deadline,
         };
         let observed = run_planned(&shortlist, &decisions, &state, &mut executor);
 
@@ -919,11 +927,20 @@ fn group_summary(
 /// (CAP_NET_RAW is never assumed), so every probe observes nothing and
 /// the latency ranking refuses on its data requirement — never a
 /// fabricated RTT.
+///
+/// The executor also carries the round's TOTAL deadline (the Codex
+/// PR-9 bound): each probe's timeout SHRINKS to the remaining budget
+/// (a single in-flight connect cannot overrun the round), and the
+/// `cancelled` seam `run_planned` polls between endpoints stops the
+/// run at the deadline — the answered prefix survives, the unprobed
+/// fall to the FR-18 shortlist boundary.
 struct TransportExecutor<'a> {
     transport: ProbeTransport,
     timeout: Duration,
     endpoints: BTreeMap<String, SocketAddr>,
     connect: &'a dyn Fn(SocketAddr, Duration) -> Option<Duration>,
+    /// When the whole round expires.
+    round_deadline: Instant,
 }
 
 impl ProbeExecutor for TransportExecutor<'_> {
@@ -933,10 +950,18 @@ impl ProbeExecutor for TransportExecutor<'_> {
                 // No logging here: the id→address mapping is never
                 // written to the log (the PR-3 review's sec item).
                 let addr = self.endpoints.get(endpoint)?;
-                (self.connect)(*addr, self.timeout)
+                let remaining = self
+                    .round_deadline
+                    .saturating_duration_since(Instant::now());
+                let timeout = self.timeout.min(remaining);
+                (self.connect)(*addr, timeout)
             }
             ProbeTransport::Icmp => None,
         }
+    }
+
+    fn cancelled(&mut self) -> bool {
+        Instant::now() >= self.round_deadline
     }
 }
 
@@ -2161,6 +2186,56 @@ mod tests {
         );
         assert_eq!(decisions["id-GB#1"], ProbeDecision::RateLimited);
         assert_eq!(decisions["id-GB#2"], ProbeDecision::RateLimited);
+    }
+
+    /// Codex PR-9 (P1, the daemon's probe round): serial probing under
+    /// the defaults (20 candidates × 750 ms) runs ≈15 s against the
+    /// 10 s IPC request deadline — `--by latency` then answered with
+    /// the TRANSPORT timeout instead of a selection. The round now
+    /// carries a TOTAL wall-clock deadline
+    /// (`latency_probe.round_deadline_ms`, default 8 s): probing stops
+    /// when it passes, the answered prefix survives, and the unprobed
+    /// fall to the FR-18 boundary — here the honest data-unavailable
+    /// refusal, returned WITHIN the deadline, never the RPC timeout.
+    #[test]
+    fn the_probe_round_finishes_within_its_deadline_not_the_rpc_timeout() {
+        fn stalls(_addr: SocketAddr, timeout: Duration) -> Option<Duration> {
+            // The worst case the deadline must bound: every connect
+            // runs out its full timeout unanswered.
+            std::thread::sleep(timeout);
+            None
+        }
+        // Five survivors under `fastest` (the SC route is server-type
+        // eliminated), each stalling 400 ms: the pre-fix serial round
+        // spends 5 × 400 = 2 s; the deadline is 500 ms (the production
+        // arithmetic is 20 × 750 = 15 s vs the 10 s RPC deadline —
+        // same shape, smaller numbers).
+        let mut config = SystemConfig::default();
+        config.server_selection.latency_probe.timeout_ms = 400;
+        config.server_selection.latency_probe.round_deadline_ms = 500;
+        let engine = engine_over(config, 1_000_000, stalls as fn(_, _) -> _);
+
+        let start = Instant::now();
+        let error = engine
+            .resolve(
+                &ConnectTarget::Fastest,
+                &SelectionModifiers {
+                    by: Some("latency".into()),
+                    ..modifiers()
+                },
+            )
+            .expect_err("nothing answers inside the deadline");
+        let elapsed = start.elapsed();
+        assert_eq!(error.code, RpcErrorCode::NoEligibleServer);
+        assert!(
+            error.message.contains("latency data unavailable"),
+            "the honest data refusal, never a fabricated ordering: {error}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(1200),
+            "the round returns within its deadline (measured {elapsed:?}; the pre-fix serial \
+             round spent the full shortlist serially)"
+        );
     }
 
     /// The verdict round's GAP-2: the daemon's `max_candidates` cap
