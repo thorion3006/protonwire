@@ -699,7 +699,11 @@ fn group_command(socket: Option<&Path>, sub: &Option<GroupSub>) -> RunResult {
             if json {
                 println!(
                     "{}",
-                    serde_json::to_string_pretty(&catalog).expect("the typed catalog serializes")
+                    serde_json::to_string_pretty(&filtered_groups_catalog(
+                        &catalog,
+                        origin.as_deref()
+                    ))
+                    .expect("the typed catalog serializes")
                 );
                 return Ok(());
             }
@@ -781,6 +785,28 @@ fn availability_line(availability: &protonwire_frontend_api::GroupAvailability) 
         (true, _) => "available".to_owned(),
         (false, Some(reason)) => format!("unavailable ({reason})"),
         (false, None) => "unavailable".to_owned(),
+    }
+}
+
+/// The `group list --origin X --json` document: the typed catalog with
+/// the origin filter APPLIED to its groups, revision stamps retained.
+/// The pure seam behind the JSON arm (the round-1 `resolve_bind_location`
+/// precedent — frontends cannot bind the IPC test server, so the
+/// document construction is what the suite pins; the one-line wiring is
+/// type-checked).
+fn filtered_groups_catalog(
+    catalog: &protonwire_frontend_api::GroupsCatalog,
+    origin: Option<&str>,
+) -> protonwire_frontend_api::GroupsCatalog {
+    protonwire_frontend_api::GroupsCatalog {
+        catalog_revision: catalog.catalog_revision.clone(),
+        taxonomy_revision: catalog.taxonomy_revision.clone(),
+        groups: catalog
+            .groups
+            .iter()
+            .filter(|group| origin.is_none_or(|wanted| group.origin == wanted))
+            .cloned()
+            .collect(),
     }
 }
 
@@ -1026,6 +1052,60 @@ fn planned_milestone(command: &Command) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Codex PR-9 round (P2, `group list --origin X --json`): the JSON
+    /// document must carry the FILTERED groups — pre-fix the filter was
+    /// display-only and the serialized catalog handed JSON consumers
+    /// every origin. Red observed against the extraction kept
+    /// pre-fix (the document ignored the filter), then green.
+    #[test]
+    fn the_filtered_groups_json_document_carries_only_the_filtered_groups() {
+        use protonwire_frontend_api::{GroupAvailability, GroupSummary, GroupsCatalog};
+        fn summary(id: &str, origin: &str) -> GroupSummary {
+            GroupSummary {
+                id: id.to_owned(),
+                label: format!("Label {id}"),
+                origin: origin.to_owned(),
+                definition_source: "protonwire".to_owned(),
+                entitlement: "plan-dependent".to_owned(),
+                ranking_policy: "proton-score".to_owned(),
+                allowed_ranking_overrides: Vec::new(),
+                availability: GroupAvailability {
+                    available: true,
+                    reason: None,
+                },
+            }
+        }
+        let catalog = GroupsCatalog {
+            catalog_revision: "reg-1".to_owned(),
+            taxonomy_revision: "tax-1".to_owned(),
+            groups: vec![
+                summary("proton:fastest-country", "proton"),
+                summary("protonwire:fastest-europe", "protonwire"),
+            ],
+        };
+        let filtered = filtered_groups_catalog(&catalog, Some("proton"));
+        assert_eq!(
+            filtered.groups.len(),
+            1,
+            "the origin filter applies to the JSON document"
+        );
+        assert!(
+            filtered.groups.iter().all(|group| group.origin == "proton"),
+            "every entry carries the filter"
+        );
+        assert_eq!(
+            filtered.catalog_revision, "reg-1",
+            "the revision stamps are retained"
+        );
+        assert_eq!(filtered.taxonomy_revision, "tax-1");
+        // No filter: the full registry document, unchanged.
+        assert_eq!(
+            filtered_groups_catalog(&catalog, None).groups.len(),
+            2,
+            "a bare `group list --json` keeps every group"
+        );
+    }
 
     #[test]
     fn status_json_shape_matches_prd_118_subset() {
