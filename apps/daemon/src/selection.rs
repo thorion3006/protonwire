@@ -551,7 +551,14 @@ impl SelectionEngine {
                     }
                     .to_owned(),
                 };
-                let request = resolved.request.clone();
+                let request = merge_group_modifiers(
+                    group_id,
+                    resolved.request,
+                    modifiers,
+                    required_features,
+                    optional_features,
+                    required_protocol,
+                )?;
                 (request, Some((provenance, resolved.group.origin)))
             }
             direct => (
@@ -950,6 +957,89 @@ fn protocol_token(protocol: ProtocolConstraint) -> String {
     .to_owned()
 }
 
+/// Merges the §9.3 selection-plane modifiers into a group-resolved
+/// request (FR-23P's user-controlled stages, the Codex PR-9 P1:
+/// pre-fix the group arm used `resolved.request` unchanged — every
+/// parsed modifier was silently dropped while the result echoed it).
+///
+/// Precedence, per FR-23P's stage discipline:
+///
+/// - **Exclusions** (country/state/city/server): UNION — the group's
+///   own lists and the user's both eliminate (either refusing is a
+///   silent downgrade of an explicit user constraint).
+/// - **Required/optional features**: UNION — the group's constraints
+///   and the user's must all hold.
+/// - **Protocol**: the group's declared override is its official
+///   semantics (T-33's `RankingOverrideForbidden` precedent —
+///   request-time overrides may not change them); a user protocol
+///   that CONFLICTS with a declared override is a typed refusal
+///   naming both — never a silent drop of either side. With no
+///   declared override, the user's protocol applies.
+///
+/// The physical-country and ranking modifiers do not pass through
+/// here: `--physical-country` composes through FR-23Q's sources and
+/// `--by` through the registry's override discipline inside
+/// [`resolve_group`] — both BEFORE this merge.
+fn merge_group_modifiers(
+    group_id: &str,
+    request: SelectionRequest,
+    modifiers: &SelectionModifiers,
+    required_features: Vec<FeatureConstraint>,
+    optional_features: Vec<FeatureConstraint>,
+    required_protocol: Option<ProtocolConstraint>,
+) -> Result<SelectionRequest, RpcError> {
+    // The protocol precedence first: a conflicting pair refuses typed
+    // before anything is merged (the refusal describes the conflict,
+    // not a half-merged request).
+    if let (Some(declared), Some(requested)) =
+        (request.constraints.required_protocol, required_protocol)
+        && declared != requested
+    {
+        return Err(RpcError::new(
+            RpcErrorCode::InvalidParams,
+            format!(
+                "group `{group_id}` declares the `{}` protocol override but the request requires \
+                 `{}` — a group's declared protocol is its official semantics (FR-23P); pass the \
+                 matching protocol or select the target directly",
+                protocol_token(declared),
+                protocol_token(requested)
+            ),
+        ));
+    }
+    let mut request = request;
+    request
+        .constraints
+        .excluded_countries
+        .extend(modifiers.excluded_countries.iter().cloned());
+    request
+        .constraints
+        .excluded_states
+        .extend(modifiers.excluded_states.iter().cloned());
+    request
+        .constraints
+        .excluded_cities
+        .extend(modifiers.excluded_cities.iter().cloned());
+    request
+        .constraints
+        .excluded_servers
+        .extend(modifiers.excluded_servers.iter().cloned());
+    request
+        .constraints
+        .required_features
+        .extend(required_features);
+    request
+        .constraints
+        .optional_features
+        .extend(optional_features);
+    // Union for protocol: the declared override (when one exists) kept,
+    // the user's applied otherwise — the conflict arm above already
+    // refused every disagreeing pair.
+    if request.constraints.required_protocol.is_none() {
+        request.constraints.required_protocol = required_protocol;
+    }
+    Ok(request)
+}
+
 /// The direct-target arm: the PRD 9.2 grammar mapped onto the core
 /// vocabulary. `--by` parses through the core's mode vocabulary (the
 /// forbidden throughput signals reject typed there); a balanced policy
@@ -1197,6 +1287,7 @@ fn selection_error_to_rpc(error: SelectionError) -> RpcError {
 mod tests {
     use super::*;
     use protonwire_frontend_api::SelectionFeature;
+    use protonwire_frontend_api::SelectionProtocol;
 
     /// A synthetic catalog body: 6 logicals over 5 countries — GB pair
     /// (scores invert loads), CH, a Secure Core CH→SE route, a P2P GB
@@ -1575,6 +1666,148 @@ mod tests {
             Some(PhysicalCountrySource::CachedLocation)
         );
         assert_ne!(result.winner.exit_country, "GB");
+    }
+
+    /// Codex PR-9 (P1, the group arm ~551): the parsed selection
+    /// modifiers must MERGE into the group-resolved request — pre-fix
+    /// `resolved.request` was used unchanged and `--exclude-country`
+    /// was silently dropped (the result even echoed it). The
+    /// discriminating shape on this fixture excludes GB (the
+    /// pre-fix winner); CH never wins pre-fix, so the literal
+    /// `--exclude-country CH` shape is covered by the same union.
+    #[test]
+    fn group_selection_honors_excluded_country_modifiers() {
+        let engine = default_engine();
+        let result = engine
+            .resolve(
+                &ConnectTarget::Group {
+                    group_id: "protonwire:fastest-europe".into(),
+                },
+                &SelectionModifiers {
+                    excluded_countries: vec!["GB".into()],
+                    ..modifiers()
+                },
+            )
+            .expect("the exclusion constrains the group");
+        assert_ne!(
+            result.winner.exit_country, "GB",
+            "the user exclusion eliminates every GB member"
+        );
+        assert_eq!(result.winner.exit_country, "CH");
+    }
+
+    /// The same merge for the `--require` family: a required feature
+    /// constrains a group selection exactly as it constrains a direct
+    /// one (pre-fix the modifier was dropped and GB#1 won).
+    #[test]
+    fn group_selection_honors_required_feature_modifiers() {
+        let engine = default_engine();
+        let result = engine
+            .resolve(
+                &ConnectTarget::Group {
+                    group_id: "protonwire:fastest-europe".into(),
+                },
+                &SelectionModifiers {
+                    required_features: vec![SelectionFeature::P2p],
+                    ..modifiers()
+                },
+            )
+            .expect("the feature constrains the group");
+        assert_eq!(
+            result.winner.name, "GB-P2P",
+            "the only p2p-bit member of the fixture's Europe"
+        );
+        assert_eq!(result.requested_features, vec!["p2p".to_owned()]);
+    }
+
+    /// The protocol precedence (FR-23P): a group's DECLARED protocol
+    /// override is its official semantics — a conflicting user
+    /// protocol refuses typed naming both, never a silent drop of
+    /// either side (pre-fix the user's value was ignored and the
+    /// selection proceeded under the group's stealth).
+    #[test]
+    fn group_protocol_modifier_conflicts_with_a_declared_override() {
+        let engine = default_engine();
+        let error = engine
+            .resolve(
+                &ConnectTarget::Group {
+                    group_id: "proton:anti-censorship".into(),
+                },
+                &SelectionModifiers {
+                    physical_country: Some("GB".into()),
+                    required_protocol: Some(SelectionProtocol::WireguardUdp),
+                    ..modifiers()
+                },
+            )
+            .expect_err("a conflicting protocol must refuse");
+        assert_eq!(error.code, RpcErrorCode::InvalidParams);
+        assert!(
+            error.message.contains("stealth"),
+            "the declared override is named: {error}"
+        );
+        assert!(
+            error.message.contains("wireguard-udp"),
+            "the requested protocol is named: {error}"
+        );
+
+        // The agreeing arm: a user protocol matching the declared
+        // override is NOT a conflict — the request proceeds under the
+        // group's stealth. The fixture's physicals expose WireGuard-UDP
+        // only, so "proceeds" is observable as the protocol-COMPATIBILITY
+        // elimination (the merged constraint evaluating against the
+        // catalog), never a merge refusal.
+        let agreed = engine
+            .resolve(
+                &ConnectTarget::Group {
+                    group_id: "proton:anti-censorship".into(),
+                },
+                &SelectionModifiers {
+                    physical_country: Some("GB".into()),
+                    required_protocol: Some(SelectionProtocol::Stealth),
+                    ..modifiers()
+                },
+            )
+            .expect_err("the fixture exposes no TLS endpoint");
+        assert_eq!(agreed.code, RpcErrorCode::NoEligibleServer);
+        let details = agreed.details.expect("FR-22 rides details");
+        assert!(
+            details["stages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|stage| stage["stage"] == "protocol-compatibility"),
+            "the agreeing pair reaches the protocol stage, not a refusal: {details}"
+        );
+    }
+
+    /// With no declared override, the user's protocol applies to the
+    /// group selection (pre-fix it was dropped and the fixture's
+    /// GB#1 — a WireGuard-UDP-only server — won under a stealth
+    /// request).
+    #[test]
+    fn group_selection_honors_the_protocol_modifier_without_an_override() {
+        let engine = default_engine();
+        let error = engine
+            .resolve(
+                &ConnectTarget::Group {
+                    group_id: "protonwire:fastest-europe".into(),
+                },
+                &SelectionModifiers {
+                    required_protocol: Some(SelectionProtocol::Stealth),
+                    ..modifiers()
+                },
+            )
+            .expect_err("the fixture exposes no TLS endpoint");
+        assert_eq!(error.code, RpcErrorCode::NoEligibleServer);
+        let details = error.details.expect("FR-22 rides details");
+        assert!(
+            details["stages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|stage| stage["stage"] == "protocol-compatibility"),
+            "the eliminating stage is the protocol stage: {details}"
+        );
     }
 
     /// The registry discipline end to end (T-33): a proton:* group
