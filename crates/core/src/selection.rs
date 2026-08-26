@@ -45,6 +45,12 @@
 //! * [`RankingPolicy::LowestLoad`] — lowest Proton-exposed load
 //!   (FR-17); a server without an exposed load is excluded WITH a
 //!   structured report entry, never approximated.
+//! * [`RankingPolicy::Random`] — the connection-groups contract's
+//!   `random-country-then-server` (M3 U2): a uniform eligible country,
+//!   then a uniform eligible server within it. The core is pure, so
+//!   the draw runs on caller-supplied entropy
+//!   ([`SelectionContext::random_entropy`]) and refuses typed without
+//!   it — no fabricated randomness.
 //!
 //! ## No speed, ever (FR-19, T-1)
 //!
@@ -99,6 +105,12 @@ pub enum Target {
     Fastest,
     /// A country's eligible Standard servers (FR-20).
     Country(String),
+    /// A resolved country SET (the regional groups' `fastest-in-region`
+    /// target, M3 U3): eligible Standard servers whose exit country is
+    /// in the set. Membership comes from the generated UN M49 mapping
+    /// at the group layer — never coordinates, locale, or ad hoc lists
+    /// (FR-23O).
+    Countries(Vec<String>),
     /// A state or region's eligible Standard servers.
     State(String),
     /// A city's eligible Standard servers.
@@ -125,6 +137,11 @@ pub enum RankingPolicy {
     },
     /// Lowest Proton-exposed load (FR-17).
     LowestLoad,
+    /// The connection-groups contract's `random-country-then-server`
+    /// (M3 U2): a uniform eligible country, then a uniform eligible
+    /// server within it. The draw is pure — entropy comes from
+    /// [`SelectionContext::random_entropy`], never fabricated here.
+    Random,
 }
 
 impl RankingPolicy {
@@ -133,8 +150,10 @@ impl RankingPolicy {
     /// `balanced`, `load`. `speed` — and the other forbidden throughput
     /// signals — is rejected with the typed T-1 error, never silently
     /// ignored (FR-19); unknown strings are invalid modes naming the
-    /// input. (`latency` lands with this milestone's PR-3 probing; the
-    /// random group policy is PR-2's.)
+    /// input. (`latency` lands with this milestone's PR-3 probing;
+    /// `random` is NOT a mode — it is the random group's catalog
+    /// policy, assembled by the group resolver, not requestable as a
+    /// `--by` value.)
     pub fn parse(mode: &str) -> Result<Self, SelectionError> {
         match mode {
             "official" => Ok(RankingPolicy::Official),
@@ -353,6 +372,11 @@ pub struct SelectionContext {
     /// is capable" answer (the request then finds no survivor — the
     /// honest FR-87 outcome).
     pub port_forwarding_capable: Option<std::collections::BTreeSet<String>>,
+    /// Entropy for [`RankingPolicy::Random`] draws, supplied by the
+    /// caller (OS randomness at the daemon boundary; the pure core
+    /// fabricates none). A random-policy request without it is a typed
+    /// refusal.
+    pub random_entropy: Option<u64>,
 }
 
 /// One hard-filter (or policy) stage, in the order FR-23P prescribes
@@ -634,6 +658,13 @@ pub enum SelectionError {
         /// The latency weight that could not be satisfied.
         weight: f32,
     },
+    /// A random-policy request with no caller-supplied entropy: the
+    /// pure core fabricates no randomness (the daemon supplies OS
+    /// entropy at the boundary).
+    #[error(
+        "random selection requires caller-supplied entropy: the pure core fabricates no randomness"
+    )]
+    RandomEntropyRequired,
     /// A port-forwarding constraint reached the pure core without the
     /// entitlement composition that must evaluate it (FR-23H).
     #[error("port-forwarding requires entitlement composition before selection can evaluate it")]
@@ -730,8 +761,14 @@ fn validate_country(code: &str) -> Result<(), SelectionError> {
 /// Validates every country input on the request (FR-20/FR-21/FR-23Q)
 /// before any candidate work.
 fn validate_request_countries(request: &SelectionRequest) -> Result<(), SelectionError> {
-    if let Target::Country(code) = &request.target {
-        validate_country(code)?;
+    match &request.target {
+        Target::Country(code) => validate_country(code)?,
+        Target::Countries(codes) => {
+            for code in codes {
+                validate_country(code)?;
+            }
+        }
+        _ => {}
     }
     for code in &request.constraints.excluded_countries {
         validate_country(code)?;
@@ -790,6 +827,7 @@ fn target_stage(server: &LogicalServer, target: &Target) -> Option<FilterStage> 
     let miss = match target {
         Target::Fastest => false,
         Target::Country(code) => server.exit_country != *code,
+        Target::Countries(codes) => !codes.contains(&server.exit_country),
         Target::State(name) => !eq_fold(server.state.as_deref(), name),
         Target::City(name) => !eq_fold(server.city.as_deref(), name),
         Target::Server(_) | Target::Gateway(_) => unreachable!("handled above"),
@@ -1075,6 +1113,12 @@ pub fn select<'a>(
             RankingPolicy::Balanced { weights } => {
                 rank_balanced(candidates, *weights, request, context, &mut report)?
             }
+            RankingPolicy::Random => {
+                let entropy = context
+                    .random_entropy
+                    .ok_or(SelectionError::RandomEntropyRequired)?;
+                rank_random(candidates, entropy)
+            }
         }
     };
     if ranked.is_empty() {
@@ -1153,6 +1197,76 @@ fn rank_lowest_load<'a>(
             .then_with(|| a.server.id.cmp(&b.server.id))
     });
     Ok(ranked)
+}
+
+/// The `random` policy (the connection-groups contract's
+/// `random-country-then-server`): a uniform eligible country, then a
+/// uniform eligible server within it. Implemented as a seeded
+/// Fisher-Yates shuffle of the (deterministically ordered) country
+/// groups followed by a shuffle of each country's servers — the head
+/// of the result IS the two-level uniform draw, and the remainder is a
+/// deterministic continuation (a full permutation of the eligible set,
+/// so `ranked.len() == survivors` and a `change-server` caller has a
+/// next candidate). Pure: the seed is caller-supplied entropy.
+fn rank_random<'a>(candidates: Vec<&'a LogicalServer>, entropy: u64) -> Vec<RankedCandidate<'a>> {
+    // Group by exit country; BTreeMap iteration is ascending country
+    // order, so the pre-shuffle layout is deterministic.
+    let mut by_country: BTreeMap<&str, Vec<&'a LogicalServer>> = BTreeMap::new();
+    for server in candidates {
+        by_country
+            .entry(server.exit_country.as_str())
+            .or_default()
+            .push(server);
+    }
+    let mut countries: Vec<(&str, Vec<&'a LogicalServer>)> = by_country.into_iter().collect();
+    let mut rng = SeededDraw(entropy);
+    fisher_yates(&mut countries, &mut rng);
+    let mut ranked = Vec::new();
+    for (_, mut servers) in countries {
+        fisher_yates(&mut servers, &mut rng);
+        ranked.extend(servers.into_iter().map(|server| RankedCandidate {
+            server,
+            signals: ScoringSignals::catalog_only(server),
+        }));
+    }
+    ranked
+}
+
+/// A seeded splitmix64 stream — the crate's ONE deterministic draw
+/// device: the random policy shuffles through it and the synthetic
+/// test fixtures (the 20k benchmark) draw from the same stream (never
+/// product randomness, which the scheduler takes from the OS CSPRNG).
+/// The output mix matters: a raw LCG's low bits have tiny periods
+/// (bit 0 alternates every call), which bit-biased a first draft of
+/// the benchmark fixture into setting the Secure Core feature on 100%
+/// of "standard" logicals.
+struct SeededDraw(u64);
+
+impl SeededDraw {
+    fn next_u64(&mut self) -> u64 {
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^ (z >> 31)
+    }
+
+    /// A draw below `bound` (the shuffle's index pick; the fixtures'
+    /// bounded rolls).
+    fn below(&mut self, bound: u64) -> u64 {
+        self.next_u64() % bound
+    }
+}
+
+/// In-place uniform shuffle (Fisher-Yates over the seeded stream).
+fn fisher_yates<T>(items: &mut [T], rng: &mut SeededDraw) {
+    for index in (1..items.len()).rev() {
+        let swap = rng.below(index as u64 + 1) as usize;
+        items.swap(index, swap);
+    }
 }
 
 /// The satisfied fraction of the optional feature set (FR-16's
@@ -2502,6 +2616,7 @@ mod tests {
                 .collect(),
             port_forwarding_entitled: None,
             port_forwarding_capable: None,
+            random_entropy: None,
         }
     }
 
@@ -2772,33 +2887,11 @@ mod tests {
     // 20k servers = 5,000 logicals x 4 physicals each, inside the
     // landed S6 caps (16,384 logicals / 262,144 physicals — a 20k
     // LOGICAL fixture is unrepresentable). Deterministic generation:
-    // a fixed-seed LCG, no wall clock, no RNG dependency.
+    // a fixed-seed [`SeededDraw`] (the production mixer this module's
+    // random policy shuffles through — folded here by the PR-2 close
+    // pass; the pair had drifted into byte-identical twins), no wall
+    // clock, no RNG dependency.
     // ------------------------------------------------------------------
-
-    /// A deterministic LCG with a splitmix64 output mix (test fixture
-    /// generation only — never product randomness; the scheduler's
-    /// jitter uses the OS CSPRNG). The mix matters: a raw LCG's low
-    /// bits have tiny periods (bit 0 alternates every call), which
-    /// bit-biased a first draft of this fixture into setting the
-    /// Secure Core feature on 100% of "standard" logicals.
-    struct Lcg(u64);
-
-    impl Lcg {
-        fn next_u64(&mut self) -> u64 {
-            self.0 = self
-                .0
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            let mut z = self.0;
-            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-            z ^ (z >> 31)
-        }
-
-        fn below(&mut self, bound: u64) -> u64 {
-            self.next_u64() % bound
-        }
-    }
 
     const BENCH_COUNTRIES: &[&str] = &[
         "AT", "BE", "BG", "CH", "CZ", "DE", "DK", "EE", "ES", "FI", "FR", "GB", "HR", "HU", "IE",
@@ -2817,7 +2910,7 @@ mod tests {
     /// work), scores on every logical, ~2% gateways and ~5%
     /// Secure-Core-shaped entries.
     fn synthetic_catalog_20k() -> String {
-        let mut rng = Lcg(0x5EED_2026_0825);
+        let mut rng = SeededDraw(0x5EED_2026_0825);
         let mut doc = String::with_capacity(8 << 20);
         doc.push_str(r#"{"Code":1000,"StatusID":"bench","LogicalServers":["#);
         for index in 0..BENCH_LOGICALS {
@@ -2957,6 +3050,214 @@ mod tests {
             total <= Duration::from_millis(500),
             "selection pipeline on 20k synthetic servers took {total:?} (parse {parsed_after:?}); \
              the M3 exit bar is 500 ms"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Slice 5 — the regional country-set target (M3 U3) and the random
+    // policy (M3 U2: the connection-groups contract's
+    // `random-country-then-server` semantics).
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn country_set_targets_limit_to_the_member_countries() {
+        // The resolved region form: eligible Standard servers whose
+        // exit country is in the set; misses charge TargetGeography
+        // (FR-23P's target geography stage, not the user exclusions).
+        let catalog = build_catalog(&[
+            Spec::new("GB#1", "GB"),
+            Spec::new("DE#1", "DE"),
+            Spec::new("US#1", "US"),
+            Spec {
+                gateway: Some("acme-corp"),
+                ..Spec::new("acme-corp#1", "GB")
+            },
+        ]);
+        let (survivors, report) = filter_candidates(
+            &catalog,
+            &official(Target::Countries(vec!["GB".into(), "DE".into()])),
+            &SelectionContext::default(),
+        )
+        .unwrap();
+        assert_eq!(names(&survivors), ["GB#1", "DE#1"]);
+        assert_eq!(stage_count(&report, FilterStage::TargetGeography), 1);
+        assert_eq!(
+            stage_count(&report, FilterStage::ServerType),
+            1,
+            "the Standard-fleet filter applies to region targets too"
+        );
+    }
+
+    #[test]
+    fn country_set_targets_validate_every_code() {
+        // One non-canonical member refuses the whole set — the pure
+        // core never approximates (no silent uppercasing of a member).
+        let catalog = build_catalog(&[Spec::new("GB#1", "GB")]);
+        let err = filter_candidates(
+            &catalog,
+            &official(Target::Countries(vec!["GB".into(), "gb".into()])),
+            &SelectionContext::default(),
+        )
+        .unwrap_err();
+        assert_eq!(err, SelectionError::InvalidCountry("gb".into()));
+    }
+
+    #[test]
+    fn random_is_not_a_by_mode() {
+        // `random` is a catalog-declared POLICY (the random group's),
+        // not a `--by` vocabulary mode (9.3 lists official/balanced/
+        // load/latency only): requesting it as a mode is an ordinary
+        // invalid mode, a distinct class from the forbidden signals.
+        let err = RankingPolicy::parse("random").unwrap_err();
+        assert_eq!(err, SelectionError::InvalidRankingMode("random".into()));
+    }
+
+    fn random_request() -> SelectionRequest {
+        SelectionRequest {
+            target: Target::Fastest,
+            policy: RankingPolicy::Random,
+            constraints: Constraints::default(),
+        }
+    }
+
+    #[test]
+    fn random_requires_caller_supplied_entropy() {
+        // The pure core fabricates no randomness: a draw without
+        // caller entropy is the typed refusal, never a constant seed
+        // in disguise.
+        let catalog = build_catalog(&[spec_with("GB#1", "GB", Some(1.0), Some(50))]);
+        let err = select(&catalog, &random_request(), &SelectionContext::default()).unwrap_err();
+        assert_eq!(err, SelectionError::RandomEntropyRequired);
+        let context = SelectionContext {
+            random_entropy: Some(42),
+            ..SelectionContext::default()
+        };
+        assert!(select(&catalog, &random_request(), &context).is_ok());
+    }
+
+    /// The two-level draw the connection-groups contract pins:
+    /// "uniform eligible country followed by uniform eligible server".
+    /// Fixture: two eligible countries — A (1 server), B (3 servers).
+    /// Over the fixed deterministic seed range 0..1000: each country
+    /// leads ~500 times, and B's three servers each lead ~1/6 of the
+    /// total (uniform within the drawn country, never uniform across
+    /// servers — that would weight B's servers 3/4 of all draws).
+    #[test]
+    fn random_draws_a_uniform_country_then_a_uniform_server() {
+        let catalog = build_catalog(&[
+            spec_with("AA#1", "AA", Some(1.0), Some(50)),
+            spec_with("BB#1", "BB", Some(1.0), Some(50)),
+            spec_with("BB#2", "BB", Some(1.0), Some(50)),
+            spec_with("BB#3", "BB", Some(1.0), Some(50)),
+        ]);
+        let mut country_leads = [0usize; 2];
+        let mut server_leads = [0usize; 3];
+        let mut distinct_orders = std::collections::BTreeSet::new();
+        for seed in 0..1000u64 {
+            let context = SelectionContext {
+                random_entropy: Some(seed),
+                ..SelectionContext::default()
+            };
+            let outcome = select(&catalog, &random_request(), &context).unwrap();
+            let ranked: Vec<&str> = outcome
+                .ranked
+                .iter()
+                .map(|c| c.server.name.as_str())
+                .collect();
+            distinct_orders.insert(ranked.join(","));
+            match ranked[0] {
+                "AA#1" => country_leads[0] += 1,
+                _ => {
+                    country_leads[1] += 1;
+                    server_leads[ranked[0].as_bytes()[3] as usize - b'1' as usize] += 1;
+                }
+            }
+        }
+        assert!(
+            (420..=580).contains(&country_leads[0]),
+            "country A led {} of 1000 draws (~500 expected): {country_leads:?}",
+            country_leads[0]
+        );
+        for leads in server_leads {
+            assert!(
+                (120..=215).contains(&leads),
+                "each of B's servers led {leads} of 1000 draws (~167 expected): \
+                 {server_leads:?} {country_leads:?}"
+            );
+        }
+        // The draw is a real permutation, not a fixed order with a
+        // swapped head: the fixture's FULL ordering space is exactly 12
+        // ([A first] x 6 B-permutations + [B first] x 6), and 1000
+        // seeds reach every one of them.
+        assert_eq!(
+            distinct_orders.len(),
+            12,
+            "a real shuffle reaches the full ordering space"
+        );
+    }
+
+    #[test]
+    fn random_draws_are_deterministic_per_seed() {
+        let catalog = build_catalog(&[
+            spec_with("GB#1", "GB", Some(1.0), Some(50)),
+            spec_with("GB#2", "GB", Some(1.0), Some(50)),
+            spec_with("DE#1", "DE", Some(1.0), Some(50)),
+        ]);
+        let draw = |seed: u64| {
+            let context = SelectionContext {
+                random_entropy: Some(seed),
+                ..SelectionContext::default()
+            };
+            select(&catalog, &random_request(), &context)
+                .unwrap()
+                .ranked
+                .iter()
+                .map(|c| c.server.name.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(draw(7), draw(7), "same seed, same draw");
+        let mut distinct = std::collections::BTreeSet::new();
+        for seed in 0..64 {
+            distinct.insert(draw(seed));
+        }
+        assert!(distinct.len() > 1, "different seeds must be able to differ");
+    }
+
+    #[test]
+    fn random_respects_hard_filters_and_covers_the_survivors() {
+        // The draw happens AFTER the pipeline: eliminated servers never
+        // appear, and every eligible one appears exactly once (the
+        // continuation is a permutation — the FR-22 accounting stays
+        // coherent: ranked.len() == survivors).
+        let catalog = build_catalog(&[
+            spec_with("GB#1", "GB", Some(1.0), Some(50)),
+            Spec {
+                status: Some(0),
+                ..spec_with("GB#2", "GB", Some(1.0), Some(50))
+            },
+            spec_with("DE#1", "DE", Some(1.0), Some(50)),
+            spec_with("US#1", "US", Some(1.0), Some(50)),
+        ]);
+        let mut request = random_request();
+        request.constraints.excluded_countries = vec!["US".into()];
+        let context = SelectionContext {
+            random_entropy: Some(2026),
+            ..SelectionContext::default()
+        };
+        let outcome = select(&catalog, &request, &context).unwrap();
+        let ranked: Vec<&str> = outcome
+            .ranked
+            .iter()
+            .map(|c| c.server.name.as_str())
+            .collect();
+        assert_eq!(ranked.len(), 2);
+        assert!(ranked.contains(&"GB#1") && ranked.contains(&"DE#1"));
+        assert!(!ranked.contains(&"GB#2") && !ranked.contains(&"US#1"));
+        assert_eq!(outcome.report.survivors(), ranked.len());
+        assert_eq!(stage_count(&outcome.report, FilterStage::Offline), 1);
+        assert_eq!(
+            stage_count(&outcome.report, FilterStage::ExcludedCountry),
+            1
         );
     }
 }
