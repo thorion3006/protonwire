@@ -1156,8 +1156,13 @@ fn rank_lowest_load<'a>(
 }
 
 /// The satisfied fraction of the optional feature set (FR-16's
-/// feature-match signal; port forwarding evaluates against the
-/// entitlement seam — fail-closed when unset).
+/// feature-match signal). Port forwarding evaluates against the SAME
+/// per-server capability rule the required arm enforces (Codex PR#5
+/// round 5, P2: the pre-fix arm marked the feature held for every
+/// candidate under entitlement alone, so a capable and an incapable
+/// server scored identically and load could select the incapable one
+/// even with a capable alternative present — optional scoring is a
+/// weaker signal, never a fabricated one).
 fn optional_match_ratio(
     server: &LogicalServer,
     optional: &[FeatureConstraint],
@@ -1169,7 +1174,13 @@ fn optional_match_ratio(
     let held = optional
         .iter()
         .filter(|feature| match feature {
-            FeatureConstraint::PortForwarding => context.port_forwarding_entitled.unwrap_or(false),
+            FeatureConstraint::PortForwarding => {
+                context.port_forwarding_entitled.unwrap_or(false)
+                    && context
+                        .port_forwarding_capable
+                        .as_ref()
+                        .is_some_and(|capable| capable.contains(&server.id))
+            }
             other => catalog_feature_holds(server, **other),
         })
         .count();
@@ -1955,6 +1966,60 @@ mod tests {
         let (survivors, report) = filter_candidates(&two, &required, &context).unwrap();
         assert!(survivors.is_empty());
         assert_eq!(stage_count(&report, FilterStage::RequiredFeatures), 2);
+    }
+
+    /// Codex PR#5 round 5 (P2): OPTIONAL port-forwarding scoring uses
+    /// the SAME per-server capability rule — a capable and an
+    /// incapable server no longer score identically under a
+    /// feature-match weight, so load cannot pick the incapable one
+    /// while a capable alternative exists. Pre-fix, entitlement alone
+    /// marked the feature held for EVERY candidate.
+    #[test]
+    fn optional_port_forwarding_scoring_requires_capability_too() {
+        // GB#1 capable (load 80), GB#2 incapable (load 10): under a
+        // feature-match weight the incapable server's advantage from
+        // load must NOT overcome its missing feature score.
+        let mut heavy = Spec::new("GB#1", "GB");
+        heavy.load = Some(80);
+        let mut light = Spec::new("GB#2", "GB");
+        light.load = Some(10);
+        let catalog = build_catalog(&[heavy, light]);
+        let capable: std::collections::BTreeSet<String> =
+            ["id-GB#1".to_owned()].into_iter().collect();
+        let context = SelectionContext {
+            port_forwarding_entitled: Some(true),
+            port_forwarding_capable: Some(capable),
+            ..SelectionContext::default()
+        };
+        let mut request = official(Target::Country("GB".into()));
+        request.policy = RankingPolicy::Balanced {
+            weights: WeightedSignals {
+                load: 0.5,
+                feature_match: 0.5,
+                ..WeightedSignals::DEFAULT_ZEROED
+            },
+        };
+        request.constraints.optional_features = vec![FeatureConstraint::PortForwarding];
+        let outcome = select(&catalog, &request, &context).unwrap();
+        assert_eq!(
+            outcome.ranked[0].server.name, "GB#1",
+            "the capable server wins: the incapable one's load advantage cannot beat a \
+             missing feature score"
+        );
+        // And the incapable one's breakdown shows it paid for the gap.
+        let gb2 = outcome
+            .ranked
+            .iter()
+            .find(|c| c.server.name == "GB#2")
+            .expect("GB#2 still ranks (optional never eliminates)");
+        let gb2_signals = gb2
+            .signals
+            .weighted
+            .expect("balanced carries the breakdown");
+        assert!(
+            gb2_signals.feature_match_term > 0.0,
+            "the incapable server pays the feature-match term: {gb2_signals:?}"
+        );
     }
 
     #[test]
