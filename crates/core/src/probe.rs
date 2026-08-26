@@ -160,24 +160,28 @@ pub fn plan_run(
     decisions
 }
 
-/// Executes one planned run: probes every `Probe` endpoint through
-/// the executor (polling `cancelled` between endpoints), returning
-/// the merged observation table — reused priors plus fresh answers.
-/// An unanswered probe contributes NOTHING for that endpoint (the
-/// prior observation, when one exists, is what the caller keeps —
-/// never an offline verdict).
+/// Executes one planned run in SHORTLIST order — the caller's ranked
+/// priority (the PR-3 review's P2-4: the decision map is key-ordered,
+/// so iterating it let cancellation cut the high-priority prefix and
+/// keep the lexicographically-first tail). Probes every `Probe`
+/// endpoint through the executor (polling `cancelled` between
+/// endpoints), returning the merged observation table — reused priors
+/// plus fresh answers. An unanswered probe contributes NOTHING for that
+/// endpoint (the prior observation, when one exists, is what the caller
+/// keeps — never an offline verdict).
 pub fn run_planned(
+    shortlist: &[String],
     decisions: &BTreeMap<String, ProbeDecision>,
     state: &BTreeMap<String, EndpointState>,
     executor: &mut dyn ProbeExecutor,
 ) -> BTreeMap<String, Observation> {
     let mut table = BTreeMap::new();
-    for (endpoint, decision) in decisions {
-        match decision {
-            ProbeDecision::Reuse(obs) => {
+    for endpoint in shortlist {
+        match decisions.get(endpoint) {
+            Some(ProbeDecision::Reuse(obs)) => {
                 table.insert(endpoint.clone(), *obs);
             }
-            ProbeDecision::RateLimited => {
+            Some(ProbeDecision::RateLimited) => {
                 if let Some(EndpointState {
                     observation: Some(obs),
                     ..
@@ -186,7 +190,7 @@ pub fn run_planned(
                     table.insert(endpoint.clone(), *obs);
                 }
             }
-            ProbeDecision::Probe => {
+            Some(ProbeDecision::Probe) => {
                 if executor.cancelled() {
                     break;
                 }
@@ -194,6 +198,9 @@ pub fn run_planned(
                     table.insert(endpoint.clone(), Observation { rtt });
                 }
             }
+            // An endpoint the planner never decided (a shortlist the
+            // planner was not given) is not this run's business.
+            None => {}
         }
     }
     table
@@ -369,7 +376,7 @@ mod tests {
             ProbeDecision::RateLimited,
             "the cap (8 probes budgeted before it) skips the 9th"
         );
-        let table = run_planned(&decisions, &state, &mut AnswerAll);
+        let table = run_planned(&shortlist, &decisions, &state, &mut AnswerAll);
         assert_eq!(
             table.get("zz"),
             Some(&Observation {
@@ -392,10 +399,50 @@ mod tests {
         }
         let decisions: BTreeMap<_, _> = [("a".to_owned(), ProbeDecision::Probe)].into();
         let state = BTreeMap::new();
-        let table = run_planned(&decisions, &state, &mut TimeoutAll);
+        let shortlist = vec!["a".to_owned()];
+        let table = run_planned(&shortlist, &decisions, &state, &mut TimeoutAll);
         assert!(
             !table.contains_key("a"),
             "a timeout is the absence of an observation, never an offline verdict (FR-19B)"
+        );
+    }
+
+    /// The priority-order seam (the PR-3 review's P2-4 track item,
+    /// landed in PR-4): execution follows the SHORTLIST order — the
+    /// caller's ranked priority — never the decision map's key order.
+    /// Against the pre-fix key-ordered iteration this was RED: a
+    /// cancel-after-one executor kept the lexicographically-first
+    /// endpoint ("a") and cut the high-priority one ("z").
+    #[test]
+    fn execution_follows_shortlist_priority_not_key_order() {
+        struct CancelAfterOne {
+            answered: usize,
+        }
+        impl ProbeExecutor for CancelAfterOne {
+            fn probe(&mut self, _endpoint: &str) -> Option<Duration> {
+                self.answered += 1;
+                Some(Duration::from_millis(10))
+            }
+            fn cancelled(&mut self) -> bool {
+                self.answered >= 1
+            }
+        }
+        // Priority order z BEFORE a; key order is the reverse.
+        let shortlist = vec!["z".to_owned(), "a".to_owned()];
+        let decisions: BTreeMap<_, _> = [
+            ("a".to_owned(), ProbeDecision::Probe),
+            ("z".to_owned(), ProbeDecision::Probe),
+        ]
+        .into();
+        let state = BTreeMap::new();
+        let table = run_planned(&shortlist, &decisions, &state, &mut CancelAfterOne { answered: 0 });
+        assert!(
+            table.contains_key("z"),
+            "the HIGH-priority endpoint is probed first (shortlist order)"
+        );
+        assert!(
+            !table.contains_key("a"),
+            "cancellation cuts the low-priority tail, never the prefix"
         );
     }
 
@@ -421,7 +468,8 @@ mod tests {
         ]
         .into();
         let state = BTreeMap::new();
-        let table = run_planned(&decisions, &state, &mut CancelAfterOne { answered: 0 });
+        let shortlist = vec!["a".to_owned(), "b".to_owned()];
+        let table = run_planned(&shortlist, &decisions, &state, &mut CancelAfterOne { answered: 0 });
         assert_eq!(table.len(), 1, "the answered prefix survives");
         assert!(table.contains_key("a"));
     }
