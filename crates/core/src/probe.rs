@@ -435,7 +435,12 @@ mod tests {
         ]
         .into();
         let state = BTreeMap::new();
-        let table = run_planned(&shortlist, &decisions, &state, &mut CancelAfterOne { answered: 0 });
+        let table = run_planned(
+            &shortlist,
+            &decisions,
+            &state,
+            &mut CancelAfterOne { answered: 0 },
+        );
         assert!(
             table.contains_key("z"),
             "the HIGH-priority endpoint is probed first (shortlist order)"
@@ -469,7 +474,12 @@ mod tests {
         .into();
         let state = BTreeMap::new();
         let shortlist = vec!["a".to_owned(), "b".to_owned()];
-        let table = run_planned(&shortlist, &decisions, &state, &mut CancelAfterOne { answered: 0 });
+        let table = run_planned(
+            &shortlist,
+            &decisions,
+            &state,
+            &mut CancelAfterOne { answered: 0 },
+        );
         assert_eq!(table.len(), 1, "the answered prefix survives");
         assert!(table.contains_key("a"));
     }
