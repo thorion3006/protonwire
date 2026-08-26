@@ -37,20 +37,43 @@
 //!   model.
 //! * [`RankingPolicy::Balanced`] — ProtonWire's weighted policy (FR-16;
 //!   lower is better) over caller-supplied weights. A positive latency
-//!   weight requires caller-supplied latency observations (probing is
-//!   PR-3 of this milestone's stack); stability and history have no
-//!   data source until connection statistics exist (post-M4), so their
-//!   terms contribute uniformly zero and the scoring-signal report
-//!   marks them absent.
+//!   weight requires caller-supplied latency observations (the bounded
+//!   on-demand prober is [`crate::probe`]); stability and history have
+//!   no data source until connection statistics exist (post-M4), so
+//!   their terms contribute uniformly zero and the scoring-signal
+//!   report marks them absent.
 //! * [`RankingPolicy::LowestLoad`] — lowest Proton-exposed load
 //!   (FR-17); a server without an exposed load is excluded WITH a
 //!   structured report entry, never approximated.
+//! * [`RankingPolicy::Latency`] — lowest locally measured latency
+//!   (FR-18): the caller-supplied observations ascending (the bounded
+//!   on-demand prober, [`crate::probe`], fills the table); an
+//!   unobserved candidate is excluded WITH a report entry (the
+//!   shortlist boundary), never guessed, never an offline verdict.
 //! * [`RankingPolicy::Random`] — the connection-groups contract's
 //!   `random-country-then-server` (M3 U2): a uniform eligible country,
 //!   then a uniform eligible server within it. The core is pure, so
 //!   the draw runs on caller-supplied entropy
 //!   ([`SelectionContext::random_entropy`]) and refuses typed without
 //!   it — no fabricated randomness.
+//!
+//! ## Secure Core routing (FR-23A..F, T-11)
+//!
+//! [`Target::SecureCore`] is the routed target: the entry→exit pair
+//! over the Secure Core fleet. Each side is fastest (`None`) or a
+//! pinned country; a route's entry and exit countries always differ
+//! (the hop-through that defines Secure Core — the same country on
+//! both sides is a typed validation refusal, FR-23F). The fleet is
+//! the exact complement of the Standard fleet (route shape or catalog
+//! bit; gateways are their own connection type), so every non-gateway
+//! logical belongs to exactly one fleet. The generic country
+//! constraints keep meaning the EXIT country (the canonical
+//! selector); the dedicated entry/exit exclusion lists are this
+//! target's alone and are refused typed on every other target
+//! (FR-23F). "Lowest load" and "lowest latency" are the policies over
+//! this target, not separate targets (FR-23C). Both ends of the
+//! selected route ride the logical's `EntryCountry`/`ExitCountry`
+//! for the status surface (FR-23D; composed at the daemon, U6).
 //!
 //! ## No speed, ever (FR-19, T-1)
 //!
@@ -85,8 +108,9 @@ use std::time::Duration;
 use protonwire_store::catalog::LogicalServer;
 
 /// Latency observations keyed by logical server ID — the caller-supplied
-/// probe results (milestone 3 PR-3 wires the bounded on-demand prober;
-/// FR-18 forbids full-catalog scans, so keys cover at most a shortlist).
+/// probe results (the bounded on-demand prober, [`crate::probe`], fills
+/// the table; FR-18 forbids full-catalog scans, so keys cover at most a
+/// shortlist).
 pub type LatencyTable = BTreeMap<String, Duration>;
 
 /// The forbidden throughput ranking signals (the connection-groups
@@ -122,6 +146,21 @@ pub enum Target {
     /// A named gateway's logicals (dedicated-server fleet identity; the
     /// *authorization* is S8 entitlement data composed at the daemon).
     Gateway(String),
+    /// A routed Secure Core target: the entry→exit pair over the Secure
+    /// Core fleet (FR-23A..F). Each side is `None` (fastest / any
+    /// eligible country) or a pinned country, and a route's entry and
+    /// exit countries always differ — the hop-through that defines
+    /// Secure Core. The generic country constraints keep meaning the
+    /// EXIT country (the canonical selector); the dedicated entry/exit
+    /// exclusion lists ([`Constraints::excluded_entry_countries`],
+    /// [`Constraints::excluded_exit_countries`]) belong to this target
+    /// alone (FR-23F).
+    SecureCore {
+        /// The entry side: fastest (`None`) or a pinned country.
+        entry_country: Option<String>,
+        /// The exit side: fastest (`None`) or a pinned country.
+        exit_country: Option<String>,
+    },
 }
 
 /// The ranking policy applied after hard filters (FR-14).
@@ -137,6 +176,14 @@ pub enum RankingPolicy {
     },
     /// Lowest Proton-exposed load (FR-17).
     LowestLoad,
+    /// Lowest locally measured latency (FR-18): the caller-supplied
+    /// probe observations ascending. Pure — no probing happens here;
+    /// the bounded on-demand prober ([`crate::probe`]) fills
+    /// [`SelectionContext::latency`], a candidate without an
+    /// observation is excluded WITH a report entry (the FR-18
+    /// shortlist boundary), and an empty table is a typed refusal —
+    /// never a fabricated ordering, never an offline verdict.
+    Latency,
     /// The connection-groups contract's `random-country-then-server`
     /// (M3 U2): a uniform eligible country, then a uniform eligible
     /// server within it. The draw is pure — entropy comes from
@@ -147,13 +194,12 @@ pub enum RankingPolicy {
 impl RankingPolicy {
     /// Parses the ranking-mode vocabulary shared by `--by`, profile
     /// `selection.by`, and the wire `selection_policy`: `official`,
-    /// `balanced`, `load`. `speed` — and the other forbidden throughput
-    /// signals — is rejected with the typed T-1 error, never silently
-    /// ignored (FR-19); unknown strings are invalid modes naming the
-    /// input. (`latency` lands with this milestone's PR-3 probing;
-    /// `random` is NOT a mode — it is the random group's catalog
-    /// policy, assembled by the group resolver, not requestable as a
-    /// `--by` value.)
+    /// `balanced`, `load`, `latency`. `speed` — and the other forbidden
+    /// throughput signals — is rejected with the typed T-1 error,
+    /// never silently ignored (FR-19); unknown strings are invalid
+    /// modes naming the input. (`random` is NOT a mode — it is the
+    /// random group's catalog policy, assembled by the group resolver,
+    /// not requestable as a `--by` value.)
     pub fn parse(mode: &str) -> Result<Self, SelectionError> {
         match mode {
             "official" => Ok(RankingPolicy::Official),
@@ -161,6 +207,7 @@ impl RankingPolicy {
                 weights: WeightedSignals::DEFAULT,
             }),
             "load" => Ok(RankingPolicy::LowestLoad),
+            "latency" => Ok(RankingPolicy::Latency),
             forbidden if FORBIDDEN_RANKING_SIGNALS.contains(&forbidden) => {
                 Err(SelectionError::UnsupportedRankingSignal {
                     key: forbidden.to_owned(),
@@ -281,8 +328,12 @@ pub enum FeatureConstraint {
     P2p,
     /// Tor-over-VPN (catalog feature bit).
     Tor,
-    /// Secure Core server (catalog feature bit; the *routed* Secure
-    /// Core target is milestone 3 PR-3).
+    /// Secure Core server (catalog feature bit). The routed Secure
+    /// Core TARGET ([`Target::SecureCore`]) is how Secure Core
+    /// connectivity is requested; this constraint under a Standard-
+    /// fleet target is the typed contradiction (a bit-marked
+    /// Standard fleet does not exist), and under the routed target it
+    /// is legal, tautological, and still evaluates against the bit.
     SecureCore,
     /// Streaming-capable where exposed (catalog feature bit).
     Streaming,
@@ -319,6 +370,13 @@ pub struct Constraints {
     pub excluded_cities: Vec<String>,
     /// Never select these logical servers by name (FR-21A).
     pub excluded_servers: Vec<String>,
+    /// Never ROUTE THROUGH these entry countries (FR-23C's excluded
+    /// entry countries). Secure Core targets only — every other target
+    /// refuses them typed as incompatible options (FR-23F).
+    pub excluded_entry_countries: Vec<String>,
+    /// Never EXIT through these countries (FR-23C's excluded exit
+    /// countries). Secure Core targets only (FR-23F).
+    pub excluded_exit_countries: Vec<String>,
     /// Exclude the physical country — set by the
     /// fastest-excluding-my-country semantics; the country itself comes
     /// from [`Self::physical_country`] (FR-23Q's resolution is PR-2's;
@@ -353,9 +411,10 @@ pub struct SelectionRequest {
 /// fetches or fabricates any of it.
 #[derive(Debug, Clone, Default)]
 pub struct SelectionContext {
-    /// Latency observations by logical id (PR-3 of this milestone wires
-    /// the bounded prober; an empty table with a positive latency
-    /// weight is a typed refusal — no fabricated latencies).
+    /// Latency observations by logical id (the bounded on-demand
+    /// prober, [`crate::probe`], supplies them; an empty table under a
+    /// latency-dependent ranking is a typed refusal — no fabricated
+    /// latencies).
     pub latency: LatencyTable,
     /// Whether the account is entitled to port forwarding (`None`:
     /// entitlement not composed yet — a port-forwarding constraint then
@@ -364,13 +423,9 @@ pub struct SelectionContext {
     /// Per-server port-forwarding CAPABILITY, by logical id (Codex
     /// PR#5 round 4, P1 / FR-87: entitlement is account permission,
     /// NOT server capability — the catalog exposes no PF bit upstream,
-    /// so the caller supplies the capability set it composed (the
-    /// daemon's PR-4/M6 wiring; official sources provision PF on a
-    /// server subset). `None`: capability not composed — a
-    /// port-forwarding constraint refuses typed, never
-    /// entitled-⇒-every-server. An empty set is a composed "no server
-    /// is capable" answer (the request then finds no survivor — the
-    /// honest FR-87 outcome).
+    /// so the caller supplies the capability set it composed. `None`:
+    /// capability not composed — a port-forwarding constraint refuses
+    /// typed, never entitled-⇒-every-server.
     pub port_forwarding_capable: Option<std::collections::BTreeSet<String>>,
     /// Entropy for [`RankingPolicy::Random`] draws, supplied by the
     /// caller (OS randomness at the daemon boundary; the pure core
@@ -403,6 +458,10 @@ pub enum FilterStage {
     PhysicalCountryExclusion,
     /// An explicitly excluded country (FR-21).
     ExcludedCountry,
+    /// An explicitly excluded Secure Core ENTRY country (FR-23C).
+    ExcludedEntryCountry,
+    /// An explicitly excluded Secure Core EXIT country (FR-23C).
+    ExcludedExitCountry,
     /// An explicitly excluded state/region (FR-21A).
     ExcludedState,
     /// An explicitly excluded city (FR-21A).
@@ -447,6 +506,8 @@ impl FilterStage {
             "physical-country-exclusion",
         ),
         (FilterStage::ExcludedCountry, "excluded-country"),
+        (FilterStage::ExcludedEntryCountry, "excluded-entry-country"),
+        (FilterStage::ExcludedExitCountry, "excluded-exit-country"),
         (FilterStage::ExcludedState, "excluded-state"),
         (FilterStage::ExcludedCity, "excluded-city"),
         (FilterStage::ExcludedServer, "excluded-server"),
@@ -551,10 +612,10 @@ pub struct ScoringSignals {
 }
 
 impl ScoringSignals {
-    /// The provenance a non-balanced policy reports: what the catalog
-    /// exposed and nothing else — no observed latency (only `balanced`
-    /// consumes the latency table today) and no weighted breakdown
-    /// (only `balanced` carries one).
+    /// The provenance a policy that consumes no latency table reports:
+    /// what the catalog exposed and nothing else — no observed latency
+    /// (only `balanced` and `latency` consume the table) and no
+    /// weighted breakdown (only `balanced` carries one).
     fn catalog_only(server: &LogicalServer) -> Self {
         Self {
             proton_score: server.score,
@@ -618,7 +679,7 @@ pub enum SelectionError {
         key: String,
     },
     /// An unrecognized ranking mode.
-    #[error("invalid ranking mode `{0}`: expected `official`, `balanced`, or `load`")]
+    #[error("invalid ranking mode `{0}`: expected `official`, `balanced`, `load`, or `latency`")]
     InvalidRankingMode(String),
     /// Invalid weights: duplicates, unknown keys, or non-finite /
     /// negative values.
@@ -648,14 +709,19 @@ pub enum SelectionError {
         "physical-country-required: the target excludes the physical country but none is known — pass it explicitly per request or set connection_groups.physical_country"
     )]
     PhysicalCountryRequired,
-    /// A balanced request with a positive latency weight and no latency
-    /// observations supplied (probing is this milestone's PR-3; no
-    /// fabricated latencies in the meantime).
+    /// A latency-dependent ranking (the `latency` policy, or a balanced
+    /// weight set with a positive latency weight) with no latency
+    /// observations supplied — the bounded on-demand prober
+    /// ([`crate::probe`]) must run first; latencies are never
+    /// fabricated.
     #[error(
-        "latency data unavailable: balanced weights assign {weight} to latency but no observations were supplied"
+        "latency data unavailable: the ranking weights latency at {weight} but no observations \
+         were supplied — the bounded on-demand prober must run first; latencies are never \
+         fabricated"
     )]
     LatencyDataUnavailable {
-        /// The latency weight that could not be satisfied.
+        /// The latency weight that could not be satisfied (1.0 under
+        /// the pure `latency` policy — latency IS the ranking).
         weight: f32,
     },
     /// A random-policy request with no caller-supplied entropy: the
@@ -670,16 +736,11 @@ pub enum SelectionError {
     #[error("port-forwarding requires entitlement composition before selection can evaluate it")]
     RequiresEntitlementComposition,
     /// A port-forwarding constraint reached the core entitled but
-    /// WITHOUT the per-server capability data FR-87 requires (Codex
-    /// PR#5 round 4, P1: entitlement is account permission, not
-    /// server capability — the pre-fix arm treated entitled as
-    /// every-server-capable and could select a server that cannot
-    /// provide the feature). The caller must compose the capability
-    /// set (the catalog exposes no PF bit upstream).
+    /// WITHOUT the per-server capability data FR-87 requires.
     #[error(
         "port-forwarding capability data unavailable: the account is entitled but no \
-         per-server capability set was supplied — supply SelectionContext.port_forwarding_capable \
-         (FR-87: only servers that support port forwarding may be selected)"
+         per-server capability set was supplied (FR-87: only servers that support port \
+         forwarding may be selected)"
     )]
     PortForwardingCapabilityUnavailable,
     /// No candidate satisfies the constraints; the report names which
@@ -705,16 +766,39 @@ pub enum SelectionError {
     /// constraint — unsatisfiable BY CONSTRUCTION (Codex PR#5, P1: the
     /// type stage removes every Secure Core logical, the feature stage
     /// then removes every Standard one). Secure Core connectivity is a
-    /// TARGET (the routed form, milestone 3 PR-3), never a
+    /// TARGET (the routed [`Target::SecureCore`]), never a
     /// Standard-fleet feature filter; the contradiction is refused at
     /// validation with this error rather than the pipeline's
     /// all-stages-empty report.
     #[error(
         "unsatisfiable request: a Standard-fleet target cannot require the `secure-core` \
-         feature — Secure Core connectivity is a routed TARGET (milestone 3 PR-3), \
+         feature — Secure Core connectivity is a routed TARGET (`secure-core`), \
          not a Standard-fleet feature filter"
     )]
     StandardFleetFeatureContradiction,
+    /// A Secure Core target naming the same country for both sides of
+    /// the route — unsatisfiable BY CONSTRUCTION: Secure Core IS the
+    /// hop-through where the entry and exit countries differ (FR-23F's
+    /// clear-error rule).
+    #[error(
+        "unsatisfiable request: a Secure Core route cannot enter and exit through the same \
+         country (`{country}` was named for both sides) — the entry and exit of a Secure Core \
+         route always differ (FR-23F)"
+    )]
+    SecureCoreEntryEqualsExit {
+        /// The country named for both sides.
+        country: String,
+    },
+    /// The Secure Core routing constraints (the excluded entry/exit
+    /// country lists) on a target that is not the routed Secure Core
+    /// target: they express routing-side exclusions only that target
+    /// evaluates (FR-23F) — refused, never silently ignored, never
+    /// repurposed as generic exclusions.
+    #[error(
+        "the excluded entry/exit country constraints apply only to a Secure Core target — \
+         request the routed `secure-core` target to use them (FR-23F)"
+    )]
+    SecureCoreOnlyConstraints,
 }
 
 impl Target {
@@ -758,8 +842,8 @@ fn validate_country(code: &str) -> Result<(), SelectionError> {
     }
 }
 
-/// Validates every country input on the request (FR-20/FR-21/FR-23Q)
-/// before any candidate work.
+/// Validates every country input on the request (FR-20/FR-21/FR-23Q/
+/// FR-23C/FR-23F) before any candidate work.
 fn validate_request_countries(request: &SelectionRequest) -> Result<(), SelectionError> {
     match &request.target {
         Target::Country(code) => validate_country(code)?,
@@ -768,9 +852,37 @@ fn validate_request_countries(request: &SelectionRequest) -> Result<(), Selectio
                 validate_country(code)?;
             }
         }
+        Target::SecureCore {
+            entry_country,
+            exit_country,
+        } => {
+            if let Some(entry) = entry_country {
+                validate_country(entry)?;
+            }
+            if let Some(exit) = exit_country {
+                validate_country(exit)?;
+            }
+            // FR-23F: the two sides of a Secure Core route always
+            // differ — the same country on both ends contradicts the
+            // definition, and the contradiction is refused here rather
+            // than surfacing as the pipeline's all-stages-empty report.
+            if let (Some(entry), Some(exit)) = (entry_country, exit_country)
+                && entry == exit
+            {
+                return Err(SelectionError::SecureCoreEntryEqualsExit {
+                    country: entry.clone(),
+                });
+            }
+        }
         _ => {}
     }
     for code in &request.constraints.excluded_countries {
+        validate_country(code)?;
+    }
+    for code in &request.constraints.excluded_entry_countries {
+        validate_country(code)?;
+    }
+    for code in &request.constraints.excluded_exit_countries {
         validate_country(code)?;
     }
     if let Some(code) = &request.constraints.physical_country {
@@ -791,6 +903,18 @@ fn eq_fold(value: Option<&str>, wanted: &str) -> bool {
 /// Standard-fleet capabilities, not types.
 fn is_standard_fleet(server: &LogicalServer) -> bool {
     !server.is_gateway() && !server.is_secure_core_route() && !server.features.secure_core()
+}
+
+/// Whether the logical belongs to the Secure Core fleet for the routed
+/// Secure Core target — the exact complement of [`is_standard_fleet`]
+/// within the non-gateway catalog (whatever makes a logical
+/// non-Standard — the route shape or the catalog bit — is what this
+/// fleet claims; no logical is orphaned from both fleets). Fleet
+/// membership is not routability: a bit-marked logical whose entry
+/// equals its exit is a member that can serve no pair (the geography
+/// stage refuses it).
+fn is_secure_core_fleet(server: &LogicalServer) -> bool {
+    !server.is_gateway() && (server.is_secure_core_route() || server.features.secure_core())
 }
 
 /// The online-state stage: unknown is never online (FR-13B,
@@ -814,13 +938,23 @@ fn online_stage(server: &LogicalServer) -> Option<FilterStage> {
 }
 
 /// The target geography/type stage. Exact targets match identity here;
-/// filtered targets require the Standard fleet, then geography
-/// (FR-23L/FR-20). Host-country (smart routing) is reported metadata,
-/// never a match key — the exit country is the canonical selector.
+/// Standard-fleet targets require that fleet, then geography
+/// (FR-23L/FR-20); the routed Secure Core target requires ITS fleet,
+/// then the entry/exit pair. Host-country (smart routing) is reported
+/// metadata, never a match key — the exit country is the canonical
+/// selector.
 fn target_stage(server: &LogicalServer, target: &Target) -> Option<FilterStage> {
     if target.is_exact() {
         return (!target.matches_exact(server)).then_some(FilterStage::TargetGeography);
     }
+    match target {
+        Target::SecureCore { .. } => secure_core_stage(server, target),
+        _ => standard_stage(server, target),
+    }
+}
+
+/// The geography/type stage of a Standard-fleet target.
+fn standard_stage(server: &LogicalServer, target: &Target) -> Option<FilterStage> {
     if !is_standard_fleet(server) {
         return Some(FilterStage::ServerType);
     }
@@ -830,9 +964,38 @@ fn target_stage(server: &LogicalServer, target: &Target) -> Option<FilterStage> 
         Target::Countries(codes) => !codes.contains(&server.exit_country),
         Target::State(name) => !eq_fold(server.state.as_deref(), name),
         Target::City(name) => !eq_fold(server.city.as_deref(), name),
-        Target::Server(_) | Target::Gateway(_) => unreachable!("handled above"),
+        Target::Server(_) | Target::Gateway(_) | Target::SecureCore { .. } => {
+            unreachable!("routed or exact targets never reach the Standard geography stage")
+        }
     };
     miss.then_some(FilterStage::TargetGeography)
+}
+
+/// The geography/type stage of the routed Secure Core target (T-11,
+/// FR-23C): the Secure Core fleet, then each side of the pair — the
+/// pinned exit(s) must match the logical's exit country, the pinned
+/// entry its entry country, and the logical must BE a route (entry ≠
+/// exit — the hop-through that defines Secure Core; a bit-marked
+/// non-route can serve no pair).
+fn secure_core_stage(server: &LogicalServer, target: &Target) -> Option<FilterStage> {
+    if !is_secure_core_fleet(server) {
+        return Some(FilterStage::ServerType);
+    }
+    let Target::SecureCore {
+        entry_country,
+        exit_country,
+    } = target
+    else {
+        unreachable!("the caller routed a Secure Core target here");
+    };
+    let exit_miss = exit_country
+        .as_ref()
+        .is_some_and(|wanted| server.exit_country != *wanted);
+    let entry_miss = entry_country
+        .as_ref()
+        .is_some_and(|wanted| server.entry_country != *wanted);
+    let not_a_route = !server.is_secure_core_route();
+    (exit_miss || entry_miss || not_a_route).then_some(FilterStage::TargetGeography)
 }
 
 /// The physical-country exclusion stage (FR-23Q): exit country equals
@@ -909,10 +1072,9 @@ fn required_features_stage(
         .iter()
         .any(|feature| match feature {
             // FR-87: entitled AND this server is in the composed
-            // capability set. The set is provably present here (the
-            // entry checks refuse None under entitlement); an empty
-            // composed set eliminates every server — the honest "no
-            // server is capable" outcome.
+            // capability set (entitlement is account permission, never
+            // server capability; the entry checks refuse the
+            // uncomposed states typed).
             FeatureConstraint::PortForwarding => {
                 !context.port_forwarding_entitled.unwrap_or(false)
                     || !context
@@ -949,6 +1111,29 @@ fn protocol_stage(server: &LogicalServer, constraints: &Constraints) -> Option<F
         .then_some(FilterStage::ProtocolCompatibility)
 }
 
+/// The Secure Core routing exclusions (FR-23C): the dedicated lists
+/// remove routes THROUGH an entry country / ENDING in an exit country.
+/// Only the routed target may carry them (validated up front), so this
+/// effectively charges Secure Core candidates alone.
+fn secure_core_exclusion_stage(
+    server: &LogicalServer,
+    constraints: &Constraints,
+) -> Option<FilterStage> {
+    if constraints
+        .excluded_entry_countries
+        .contains(&server.entry_country)
+    {
+        return Some(FilterStage::ExcludedEntryCountry);
+    }
+    if constraints
+        .excluded_exit_countries
+        .contains(&server.exit_country)
+    {
+        return Some(FilterStage::ExcludedExitCountry);
+    }
+    None
+}
+
 /// The first stage that eliminates this candidate, in FR-23P order.
 fn eliminating_stage(
     server: &LogicalServer,
@@ -959,6 +1144,7 @@ fn eliminating_stage(
         .or_else(|| target_stage(server, &request.target))
         .or_else(|| physical_country_stage(server, &request.constraints))
         .or_else(|| exclusion_stage(server, &request.constraints))
+        .or_else(|| secure_core_exclusion_stage(server, &request.constraints))
         .or_else(|| required_features_stage(server, &request.constraints, context))
         .or_else(|| protocol_stage(server, &request.constraints))
 }
@@ -995,14 +1181,26 @@ pub fn filter_candidates<'a>(
     context: &SelectionContext,
 ) -> Result<(Vec<&'a LogicalServer>, EliminationReport), SelectionError> {
     validate_request_countries(request)?;
+    // FR-23F: the Secure Core routing constraints (the dedicated
+    // entry/exit exclusion lists) express ROUTED exclusions only the
+    // secure-core target evaluates — on any other target they are
+    // incompatible options, refused here rather than silently ignored
+    // or repurposed as generic exclusions.
+    if !matches!(request.target, Target::SecureCore { .. })
+        && (!request.constraints.excluded_entry_countries.is_empty()
+            || !request.constraints.excluded_exit_countries.is_empty())
+    {
+        return Err(SelectionError::SecureCoreOnlyConstraints);
+    }
     // Codex PR#5 (P1): a Standard-fleet target plus the secure-core
     // feature constraint is unsatisfiable BY CONSTRUCTION — refuse at
     // validation with the typed contradiction instead of letting the
-    // pipeline produce its baffling all-stages-empty report. (Exact
-    // targets match identity before any fleet filtering, so an exact
-    // SC server name remains the working spelling until PR-3's
-    // routed target lands.)
+    // pipeline produce its baffling all-stages-empty report. The scope
+    // is Standard-fleet and exact targets only: under the routed
+    // Secure Core target the constraint is legal (the fleet IS Secure
+    // Core) and still evaluates against the catalog bit (T-4).
     if !request.target.is_exact()
+        && !matches!(request.target, Target::SecureCore { .. })
         && request
             .constraints
             .required_features
@@ -1018,11 +1216,9 @@ pub fn filter_candidates<'a>(
     if needs_port_forwarding_composition(request) && context.port_forwarding_entitled.is_none() {
         return Err(SelectionError::RequiresEntitlementComposition);
     }
-    // Codex PR#5 round 4 (P1, FR-87): entitlement is account
-    // permission, NOT server capability. An entitled request must
-    // still carry the per-server capability set — the pre-fix arm
-    // treated entitled as every-server-capable and could select a
-    // server that cannot provide the feature.
+    // FR-87 (Codex PR#5 round 4): entitled is not capable — the
+    // per-server capability set must be composed too, typed refusal
+    // otherwise (never entitled-⇒-every-server).
     if needs_port_forwarding_composition(request)
         && context.port_forwarding_entitled == Some(true)
         && context.port_forwarding_capable.is_none()
@@ -1109,6 +1305,7 @@ pub fn select<'a>(
     } else {
         match &request.policy {
             RankingPolicy::Official => rank_official(candidates)?,
+            RankingPolicy::Latency => rank_lowest_latency(candidates, context, &mut report)?,
             RankingPolicy::LowestLoad => rank_lowest_load(candidates, &mut report)?,
             RankingPolicy::Balanced { weights } => {
                 rank_balanced(candidates, *weights, request, context, &mut report)?
@@ -1170,6 +1367,49 @@ fn rank_official<'a>(
     Ok(ranked)
 }
 
+/// The `latency` policy (FR-18): lowest locally measured latency — the
+/// caller-supplied observations ascending, ties by logical id. A
+/// candidate without an observation is excluded WITH a report entry
+/// (the FR-18 shortlist boundary: the bounded prober
+/// ([`crate::probe`]) decides what was measured — an unobserved
+/// candidate is absent data, never an offline verdict); an empty table
+/// is the typed data refusal (weight 1.0: latency IS the ranking).
+fn rank_lowest_latency<'a>(
+    candidates: Vec<&'a LogicalServer>,
+    context: &SelectionContext,
+    report: &mut EliminationReport,
+) -> Result<Vec<RankedCandidate<'a>>, SelectionError> {
+    if context.latency.is_empty() {
+        return Err(SelectionError::LatencyDataUnavailable { weight: 1.0 });
+    }
+    let mut ranked = Vec::with_capacity(candidates.len());
+    let mut missing = 0usize;
+    for server in candidates {
+        match context.latency.get(&server.id) {
+            Some(&rtt) => ranked.push(RankedCandidate {
+                server,
+                signals: ScoringSignals {
+                    proton_score: server.score,
+                    load: server.load,
+                    latency: Some(rtt),
+                    weighted: None,
+                },
+            }),
+            None => missing += 1,
+        }
+    }
+    report.charge(FilterStage::NoLatencyObservation, missing);
+    ranked.sort_by(|a, b| {
+        let (Some(a_rtt), Some(b_rtt)) = (a.signals.latency, b.signals.latency) else {
+            unreachable!("only observed candidates are ranked here");
+        };
+        a_rtt
+            .cmp(&b_rtt)
+            .then_with(|| a.server.id.cmp(&b.server.id))
+    });
+    Ok(ranked)
+}
+
 /// The `load` policy (FR-17): lowest Proton-exposed load; a candidate
 /// without an exposed load is excluded WITH a report entry (decision 4
 /// — never approximated).
@@ -1226,20 +1466,20 @@ fn rank_random<'a>(candidates: Vec<&'a LogicalServer>, entropy: u64) -> Vec<Rank
         fisher_yates(&mut servers, &mut rng);
         ranked.extend(servers.into_iter().map(|server| RankedCandidate {
             server,
-            signals: ScoringSignals::catalog_only(server),
+            signals: ScoringSignals {
+                proton_score: server.score,
+                load: server.load,
+                latency: None,
+                weighted: None,
+            },
         }));
     }
     ranked
 }
 
-/// A seeded splitmix64 stream — the crate's ONE deterministic draw
-/// device: the random policy shuffles through it and the synthetic
-/// test fixtures (the 20k benchmark) draw from the same stream (never
-/// product randomness, which the scheduler takes from the OS CSPRNG).
-/// The output mix matters: a raw LCG's low bits have tiny periods
-/// (bit 0 alternates every call), which bit-biased a first draft of
-/// the benchmark fixture into setting the Secure Core feature on 100%
-/// of "standard" logicals.
+/// A seeded splitmix64 stream — the deterministic draw device for the
+/// random policy (same mixer as the test fixtures; never product
+/// randomness, which the scheduler takes from the OS CSPRNG).
 struct SeededDraw(u64);
 
 impl SeededDraw {
@@ -1253,30 +1493,19 @@ impl SeededDraw {
         z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
         z ^ (z >> 31)
     }
-
-    /// A draw below `bound` (the shuffle's index pick; the fixtures'
-    /// bounded rolls).
-    fn below(&mut self, bound: u64) -> u64 {
-        self.next_u64() % bound
-    }
 }
 
 /// In-place uniform shuffle (Fisher-Yates over the seeded stream).
 fn fisher_yates<T>(items: &mut [T], rng: &mut SeededDraw) {
     for index in (1..items.len()).rev() {
-        let swap = rng.below(index as u64 + 1) as usize;
+        let swap = (rng.next_u64() % (index as u64 + 1)) as usize;
         items.swap(index, swap);
     }
 }
 
 /// The satisfied fraction of the optional feature set (FR-16's
-/// feature-match signal). Port forwarding evaluates against the SAME
-/// per-server capability rule the required arm enforces (Codex PR#5
-/// round 5, P2: the pre-fix arm marked the feature held for every
-/// candidate under entitlement alone, so a capable and an incapable
-/// server scored identically and load could select the incapable one
-/// even with a capable alternative present — optional scoring is a
-/// weaker signal, never a fabricated one).
+/// feature-match signal; port forwarding evaluates against the
+/// entitlement seam — fail-closed when unset).
 fn optional_match_ratio(
     server: &LogicalServer,
     optional: &[FeatureConstraint],
@@ -1288,13 +1517,7 @@ fn optional_match_ratio(
     let held = optional
         .iter()
         .filter(|feature| match feature {
-            FeatureConstraint::PortForwarding => {
-                context.port_forwarding_entitled.unwrap_or(false)
-                    && context
-                        .port_forwarding_capable
-                        .as_ref()
-                        .is_some_and(|capable| capable.contains(&server.id))
-            }
+            FeatureConstraint::PortForwarding => context.port_forwarding_entitled.unwrap_or(false),
             other => catalog_feature_holds(server, **other),
         })
         .count();
@@ -1461,17 +1684,117 @@ mod tests {
         }
     }
 
-    /// The intermediate state (M3 U1 review nit): `latency` is PR-3's
-    /// mode (the bounded on-demand prober); until then it must parse as
-    /// an ordinary INVALID mode — never silently accepted, never the
-    /// unsupported-SIGNAL class.
+    /// `latency` is the fourth `--by` mode (FR-18): the bounded
+    /// on-demand prober ([`crate::probe`]) supplies the observations
+    /// this policy ranks by. The M3 U1 intermediate state (parse
+    /// refused as an ordinary invalid mode) ended with this unit.
     #[test]
-    fn latency_mode_is_invalid_until_pr3_wires_the_prober() {
-        let err = RankingPolicy::parse("latency").unwrap_err();
+    fn latency_mode_parses() {
         assert_eq!(
-            err,
-            SelectionError::InvalidRankingMode("latency".to_owned())
+            RankingPolicy::parse("latency").unwrap(),
+            RankingPolicy::Latency
         );
+    }
+
+    #[test]
+    fn latency_ranks_by_observed_rtt_and_reports_the_boundary() {
+        // FR-18: lowest measured latency over the candidates that HAVE
+        // observations; a candidate without one is excluded WITH a
+        // report entry (the shortlist boundary — never probed here,
+        // never guessed, never an offline verdict).
+        let catalog = build_catalog(&[
+            spec_with("GB#1", "GB", Some(1.0), Some(50)),
+            spec_with("GB#2", "GB", Some(0.1), Some(50)),
+            spec_with("GB#3", "GB", Some(2.0), Some(50)),
+        ]);
+        let mut request = official(Target::Country("GB".into()));
+        request.policy = RankingPolicy::Latency;
+        let outcome = select(
+            &catalog,
+            &request,
+            &latency_context(&[("id-GB#1", 120), ("id-GB#3", 30)]),
+        )
+        .unwrap();
+        let ranked: Vec<&str> = outcome
+            .ranked
+            .iter()
+            .map(|c| c.server.name.as_str())
+            .collect();
+        assert_eq!(ranked, ["GB#3", "GB#1"], "RTT order, not score order");
+        assert_eq!(
+            outcome.ranked[0].signals.latency,
+            Some(Duration::from_millis(30)),
+            "the winning observation rides the scoring signals"
+        );
+        assert_eq!(outcome.ranked[0].signals.weighted, None);
+        assert_eq!(
+            stage_count(&outcome.report, FilterStage::NoLatencyObservation),
+            1,
+            "GB#2 was never observed: excluded with the report entry"
+        );
+    }
+
+    #[test]
+    fn latency_without_any_observations_refuses() {
+        // The data requirement is the policy's own: an empty probe
+        // table refuses typed (weight 1.0 — latency IS the whole
+        // ranking), never a fabricated ordering.
+        let catalog = build_catalog(&[spec_with("GB#1", "GB", Some(1.0), Some(50))]);
+        let mut request = official(Target::Country("GB".into()));
+        request.policy = RankingPolicy::Latency;
+        let err = select(&catalog, &request, &SelectionContext::default()).unwrap_err();
+        assert_eq!(err, SelectionError::LatencyDataUnavailable { weight: 1.0 });
+        assert!(
+            err.to_string().contains("latency data unavailable"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn latency_ties_break_by_id_for_determinism() {
+        // The fixture's scores INVERT the expected order (B scores
+        // better), so a score-ordering implementation fails this pin —
+        // equal RTTs must fall to the id, not to any catalog signal.
+        let catalog = build_catalog(&[
+            spec_with("GB#B", "GB", Some(0.1), Some(50)),
+            spec_with("GB#A", "GB", Some(2.0), Some(50)),
+        ]);
+        let mut request = official(Target::Country("GB".into()));
+        request.policy = RankingPolicy::Latency;
+        let outcome = select(
+            &catalog,
+            &request,
+            &latency_context(&[("id-GB#A", 50), ("id-GB#B", 50)]),
+        )
+        .unwrap();
+        let ranked: Vec<&str> = outcome
+            .ranked
+            .iter()
+            .map(|c| c.server.name.as_str())
+            .collect();
+        assert_eq!(ranked, ["GB#A", "GB#B"]);
+    }
+
+    /// FR-23C's "lowest latency" arm is the composition of U4 and U5:
+    /// the routed Secure Core target under the latency policy ranks
+    /// the SC fleet by probe observations.
+    #[test]
+    fn secure_core_routes_rank_by_latency() {
+        let catalog = build_catalog(&[route("CH-SE#1", "CH", "SE"), route("IS-SE#1", "IS", "SE")]);
+        let mut request = official(sc(None, Some("SE")));
+        request.policy = RankingPolicy::Latency;
+        let outcome = select(
+            &catalog,
+            &request,
+            &latency_context(&[("id-CH-SE#1", 200), ("id-IS-SE#1", 40)]),
+        )
+        .unwrap();
+        let ranked: Vec<&str> = outcome
+            .ranked
+            .iter()
+            .map(|c| c.server.name.as_str())
+            .collect();
+        assert_eq!(ranked, ["IS-SE#1", "CH-SE#1"]);
     }
 
     #[test]
@@ -2040,23 +2363,9 @@ mod tests {
         assert!(survivors.is_empty());
         assert_eq!(stage_count(&report, FilterStage::RequiredFeatures), 1);
 
-        // Composed true WITHOUT the capability set: the typed refusal
-        // (Codex PR#5 round 4 — the pre-fix shape passed here for
-        // every server, selecting PF-incapable servers under an
-        // entitled account).
-        let context = SelectionContext {
-            port_forwarding_entitled: Some(true),
-            ..SelectionContext::default()
-        };
-        let err = filter_candidates(&catalog, &required, &context).unwrap_err();
-        assert_eq!(
-            err,
-            SelectionError::PortForwardingCapabilityUnavailable,
-            "entitlement alone must never satisfy FR-87"
-        );
-
-        // Entitled + the composed capability set naming GB#1 only:
-        // GB#2 eliminates at the feature stage; GB#1 survives.
+        // Composed true + capability naming GB#1: GB#1 survives (the
+        // FR-87 matrix — entitled AND a member; support derives from
+        // the composed capability set, never a catalog bit).
         let capable: std::collections::BTreeSet<String> =
             ["id-GB#1".to_owned()].into_iter().collect();
         let context = SelectionContext {
@@ -2064,76 +2373,8 @@ mod tests {
             port_forwarding_capable: Some(capable),
             ..SelectionContext::default()
         };
-        let two = build_catalog(&[Spec::new("GB#1", "GB"), Spec::new("GB#2", "GB")]);
-        let (survivors, report) = filter_candidates(&two, &required, &context).unwrap();
+        let (survivors, _) = filter_candidates(&catalog, &required, &context).unwrap();
         assert_eq!(names(&survivors), ["GB#1"]);
-        assert_eq!(stage_count(&report, FilterStage::RequiredFeatures), 1);
-
-        // Entitled + an EMPTY composed set: the honest "no server is
-        // capable" outcome — every candidate eliminates with the
-        // report, not a bare refusal.
-        let context = SelectionContext {
-            port_forwarding_entitled: Some(true),
-            port_forwarding_capable: Some(std::collections::BTreeSet::new()),
-            ..SelectionContext::default()
-        };
-        let (survivors, report) = filter_candidates(&two, &required, &context).unwrap();
-        assert!(survivors.is_empty());
-        assert_eq!(stage_count(&report, FilterStage::RequiredFeatures), 2);
-    }
-
-    /// Codex PR#5 round 5 (P2): OPTIONAL port-forwarding scoring uses
-    /// the SAME per-server capability rule — a capable and an
-    /// incapable server no longer score identically under a
-    /// feature-match weight, so load cannot pick the incapable one
-    /// while a capable alternative exists. Pre-fix, entitlement alone
-    /// marked the feature held for EVERY candidate.
-    #[test]
-    fn optional_port_forwarding_scoring_requires_capability_too() {
-        // GB#1 capable (load 80), GB#2 incapable (load 10): under a
-        // feature-match weight the incapable server's advantage from
-        // load must NOT overcome its missing feature score.
-        let mut heavy = Spec::new("GB#1", "GB");
-        heavy.load = Some(80);
-        let mut light = Spec::new("GB#2", "GB");
-        light.load = Some(10);
-        let catalog = build_catalog(&[heavy, light]);
-        let capable: std::collections::BTreeSet<String> =
-            ["id-GB#1".to_owned()].into_iter().collect();
-        let context = SelectionContext {
-            port_forwarding_entitled: Some(true),
-            port_forwarding_capable: Some(capable),
-            ..SelectionContext::default()
-        };
-        let mut request = official(Target::Country("GB".into()));
-        request.policy = RankingPolicy::Balanced {
-            weights: WeightedSignals {
-                load: 0.5,
-                feature_match: 0.5,
-                ..WeightedSignals::DEFAULT_ZEROED
-            },
-        };
-        request.constraints.optional_features = vec![FeatureConstraint::PortForwarding];
-        let outcome = select(&catalog, &request, &context).unwrap();
-        assert_eq!(
-            outcome.ranked[0].server.name, "GB#1",
-            "the capable server wins: the incapable one's load advantage cannot beat a \
-             missing feature score"
-        );
-        // And the incapable one's breakdown shows it paid for the gap.
-        let gb2 = outcome
-            .ranked
-            .iter()
-            .find(|c| c.server.name == "GB#2")
-            .expect("GB#2 still ranks (optional never eliminates)");
-        let gb2_signals = gb2
-            .signals
-            .weighted
-            .expect("balanced carries the breakdown");
-        assert!(
-            gb2_signals.feature_match_term > 0.0,
-            "the incapable server pays the feature-match term: {gb2_signals:?}"
-        );
     }
 
     #[test]
@@ -2275,8 +2516,8 @@ mod tests {
     /// CONSTRUCTION (the type stage removes every SC logical; the
     /// feature stage then removes every Standard one). The
     /// contradiction is detectable at validation time and refuses with
-    /// a typed error naming it and the routed target that lands in
-    /// PR-3 — never the pipeline's baffling all-stages-empty report.
+    /// a typed error naming it and the routed target — never the
+    /// pipeline's baffling all-stages-empty report.
     #[test]
     fn a_standard_fleet_target_with_the_secure_core_feature_refuses_at_validation() {
         let catalog = build_catalog(&[Spec::new("UK#1", "GB"), Spec::new("GB#1", "GB")]);
@@ -2382,8 +2623,8 @@ mod tests {
     fn exact_matching_covers_special_name_forms() {
         // Secure Core `CH-SE#1` and gateway `acme-corp#1` are logical
         // names: exact matching serves them without the Standard-type
-        // filter (the routed-Secure-Core TARGET is this milestone's
-        // PR-3; the NAME resolves today).
+        // filter (the routed-Secure-Core TARGET is Slice 6; the NAME
+        // has resolved since U1).
         let mut secure_core = Spec::new("CH-SE#1", "SE");
         secure_core.entry = "CH";
         secure_core.features = 1;
@@ -2669,8 +2910,9 @@ mod tests {
 
     #[test]
     fn balanced_latency_weight_without_observations_refuses() {
-        // Decision 5: latency probing is PR-3; no table and a positive
-        // latency weight is a typed refusal — no fabricated latencies.
+        // Decision 5: no table and a positive latency weight is a
+        // typed refusal — no fabricated latencies (the prober is the
+        // only legitimate source of observations).
         let catalog = build_catalog(&[spec_with("GB#1", "GB", Some(1.0), Some(50))]);
         let weights = WeightedSignals {
             latency: 0.4,
@@ -2887,11 +3129,33 @@ mod tests {
     // 20k servers = 5,000 logicals x 4 physicals each, inside the
     // landed S6 caps (16,384 logicals / 262,144 physicals — a 20k
     // LOGICAL fixture is unrepresentable). Deterministic generation:
-    // a fixed-seed [`SeededDraw`] (the production mixer this module's
-    // random policy shuffles through — folded here by the PR-2 close
-    // pass; the pair had drifted into byte-identical twins), no wall
-    // clock, no RNG dependency.
+    // a fixed-seed LCG, no wall clock, no RNG dependency.
     // ------------------------------------------------------------------
+
+    /// A deterministic LCG with a splitmix64 output mix (test fixture
+    /// generation only — never product randomness; the scheduler's
+    /// jitter uses the OS CSPRNG). The mix matters: a raw LCG's low
+    /// bits have tiny periods (bit 0 alternates every call), which
+    /// bit-biased a first draft of this fixture into setting the
+    /// Secure Core feature on 100% of "standard" logicals.
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn next_u64(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            z ^ (z >> 31)
+        }
+
+        fn below(&mut self, bound: u64) -> u64 {
+            self.next_u64() % bound
+        }
+    }
 
     const BENCH_COUNTRIES: &[&str] = &[
         "AT", "BE", "BG", "CH", "CZ", "DE", "DK", "EE", "ES", "FI", "FR", "GB", "HR", "HU", "IE",
@@ -2910,7 +3174,7 @@ mod tests {
     /// work), scores on every logical, ~2% gateways and ~5%
     /// Secure-Core-shaped entries.
     fn synthetic_catalog_20k() -> String {
-        let mut rng = SeededDraw(0x5EED_2026_0825);
+        let mut rng = Lcg(0x5EED_2026_0825);
         let mut doc = String::with_capacity(8 << 20);
         doc.push_str(r#"{"Code":1000,"StatusID":"bench","LogicalServers":["#);
         for index in 0..BENCH_LOGICALS {
@@ -3259,5 +3523,360 @@ mod tests {
             stage_count(&outcome.report, FilterStage::ExcludedCountry),
             1
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Slice 6 — routed Secure Core selection (M3 U4; T-11, FR-23A..F):
+    // the entry→exit pair over the Secure Core fleet. The target names
+    // each side (`None` = fastest / any eligible country); a logical's
+    // EntryCountry is the entry hop, its ExitCountry the exit, and the
+    // two always differ — the hop-through that defines Secure Core.
+    // ------------------------------------------------------------------
+
+    fn sc(entry: Option<&str>, exit: Option<&str>) -> Target {
+        Target::SecureCore {
+            entry_country: entry.map(str::to_owned),
+            exit_country: exit.map(str::to_owned),
+        }
+    }
+
+    /// The canonical route shape: a Secure Core bit and an entry that
+    /// differs from the exit.
+    fn route(name: &'static str, entry: &'static str, exit: &'static str) -> Spec {
+        Spec {
+            entry,
+            features: 1,
+            ..Spec::new(name, exit)
+        }
+    }
+
+    #[test]
+    fn secure_core_targets_the_secure_core_fleet_only() {
+        // FR-23A/FR-23L: the routed target addresses the Secure Core
+        // fleet — Standard logicals and gateways fall at the type
+        // stage, and a bit-marked logical that is not a route (entry
+        // == exit) is a fleet member that can serve NO pair.
+        let catalog = build_catalog(&[
+            route("CH-SE#1", "CH", "SE"),
+            Spec::new("GB#1", "GB"),
+            Spec {
+                gateway: Some("acme-corp"),
+                ..Spec::new("acme-corp#1", "SE")
+            },
+            Spec {
+                features: 1,
+                ..Spec::new("SE#9", "SE")
+            },
+        ]);
+        let (survivors, report) = filter_candidates(
+            &catalog,
+            &official(sc(None, None)),
+            &SelectionContext::default(),
+        )
+        .unwrap();
+        assert_eq!(names(&survivors), ["CH-SE#1"]);
+        assert_eq!(
+            stage_count(&report, FilterStage::ServerType),
+            2,
+            "Standard + gateway are other connection types"
+        );
+        assert_eq!(
+            stage_count(&report, FilterStage::TargetGeography),
+            1,
+            "bit-marked but entry == exit: fleet member, no routable pair"
+        );
+    }
+
+    #[test]
+    fn the_two_fleets_partition_the_non_gateway_catalog() {
+        // is_standard_fleet and is_secure_core_fleet are exact
+        // complements (mod gateways): no logical is orphaned from both
+        // fleets and none belongs to both — whatever marks a logical
+        // as non-Standard (the route shape or the catalog bit) is
+        // exactly what the Secure Core fleet claims.
+        let cases = [
+            (Spec::new("GB#1", "GB"), true, false), // plain Standard
+            (
+                Spec {
+                    entry: "CH",
+                    ..Spec::new("CH-SE#1", "SE")
+                },
+                false,
+                true,
+            ), // route shape, no bit
+            (
+                Spec {
+                    features: 1,
+                    ..Spec::new("SE#9", "SE")
+                },
+                false,
+                true,
+            ), // bit, no route
+            (route("IS-GB#1", "IS", "GB"), false, true), // both markings
+        ];
+        for (spec, standard, secure_core) in cases {
+            let catalog = build_catalog(&[spec]);
+            let server = &catalog.logical_servers[0];
+            assert_eq!(is_standard_fleet(server), standard, "{}", server.name);
+            assert_eq!(is_secure_core_fleet(server), secure_core, "{}", server.name);
+            assert_ne!(
+                standard, secure_core,
+                "{}: never both fleets, never neither",
+                server.name
+            );
+        }
+        let catalog = build_catalog(&[Spec {
+            gateway: Some("acme-corp"),
+            ..Spec::new("acme-corp#1", "SE")
+        }]);
+        let gateway = &catalog.logical_servers[0];
+        assert!(!is_standard_fleet(gateway) && !is_secure_core_fleet(gateway));
+    }
+
+    #[test]
+    fn secure_core_sides_pin_the_entry_exit_pair() {
+        // FR-23C: exit-country, entry-country, and both together — each
+        // side filters its own end of the route.
+        let catalog = build_catalog(&[
+            route("CH-SE#1", "CH", "SE"),
+            route("CH-GB#1", "CH", "GB"),
+            route("IS-SE#1", "IS", "SE"),
+        ]);
+        let (survivors, report) = filter_candidates(
+            &catalog,
+            &official(sc(Some("CH"), Some("GB"))),
+            &SelectionContext::default(),
+        )
+        .unwrap();
+        assert_eq!(names(&survivors), ["CH-GB#1"]);
+        assert_eq!(stage_count(&report, FilterStage::TargetGeography), 2);
+
+        let (survivors, _) = filter_candidates(
+            &catalog,
+            &official(sc(None, Some("GB"))),
+            &SelectionContext::default(),
+        )
+        .unwrap();
+        assert_eq!(names(&survivors), ["CH-GB#1"]);
+
+        let (survivors, _) = filter_candidates(
+            &catalog,
+            &official(sc(Some("IS"), None)),
+            &SelectionContext::default(),
+        )
+        .unwrap();
+        assert_eq!(names(&survivors), ["IS-SE#1"]);
+
+        // An exit side nothing satisfies: the structured FR-22 report —
+        // the Standard GB server is NOT offered as a fallback.
+        let catalog = build_catalog(&[route("CH-SE#1", "CH", "SE"), Spec::new("GB#1", "GB")]);
+        let err = select(
+            &catalog,
+            &official(sc(None, Some("GB"))),
+            &SelectionContext::default(),
+        )
+        .unwrap_err();
+        match &err {
+            SelectionError::ConstraintsNotSatisfied { report } => {
+                assert_eq!(stage_count(report, FilterStage::ServerType), 1);
+                assert_eq!(stage_count(report, FilterStage::TargetGeography), 1);
+                assert!(
+                    err.to_string().contains("no eligible server"),
+                    "the Display carries the accounting: {err}"
+                );
+            }
+            other => panic!("expected the FR-22 error, got {other}"),
+        }
+    }
+
+    #[test]
+    fn secure_core_entry_equals_exit_refuses_at_validation() {
+        // FR-23F: the same country on both sides contradicts the
+        // definition of Secure Core — a typed validation refusal, never
+        // the pipeline's all-stages-empty report.
+        let catalog = build_catalog(&[route("CH-SE#1", "CH", "SE")]);
+        let err = filter_candidates(
+            &catalog,
+            &official(sc(Some("CH"), Some("CH"))),
+            &SelectionContext::default(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            SelectionError::SecureCoreEntryEqualsExit {
+                country: "CH".to_owned()
+            }
+        );
+        let message = err.to_string();
+        assert!(
+            message.contains("FR-23F") && message.contains("CH"),
+            "the refusal names the country and cites the rule: {message}"
+        );
+    }
+
+    #[test]
+    fn excluded_entry_and_exit_countries_eliminate_their_sides() {
+        // FR-23C's dedicated exclusion lists: the entry list removes
+        // routes THROUGH a country, the exit list routes ENDING in one —
+        // each charged to its own stage in the exclusion family.
+        let catalog = build_catalog(&[
+            route("CH-SE#1", "CH", "SE"),
+            route("IS-SE#1", "IS", "SE"),
+            route("CH-GB#1", "CH", "GB"),
+        ]);
+        let mut request = official(sc(None, Some("SE")));
+        request.constraints.excluded_entry_countries = vec!["CH".into()];
+        let (survivors, report) =
+            filter_candidates(&catalog, &request, &SelectionContext::default()).unwrap();
+        assert_eq!(names(&survivors), ["IS-SE#1"]);
+        assert_eq!(stage_count(&report, FilterStage::ExcludedEntryCountry), 1);
+
+        let mut request = official(sc(None, None));
+        request.constraints.excluded_exit_countries = vec!["SE".into()];
+        let (survivors, report) =
+            filter_candidates(&catalog, &request, &SelectionContext::default()).unwrap();
+        assert_eq!(names(&survivors), ["CH-GB#1"]);
+        assert_eq!(stage_count(&report, FilterStage::ExcludedExitCountry), 2);
+    }
+
+    #[test]
+    fn generic_country_exclusions_apply_to_the_exit_under_secure_core() {
+        // The generic FR-21 list keeps one meaning under the routed
+        // target: the EXIT country is the canonical selector, so
+        // `--exclude-country` removes routes ending there (the
+        // dedicated entry list is the user's tool for the other side).
+        let catalog = build_catalog(&[route("CH-SE#1", "CH", "SE"), route("CH-GB#1", "CH", "GB")]);
+        let mut request = official(sc(None, None));
+        request.constraints.excluded_countries = vec!["SE".into()];
+        let (survivors, report) =
+            filter_candidates(&catalog, &request, &SelectionContext::default()).unwrap();
+        assert_eq!(names(&survivors), ["CH-GB#1"]);
+        assert_eq!(stage_count(&report, FilterStage::ExcludedCountry), 1);
+    }
+
+    #[test]
+    fn secure_core_routing_constraints_refuse_on_other_targets() {
+        // FR-23F: the entry/exit exclusion lists express ROUTED
+        // exclusions only the secure-core target evaluates. On any
+        // other target they are incompatible options — a typed
+        // refusal, never silently ignored, never repurposed as generic
+        // exclusions (exact server names included: the flags are the
+        // secure-core grammar's).
+        let catalog = build_catalog(&[Spec::new("GB#1", "GB")]);
+        let mut entry = official(Target::Fastest);
+        entry.constraints.excluded_entry_countries = vec!["US".into()];
+        assert_eq!(
+            filter_candidates(&catalog, &entry, &SelectionContext::default()).unwrap_err(),
+            SelectionError::SecureCoreOnlyConstraints
+        );
+        let mut exit = official(Target::Fastest);
+        exit.constraints.excluded_exit_countries = vec!["AU".into()];
+        assert_eq!(
+            filter_candidates(&catalog, &exit, &SelectionContext::default()).unwrap_err(),
+            SelectionError::SecureCoreOnlyConstraints
+        );
+        let mut exact = official(Target::Server("GB#1".into()));
+        exact.constraints.excluded_entry_countries = vec!["US".into()];
+        assert_eq!(
+            filter_candidates(&catalog, &exact, &SelectionContext::default()).unwrap_err(),
+            SelectionError::SecureCoreOnlyConstraints
+        );
+        assert!(
+            SelectionError::SecureCoreOnlyConstraints
+                .to_string()
+                .contains("FR-23F"),
+            "the refusal cites the rule"
+        );
+    }
+
+    #[test]
+    fn secure_core_country_inputs_must_be_canonical() {
+        // The matching discipline extends to both routed sides and both
+        // dedicated lists: uppercase ISO alpha-2, refused typed — the
+        // pure core never uppercases user input.
+        let catalog = build_catalog(&[route("CH-SE#1", "CH", "SE")]);
+        let err = filter_candidates(
+            &catalog,
+            &official(sc(Some("ch"), None)),
+            &SelectionContext::default(),
+        )
+        .unwrap_err();
+        assert_eq!(err, SelectionError::InvalidCountry("ch".to_owned()));
+        let err = filter_candidates(
+            &catalog,
+            &official(sc(None, Some("se"))),
+            &SelectionContext::default(),
+        )
+        .unwrap_err();
+        assert_eq!(err, SelectionError::InvalidCountry("se".to_owned()));
+
+        let mut request = official(sc(None, None));
+        request.constraints.excluded_entry_countries = vec!["usa".into()];
+        assert_eq!(
+            filter_candidates(&catalog, &request, &SelectionContext::default()).unwrap_err(),
+            SelectionError::InvalidCountry("usa".to_owned())
+        );
+    }
+
+    #[test]
+    fn physical_country_exclusion_composes_on_the_exit_side() {
+        // U1's FR-23Q rule composes unchanged with the routed target:
+        // the exit country is the canonical selector, so a route ENDING
+        // in the physical country is eliminated at the dedicated stage
+        // (the entry side has no physical-country composition in v1 —
+        // the dedicated entry exclusion list is the user's tool).
+        let catalog = build_catalog(&[route("CH-GB#1", "CH", "GB"), route("CH-SE#1", "CH", "SE")]);
+        let mut request = official(sc(None, None));
+        request.constraints.exclude_physical_country = true;
+        request.constraints.physical_country = Some("GB".into());
+        let (survivors, report) =
+            filter_candidates(&catalog, &request, &SelectionContext::default()).unwrap();
+        assert_eq!(names(&survivors), ["CH-SE#1"]);
+        assert_eq!(
+            stage_count(&report, FilterStage::PhysicalCountryExclusion),
+            1
+        );
+    }
+
+    #[test]
+    fn the_secure_core_feature_constraint_is_tautological_under_the_routed_target() {
+        // The Codex PR#5 contradiction is SCOPED to Standard-fleet
+        // targets: under the routed target the constraint is legal —
+        // and still evaluates against the catalog BIT (T-4), so a
+        // route-shaped logical without the marking falls at the
+        // feature stage, never silently passes.
+        let catalog = build_catalog(&[
+            route("CH-SE#1", "CH", "SE"),
+            Spec {
+                entry: "IS",
+                ..Spec::new("IS-SE#1", "SE")
+            },
+        ]);
+        let mut request = official(sc(None, None));
+        request.constraints.required_features = vec![FeatureConstraint::SecureCore];
+        let (survivors, report) =
+            filter_candidates(&catalog, &request, &SelectionContext::default()).unwrap();
+        assert_eq!(names(&survivors), ["CH-SE#1"]);
+        assert_eq!(stage_count(&report, FilterStage::RequiredFeatures), 1);
+    }
+
+    #[test]
+    fn secure_core_routes_compose_with_the_load_policy() {
+        // FR-23C's "lowest load" arm: the routed target under the load
+        // policy ranks the Secure Core fleet by Proton-exposed load.
+        let mut busy = route("CH-SE#1", "CH", "SE");
+        busy.load = Some(80);
+        let mut idle = route("IS-SE#1", "IS", "SE");
+        idle.load = Some(10);
+        let catalog = build_catalog(&[busy, idle]);
+        let mut request = official(sc(None, Some("SE")));
+        request.policy = RankingPolicy::LowestLoad;
+        let outcome = select(&catalog, &request, &SelectionContext::default()).unwrap();
+        let ranked: Vec<&str> = outcome
+            .ranked
+            .iter()
+            .map(|c| c.server.name.as_str())
+            .collect();
+        assert_eq!(ranked, ["IS-SE#1", "CH-SE#1"]);
     }
 }

@@ -212,8 +212,9 @@ pub enum GroupTarget {
     /// A random eligible target (uniform country, then uniform server;
     /// the draw policy is [`GroupRankingPolicy::RandomCountryThenServer`]).
     Random,
-    /// A Secure Core entry/exit route — delegates to the Secure Core
-    /// routing unit (M3 PR-3/U4).
+    /// A Secure Core entry/exit route — resolves onto the routed
+    /// [`Target::SecureCore`] (M3 U4: `fastest` is any eligible
+    /// country, anything else pins that side's country).
     SecureCore {
         /// The entry side (`fastest` or a country, as pinned).
         entry_country: &'static str,
@@ -393,32 +394,24 @@ pub enum GroupError {
         /// The declared override list, comma-separated.
         declared: String,
     },
-    /// Declared by the catalog but not yet selectable: `latency` needs
-    /// the bounded on-demand prober (M3 PR-3).
-    #[error(
-        "ranking policy `{requested}` on `{id}` is declared but unavailable until M3 PR-3 wires \
-         the bounded on-demand latency prober"
-    )]
+    /// Declared by the catalog but not selectable on this build:
+    /// reserved for a declared override whose machinery is not yet
+    /// wired. (The latency arm's PR-3 condition is satisfied on this
+    /// branch — the variant remains for a future declared-but-pending
+    /// mode; it currently has no constructor.)
+    #[error("ranking policy `{requested}` on `{id}` is declared but unavailable in this build")]
     RankingOverrideUnavailable {
         /// The group.
         id: &'static str,
         /// The requested policy token.
         requested: String,
     },
-    /// The Secure Core routing unit (M3 PR-3/U4) owns this target; its
-    /// resolution is delegated, not approximated here.
-    #[error(
-        "group `{id}` selects a Secure Core entry/exit route — Secure Core routing lands with M3 \
-         PR-3 (the group's frozen definition remains available through the registry)"
-    )]
-    SecureCoreRoutingPending {
-        /// The group.
-        id: &'static str,
-    },
 }
 
-/// How the applied ranking policy was chosen (FR-23P/T-33: a declared
-/// regional override must be explicit in status).
+/// How a resolved group's effective ranking policy came to be (T-33:
+/// the status surface distinguishes the catalog default from a
+/// request-time override — a regional override must be explicit in
+/// status).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PolicyProvenance {
     /// The catalog's declared default policy.
@@ -441,24 +434,30 @@ pub struct ResolvedGroup {
 }
 
 /// Maps a catalog ranking-policy token onto the executable policy.
-/// `latency` is declared vocabulary but unconstructible until PR-3's
-/// prober exists — a typed refusal, never a silent substitute.
-fn to_selection_policy(
-    id: &'static str,
-    policy: GroupRankingPolicy,
-) -> Result<RankingPolicy, GroupError> {
+/// `latency` maps onto the latency ranking policy — the observations
+/// arrive via [`SelectionContext::latency`] at selection time (the
+/// bounded on-demand prober's table; an empty one refuses typed
+/// THERE, never a silent substitute here).
+fn to_selection_policy(policy: GroupRankingPolicy) -> RankingPolicy {
     match policy {
-        GroupRankingPolicy::ProtonScore => Ok(RankingPolicy::Official),
-        GroupRankingPolicy::Balanced => Ok(RankingPolicy::Balanced {
+        GroupRankingPolicy::ProtonScore => RankingPolicy::Official,
+        GroupRankingPolicy::Balanced => RankingPolicy::Balanced {
             weights: WeightedSignals::DEFAULT,
-        }),
-        GroupRankingPolicy::Load => Ok(RankingPolicy::LowestLoad),
-        GroupRankingPolicy::RandomCountryThenServer => Ok(RankingPolicy::Random),
-        GroupRankingPolicy::Latency => Err(GroupError::RankingOverrideUnavailable {
-            id,
-            requested: "latency".to_owned(),
-        }),
+        },
+        GroupRankingPolicy::Load => RankingPolicy::LowestLoad,
+        GroupRankingPolicy::RandomCountryThenServer => RankingPolicy::Random,
+        GroupRankingPolicy::Latency => RankingPolicy::Latency,
     }
+}
+
+/// Maps one side of the yaml's Secure Core target vocabulary (`fastest`
+/// or a country code) onto the routed target's `Option<String>`:
+/// `fastest` is any eligible country. The generator validates presence
+/// only, so a non-`fastest` token that is not a canonical country
+/// refuses at selection ([`SelectionError::InvalidCountry`]) — never
+/// approximated here.
+fn routed_side(token: &str) -> Option<String> {
+    (token != "fastest").then(|| token.to_owned())
 }
 
 /// The comma-separated declared-override list for refusal messages.
@@ -500,7 +499,7 @@ pub fn resolve_group(
 
     let (policy, policy_provenance) = match ranking_override {
         None => (
-            to_selection_policy(group.id, group.ranking_policy)?,
+            to_selection_policy(group.ranking_policy),
             PolicyProvenance::CatalogDefault,
         ),
         Some(mode) => {
@@ -525,7 +524,7 @@ pub fn resolve_group(
                 });
             }
             (
-                to_selection_policy(group.id, requested)?,
+                to_selection_policy(requested),
                 PolicyProvenance::DeclaredOverride,
             )
         }
@@ -556,9 +555,13 @@ pub fn resolve_group(
             Target::Countries(countries.into_iter().map(str::to_owned).collect())
         }
         GroupTarget::Random => Target::Fastest,
-        GroupTarget::SecureCore { .. } => {
-            return Err(GroupError::SecureCoreRoutingPending { id: group.id });
-        }
+        GroupTarget::SecureCore {
+            entry_country,
+            exit_country,
+        } => Target::SecureCore {
+            entry_country: routed_side(entry_country),
+            exit_country: routed_side(exit_country),
+        },
     };
 
     Ok(ResolvedGroup {
@@ -577,8 +580,7 @@ pub fn resolve_group(
 /// distinguishable for exit-code mapping.
 #[derive(Debug, PartialEq, thiserror::Error)]
 pub enum GroupSelectionError {
-    /// Resolution refused (unknown group, override discipline, the
-    /// Secure Core delegation).
+    /// Resolution refused (unknown group, override discipline).
     #[error(transparent)]
     Group(#[from] GroupError),
     /// Selection refused (the FR-22 report, FR-23Q/FR-23H typed
@@ -838,31 +840,34 @@ mod tests {
         resolve_group(id, None, &PhysicalCountrySources::default())
     }
 
-    /// T-28: the canonical catalog resolves — every group except the
-    /// Secure Core one maps onto selection parameters; `proton:max-security`
-    /// is the DELEGATION case (U4 lands with M3 PR-3), and its frozen
-    /// definition stays available through the registry either way.
+    /// T-28: the canonical catalog resolves — every group maps onto
+    /// selection parameters; `proton:max-security` resolves the ROUTED
+    /// Secure Core target (U4): the yaml's `fastest`/`fastest` becomes
+    /// the any/any pair over the Secure Core fleet.
     #[test]
-    fn every_canonical_group_resolves_or_delegates() {
+    fn every_canonical_group_resolves() {
         for entry in all_groups() {
-            match resolve(entry.id) {
-                Ok(resolved) => {
-                    assert_eq!(resolved.group.id, entry.id);
-                }
-                Err(GroupError::SecureCoreRoutingPending { id }) => {
-                    assert_eq!(id, "proton:max-security", "the one delegated kind");
-                }
-                Err(other) => panic!("{}: unexpected resolution failure: {other}", entry.id),
-            }
+            let resolved = resolve(entry.id).unwrap_or_else(|e| panic!("{}: {e}", entry.id));
+            assert_eq!(resolved.group.id, entry.id);
         }
         let max_security = group("proton:max-security").expect("the definition stays available");
         assert_eq!(
             max_security.target,
             GroupTarget::SecureCore {
                 entry_country: "fastest",
-                exit_country: "fastest",
+                exit_country: "fastest"
             }
         );
+        let resolved = resolve("proton:max-security").unwrap();
+        assert_eq!(
+            resolved.request.target,
+            Target::SecureCore {
+                entry_country: None,
+                exit_country: None
+            },
+            "the yaml's `fastest` maps onto the routed side's any"
+        );
+        assert_eq!(resolved.request.policy, RankingPolicy::Official);
         assert_eq!(
             max_security.connection_overrides,
             &[("lan_access", "block")],
@@ -1012,7 +1017,7 @@ mod tests {
 
     /// T-33: declared regional overrides apply and are explicit in the
     /// resolution (status-visible); undeclared ones refuse naming the
-    /// declared list; latency is declared but pending PR-3.
+    /// declared list; latency is declared and real since U5.
     #[test]
     fn regional_declared_overrides_apply_and_undeclared_refuse() {
         let load = resolve_group(
@@ -1065,15 +1070,9 @@ mod tests {
             Some("latency"),
             &PhysicalCountrySources::default(),
         )
-        .unwrap_err();
-        assert_eq!(
-            err,
-            GroupError::RankingOverrideUnavailable {
-                id: "protonwire:fastest-europe",
-                requested: "latency".to_owned(),
-            },
-            "declared-but-pending is distinct from not-declared"
-        );
+        .unwrap();
+        assert_eq!(err.request.policy, RankingPolicy::Latency);
+        assert_eq!(err.policy_provenance, PolicyProvenance::DeclaredOverride);
     }
 
     /// FR-23Q: explicit request → explicit config → cached Muon
@@ -1481,24 +1480,44 @@ mod tests {
         );
     }
 
-    /// The delegation refusal through the composed path (selection-time,
-    /// not lookup-time — FR-23S keeps the group visible).
+    /// T-11 through the composed path: the max-security group selects
+    /// the Secure Core fleet — every ranked candidate is a route
+    /// (entry ≠ exit), the Standard logical never leaks in, and the
+    /// official policy orders the routes by Proton score.
     #[test]
-    fn max_security_selection_delegates_to_secure_core_routing() {
-        let catalog = fixture_catalog(&[("CH-SE#1", "SE", 1.0, true)]);
-        let err = select_group(
+    fn max_security_selects_the_secure_core_fleet() {
+        let logical = |name: &str, entry: &str, exit: &str, features: u64, score: f32| {
+            format!(
+                r#"{{"ID":"id-{name}","Name":"{name}","EntryCountry":"{entry}","ExitCountry":"{exit}","Tier":2,"Features":{features},"Status":1,"Load":20,"Score":{score},"Servers":[{{"Domain":"p0.example","Status":1,"EntryPerProtocol":{{"WireGuardUDP":{{"IPv4":"192.0.2.1","Ports":[443]}}}}}}]}}"#
+            )
+        };
+        let body = format!(
+            r#"{{"Code":1000,"StatusID":"t","LogicalServers":[{},{},{}]}}"#,
+            logical("IS-SE#1", "IS", "SE", 1, 1.5),
+            logical("CH-SE#1", "CH", "SE", 1, 0.5),
+            logical("GB#1", "GB", "GB", 0, 0.1), // Standard: best score, wrong fleet
+        );
+        let catalog = CatalogDocument::from_bytes(body.as_bytes())
+            .unwrap_or_else(|e| panic!("fixture catalog must parse: {e}"));
+        let outcome = select_group(
             &catalog,
             "proton:max-security",
             None,
             &sources(None),
             &SelectionContext::default(),
         )
-        .unwrap_err();
-        assert_eq!(
-            err,
-            GroupSelectionError::Group(GroupError::SecureCoreRoutingPending {
-                id: "proton:max-security",
-            })
+        .unwrap();
+        let ranked: Vec<&str> = outcome
+            .ranked
+            .iter()
+            .map(|c| c.server.name.as_str())
+            .collect();
+        assert_eq!(ranked, ["CH-SE#1", "IS-SE#1"]);
+        assert!(
+            outcome
+                .ranked
+                .iter()
+                .all(|c| c.server.entry_country != c.server.exit_country)
         );
     }
 }

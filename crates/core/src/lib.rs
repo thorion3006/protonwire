@@ -9,6 +9,7 @@
 
 pub mod error;
 pub mod groups;
+pub mod probe;
 pub mod redact;
 pub mod scheduler;
 pub mod selection;

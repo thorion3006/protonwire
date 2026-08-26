@@ -1576,3 +1576,38 @@ Proof of behavior identity: temp-worktree `--locked` runs at
    PR #5 — see that entry's resolution note — as were its round-3
    findings: the balanced-overflow refusal and the doc-sync, both at
    758ffc2.)*
+
+## 2026-08-26 — M3 PR-3 verdict round (U4+U5) + fix lane
+
+SEC PASS / RUST PASS / QA CONFIRMED-WITH-GAPS on `m3/secure-core-latency`
+(741f7f8 → d739bb4 → 3a2b32d). Sec ran for real (the prober is the
+network-probing surface): core performs no I/O — the executor seam is
+uninjected until PR-4; the hammering math verified (per-endpoint attempt
+rate bounded at 1/60s no-obs, 1/300s with-obs); no SC-fleet bypass path
+exists (the fleet partition is pinned, same-country-both-sides is a typed
+refusal, entry/exit lists refuse on every other target). Four named
+mutations killed exactly (cap/guard/cancellation/timeouts-as-∞).
+
+Fix lane (this commit): the GAP-1 asymmetry pin
+(`observed_endpoints_between_the_two_windows_are_reused` — the
+discriminating 60s–300s window the mid-development reorder left
+unpinned; the threshold-swap mutant survived the whole 187-test suite),
+the GAP-2 passthrough pin
+(`rate_limited_decisions_carry_prior_observations` — the
+prior-survives-RateLimited arm was deletable green), the P2-1 doc
+mangle restored (PolicyProvenance's header line, lost in the WIP
+recovery — the 58174cd class), and the P2-2 dead variant redocumented
+(`RankingOverrideUnavailable`'s PR-3 condition is satisfied on this
+branch; the variant stays reserved with an honest doc, no constructor).
+
+Track items (PR-4 and named lanes): the priority-order seam
+(`run_planned` iterates the map in key order — the cap fills in
+priority order but cancellation can keep the LOW-priority prefix; fix
+shape: return the decisions in shortlist order — P2-4, an owner call
+for now-or-PR-4); the caller's `last_attempt_ms` write-back contract
+(including unanswered attempts — the daemon wrapper owns it, needs a
+test); FR-23E connection-plane composition (U6/M4); the
+budget-arm-vs-rate-arm labeling split (P3); the d739bb4 doc-gate bisect
+hazard (disclosed in 3a2b32d's message; recorded here per the F3
+precedent); the executor must not log the id→address mapping (PR-4
+sec).
