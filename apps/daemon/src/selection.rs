@@ -430,17 +430,21 @@ impl SelectionEngine {
         // The write-back: EVERY probed endpoint advances its attempt
         // clock (unanswered ones too — that is what stops a dead
         // endpoint being re-attempted every request inside the rate
-        // window), and answered ones record the observation.
+        // window), and answered ones record BOTH the observation and
+        // its answer time (the reuse window measures from the
+        // observation, the rate limit from the attempt).
         let mut guard = self.probes.state.lock().expect("probe table lock");
         for endpoint in &shortlist {
             if decisions.get(endpoint) == Some(&ProbeDecision::Probe) {
                 let entry = guard.entry(endpoint.clone()).or_insert(EndpointState {
                     observation: None,
+                    observed_at_ms: 0,
                     last_attempt_ms: 0,
                 });
                 entry.last_attempt_ms = now;
                 if let Some(observation) = observed.get(endpoint) {
                     entry.observation = Some(*observation);
+                    entry.observed_at_ms = now;
                 }
             }
         }
