@@ -13,17 +13,22 @@
 //!
 //! ## Hard filters, in the FR-23P order (the core-owned stages)
 //!
-//! online state → target geography/type → physical-country exclusion →
-//! explicit user exclusions → required features → protocol
-//! compatibility. The entitlement and authoritative-subset stages
-//! compose at the daemon boundary over S8 (milestone 3 PR-4); the one
-//! entitlement-dependent constraint this module knows — port forwarding
-//! (no catalog field exists upstream; see the S6 catalog module docs) —
-//! evaluates against two explicit [`SelectionContext`] seams (the
-//! entitlement fact and the per-server capability set, FR-23H + FR-87)
-//! and refuses typed while either is unset rather than guessing: no
-//! silent pass, no silent downgrade, and an entitled account alone
-//! never invents per-server capability.
+//! account entitlement (the composed tier) → online state → target
+//! geography/type → physical-country exclusion → explicit user
+//! exclusions → required features → protocol compatibility. The
+//! authoritative-subset stage composes at the daemon boundary (S3's
+//! authority report names it); the account-ENTITLEMENT stage composes
+//! there too over S8 — the daemon reads the wire `MaxTier` into
+//! [`SelectionContext::account_tier`] and a candidate whose catalog
+//! `Tier` exceeds it is eliminated here (an uncomposed seam eliminates
+//! nothing; never a guessed tier). The one entitlement-dependent
+//! CONSTRAINT this module knows — port forwarding (no catalog field
+//! exists upstream; see the S6 catalog module docs) — evaluates
+//! against two explicit [`SelectionContext`] seams (the entitlement
+//! fact and the per-server capability set, FR-23H + FR-87) and refuses
+//! typed while either is unset rather than guessing: no silent pass,
+//! no silent downgrade, and an entitled account alone never invents
+//! per-server capability.
 //!
 //! ## Policies (FR-14..FR-19)
 //!
@@ -418,6 +423,14 @@ pub struct SelectionContext {
     /// latency-dependent ranking is a typed refusal — no fabricated
     /// latencies).
     pub latency: LatencyTable,
+    /// The account's maximum accessible server tier (the S8 wire
+    /// `MaxTier`: 0 free, 1 basic, 2 plus, 3 PM), composed by the
+    /// daemon. A candidate whose catalog `Tier` exceeds it is
+    /// eliminated at the account-entitlement stage — FR-23P's own
+    /// stage, AHEAD of online state. `None` = the entitlement seam is
+    /// uncomposed (no account known): the stage eliminates nothing
+    /// rather than guessing a tier in either direction.
+    pub account_tier: Option<i8>,
     /// Whether the account is entitled to port forwarding (`None`:
     /// entitlement not composed yet — a port-forwarding constraint then
     /// refuses typed rather than guessing).
@@ -445,6 +458,11 @@ pub struct SelectionContext {
 /// candidate is the one reported for it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FilterStage {
+    /// The account's composed entitlement tier does not cover the
+    /// server's catalog tier (FR-23P's account-entitlement stage; the
+    /// tier composes at the daemon over S8 —
+    /// [`SelectionContext::account_tier`]).
+    AccountTier,
     /// Logical status absent — unknown is never online (FR-13B,
     /// fail-closed).
     UnknownStatus,
@@ -501,6 +519,7 @@ impl FilterStage {
     /// candidate is charged to the FIRST stage that eliminates it; the
     /// report renders in this order.
     const STAGES: &[(FilterStage, &'static str)] = &[
+        (FilterStage::AccountTier, "account-tier"),
         (FilterStage::UnknownStatus, "unknown-status"),
         (FilterStage::Offline, "offline"),
         (FilterStage::AllPhysicalsOffline, "all-physicals-offline"),
@@ -918,6 +937,18 @@ fn is_secure_core_fleet(server: &LogicalServer) -> bool {
     !server.is_gateway() && (server.is_secure_core_route() || server.features.secure_core())
 }
 
+/// The account-entitlement stage (FR-23P's second hard-filter stage,
+/// ahead of online state): a server whose catalog tier exceeds the
+/// account's composed tier is inaccessible to this account. `None` on
+/// the seam (no entitlement composed) eliminates nothing — never a
+/// guessed tier in either direction.
+fn account_tier_stage(server: &LogicalServer, context: &SelectionContext) -> Option<FilterStage> {
+    context
+        .account_tier
+        .is_some_and(|account_tier| server.tier > account_tier)
+        .then_some(FilterStage::AccountTier)
+}
+
 /// The online-state stage: unknown is never online (FR-13B,
 /// fail-closed), offline is offline, and an online logical needs at
 /// least one online physical to be connectable.
@@ -1146,7 +1177,8 @@ fn eliminating_stage(
     request: &SelectionRequest,
     context: &SelectionContext,
 ) -> Option<FilterStage> {
-    online_stage(server)
+    account_tier_stage(server, context)
+        .or_else(|| online_stage(server))
         .or_else(|| target_stage(server, &request.target))
         .or_else(|| physical_country_stage(server, &request.constraints))
         .or_else(|| exclusion_stage(server, &request.constraints))
@@ -2827,6 +2859,115 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
+    // Slice — the account-entitlement tier stage (FR-23P's second
+    // hard-filter stage; the Codex PR-9 P1 core seam). The daemon
+    // composes the S8 `MaxTier` onto `SelectionContext::account_tier`;
+    // these pins hold the stage's own semantics.
+    // ------------------------------------------------------------------
+
+    fn tiered_context(account_tier: Option<i8>) -> SelectionContext {
+        SelectionContext {
+            account_tier,
+            ..SelectionContext::default()
+        }
+    }
+
+    fn spec_tiered(name: &'static str, exit: &'static str, tier: i8) -> Spec {
+        Spec {
+            tier,
+            ..Spec::new(name, exit)
+        }
+    }
+
+    /// The stage itself: a server whose catalog tier exceeds the
+    /// account's composed tier is eliminated and FR-22-accounted; a
+    /// covering account keeps the field untouched.
+    #[test]
+    fn account_tier_eliminates_servers_above_the_composed_tier() {
+        let catalog = build_catalog(&[spec_tiered("GB#1", "GB", 0), spec_tiered("GB#2", "GB", 2)]);
+        let request = official(Target::Country("GB".into()));
+        let outcome = select(&catalog, &request, &tiered_context(Some(0))).unwrap();
+        let ranked: Vec<&str> = outcome
+            .ranked
+            .iter()
+            .map(|c| c.server.name.as_str())
+            .collect();
+        assert_eq!(
+            ranked,
+            ["GB#1"],
+            "the tier-2 server is inaccessible at MaxTier 0"
+        );
+        assert_eq!(stage_count(&outcome.report, FilterStage::AccountTier), 1);
+
+        let outcome = select(&catalog, &request, &tiered_context(Some(2))).unwrap();
+        assert_eq!(outcome.report.survivors(), 2, "MaxTier 2 covers the field");
+        assert_eq!(stage_count(&outcome.report, FilterStage::AccountTier), 0);
+    }
+
+    /// FR-23P's ORDER: account entitlement precedes online state — an
+    /// offline paid server under a free account charges to the
+    /// entitlement stage, not to `offline` (the first eliminating
+    /// stage owns the report entry).
+    #[test]
+    fn account_tier_charges_before_the_online_state() {
+        let catalog = build_catalog(&[Spec {
+            tier: 2,
+            status: Some(0),
+            online_physicals: 0,
+            ..Spec::new("GB#1", "GB")
+        }]);
+        let outcome = select(
+            &catalog,
+            &official(Target::Country("GB".into())),
+            &tiered_context(Some(0)),
+        )
+        .unwrap_err();
+        let SelectionError::ConstraintsNotSatisfied { report } = outcome else {
+            panic!("the emptied pool is the structured refusal");
+        };
+        assert_eq!(stage_count(&report, FilterStage::AccountTier), 1);
+        assert_eq!(stage_count(&report, FilterStage::Offline), 0);
+    }
+
+    /// `None` on the seam is NOT a tier: no account composed means the
+    /// stage eliminates nothing — never a guessed restrictive tier
+    /// (the login-free selection surface stays queryable) and never a
+    /// fabricated permissive one (the daemon composes the real fact).
+    #[test]
+    fn uncomposed_account_tier_eliminates_nothing() {
+        let catalog = build_catalog(&[spec_tiered("GB#1", "GB", 2)]);
+        let outcome = select(
+            &catalog,
+            &official(Target::Country("GB".into())),
+            &tiered_context(None),
+        )
+        .unwrap();
+        assert_eq!(outcome.report.survivors(), 1);
+        assert_eq!(stage_count(&outcome.report, FilterStage::AccountTier), 0);
+    }
+
+    /// FR-23's no-fallback diagnosis under the tier stage: an exact
+    /// request for a paid server under a free account names
+    /// `account-tier` as the refusing stage.
+    #[test]
+    fn exact_paid_server_under_a_free_account_refuses_at_the_tier_stage() {
+        let catalog = build_catalog(&[spec_tiered("GB#9", "GB", 2)]);
+        let error = select(
+            &catalog,
+            &official(Target::Server("GB#9".into())),
+            &tiered_context(Some(0)),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            SelectionError::ExactServerUnavailable {
+                stage: FilterStage::AccountTier,
+                ..
+            }
+        ));
+    }
+
+    // ------------------------------------------------------------------
     // Slice 3 — the ranking policies through select (T-1): official
     // ordering and its refusal class, lowest load, the balanced
     // weighted model, and the FR-22 end-to-end error.
@@ -2966,6 +3107,7 @@ mod tests {
                 .iter()
                 .map(|(id, ms)| ((*id).to_owned(), Duration::from_millis(*ms)))
                 .collect(),
+            account_tier: None,
             port_forwarding_entitled: None,
             port_forwarding_capable: None,
             random_entropy: None,

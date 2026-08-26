@@ -341,16 +341,19 @@ impl SelectionEngine {
             })
     }
 
-    /// Composes the S8 entitlement + PF capability seams (FR-23H/87).
-    /// `Ok(None)` = the cell is empty (the seam stays uncomposed and
-    /// the pure core refuses typed); the capability source is ALWAYS
-    /// the empty set under a composed entitlement — documented, never
-    /// fabricated.
-    fn port_forwarding_composition(&self) -> Result<Option<bool>, RpcError> {
+    /// Composes the S8 entitlement snapshot once per request
+    /// (FR-23H/87 for the PF fact, FR-23P's account-entitlement stage
+    /// for the tier). `Ok(None)` = the cell is empty (no adapter
+    /// installed — the session lane's M4 wiring): every seam the
+    /// snapshot feeds then composes as uncomposed (the PF constraint
+    /// refuses typed; the tier stage eliminates nothing).
+    fn entitlement_composition(
+        &self,
+    ) -> Result<Option<protonwire_api::entitlements::VpnEntitlements>, RpcError> {
         let Some(adapter) = self.entitlement.current() else {
             return Ok(None);
         };
-        let entitlements = adapter.fetch().map_err(|error| match error {
+        adapter.fetch().map(Some).map_err(|error| match error {
             EntitlementsError::Transport(detail) => RpcError::new(
                 RpcErrorCode::NetworkUnavailable,
                 format!("entitlements read failed: {detail}"),
@@ -359,13 +362,32 @@ impl SelectionEngine {
                 RpcErrorCode::Internal,
                 format!("entitlements read failed: {other}"),
             ),
-        })?;
-        // The wire model carries no PF allowance field; the composition
-        // rides the recorded paid-plan classification (the same rule
-        // the p2p/secure-core/tor allowances derive from — the S8
-        // module docs). With the capability set empty today, this fact
-        // only differentiates the refusal's code, never a pass.
-        Ok(Some(entitlements.plan_tier == Some(PlanTier::Paid)))
+        })
+    }
+
+    /// The account-entitlement tier over the S8 wire `MaxTier` (0
+    /// free / 1 basic / 2 plus / 3 PM), saturated into the catalog's
+    /// `i8` tier domain — the core's account-entitlement stage
+    /// eliminates every candidate above it (FR-23P). An absent
+    /// `MaxTier` is not a tier (the S8 tri-state rule): `None`.
+    fn account_tier(
+        entitlements: Option<&protonwire_api::entitlements::VpnEntitlements>,
+    ) -> Option<i8> {
+        entitlements
+            .and_then(|snapshot| snapshot.max_tier)
+            .map(|tier| tier.min(i64::from(i8::MAX)) as i8)
+    }
+
+    /// The PF entitlement fact off the same snapshot: the wire model
+    /// carries no PF allowance field, so the composition rides the
+    /// recorded paid-plan classification (the same rule the
+    /// p2p/secure-core/tor allowances derive from — the S8 module
+    /// docs). With the capability set empty today, this fact only
+    /// differentiates the refusal's code, never a pass.
+    fn pf_entitlement(
+        entitlements: Option<&protonwire_api::entitlements::VpnEntitlements>,
+    ) -> Option<bool> {
+        entitlements.map(|snapshot| snapshot.plan_tier == Some(PlanTier::Paid))
     }
 
     /// The empty per-server PF capability composition (FR-87's honest
@@ -515,8 +537,13 @@ impl SelectionEngine {
             wire_features(&modifiers.required_features, &modifiers.optional_features);
         let required_protocol = wire_protocol(modifiers.required_protocol);
 
-        // The PF composition (None = uncomposed — the core refuses).
-        let pf_entitled = self.port_forwarding_composition()?;
+        // The S8 entitlement snapshot, composed ONCE: the PF fact
+        // (None = uncomposed — the core refuses) and the
+        // account-entitlement tier (None = the stage eliminates
+        // nothing; FR-23P's own stage ahead of online state).
+        let entitlements = self.entitlement_composition()?;
+        let pf_entitled = Self::pf_entitlement(entitlements.as_ref());
+        let account_tier = Self::account_tier(entitlements.as_ref());
         let pf_requested = modifiers
             .required_features
             .contains(&SelectionFeature::PortForwarding)
@@ -586,6 +613,7 @@ impl SelectionEngine {
         };
 
         let mut context = SelectionContext {
+            account_tier,
             port_forwarding_entitled: pf_entitled,
             port_forwarding_capable: pf_entitled.map(|_| self.port_forwarding_capable()),
             ..SelectionContext::default()
@@ -712,10 +740,14 @@ impl SelectionEngine {
 
     /// The built-in group catalog with FR-23S availability (the
     /// `GroupsList` body). Served from core's registry — no network
-    /// (FR-23R), no hard-coded lists (FR-23I).
+    /// beyond the entitlement snapshot (FR-23R), no hard-coded lists
+    /// (FR-23I). A failed entitlement read fails the listing whole:
+    /// reporting paid-location groups available because the tier could
+    /// not be read would be the silent downgrade FR-23S forbids.
     pub fn groups_catalog(&self) -> Result<GroupsCatalog, RpcError> {
         let cached = self.cached_catalog()?;
         let weights = self.balanced_weights();
+        let account_tier = Self::account_tier(self.entitlement_composition()?.as_ref());
         let groups = protonwire_core::groups::all_groups()
             .iter()
             .map(|entry| {
@@ -723,6 +755,7 @@ impl SelectionEngine {
                     cached.as_ref().map(|(_, _, document)| document),
                     entry,
                     &weights,
+                    account_tier,
                 );
                 group_summary(entry, availability)
             })
@@ -737,12 +770,15 @@ impl SelectionEngine {
     /// One group's FR-23S availability: resolve + hard-filter over the
     /// cached catalog (no ranking — availability is not an ordering
     /// question, so the official missing-score refusal cannot pollute
-    /// it).
+    /// it). The account-entitlement tier composes like every select
+    /// (FR-23P): a paid-location group under a free account reports
+    /// the precise `account-tier` reason, never a false "available".
     fn group_availability(
         &self,
         catalog: Option<&CatalogDocument>,
         entry: &protonwire_core::groups::GroupEntry,
         weights: &WeightedSignals,
+        account_tier: Option<i8>,
     ) -> GroupAvailability {
         let Some(catalog) = catalog else {
             return GroupAvailability {
@@ -759,7 +795,10 @@ impl SelectionEngine {
         // No v1 group carries a PF constraint; the composition stays
         // uncomposed so a future PF-requiring group reports the
         // missing-composition reason rather than passing.
-        let context = SelectionContext::default();
+        let context = SelectionContext {
+            account_tier,
+            ..SelectionContext::default()
+        };
         match resolve_group(entry.id, None, &sources, weights) {
             Ok(resolved) => match protonwire_core::selection::filter_candidates(
                 catalog,
@@ -770,7 +809,20 @@ impl SelectionEngine {
                     available: true,
                     reason: None,
                 },
-                Ok(_) => unavailable("no-eligible-server"),
+                Ok((_, report)) => {
+                    // FR-23S's "precise entitlement" reason: when the
+                    // tier stage is what emptied the pool, that is the
+                    // availability answer — not the generic
+                    // no-eligible-server.
+                    let tier_bound = report.stages().iter().any(|(stage, count)| {
+                        *stage == protonwire_core::selection::FilterStage::AccountTier && *count > 0
+                    });
+                    if tier_bound {
+                        unavailable("account-tier")
+                    } else {
+                        unavailable("no-eligible-server")
+                    }
+                }
                 Err(SelectionError::PhysicalCountryRequired) => {
                     unavailable("physical-country-required")
                 }
@@ -802,6 +854,7 @@ impl SelectionEngine {
                 .map(|(_, _, document)| document),
             entry,
             &weights,
+            Self::account_tier(self.entitlement_composition()?.as_ref()),
         );
         let (target, target_detail) = group_target_render(&entry.target);
         Ok(Box::new(GroupDetails {
@@ -1573,6 +1626,150 @@ mod tests {
                 .unwrap()
                 .iter()
                 .any(|stage| stage["stage"] == "required-features")
+        );
+    }
+
+    /// Codex PR-9 (P1, the entitlement tier): a FREE account's
+    /// selection must never return a PAID-tier server. Pre-fix the
+    /// context carried only the PF boolean — the full cached catalog
+    /// reached `select()` unfiltered, so `country CH` (whose only
+    /// member, CH#10, is tier 2) happily returned the paid server.
+    /// The S8 `MaxTier` now composes onto the core's
+    /// account-entitlement stage (FR-23P's own stage, ahead of online
+    /// state) and the refusal's FR-22 report names it.
+    #[test]
+    fn free_account_selection_eliminates_paid_tier_servers() {
+        let engine = default_engine();
+        engine
+            .entitlement()
+            .install(Arc::new(FakeEntitlements::free()));
+        let error = engine
+            .resolve(&country("CH"), &modifiers())
+            .expect_err("a free account cannot select the tier-2 CH#10");
+        assert_eq!(error.code, RpcErrorCode::NoEligibleServer);
+        let details = error.details.expect("the report rides details");
+        let tier_stage = details["stages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|stage| stage["stage"] == "account-tier")
+            .expect("the eliminating stage is the entitlement tier");
+        assert_eq!(
+            tier_stage["eliminated"], 3,
+            "every tier-2 logical (CH#10, CH-SE#1, JP#1) — the entitlement stage precedes \
+             geography (FR-23P), so non-members above the tier charge here too"
+        );
+    }
+
+    /// The same composition over a mixed field: a free account's
+    /// fastest-europe winner is a FREE-tier member and the FR-22 report
+    /// accounts the paid members (CH#10) to the account-tier stage.
+    #[test]
+    fn free_account_ranks_only_free_tier_members() {
+        let engine = default_engine();
+        engine
+            .entitlement()
+            .install(Arc::new(FakeEntitlements::free()));
+        let result = engine
+            .resolve(
+                &ConnectTarget::Group {
+                    group_id: "protonwire:fastest-europe".into(),
+                },
+                &modifiers(),
+            )
+            .expect("the fixture's Europe keeps free-tier members");
+        assert_eq!(result.winner.name, "GB#1", "official order over tier 0");
+        assert_eq!(result.winner.tier, 0);
+        assert!(
+            result
+                .hard_filters
+                .stages
+                .iter()
+                .any(|stage| stage.stage == "account-tier" && stage.eliminated == 3),
+            "every tier-2 logical is accounted to the entitlement tier (the stage precedes \
+             geography): {:?}",
+            result.hard_filters.stages
+        );
+    }
+
+    /// A PAID account (MaxTier 3) keeps the full field — the stage is
+    /// the account's, not a global paywall.
+    #[test]
+    fn paid_account_selection_includes_paid_tier_servers() {
+        let engine = default_engine();
+        engine
+            .entitlement()
+            .install(Arc::new(FakeEntitlements::paid()));
+        let result = engine
+            .resolve(&country("CH"), &modifiers())
+            .expect("MaxTier 3 covers the tier-2 server");
+        assert_eq!(result.winner.name, "CH#10");
+        assert_eq!(result.winner.tier, 2);
+    }
+
+    /// FR-23S at the tier seam: a paid-location group (asia's only
+    /// fixture member is tier 2) reports UNAVAILABLE under a free
+    /// account with the precise entitlement reason — pre-fix the
+    /// availability path ignored entitlements entirely and asia read
+    /// available. Free-member groups (europe) stay available.
+    #[test]
+    fn free_account_reports_paid_location_groups_unavailable() {
+        let engine = default_engine();
+        engine
+            .entitlement()
+            .install(Arc::new(FakeEntitlements::free()));
+        let catalog = engine.groups_catalog().expect("the registry serves");
+        let asia = catalog
+            .groups
+            .iter()
+            .find(|group| group.id == "protonwire:fastest-asia")
+            .unwrap();
+        assert!(!asia.availability.available);
+        assert_eq!(
+            asia.availability.reason.as_deref(),
+            Some("account-tier"),
+            "the precise FR-23S entitlement reason"
+        );
+        let europe = catalog
+            .groups
+            .iter()
+            .find(|group| group.id == "protonwire:fastest-europe")
+            .unwrap();
+        assert!(
+            europe.availability.available,
+            "the fixture's free-tier Europe members stay reachable"
+        );
+
+        // The paid account keeps asia available.
+        let engine = default_engine();
+        engine
+            .entitlement()
+            .install(Arc::new(FakeEntitlements::paid()));
+        let catalog = engine.groups_catalog().expect("the registry serves");
+        let asia = catalog
+            .groups
+            .iter()
+            .find(|group| group.id == "protonwire:fastest-asia")
+            .unwrap();
+        assert!(asia.availability.available);
+    }
+
+    /// `group show` rides the same availability seam: the paid-location
+    /// group's summary carries the account-tier reason under a free
+    /// account.
+    #[test]
+    fn free_account_group_show_carries_the_tier_reason() {
+        let engine = default_engine();
+        engine
+            .entitlement()
+            .install(Arc::new(FakeEntitlements::free()));
+        let details = engine
+            .group_details("protonwire:fastest-asia")
+            .expect("the group stays visible (FR-23S)");
+        assert!(!details.summary.availability.available);
+        assert_eq!(
+            details.summary.availability.reason.as_deref(),
+            Some("account-tier")
         );
     }
 
