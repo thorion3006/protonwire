@@ -32,15 +32,18 @@
 //! 4. **The bounded on-demand prober** (U5's executor seam): for a
 //!    latency-dependent ranking the engine derives the shortlist from
 //!    the hard-filtered candidates in official order (Proton score,
-//!    load, id — allowed signals only), plans one bounded run, executes
-//!    it through the TCP connect-timing transport, and writes
-//!    `last_attempt_ms` back for every PROBED endpoint — answered or
-//!    not (the hammering guard's contract: an unanswered endpoint is
-//!    not re-attempted inside the per-endpoint rate window).
-//!    ICMP is honored as a config VALUE but its raw-socket executor is
-//!    deliberately not wired: CAP_NET_RAW is never assumed, so the
-//!    icmp arm observes nothing and a latency ranking over it fails
-//!    closed (the typed data refusal), never a fabricated RTT.
+//!    load, id — allowed signals only), plans one bounded run, and
+//!    RESERVES every planned probe under the state lock BEFORE
+//!    executing it (advancing `last_attempt_ms` — the hammering
+//!    guard's contract, and the atomicity that keeps concurrent
+//!    rounds from double-probing an endpoint); the write-back after
+//!    the round records only observations. The whole round runs under
+//!    a total wall-clock deadline (`round_deadline_ms`) beneath the
+//!    10 s IPC request deadline. ICMP is honored as a config VALUE but
+//!    its raw-socket executor is deliberately not wired: CAP_NET_RAW
+//!    is never assumed, so the icmp arm observes nothing and a latency
+//!    ranking over it fails closed (the typed data refusal), never a
+//!    fabricated RTT.
 //! 5. **The pure core** ([`protonwire_core::selection::select`] over
 //!    the registry-resolved or direct request): the daemon maps the
 //!    wire request onto the core vocabulary, supplies OS entropy for
@@ -415,13 +418,28 @@ impl SelectionEngine {
 
     /// Runs one bounded probe round over `shortlist` (logical ids in
     /// priority order) and returns the merged observation table.
-    /// Writes `last_attempt_ms` back for every PROBED endpoint —
-    /// answered or not (the hammering guard's contract). The WHOLE
-    /// round is bounded by the configured total deadline (the Codex
-    /// PR-9 arithmetic: a serial worst case of 20 × 750 ms ≈ 15 s must
-    /// never answer `--by latency` with the 10 s RPC transport
-    /// timeout): probing stops at the deadline, the answered prefix
-    /// survives, and the unprobed fall to the FR-18 shortlist boundary.
+    ///
+    /// The RESERVATION protocol (the Codex PR-9 P1): the plan AND the
+    /// attempt-clock advance for every endpoint the plan will probe
+    /// happen under ONE lock hold, BEFORE execution — a concurrent
+    /// round's plan then sees those endpoints rate-limited, so no
+    /// endpoint is probed twice inside the per-endpoint interval and
+    /// the global per-run bound holds across sessions. (Pre-fix the
+    /// table was cloned and unlocked before planning, with the clock
+    /// advancing only at the write-back — exactly the window two
+    /// concurrent rounds both slipped through.)
+    ///
+    /// The write-back after the round records ONLY observations (and
+    /// their answer times); the attempt clock already moved at the
+    /// reservation, which is also what an unanswered probed endpoint
+    /// keeps — the hammering guard's contract.
+    ///
+    /// The WHOLE round is bounded by the configured total deadline
+    /// (the Codex PR-9 arithmetic: a serial worst case of
+    /// 20 × 750 ms ≈ 15 s must never answer `--by latency` with the
+    /// 10 s RPC transport timeout): probing stops at the deadline, the
+    /// answered prefix survives, and the unprobed fall to the FR-18
+    /// shortlist boundary.
     fn probe_round(
         &self,
         catalog: &CatalogDocument,
@@ -435,8 +453,29 @@ impl SelectionEngine {
             Instant::now() + Duration::from_millis(u64::from(probe_config.round_deadline_ms));
         let now = (self.now_ms)();
         let budget = self.probe_budget();
-        let state = self.probes.state.lock().expect("probe table lock").clone();
-        let decisions = plan_run(&shortlist, &state, &budget, now);
+
+        // Plan + reserve atomically. `state` is the same locked-now
+        // snapshot the plan ran over (its observations feed
+        // `run_planned`'s rate-limited passthrough; the reservation
+        // only advances attempt clocks, which that path never reads).
+        let (state, decisions) = {
+            let mut guard = self.probes.state.lock().expect("probe table lock");
+            let state = guard.clone();
+            let decisions = plan_run(&shortlist, &state, &budget, now);
+            for endpoint in &shortlist {
+                if decisions.get(endpoint) == Some(&ProbeDecision::Probe) {
+                    guard
+                        .entry(endpoint.clone())
+                        .or_insert(EndpointState {
+                            observation: None,
+                            observed_at_ms: 0,
+                            last_attempt_ms: 0,
+                        })
+                        .last_attempt_ms = now;
+                }
+            }
+            (state, decisions)
+        };
 
         // Resolve the endpoints fresh from the loaded catalog (never a
         // cached id→address mapping, never logged — the PR-3 review's
@@ -457,25 +496,24 @@ impl SelectionEngine {
         };
         let observed = run_planned(&shortlist, &decisions, &state, &mut executor);
 
-        // The write-back: EVERY probed endpoint advances its attempt
-        // clock (unanswered ones too — that is what stops a dead
-        // endpoint being re-attempted every request inside the rate
-        // window), and answered ones record BOTH the observation and
-        // its answer time (the reuse window measures from the
-        // observation, the rate limit from the attempt).
+        // The write-back: observations only. The attempt clock moved at
+        // the reservation (before execution); answered endpoints
+        // additionally record the observation and its answer time (the
+        // reuse window measures from the observation, the rate limit
+        // from the reserved attempt).
+        let answered_at = (self.now_ms)();
         let mut guard = self.probes.state.lock().expect("probe table lock");
         for endpoint in &shortlist {
-            if decisions.get(endpoint) == Some(&ProbeDecision::Probe) {
+            if decisions.get(endpoint) == Some(&ProbeDecision::Probe)
+                && let Some(observation) = observed.get(endpoint)
+            {
                 let entry = guard.entry(endpoint.clone()).or_insert(EndpointState {
                     observation: None,
                     observed_at_ms: 0,
                     last_attempt_ms: 0,
                 });
-                entry.last_attempt_ms = now;
-                if let Some(observation) = observed.get(endpoint) {
-                    entry.observation = Some(*observation);
-                    entry.observed_at_ms = now;
-                }
+                entry.observation = Some(*observation);
+                entry.observed_at_ms = answered_at;
             }
         }
         // The latency table the ranking consumes: the run's merged
@@ -2236,6 +2274,87 @@ mod tests {
             "the round returns within its deadline (measured {elapsed:?}; the pre-fix serial \
              round spent the full shortlist serially)"
         );
+    }
+
+    /// Codex PR-9 (P1, the probe round ~410): the table was cloned and
+    /// the lock released BEFORE planning/execution, with the attempt
+    /// clock advancing only at the write-back — two concurrent rounds
+    /// could both see the same endpoints eligible and DOUBLE-proBE
+    /// them, bypassing the per-endpoint interval and the global bound.
+    /// The reservation protocol plans AND advances `last_attempt_ms`
+    /// under one lock hold, before execution; the write-back then
+    /// records only observations. Asserted via the connect seam's call
+    /// count: exactly one probe per endpoint across both rounds.
+    #[test]
+    fn concurrent_rounds_never_double_probe_the_same_endpoint() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let parked_once = Arc::new(AtomicBool::new(false));
+        // Forces the pre-fix interleaving deterministically: the FIRST
+        // connect call parks until a second thread reaches the seam —
+        // proof that thread planned probes over the pre-reservation
+        // state — or 300 ms (the green case: the second round plans
+        // nothing and never reaches the seam).
+        let mut engine = SelectionEngine::new(
+            Arc::new(SystemConfig::default()),
+            Path::new("/hermetic-unused"),
+            Path::new("/hermetic-unused"),
+        );
+        engine.now_ms = Box::new(|| 1_000_000);
+        {
+            let calls = calls.clone();
+            let parked_once = parked_once.clone();
+            engine.connect = Box::new(move |_addr, _timeout| {
+                let mine = calls.fetch_add(1, Ordering::SeqCst);
+                if !parked_once.swap(true, Ordering::SeqCst) {
+                    let deadline = Instant::now() + Duration::from_millis(300);
+                    while calls.load(Ordering::SeqCst) < 2 && Instant::now() < deadline {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                }
+                let _ = mine;
+                Some(Duration::from_millis(25))
+            });
+        }
+        engine.catalog_read = Box::new(|| {
+            Ok(Some(CachedCatalog {
+                schema_version: 1,
+                etag: Some("\"test-rev-1\"".to_owned()),
+                fetched_unix: 1_771_000_000,
+                body: catalog_body(),
+            }))
+        });
+        engine.location_read = Box::new(|| Ok(None));
+
+        // `country GB` shortlists exactly the three GB logicals.
+        let target = country("GB");
+        let mods = SelectionModifiers {
+            by: Some("latency".into()),
+            ..modifiers()
+        };
+        std::thread::scope(|scope| {
+            scope.spawn(|| engine.resolve(&target, &mods));
+            scope.spawn(|| engine.resolve(&target, &mods));
+        });
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            3,
+            "each of the three GB endpoints is probed exactly ONCE across both concurrent \
+             rounds — the reservation holds the per-endpoint interval and the global bound \
+             across sessions (pre-fix: 6, both rounds probing the full shortlist)"
+        );
+        // And the probe table shows it: every GB endpoint carries the
+        // reserved attempt clock.
+        let state = engine.probe_state();
+        for endpoint in ["id-GB#1", "id-GB#2", "id-GB-P2P"] {
+            assert_eq!(
+                state.get(endpoint).map(|entry| entry.last_attempt_ms),
+                Some(1_000_000),
+                "`{endpoint}` carries the reserved attempt clock"
+            );
+        }
     }
 
     /// The verdict round's GAP-2: the daemon's `max_candidates` cap
