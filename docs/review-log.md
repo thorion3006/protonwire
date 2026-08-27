@@ -1876,4 +1876,25 @@ sec's session-lane gating of the entitlement fetch, FR-23U's
 pin/unpin and copy-to-profile (M6); E2E-23/24 (the M6 staging lane);
 the P3 list in PR-4's entry above.
 
+## 2026-08-27 — Codex PR#9 round 7 (post-completion, pre-merge)
+
+One P2, verified GENUINE and fixed red-first at 5dade73: the
+entitlement wait consumed its CONFIGURED budget
+(`entitlement_fetch_budget_ms`, validation ceiling 9500 ms)
+independently of the 9 s request deadline `resolve()` arms — a slow
+fetch could overrun the daemon's own deadline toward the IPC
+client's 10 s timeout before selection or reply work began,
+contradicting the round-3 one-deadline invariant the code itself
+documents. `entitlement_composition` now takes the request deadline
+and min()-clamps the wait to its REMAINDER (the configured budget
+only tightens, never extends); the timeout warn/error report the
+EFFECTIVE clamped wait; the refusal stays the fail-closed typed
+EntitlementMissing. Pins: the clamp arm (E0061 red; ~250 ms refusal
+under a nearly-spent deadline with a never-landing adapter) and the
+budget arm (250 ms floor binding under a far deadline, lower AND
+upper bounds — the upper kills the reviewer's "deadline replaces
+budget" mutant). RUST PASS, no P1; its two P3 track items join the
+P3 list (the zero-remainder edge test; the sections.rs budget doc's
+stale 10 s framing).
+
 
