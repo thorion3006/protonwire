@@ -354,15 +354,19 @@ impl SelectionEngine {
         &self,
     ) -> Result<Option<protonwire_api::entitlements::VpnEntitlements>, RpcError> {
         let Some(adapter) = self.entitlement.current() else {
+            // No adapter installed = the login-free surface: no
+            // session exists, no account, no tier — None is the
+            // documented semantics (queryable without guessing).
             return Ok(None);
         };
         // The composition is RPC-DEADLINE-BOUNDED (Codex PR#9, P1): the
         // adapter's own fetch timeout is 30 s while the IPC client's
         // request deadline is 10 s — an unbounded synchronous fetch
         // would poison the client connection before the daemon replies.
-        // A slow endpoint degrades THIS request to tier-None (the
-        // documented None semantics: no guessing, never a hang); the
-        // next request re-attempts the composition.
+        // A budget miss is FAIL-CLOSED (Codex PR#9 round 3, P1): an
+        // installed adapter whose entitlements cannot be read must
+        // REFUSE — returning None would let a free account select
+        // paid-tier servers whenever the entitlement service is slow.
         let budget = std::time::Duration::from_millis(
             self.config.server_selection.entitlement_fetch_budget_ms,
         );
@@ -385,10 +389,17 @@ impl SelectionEngine {
             Err(_) => {
                 tracing::warn!(
                     budget_ms = self.config.server_selection.entitlement_fetch_budget_ms,
-                    "entitlement composition exceeded its RPC-deadline budget; \
-                     degrading this request to tier-None (no guessing, never a hang)"
+                    "entitlement composition exceeded its RPC-deadline budget; refusing \
+                     (fail-closed: an installed adapter's tier must never be guessed)"
                 );
-                Ok(None)
+                Err(RpcError::new(
+                    RpcErrorCode::EntitlementMissing,
+                    format!(
+                        "the entitlement read exceeded its {} ms budget — the account tier \
+                         cannot be composed safely; retry shortly",
+                        self.config.server_selection.entitlement_fetch_budget_ms
+                    ),
+                ))
             }
         }
     }
@@ -469,13 +480,19 @@ impl SelectionEngine {
         &self,
         catalog: &CatalogDocument,
         shortlist: Vec<String>,
+        request_deadline: Instant,
     ) -> BTreeMap<String, Duration> {
         let probe_config = &self.config.server_selection.latency_probe;
         if !probe_config.enabled || shortlist.is_empty() {
             return BTreeMap::new();
         }
-        let round_deadline =
+        // The round deadline clamps to the REQUEST deadline's remainder
+        // (Codex PR#9 round 3, P1): 6 s of entitlement composition plus
+        // an unclamped 8 s round would exceed the 10 s IPC bar; the
+        // round gets whatever the single request deadline leaves.
+        let configured =
             Instant::now() + Duration::from_millis(u64::from(probe_config.round_deadline_ms));
+        let round_deadline = configured.min(request_deadline);
         let now = (self.now_ms)();
         let budget = self.probe_budget();
 
@@ -613,11 +630,26 @@ impl SelectionEngine {
     /// Resolves a selection request end to end (the `Select` handler's
     /// body). Read-only against daemon state except the bounded probe
     /// round a latency-dependent ranking triggers.
+    /// The single request deadline spanning the entitlement
+    /// composition and the probe round (Codex PR#9 round 3, P1): the
+    /// IPC client's default request timeout is 10 s
+    /// (`ipc::client::DEFAULT_REQUEST_TIMEOUT`); this leaves 1 s of
+    /// headroom for the selection itself and the reply write.
+    fn request_deadline_ms(&self) -> u64 {
+        9_000
+    }
+
     pub fn resolve(
         &self,
         target: &ConnectTarget,
         modifiers: &SelectionModifiers,
     ) -> Result<Box<SelectionResult>, RpcError> {
+        // ONE request deadline spans the entitlement composition AND
+        // the probe round (Codex PR#9 round 3, P1): independent serial
+        // budgets (6 s + 8 s defaults) exceeded the 10 s IPC request
+        // timeout. The probe round clamps its own configured deadline
+        // to whatever this deadline leaves.
+        let request_deadline = Instant::now() + Duration::from_millis(self.request_deadline_ms());
         let Some((etag, fetched_unix, catalog)) = self.cached_catalog()? else {
             return Err(RpcError::new(
                 RpcErrorCode::NoEligibleServer,
@@ -723,7 +755,7 @@ impl SelectionEngine {
         };
         if latency_weighted {
             let shortlist = self.probe_shortlist(&catalog, &request, &context);
-            context.latency = self.probe_round(&catalog, shortlist);
+            context.latency = self.probe_round(&catalog, shortlist, request_deadline);
         }
 
         // The random policy draws on OS entropy.

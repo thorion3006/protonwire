@@ -120,14 +120,27 @@ pub fn plan_run(
             Some(EndpointState {
                 observation: Some(obs),
                 observed_at_ms,
-                ..
+                last_attempt_ms,
             }) => {
-                // The reuse window measures from the OBSERVATION time
-                // (Codex PR#8, P2): a stale RTT whose refresh attempt
-                // timed out ages out regardless of attempt recency.
-                let age = Duration::from_millis(now_ms.saturating_sub(*observed_at_ms));
-                if age < budget.min_reuse_age {
+                let attempt_age = Duration::from_millis(now_ms.saturating_sub(*last_attempt_ms));
+                let obs_age = Duration::from_millis(now_ms.saturating_sub(*observed_at_ms));
+                if obs_age < budget.min_reuse_age {
+                    // Fresh observation: REUSE — no probe is issued, so
+                    // the attempt clock is irrelevant here (the reuse
+                    // window measures from the OBSERVATION time, Codex
+                    // PR#8, P2).
                     ProbeDecision::Reuse(*obs)
+                } else if attempt_age < budget.min_probe_interval {
+                    // STALE observation with a recent attempt: the
+                    // hammering guard applies (Codex PR#9 round 3, P1:
+                    // the pre-fix arm decided Probe solely on
+                    // observation staleness, ignoring the attempt
+                    // clock, so a concurrent round or the next request
+                    // after a failed refresh re-probed the same stale
+                    // endpoint inside the interval). The prior
+                    // observation still serves selection via the
+                    // rate-limited passthrough.
+                    ProbeDecision::RateLimited
                 } else {
                     ProbeDecision::Probe
                 }
@@ -345,27 +358,54 @@ mod tests {
         );
     }
 
-    /// Codex PR#8 (P2): the reuse window measures from the
-    /// OBSERVATION time, not the attempt time — a stale RTT whose
-    /// refresh attempt is RECENT (timed out, clock written back) must
-    /// not read as fresh. Pre-fix, the age came from last_attempt_ms,
-    /// so repeated failed refreshes kept an arbitrarily old RTT alive
-    /// indefinitely.
+    /// Codex PR#8 (P2) + PR#9 round 3 (P1): the reuse window measures
+    /// from the OBSERVATION time, not the attempt time — a stale RTT
+    /// whose refresh attempt is RECENT (timed out, clock written back)
+    /// must not read as fresh, AND the recent attempt rate-limits the
+    /// re-probe (the hammering guard). Pre-fix, the age came from
+    /// last_attempt_ms, so repeated failed refreshes kept an
+    /// arbitrarily old RTT alive indefinitely.
     #[test]
     fn a_stale_observation_with_a_recent_failed_refresh_is_not_fresh() {
         let shortlist = vec!["a".to_owned()];
-        // Observed 400s ago (stale), last attempted 10s ago (a failed
-        // refresh wrote the clock). The pre-fix code computed age from
-        // the attempt: 10s < 300s → Reuse — the dead RTT read fresh.
-        let state: BTreeMap<_, _> = [endpoint_full("a", Some(42), 10_000, 1_000)].into();
-        let now = 401_000;
+        // Observed 399s ago (stale), last ATTEMPTED 10s ago (a failed
+        // refresh wrote the clock). Pre-fix computed age from the
+        // attempt: 10s < 300s → Reuse — the dead RTT read fresh.
+        let state: BTreeMap<_, _> = [endpoint_full("a", Some(42), 390_000, 1_000)].into();
+        let now = 400_000;
         let decisions = plan_run(&shortlist, &state, &ProbeBudget::default(), now);
         assert_eq!(
             decisions["a"],
-            ProbeDecision::Probe,
-            "the reuse window measures from the OBSERVATION (400s old = stale), not the \
-             recent failed attempt"
+            ProbeDecision::RateLimited,
+            "stale observation + recent attempt: the hammering guard holds (the prior \
+             RTT still serves via the passthrough); the attempt age never refreshes \
+             the observation"
         );
+    }
+
+    /// Codex PR#9 round 3 (P1): a stale-observation endpoint whose
+    /// attempt is INSIDE the interval must not be re-probed — the
+    /// pre-fix arm decided Probe solely on observation staleness,
+    /// ignoring the attempt clock (duplicate probing for the most
+    /// common state: a prior failed refresh).
+    #[test]
+    fn a_stale_observation_inside_the_attempt_interval_is_rate_limited_not_probed() {
+        let shortlist = vec!["a".to_owned()];
+        // Observed 429s ago (stale — would probe on staleness alone),
+        // attempted 30s ago (inside the 60 s interval).
+        let state: BTreeMap<_, _> = [endpoint_full("a", Some(42), 370_000, 1_000)].into();
+        let now = 400_000;
+        let decisions = plan_run(&shortlist, &state, &ProbeBudget::default(), now);
+        assert_eq!(
+            decisions["a"],
+            ProbeDecision::RateLimited,
+            "the hammering guard gates STALE-observation re-probes too, not just \
+             never-answered endpoints"
+        );
+        // Past the interval: the refresh may proceed.
+        let now = 440_000;
+        let decisions = plan_run(&shortlist, &state, &ProbeBudget::default(), now);
+        assert_eq!(decisions["a"], ProbeDecision::Probe);
     }
 
     /// The RateLimited passthrough (GAP-2): a prior observation
