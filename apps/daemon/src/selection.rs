@@ -74,6 +74,7 @@ use std::time::Instant;
 
 use protonwire_api::entitlements::EntitlementsApi;
 
+use protonwire_api::entitlements::EntitlementsError;
 use protonwire_api::entitlements::PlanTier;
 use protonwire_api::entitlements::VpnAccess;
 use protonwire_api::entitlements::VpnEntitlements;
@@ -153,12 +154,12 @@ pub struct EntitlementProvider {
 
 /// The single-flight slot: the worker stores the result ONCE; every
 /// waiter takes a clone of the SAME outcome (broadcast semantics over
-/// a Mutex+Condvar pair). The error arm carries the error's Display
-/// string (the error type is not Clone) — the composition re-wraps it.
+/// a Mutex+Condvar pair). The error arm carries the structured
+/// RpcError (Clone) so variants survive the broadcast.
 type EntitlementFetchSlot = Arc<EntitlementFetchShared>;
 
 struct EntitlementFetchShared {
-    result: Mutex<Option<Result<VpnEntitlements, String>>>,
+    result: Mutex<Option<Result<VpnEntitlements, RpcError>>>,
     done: std::sync::Condvar,
 }
 
@@ -199,7 +200,22 @@ impl EntitlementProvider {
         });
         let worker_shared = Arc::clone(&shared);
         std::thread::spawn(move || {
-            let outcome = adapter.fetch().map_err(|error| error.to_string());
+            // The structured error mapping happens ONCE in the worker
+            // (Codex PR#9 round 6, P2): RpcError is Clone, so every
+            // waiter receives the VARIANT-preserving outcome — Transport
+            // → NetworkUnavailable, Api/Malformed → Internal — never the
+            // everything-is-a-network-outage flattening the String arm
+            // caused.
+            let outcome = adapter.fetch().map_err(|error| match error {
+                EntitlementsError::Transport(detail) => RpcError::new(
+                    RpcErrorCode::NetworkUnavailable,
+                    format!("entitlements read failed: {detail}"),
+                ),
+                other => RpcError::new(
+                    RpcErrorCode::Internal,
+                    format!("entitlements read failed: {other}"),
+                ),
+            });
             let mut result = worker_shared.result.lock().expect("fetch result lock");
             *result = Some(outcome);
             worker_shared.done.notify_all();
@@ -217,7 +233,7 @@ impl EntitlementProvider {
         &self,
         slot: &EntitlementFetchSlot,
         budget: Duration,
-    ) -> Option<Result<VpnEntitlements, String>> {
+    ) -> Option<Result<VpnEntitlements, RpcError>> {
         let guard = slot.result.lock().expect("fetch result lock");
         if guard.is_some() {
             return guard.deref().clone();
@@ -234,8 +250,18 @@ impl EntitlementProvider {
     /// once the slot is cleared by the LAST waiter to observe the
     /// outcome (the caller clears after consuming; a racing earlier
     /// timeout leaves the slot for the landed result to be observed).
-    fn clear_single_flight(&self) {
-        self.in_flight.lock().expect("in-flight slot lock").take();
+    fn clear_single_flight(&self, consumed: &EntitlementFetchSlot) {
+        // Clear ONLY the slot whose outcome this waiter consumed
+        // (Codex PR#9 round 6, P1): an unconditional take() let an old
+        // waiter remove a NEW slot another request had installed after
+        // the first clear — a third worker could then spawn while the
+        // second still fetched, defeating the one-worker bound.
+        let mut slot = self.in_flight.lock().expect("in-flight slot lock");
+        if let Some(current) = slot.as_ref()
+            && Arc::ptr_eq(current, consumed)
+        {
+            *slot = None;
+        }
     }
 
     /// The last successfully composed snapshot (the network-free
@@ -471,11 +497,12 @@ impl SelectionEngine {
         );
         let slot = self.entitlement.single_flight_slot()?;
         let outcome = self.entitlement.wait_for_outcome(&slot, budget);
-        // The slot clears only when the outcome LANDED for this waiter;
-        // a budget-timeout waiter leaves it (the landed result serves
-        // the next waiter — broadcast).
+        // The slot clears only when the outcome LANDED for this waiter
+        // AND the cell still holds THIS slot (a racing waiter's clear +
+        // a new install must survive); a budget-timeout waiter leaves
+        // it (the landed result serves the next waiter — broadcast).
         if outcome.is_some() {
-            self.entitlement.clear_single_flight();
+            self.entitlement.clear_single_flight(&slot);
         }
         let Some(result) = outcome else {
             tracing::warn!(
@@ -513,10 +540,10 @@ impl SelectionEngine {
                 self.entitlement.store_snapshot(entitlements.clone());
                 Ok(Some(entitlements))
             }
-            Err(detail) => Err(RpcError::new(
-                RpcErrorCode::NetworkUnavailable,
-                format!("entitlements read failed: {detail}"),
-            )),
+            // The worker pre-mapped the variant (Transport →
+            // NetworkUnavailable; Api/Malformed → Internal); the
+            // clone preserves it.
+            Err(rpc) => Err(rpc),
         }
     }
 
@@ -1056,6 +1083,37 @@ impl SelectionEngine {
                 reason: Some("no-catalog".into()),
             };
         };
+        // The GROUP-LEVEL entitlement gate (Codex PR#9 round 6, P2):
+        // a PaidLocationSelection group is unavailable to non-paid
+        // plans regardless of member tiers — resolve() refuses the
+        // same request, and availability must agree with it (the
+        // tier-0-in-region shape read available under a cached free
+        // snapshot even though selecting it refuses). The cached
+        // snapshot's plan_tier is the network-free source; None (no
+        // snapshot) leaves the tier unknown — the paid-location answer
+        // is then unknown-unavailable, never a false available.
+        if entry.entitlement == protonwire_core::groups::GroupEntitlement::PaidLocationSelection {
+            let paid = self
+                .entitlement
+                .cached_snapshot()
+                .as_ref()
+                .map(|snapshot| snapshot.plan_tier == Some(PlanTier::Paid));
+            match paid {
+                Some(true) => {}
+                Some(false) => {
+                    return GroupAvailability {
+                        available: false,
+                        reason: Some("entitlement".into()),
+                    };
+                }
+                None => {
+                    return GroupAvailability {
+                        available: false,
+                        reason: Some("entitlement-composition-missing".into()),
+                    };
+                }
+            }
+        }
         let cached_country = self.cached_location_country();
         let sources = PhysicalCountrySources {
             explicit_request: None,
@@ -2068,7 +2126,7 @@ mod tests {
         assert!(!asia.availability.available);
         assert_eq!(
             asia.availability.reason.as_deref(),
-            Some("account-tier"),
+            Some("entitlement"),
             "the precise FR-23S entitlement reason"
         );
         let europe = catalog
@@ -2077,15 +2135,19 @@ mod tests {
             .find(|group| group.id == "protonwire:fastest-europe")
             .unwrap();
         assert!(
-            europe.availability.available,
-            "the fixture's free-tier Europe members stay reachable"
+            !europe.availability.available,
+            "Europe is likewise a paid-location group — unavailable to the free account"
         );
+        assert_eq!(europe.availability.reason.as_deref(), Some("entitlement"));
 
         // The paid account keeps asia available.
         let engine = default_engine();
         engine
             .entitlement()
             .install(Arc::new(FakeEntitlements::paid()));
+        // Prime the network-free cache (the listing reads the CACHED
+        // snapshot — round 4's contract).
+        drop(engine.resolve(&country("CH"), &modifiers()));
         let catalog = engine.groups_catalog().expect("the registry serves");
         let asia = catalog
             .groups
@@ -2112,7 +2174,7 @@ mod tests {
         assert!(!details.summary.availability.available);
         assert_eq!(
             details.summary.availability.reason.as_deref(),
-            Some("account-tier")
+            Some("entitlement")
         );
     }
 
@@ -2780,19 +2842,33 @@ mod tests {
             .iter()
             .find(|group| group.id == "protonwire:fastest-asia")
             .unwrap();
+        // The regional group is GROUP-LEVEL entitlement-gated (round 6):
+        // no cached snapshot on this engine → composition-missing, never
+        // a false available — even though the fixture's JP#1 is a
+        // tier-0 member.
         assert!(
-            asia.availability.available,
-            "the fixture's JP#1 is a member"
+            !asia.availability.available,
+            "the regional group is entitlement-gated (no snapshot composed on this engine)"
+        );
+        assert_eq!(
+            asia.availability.reason.as_deref(),
+            Some("entitlement-composition-missing")
         );
 
-        // GB/CH/SE are European: the Europe group IS available over the
-        // fixture; South America has no member at all.
+        // GB/CH/SE are European, but Europe is a PaidLocationSelection
+        // regional group under the round-6 gate: with no snapshot
+        // composed on this engine it reports composition-missing (never
+        // a false available); South America has no member at all.
         let europe = catalog
             .groups
             .iter()
             .find(|group| group.id == "protonwire:fastest-europe")
             .unwrap();
-        assert!(europe.availability.available);
+        assert!(!europe.availability.available);
+        assert_eq!(
+            europe.availability.reason.as_deref(),
+            Some("entitlement-composition-missing")
+        );
         let south_america = catalog
             .groups
             .iter()
@@ -2801,8 +2877,8 @@ mod tests {
         assert!(!south_america.availability.available);
         assert_eq!(
             south_america.availability.reason.as_deref(),
-            Some("no-eligible-server"),
-            "no fixture member in South America"
+            Some("entitlement-composition-missing"),
+            "the regional gate precedes the member check (no snapshot on this engine)"
         );
     }
 
