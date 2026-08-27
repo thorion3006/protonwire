@@ -264,26 +264,24 @@ impl SystemConfig {
         // it (or past it) answers with the transport timeout instead of
         // a selection — the Codex PR-9 bound. The floor keeps a round
         // from degenerating into never-probe (a sanity bar, disclosed).
-        if !(250..=9500).contains(&self.server_selection.latency_probe.round_deadline_ms) {
-            violations.push(format!(
-                "server_selection.latency_probe.round_deadline_ms must be between 250 and 9500 \
-                 (found {}) — the whole probe round must finish under the 10 s IPC request \
-                 deadline",
-                self.server_selection.latency_probe.round_deadline_ms
-            ));
+        if let Some(violation) = ipc_budget_violation(
+            "server_selection.latency_probe.round_deadline_ms",
+            u64::from(self.server_selection.latency_probe.round_deadline_ms),
+            "the whole probe round must finish",
+        ) {
+            violations.push(violation);
         }
         // The entitlement composition budget shares the IPC-deadline
         // logic (Codex PR#9, P1): the adapter's fetch timeout is 30 s;
         // the per-request composition must give up (tier-None) inside
         // the 10 s request deadline, leaving headroom for the
         // selection itself.
-        if !(250..=9500).contains(&self.server_selection.entitlement_fetch_budget_ms) {
-            violations.push(format!(
-                "server_selection.entitlement_fetch_budget_ms must be between 250 and 9500 \
-                 (found {}) — the entitlement composition must stay under the 10 s IPC \
-                 request deadline",
-                self.server_selection.entitlement_fetch_budget_ms
-            ));
+        if let Some(violation) = ipc_budget_violation(
+            "server_selection.entitlement_fetch_budget_ms",
+            self.server_selection.entitlement_fetch_budget_ms,
+            "the entitlement composition must stay",
+        ) {
+            violations.push(violation);
         }
         if self.features.port_forwarding && self.features.nat == NatMode::Moderate {
             violations.push(
@@ -544,6 +542,22 @@ impl SystemConfig {
             ("profiles.default.selection.require", Authority::PerUser),
         ]
     }
+}
+
+/// One selection-plane budget that must fit under the IPC request
+/// deadline (10 s — the IPC client's default request timeout; store
+/// cannot depend on the ipc crate, so the bar is recorded here, once,
+/// for every budget the selection plane composes per request). The
+/// ceiling leaves the RPC round trip its own room; the floor keeps a
+/// budget from degenerating into never-run. One message template for
+/// both budget fields the Codex PR-9 rounds added.
+fn ipc_budget_violation(field: &str, value: u64, purpose: &str) -> Option<String> {
+    (!(250..=9_500).contains(&value)).then(|| {
+        format!(
+            "{field} must be between 250 and 9500 (found {value}) — {purpose} under the \
+             10 s IPC request deadline"
+        )
+    })
 }
 
 /// Configuration loading failures.
