@@ -54,8 +54,10 @@ impl Default for ProbeBudget {
     }
 }
 
-/// The per-endpoint prior state the planner consults.
-#[derive(Debug, Clone, Copy)]
+/// The per-endpoint prior state the planner consults. The all-zero
+/// row (no observation, never attempted) is the legitimate unknown
+/// endpoint state.
+#[derive(Debug, Clone, Copy, Default)]
 pub struct EndpointState {
     /// The last observation, when one exists.
     pub observation: Option<Observation>,

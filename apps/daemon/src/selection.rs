@@ -508,11 +508,7 @@ impl SelectionEngine {
                 if decisions.get(endpoint) == Some(&ProbeDecision::Probe) {
                     guard
                         .entry(endpoint.clone())
-                        .or_insert(EndpointState {
-                            observation: None,
-                            observed_at_ms: 0,
-                            last_attempt_ms: 0,
-                        })
+                        .or_default()
                         .last_attempt_ms = now;
                 }
             }
@@ -571,11 +567,7 @@ impl SelectionEngine {
                 continue;
             }
             if let Some(observation) = observed.get(endpoint) {
-                let entry = guard.entry(endpoint.clone()).or_insert(EndpointState {
-                    observation: None,
-                    observed_at_ms: 0,
-                    last_attempt_ms: 0,
-                });
+                let entry = guard.entry(endpoint.clone()).or_default();
                 entry.observation = Some(*observation);
                 entry.observed_at_ms = answered_at;
             }
