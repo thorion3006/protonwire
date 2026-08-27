@@ -506,10 +506,7 @@ impl SelectionEngine {
             let decisions = plan_run(&shortlist, &state, &budget, now);
             for endpoint in &shortlist {
                 if decisions.get(endpoint) == Some(&ProbeDecision::Probe) {
-                    guard
-                        .entry(endpoint.clone())
-                        .or_default()
-                        .last_attempt_ms = now;
+                    guard.entry(endpoint.clone()).or_default().last_attempt_ms = now;
                 }
             }
             (state, decisions)
@@ -619,9 +616,6 @@ impl SelectionEngine {
             .collect()
     }
 
-    /// Resolves a selection request end to end (the `Select` handler's
-    /// body). Read-only against daemon state except the bounded probe
-    /// round a latency-dependent ranking triggers.
     /// The single request deadline spanning the entitlement
     /// composition and the probe round (Codex PR#9 round 3, P1): the
     /// IPC client's default request timeout is 10 s
@@ -631,6 +625,9 @@ impl SelectionEngine {
         9_000
     }
 
+    /// Resolves a selection request end to end (the `Select` handler's
+    /// body). Read-only against daemon state except the bounded probe
+    /// round a latency-dependent ranking triggers.
     pub fn resolve(
         &self,
         target: &ConnectTarget,
@@ -703,7 +700,7 @@ impl SelectionEngine {
                     optional_features,
                     required_protocol,
                 )?;
-                (request, Some((provenance, resolved.group.origin)))
+                (request, Some(provenance))
             }
             direct => (
                 direct_request(
@@ -755,38 +752,15 @@ impl SelectionEngine {
             context.random_entropy = Some(Self::os_entropy()?);
         }
 
-        let outcome =
-            protonwire_core::selection::select(&catalog, &request, &context).map_err(|error| {
-                // The PF empty-capability composition's honest
-                // explanation rides the ConstraintsNotSatisfied message
-                // when the PF constraint was requested (the bare report
-                // says "required-features" without saying why nothing
-                // passed).
-                if pf_requested
-                    && let SelectionError::ConstraintsNotSatisfied { ref report } = error
-                {
-                    let mut enriched = RpcError::new(
-                        RpcErrorCode::NoEligibleServer,
-                        format!(
-                            "no eligible server: {report}; the port-forwarding constraint \
-                             eliminated every candidate because no per-server \
-                             port-forwarding capability source exists yet (M6's NAT-PMP \
-                             lane supplies it — the composition is honestly empty, never \
-                             fabricated)"
-                        ),
-                    );
-                    enriched.details = report_details(report);
-                    return enriched;
-                }
-                selection_error_to_rpc(error)
-            })?;
+        let outcome = protonwire_core::selection::select(&catalog, &request, &context)
+            .map_err(|error| selection_error_to_rpc_pf_explained(error, pf_requested))?;
         let winner = outcome
             .ranked
             .first()
             .ok_or_else(|| RpcError::new(RpcErrorCode::Internal, "selection returned no winner"))?;
 
         let selector = match &group {
-            Some((provenance, _)) => ResolvedSelector {
+            Some(provenance) => ResolvedSelector {
                 target: "group".into(),
                 detail: Some(provenance.group_id.clone()),
                 policy: policy_token(&request.policy),
@@ -817,7 +791,7 @@ impl SelectionEngine {
                     .as_ref()
                     .map(|_| protonwire_core::groups::catalog_revision().to_owned()),
             },
-            group: group.map(|(provenance, _)| provenance),
+            group,
             selector,
             hard_filters: HardFiltersReport {
                 considered: outcome.report.considered(),
@@ -1468,6 +1442,30 @@ fn selection_error_to_rpc(error: SelectionError) -> RpcError {
             RpcError::new(RpcErrorCode::InvalidParams, error.to_string())
         }
     }
+}
+
+/// [`selection_error_to_rpc`] with the PF empty-capability composition's
+/// honest explanation attached when the request carried the
+/// port-forwarding constraint: the bare FR-22 report says
+/// "required-features" without saying WHY nothing passed, so the
+/// ConstraintsNotSatisfied message names the M6 capability source and
+/// the structured report still rides `details`.
+fn selection_error_to_rpc_pf_explained(error: SelectionError, pf_requested: bool) -> RpcError {
+    if pf_requested && let SelectionError::ConstraintsNotSatisfied { ref report } = error {
+        let mut enriched = RpcError::new(
+            RpcErrorCode::NoEligibleServer,
+            format!(
+                "no eligible server: {report}; the port-forwarding constraint \
+                 eliminated every candidate because no per-server \
+                 port-forwarding capability source exists yet (M6's NAT-PMP \
+                 lane supplies it — the composition is honestly empty, never \
+                 fabricated)"
+            ),
+        );
+        enriched.details = report_details(report);
+        return enriched;
+    }
+    selection_error_to_rpc(error)
 }
 
 #[cfg(test)]
