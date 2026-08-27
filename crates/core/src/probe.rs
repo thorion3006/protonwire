@@ -176,8 +176,9 @@ pub fn run_planned(
     decisions: &BTreeMap<String, ProbeDecision>,
     state: &BTreeMap<String, EndpointState>,
     executor: &mut dyn ProbeExecutor,
-) -> BTreeMap<String, Observation> {
+) -> ProbeRun {
     let mut table = BTreeMap::new();
+    let mut attempted = Vec::new();
     for endpoint in shortlist {
         match decisions.get(endpoint) {
             Some(ProbeDecision::Reuse(obs)) => {
@@ -196,6 +197,7 @@ pub fn run_planned(
                 if executor.cancelled() {
                     break;
                 }
+                attempted.push(endpoint.clone());
                 if let Some(rtt) = executor.probe(endpoint) {
                     table.insert(endpoint.clone(), Observation { rtt });
                 }
@@ -205,7 +207,26 @@ pub fn run_planned(
             None => {}
         }
     }
-    table
+    ProbeRun {
+        observations: table,
+        attempted,
+    }
+}
+
+/// One planned run's outcome: the merged observation table (reused
+/// priors plus fresh answers) AND the endpoints whose `probe()` was
+/// actually started — the reservation-release contract (Codex PR#9
+/// P2: a deadline cut before an endpoint's turn means its daemon-side
+/// reservation must be released; an attempted-but-unanswered endpoint
+/// keeps its reservation — the hammering guard's contract).
+#[derive(Debug, Clone)]
+pub struct ProbeRun {
+    /// The merged observations, keyed by logical id.
+    pub observations: BTreeMap<String, Observation>,
+    /// The endpoints whose `probe()` actually started (answered or
+    /// not) — reservations for OTHER planned endpoints should be
+    /// released by the caller.
+    pub attempted: Vec<String>,
 }
 
 #[cfg(test)]
@@ -378,7 +399,8 @@ mod tests {
             ProbeDecision::RateLimited,
             "the cap (8 probes budgeted before it) skips the 9th"
         );
-        let table = run_planned(&shortlist, &decisions, &state, &mut AnswerAll);
+        let run = run_planned(&shortlist, &decisions, &state, &mut AnswerAll);
+        let table = &run.observations;
         assert_eq!(
             table.get("zz"),
             Some(&Observation {
@@ -402,7 +424,8 @@ mod tests {
         let decisions: BTreeMap<_, _> = [("a".to_owned(), ProbeDecision::Probe)].into();
         let state = BTreeMap::new();
         let shortlist = vec!["a".to_owned()];
-        let table = run_planned(&shortlist, &decisions, &state, &mut TimeoutAll);
+        let run = run_planned(&shortlist, &decisions, &state, &mut TimeoutAll);
+        let table = &run.observations;
         assert!(
             !table.contains_key("a"),
             "a timeout is the absence of an observation, never an offline verdict (FR-19B)"
@@ -437,12 +460,13 @@ mod tests {
         ]
         .into();
         let state = BTreeMap::new();
-        let table = run_planned(
+        let run = run_planned(
             &shortlist,
             &decisions,
             &state,
             &mut CancelAfterOne { answered: 0 },
         );
+        let table = &run.observations;
         assert!(
             table.contains_key("z"),
             "the HIGH-priority endpoint is probed first (shortlist order)"
@@ -476,12 +500,13 @@ mod tests {
         .into();
         let state = BTreeMap::new();
         let shortlist = vec!["a".to_owned(), "b".to_owned()];
-        let table = run_planned(
+        let run = run_planned(
             &shortlist,
             &decisions,
             &state,
             &mut CancelAfterOne { answered: 0 },
         );
+        let table = &run.observations;
         assert_eq!(table.len(), 1, "the answered prefix survives");
         assert!(table.contains_key("a"));
     }

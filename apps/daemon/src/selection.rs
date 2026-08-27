@@ -356,16 +356,41 @@ impl SelectionEngine {
         let Some(adapter) = self.entitlement.current() else {
             return Ok(None);
         };
-        adapter.fetch().map(Some).map_err(|error| match error {
-            EntitlementsError::Transport(detail) => RpcError::new(
-                RpcErrorCode::NetworkUnavailable,
-                format!("entitlements read failed: {detail}"),
-            ),
-            other => RpcError::new(
-                RpcErrorCode::Internal,
-                format!("entitlements read failed: {other}"),
-            ),
-        })
+        // The composition is RPC-DEADLINE-BOUNDED (Codex PR#9, P1): the
+        // adapter's own fetch timeout is 30 s while the IPC client's
+        // request deadline is 10 s — an unbounded synchronous fetch
+        // would poison the client connection before the daemon replies.
+        // A slow endpoint degrades THIS request to tier-None (the
+        // documented None semantics: no guessing, never a hang); the
+        // next request re-attempts the composition.
+        let budget = std::time::Duration::from_millis(
+            self.config.server_selection.entitlement_fetch_budget_ms,
+        );
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(adapter.fetch());
+        });
+        match rx.recv_timeout(budget) {
+            Ok(Ok(entitlements)) => Ok(Some(entitlements)),
+            Ok(Err(error)) => Err(match error {
+                EntitlementsError::Transport(detail) => RpcError::new(
+                    RpcErrorCode::NetworkUnavailable,
+                    format!("entitlements read failed: {detail}"),
+                ),
+                other => RpcError::new(
+                    RpcErrorCode::Internal,
+                    format!("entitlements read failed: {other}"),
+                ),
+            }),
+            Err(_) => {
+                tracing::warn!(
+                    budget_ms = self.config.server_selection.entitlement_fetch_budget_ms,
+                    "entitlement composition exceeded its RPC-deadline budget; \
+                     degrading this request to tier-None (no guessing, never a hang)"
+                );
+                Ok(None)
+            }
+        }
     }
 
     /// The account-entitlement tier over the S8 wire `MaxTier` (0
@@ -494,19 +519,41 @@ impl SelectionEngine {
             connect,
             round_deadline,
         };
-        let observed = run_planned(&shortlist, &decisions, &state, &mut executor);
+        let run = run_planned(&shortlist, &decisions, &state, &mut executor);
+        let observed = run.observations;
 
-        // The write-back: observations only. The attempt clock moved at
-        // the reservation (before execution); answered endpoints
-        // additionally record the observation and its answer time (the
-        // reuse window measures from the observation, the rate limit
-        // from the reserved attempt).
+        // The write-back: observations only, plus the reservation
+        // RELEASE for planned-but-never-attempted endpoints (Codex
+        // PR#9, P2: a deadline cut before an endpoint's turn must not
+        // rate-limit it for the 60 s interval — the untouched endpoint
+        // returns to probeable immediately; an attempted one keeps its
+        // reservation, the hammering guard's contract).
         let answered_at = (self.now_ms)();
+        let attempted: std::collections::BTreeSet<&str> =
+            run.attempted.iter().map(String::as_str).collect();
         let mut guard = self.probes.state.lock().expect("probe table lock");
         for endpoint in &shortlist {
-            if decisions.get(endpoint) == Some(&ProbeDecision::Probe)
-                && let Some(observation) = observed.get(endpoint)
-            {
+            if decisions.get(endpoint) != Some(&ProbeDecision::Probe) {
+                continue;
+            }
+            if !attempted.contains(endpoint.as_str()) {
+                // Never attempted: release the reservation — restore
+                // the prior clock (0 when the reservation created the
+                // entry; the pre-round value otherwise — the snapshot
+                // in `state` holds it).
+                match state.get(endpoint) {
+                    Some(prior) => {
+                        if let Some(entry) = guard.get_mut(endpoint) {
+                            entry.last_attempt_ms = prior.last_attempt_ms;
+                        }
+                    }
+                    None => {
+                        guard.remove(endpoint);
+                    }
+                }
+                continue;
+            }
+            if let Some(observation) = observed.get(endpoint) {
                 let entry = guard.entry(endpoint.clone()).or_insert(EndpointState {
                     observation: None,
                     observed_at_ms: 0,
