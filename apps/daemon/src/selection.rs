@@ -67,12 +67,15 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::RwLock;
+use std::sync::mpsc;
 use std::time::Duration;
 use std::time::Instant;
 
 use protonwire_api::entitlements::EntitlementsApi;
 use protonwire_api::entitlements::EntitlementsError;
 use protonwire_api::entitlements::PlanTier;
+use protonwire_api::entitlements::VpnAccess;
+use protonwire_api::entitlements::VpnEntitlements;
 use protonwire_core::groups::GroupTarget;
 use protonwire_core::groups::PhysicalCountrySources;
 use protonwire_core::groups::PolicyProvenance;
@@ -129,9 +132,22 @@ use protonwire_store::location::LocationCacheError;
 /// `&dyn EntitlementsApi` once the engine wiring lands. An empty cell
 /// leaves the PF entitlement seam uncomposed — the pure core's typed
 /// refusal, never a guessed entitlement.
+///
+/// The fetch is SINGLE-FLIGHT (Codex PR#9 round 4, P1): at most one
+/// detached worker exists at a time — concurrent callers share that
+/// worker's result channel, so repeated or concurrent requests cannot
+/// accumulate unbounded threads and upstream calls.
 #[derive(Default)]
 pub struct EntitlementProvider {
     inner: RwLock<Option<Arc<dyn EntitlementsApi>>>,
+    /// The in-flight fetch's shared receiver (the single-flight slot:
+    /// concurrent callers wait on the SAME result — at most one
+    /// worker exists per instant).
+    in_flight:
+        Mutex<Option<Arc<Mutex<mpsc::Receiver<Result<VpnEntitlements, EntitlementsError>>>>>>,
+    /// The last successfully composed snapshot (the network-free
+    /// listing's tier source — never initiating traffic).
+    cached: Mutex<Option<VpnEntitlements>>,
 }
 
 impl EntitlementProvider {
@@ -146,6 +162,56 @@ impl EntitlementProvider {
             .read()
             .expect("entitlement provider lock")
             .clone()
+    }
+
+    /// SINGLE-FLIGHT bounded fetch (Codex PR#9 round 4, P1): the first
+    /// caller spawns ONE detached worker and parks its receiver in the
+    /// slot; concurrent callers take a clone of that SAME receiver, so
+    /// at most one worker (and one upstream fetch) exists per instant
+    /// — repeated or concurrent requests cannot accumulate unbounded
+    /// threads. The slot clears when the last receiver drops or the
+    /// result is consumed (recv consumes; each waiter gets its own
+    /// cloned receiver so all observe the same result).
+    fn single_flight_receiver(
+        &self,
+    ) -> Result<Arc<Mutex<mpsc::Receiver<Result<VpnEntitlements, EntitlementsError>>>>, RpcError>
+    {
+        let mut slot = self.in_flight.lock().expect("in-flight slot lock");
+        if let Some(existing) = slot.as_ref() {
+            return Ok(Arc::clone(existing));
+        }
+        let Some(adapter) = self.current() else {
+            return Err(RpcError::new(
+                RpcErrorCode::Internal,
+                "single-flight receiver requested with no adapter installed",
+            ));
+        };
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(adapter.fetch());
+        });
+        let shared = Arc::new(Mutex::new(rx));
+        *slot = Some(Arc::clone(&shared));
+        Ok(shared)
+    }
+
+    /// Clears the single-flight slot (called after a consumed result,
+    /// so the next request starts a fresh worker).
+    fn clear_single_flight(&self) {
+        self.in_flight.lock().expect("in-flight slot lock").take();
+    }
+
+    /// The last successfully composed snapshot (the network-free
+    /// surfaces' tier source — Codex PR#9 round 4, P2). None until
+    /// the first successful composition.
+    fn cached_snapshot(&self) -> Option<VpnEntitlements> {
+        self.cached.lock().expect("entitlement cache lock").clone()
+    }
+
+    /// Stores a successfully composed snapshot for the network-free
+    /// surfaces.
+    fn store_snapshot(&self, snapshot: VpnEntitlements) {
+        *self.cached.lock().expect("entitlement cache lock") = Some(snapshot);
     }
 }
 
@@ -350,32 +416,49 @@ impl SelectionEngine {
     /// installed — the session lane's M4 wiring): every seam the
     /// snapshot feeds then composes as uncomposed (the PF constraint
     /// refuses typed; the tier stage eliminates nothing).
-    fn entitlement_composition(
-        &self,
-    ) -> Result<Option<protonwire_api::entitlements::VpnEntitlements>, RpcError> {
-        let Some(adapter) = self.entitlement.current() else {
+    fn entitlement_composition(&self) -> Result<Option<VpnEntitlements>, RpcError> {
+        if self.entitlement.current().is_none() {
             // No adapter installed = the login-free surface: no
             // session exists, no account, no tier — None is the
             // documented semantics (queryable without guessing).
             return Ok(None);
-        };
-        // The composition is RPC-DEADLINE-BOUNDED (Codex PR#9, P1): the
-        // adapter's own fetch timeout is 30 s while the IPC client's
-        // request deadline is 10 s — an unbounded synchronous fetch
-        // would poison the client connection before the daemon replies.
-        // A budget miss is FAIL-CLOSED (Codex PR#9 round 3, P1): an
-        // installed adapter whose entitlements cannot be read must
-        // REFUSE — returning None would let a free account select
-        // paid-tier servers whenever the entitlement service is slow.
+        }
+        // SINGLE-FLIGHT (Codex PR#9 round 4, P1): concurrent callers
+        // share one worker's channel — no thread-per-request
+        // accumulation. RPC-DEADLINE-BOUNDED (round 3, P1): a budget
+        // miss is FAIL-CLOSED. An unusable snapshot (round 4, P1:
+        // NoAccess/Waitlisted, or an absent MaxTier) is likewise a
+        // typed refusal — never a tier-less selection.
         let budget = std::time::Duration::from_millis(
             self.config.server_selection.entitlement_fetch_budget_ms,
         );
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let _ = tx.send(adapter.fetch());
-        });
-        match rx.recv_timeout(budget) {
-            Ok(Ok(entitlements)) => Ok(Some(entitlements)),
+        let rx = self.entitlement.single_flight_receiver()?;
+        let result = rx
+            .lock()
+            .expect("single-flight receiver lock")
+            .recv_timeout(budget);
+        self.entitlement.clear_single_flight();
+        match result {
+            Ok(Ok(entitlements)) => {
+                if entitlements.vpn_access != VpnAccess::Active {
+                    return Err(RpcError::new(
+                        RpcErrorCode::EntitlementMissing,
+                        format!(
+                            "the account's VPN access is {:?} — no server may be selected",
+                            entitlements.vpn_access
+                        ),
+                    ));
+                }
+                if entitlements.max_tier.is_none() {
+                    return Err(RpcError::new(
+                        RpcErrorCode::EntitlementMissing,
+                        "the entitlement snapshot carries no MaxTier — the account tier \
+                         cannot be composed safely; retry after the next refresh",
+                    ));
+                }
+                self.entitlement.store_snapshot(entitlements.clone());
+                Ok(Some(entitlements))
+            }
             Ok(Err(error)) => Err(match error {
                 EntitlementsError::Transport(detail) => RpcError::new(
                     RpcErrorCode::NetworkUnavailable,
@@ -413,6 +496,19 @@ impl SelectionEngine {
         entitlements: Option<&protonwire_api::entitlements::VpnEntitlements>,
     ) -> Option<i8> {
         entitlements
+            .and_then(|snapshot| snapshot.max_tier)
+            .map(|tier| tier.min(i64::from(i8::MAX)) as i8)
+    }
+
+    /// The CACHED entitlement tier for network-free surfaces (the
+    /// built-in listing, Codex PR#9 round 4, P2): reads the last
+    /// successfully composed snapshot without initiating any traffic.
+    /// None when no snapshot exists — the listing reports the honest
+    /// unknown, never a guessed tier, never a blocked RPC.
+    fn cached_entitlement_tier(&self) -> Option<i8> {
+        self.entitlement
+            .cached_snapshot()
+            .as_ref()
             .and_then(|snapshot| snapshot.max_tier)
             .map(|tier| tier.min(i64::from(i8::MAX)) as i8)
     }
@@ -658,6 +754,23 @@ impl SelectionEngine {
         let entitlements = self.entitlement_composition()?;
         let pf_entitled = Self::pf_entitlement(entitlements.as_ref());
         let account_tier = Self::account_tier(entitlements.as_ref());
+        // The GATEWAY authorization (Codex PR#9 round 4, P1): a gateway
+        // target requires the business/organization entitlement — the
+        // tier stage alone admits any online gateway within the numeric
+        // tier. None (login-free) and Some(false) both refuse; only an
+        // affirmative is_business proceeds.
+        if matches!(target, ConnectTarget::Gateway { .. })
+            && !entitlements
+                .as_ref()
+                .and_then(|snapshot| snapshot.is_business)
+                .unwrap_or(false)
+        {
+            return Err(RpcError::new(
+                RpcErrorCode::EntitlementMissing,
+                "gateway targets require a Proton Business (organization) entitlement — \
+                 this account is not entitled to dedicated servers",
+            ));
+        }
         let pf_requested = modifiers
             .required_features
             .contains(&SelectionFeature::PortForwarding)
@@ -832,13 +945,16 @@ impl SelectionEngine {
     /// The built-in group catalog with FR-23S availability (the
     /// `GroupsList` body). Served from core's registry — no network
     /// beyond the entitlement snapshot (FR-23R), no hard-coded lists
-    /// (FR-23I). A failed entitlement read fails the listing whole:
-    /// reporting paid-location groups available because the tier could
-    /// not be read would be the silent downgrade FR-23S forbids.
+    /// (FR-23I). NETWORK-FREE (Codex PR#9 round 4, P2): the built-in
+    /// listing reads only local state (the registry + the cached
+    /// catalog) — the entitlement tier comes from the CACHED snapshot
+    /// when one exists and is unknown otherwise (the listing reports
+    /// the honest unknown rather than initiating API traffic or
+    /// blocking on a slow entitlement service).
     pub fn groups_catalog(&self) -> Result<GroupsCatalog, RpcError> {
         let cached = self.cached_catalog()?;
         let weights = self.balanced_weights();
-        let account_tier = Self::account_tier(self.entitlement_composition()?.as_ref());
+        let account_tier = self.cached_entitlement_tier();
         let groups = protonwire_core::groups::all_groups()
             .iter()
             .map(|entry| {
@@ -945,7 +1061,7 @@ impl SelectionEngine {
                 .map(|(_, _, document)| document),
             entry,
             &weights,
-            Self::account_tier(self.entitlement_composition()?.as_ref()),
+            self.cached_entitlement_tier(),
         );
         let (target, target_detail) = group_target_render(&entry.target);
         Ok(Box::new(GroupDetails {
@@ -1843,13 +1959,19 @@ mod tests {
     /// fixture member is tier 2) reports UNAVAILABLE under a free
     /// account with the precise entitlement reason — pre-fix the
     /// availability path ignored entitlements entirely and asia read
-    /// available. Free-member groups (europe) stay available.
+    /// available. Free-member groups (europe) stay available. The
+    /// NETWORK-FREE listing (round 4, P2) uses the CACHED snapshot:
+    /// the test primes it with one resolve first (which composes and
+    /// stores), then the listing reads it without traffic.
     #[test]
     fn free_account_reports_paid_location_groups_unavailable() {
         let engine = default_engine();
         engine
             .entitlement()
             .install(Arc::new(FakeEntitlements::free()));
+        // Prime the cached snapshot (one network composition — the
+        // resolve that a logged-in session would have performed).
+        drop(engine.resolve(&country("CH"), &modifiers()));
         let catalog = engine.groups_catalog().expect("the registry serves");
         let asia = catalog
             .groups
@@ -1895,6 +2017,8 @@ mod tests {
         engine
             .entitlement()
             .install(Arc::new(FakeEntitlements::free()));
+        // Prime the cached snapshot (the network-free listing's source).
+        drop(engine.resolve(&country("CH"), &modifiers()));
         let details = engine
             .group_details("protonwire:fastest-asia")
             .expect("the group stays visible (FR-23S)");
