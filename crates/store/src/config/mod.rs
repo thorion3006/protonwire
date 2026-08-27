@@ -272,6 +272,19 @@ impl SystemConfig {
                 self.server_selection.latency_probe.round_deadline_ms
             ));
         }
+        // The entitlement composition budget shares the IPC-deadline
+        // logic (Codex PR#9, P1): the adapter's fetch timeout is 30 s;
+        // the per-request composition must give up (tier-None) inside
+        // the 10 s request deadline, leaving headroom for the
+        // selection itself.
+        if !(250..=9500).contains(&self.server_selection.entitlement_fetch_budget_ms) {
+            violations.push(format!(
+                "server_selection.entitlement_fetch_budget_ms must be between 250 and 9500 \
+                 (found {}) — the entitlement composition must stay under the 10 s IPC \
+                 request deadline",
+                self.server_selection.entitlement_fetch_budget_ms
+            ));
+        }
         if self.features.port_forwarding && self.features.nat == NatMode::Moderate {
             violations.push(
                 "features.port_forwarding is incompatible with features.nat=moderate".to_owned(),
@@ -423,6 +436,10 @@ impl SystemConfig {
             ),
             (
                 "server_selection.latency_probe.round_deadline_ms",
+                Authority::System,
+            ),
+            (
+                "server_selection.entitlement_fetch_budget_ms",
                 Authority::System,
             ),
             (
