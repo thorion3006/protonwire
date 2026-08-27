@@ -1534,7 +1534,7 @@ mod tests {
     fn engine_over(
         config: SystemConfig,
         now_ms: u64,
-        connect: fn(SocketAddr, Duration) -> Option<Duration>,
+        connect: impl Fn(SocketAddr, Duration) -> Option<Duration> + Send + Sync + 'static,
     ) -> SelectionEngine {
         let mut engine = SelectionEngine::new(
             Arc::new(config),
@@ -2365,36 +2365,25 @@ mod tests {
         // proof that thread planned probes over the pre-reservation
         // state — or 300 ms (the green case: the second round plans
         // nothing and never reaches the seam).
-        let mut engine = SelectionEngine::new(
-            Arc::new(SystemConfig::default()),
-            Path::new("/hermetic-unused"),
-            Path::new("/hermetic-unused"),
-        );
-        engine.now_ms = Box::new(|| 1_000_000);
-        {
+        let engine = {
             let calls = calls.clone();
             let parked_once = parked_once.clone();
-            engine.connect = Box::new(move |_addr, _timeout| {
-                let mine = calls.fetch_add(1, Ordering::SeqCst);
-                if !parked_once.swap(true, Ordering::SeqCst) {
-                    let deadline = Instant::now() + Duration::from_millis(300);
-                    while calls.load(Ordering::SeqCst) < 2 && Instant::now() < deadline {
-                        std::thread::sleep(Duration::from_millis(5));
+            engine_over(
+                SystemConfig::default(),
+                1_000_000,
+                move |_addr, _timeout| {
+                    let mine = calls.fetch_add(1, Ordering::SeqCst);
+                    if !parked_once.swap(true, Ordering::SeqCst) {
+                        let deadline = Instant::now() + Duration::from_millis(300);
+                        while calls.load(Ordering::SeqCst) < 2 && Instant::now() < deadline {
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
                     }
-                }
-                let _ = mine;
-                Some(Duration::from_millis(25))
-            });
-        }
-        engine.catalog_read = Box::new(|| {
-            Ok(Some(CachedCatalog {
-                schema_version: 1,
-                etag: Some("\"test-rev-1\"".to_owned()),
-                fetched_unix: 1_771_000_000,
-                body: catalog_body(),
-            }))
-        });
-        engine.location_read = Box::new(|| Ok(None));
+                    let _ = mine;
+                    Some(Duration::from_millis(25))
+                },
+            )
+        };
 
         // `country GB` shortlists exactly the three GB logicals.
         let target = country("GB");
