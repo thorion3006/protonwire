@@ -478,8 +478,14 @@ impl SelectionEngine {
     /// for the tier). `Ok(None)` = the cell is empty (no adapter
     /// installed — the session lane's M4 wiring): every seam the
     /// snapshot feeds then composes as uncomposed (the PF constraint
-    /// refuses typed; the tier stage eliminates nothing).
-    fn entitlement_composition(&self) -> Result<Option<VpnEntitlements>, RpcError> {
+    /// refuses typed; the tier stage eliminates nothing). The wait
+    /// clamps to `request_deadline`'s REMAINDER (round 7): the
+    /// configured budget only tightens it, never extends the wait
+    /// past the deadline `resolve()` arms.
+    fn entitlement_composition(
+        &self,
+        request_deadline: Instant,
+    ) -> Result<Option<VpnEntitlements>, RpcError> {
         if self.entitlement.current().is_none() {
             // No adapter installed = the login-free surface: no
             // session exists, no account, no tier — None is the
@@ -492,9 +498,16 @@ impl SelectionEngine {
         // miss is FAIL-CLOSED. An unusable snapshot (round 4, P1:
         // NoAccess/Waitlisted, or an absent MaxTier) is likewise a
         // typed refusal — never a tier-less selection.
-        let budget = std::time::Duration::from_millis(
+        let configured = std::time::Duration::from_millis(
             self.config.server_selection.entitlement_fetch_budget_ms,
         );
+        // DEADLINE CLAMP (Codex PR#9 round 7, P2): validation permits
+        // a 9.5 s budget while `resolve()` arms ONE 9 s request
+        // deadline spanning this composition and the probe round —
+        // min() keeps whichever bound EXPIRES FIRST, so a slow fetch
+        // gives up at the deadline's remainder (fail-closed), never
+        // overruns it toward the IPC client's 10 s timeout.
+        let budget = configured.min(request_deadline.saturating_duration_since(Instant::now()));
         let slot = self.entitlement.single_flight_slot()?;
         let outcome = self.entitlement.wait_for_outcome(&slot, budget);
         // The slot clears only when the outcome LANDED for this waiter
@@ -506,16 +519,16 @@ impl SelectionEngine {
         }
         let Some(result) = outcome else {
             tracing::warn!(
-                budget_ms = self.config.server_selection.entitlement_fetch_budget_ms,
-                "entitlement composition exceeded its RPC-deadline budget; refusing \
+                budget_ms = budget.as_millis() as u64,
+                "entitlement composition exceeded its deadline-clamped wait; refusing \
                  (fail-closed: an installed adapter's tier must never be guessed)"
             );
             return Err(RpcError::new(
                 RpcErrorCode::EntitlementMissing,
                 format!(
-                    "the entitlement read exceeded its {} ms budget — the account tier \
-                     cannot be composed safely; retry shortly",
-                    self.config.server_selection.entitlement_fetch_budget_ms
+                    "the entitlement read exceeded its {} ms wait (deadline-clamped) — the \
+                     account tier cannot be composed safely; retry shortly",
+                    budget.as_millis()
                 ),
             ));
         };
@@ -810,8 +823,10 @@ impl SelectionEngine {
         // The S8 entitlement snapshot, composed ONCE: the PF fact
         // (None = uncomposed — the core refuses) and the
         // account-entitlement tier (None = the stage eliminates
-        // nothing; FR-23P's own stage ahead of online state).
-        let entitlements = self.entitlement_composition()?;
+        // nothing; FR-23P's own stage ahead of online state). The
+        // wait clamps to this request deadline's remainder (round 7)
+        // — the configured budget only tightens it.
+        let entitlements = self.entitlement_composition(request_deadline)?;
         let pf_entitled = Self::pf_entitlement(entitlements.as_ref());
         let account_tier = Self::account_tier(entitlements.as_ref());
         // The GATEWAY authorization (Codex PR#9 rounds 4+5, P1): a
@@ -1998,6 +2013,68 @@ mod tests {
         );
     }
 
+    /// Codex PR#9 round 7 (P2, the deadline clamp): the entitlement
+    /// wait shares resolve()'s ONE request deadline — the CONFIGURED
+    /// budget (6 s default; validation permits 9.5 s) only TIGHTENS
+    /// the wait, never extends it past the deadline's remainder. A
+    /// never-landing adapter under a nearly-spent deadline refuses at
+    /// the remainder (fail-closed), not at the full budget — pre-fix
+    /// the 6 s wait overran the 9 s deadline toward the IPC client's
+    /// 10 s timeout before selection or reply work began.
+    #[test]
+    fn entitlement_wait_clamps_to_the_shared_request_deadline() {
+        let engine = default_engine();
+        engine
+            .entitlement()
+            .install(Arc::new(NeverLandingEntitlements));
+        let deadline = Instant::now() + Duration::from_millis(250);
+        let start = Instant::now();
+        let error = engine
+            .entitlement_composition(deadline)
+            .expect_err("the deadline's remainder bounds the wait");
+        assert_eq!(error.code, RpcErrorCode::EntitlementMissing);
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(2_000),
+            "the wait clamps to the deadline's ~250 ms remainder (measured {elapsed:?}; the \
+             pre-fix wait blocked the full configured 6 s budget, past the 9 s deadline)"
+        );
+    }
+
+    /// The clamp never LOOSENS the wait (the other min() arm): when
+    /// the deadline leaves ample room, the CONFIGURED budget still
+    /// bounds it — here the 250 ms validation floor under a 60 s
+    /// deadline, so the refusal arrives only after the budget spent.
+    #[test]
+    fn entitlement_wait_keeps_the_configured_budget_when_the_deadline_is_far() {
+        let mut config = SystemConfig::default();
+        config.server_selection.entitlement_fetch_budget_ms = 250;
+        let engine = engine_over(config, 1_000_000, never_answers);
+        engine
+            .entitlement()
+            .install(Arc::new(NeverLandingEntitlements));
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let start = Instant::now();
+        let error = engine
+            .entitlement_composition(deadline)
+            .expect_err("the configured budget still bounds the wait");
+        assert_eq!(error.code, RpcErrorCode::EntitlementMissing);
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(240),
+            "the full configured 250 ms budget elapsed before the refusal (measured \
+             {elapsed:?})"
+        );
+        // The upper bound pins the min()'s OTHER arm: a mutant that
+        // DROPS the configured budget (deadline replaces it) would
+        // park this waiter the full 60 s deadline.
+        assert!(
+            elapsed < Duration::from_millis(2_000),
+            "the configured budget (not the far deadline) bounds the wait (measured \
+             {elapsed:?})"
+        );
+    }
+
     /// Codex PR-9 (P1, the entitlement tier): a FREE account's
     /// selection must never return a PAID-tier server. Pre-fix the
     /// context carried only the PF boolean — the full cached catalog
@@ -2984,6 +3061,25 @@ mod tests {
             .expect("the p2p class selects");
         assert_eq!(p2p.winner.name, "GB-P2P", "the feature bit filtered");
         assert_eq!(p2p.selector.target, "p2p");
+    }
+
+    /// An adapter whose fetch NEVER lands (the worker parks in a
+    /// loop): isolates the WAITER-side timing from the worker side —
+    /// the deadline-clamp tests measure when the waiter gives up,
+    /// never when an answer arrives.
+    struct NeverLandingEntitlements;
+
+    impl EntitlementsApi for NeverLandingEntitlements {
+        fn fetch(
+            &self,
+        ) -> Result<
+            protonwire_api::entitlements::VpnEntitlements,
+            protonwire_api::entitlements::EntitlementsError,
+        > {
+            loop {
+                std::thread::park();
+            }
+        }
     }
 
     /// A scripted entitlements adapter over the recorded contract's
