@@ -143,12 +143,15 @@ pub struct EntitlementProvider {
     /// The in-flight fetch's shared receiver (the single-flight slot:
     /// concurrent callers wait on the SAME result — at most one
     /// worker exists per instant).
-    in_flight:
-        Mutex<Option<Arc<Mutex<mpsc::Receiver<Result<VpnEntitlements, EntitlementsError>>>>>>,
+    in_flight: Mutex<Option<EntitlementFetchSlot>>,
     /// The last successfully composed snapshot (the network-free
     /// listing's tier source — never initiating traffic).
     cached: Mutex<Option<VpnEntitlements>>,
 }
+
+/// The single-flight slot: the shared receiver of the ONE in-flight
+/// entitlement fetch.
+type EntitlementFetchSlot = Arc<Mutex<mpsc::Receiver<Result<VpnEntitlements, EntitlementsError>>>>;
 
 impl EntitlementProvider {
     /// Installs (or replaces) the entitlements adapter.
@@ -172,10 +175,7 @@ impl EntitlementProvider {
     /// threads. The slot clears when the last receiver drops or the
     /// result is consumed (recv consumes; each waiter gets its own
     /// cloned receiver so all observe the same result).
-    fn single_flight_receiver(
-        &self,
-    ) -> Result<Arc<Mutex<mpsc::Receiver<Result<VpnEntitlements, EntitlementsError>>>>, RpcError>
-    {
+    fn single_flight_receiver(&self) -> Result<EntitlementFetchSlot, RpcError> {
         let mut slot = self.in_flight.lock().expect("in-flight slot lock");
         if let Some(existing) = slot.as_ref() {
             return Ok(Arc::clone(existing));
