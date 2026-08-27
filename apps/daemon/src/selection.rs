@@ -63,16 +63,17 @@ use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::net::SocketAddr;
 use std::net::TcpStream;
+use std::ops::Deref;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::RwLock;
-use std::sync::mpsc;
+
 use std::time::Duration;
 use std::time::Instant;
 
 use protonwire_api::entitlements::EntitlementsApi;
-use protonwire_api::entitlements::EntitlementsError;
+
 use protonwire_api::entitlements::PlanTier;
 use protonwire_api::entitlements::VpnAccess;
 use protonwire_api::entitlements::VpnEntitlements;
@@ -140,18 +141,26 @@ use protonwire_store::location::LocationCacheError;
 #[derive(Default)]
 pub struct EntitlementProvider {
     inner: RwLock<Option<Arc<dyn EntitlementsApi>>>,
-    /// The in-flight fetch's shared receiver (the single-flight slot:
-    /// concurrent callers wait on the SAME result — at most one
-    /// worker exists per instant).
+    /// The in-flight fetch's broadcast slot (the single-flight seam):
+    /// ONE worker, EVERY waiter observes the SAME outcome (Codex
+    /// PR#9 round 5, P1 — mpsc is single-consumer; the first waiter
+    /// consumed the only result and the rest read Disconnected).
     in_flight: Mutex<Option<EntitlementFetchSlot>>,
     /// The last successfully composed snapshot (the network-free
     /// listing's tier source — never initiating traffic).
     cached: Mutex<Option<VpnEntitlements>>,
 }
 
-/// The single-flight slot: the shared receiver of the ONE in-flight
-/// entitlement fetch.
-type EntitlementFetchSlot = Arc<Mutex<mpsc::Receiver<Result<VpnEntitlements, EntitlementsError>>>>;
+/// The single-flight slot: the worker stores the result ONCE; every
+/// waiter takes a clone of the SAME outcome (broadcast semantics over
+/// a Mutex+Condvar pair). The error arm carries the error's Display
+/// string (the error type is not Clone) — the composition re-wraps it.
+type EntitlementFetchSlot = Arc<EntitlementFetchShared>;
+
+struct EntitlementFetchShared {
+    result: Mutex<Option<Result<VpnEntitlements, String>>>,
+    done: std::sync::Condvar,
+}
 
 impl EntitlementProvider {
     /// Installs (or replaces) the entitlements adapter.
@@ -167,15 +176,13 @@ impl EntitlementProvider {
             .clone()
     }
 
-    /// SINGLE-FLIGHT bounded fetch (Codex PR#9 round 4, P1): the first
-    /// caller spawns ONE detached worker and parks its receiver in the
-    /// slot; concurrent callers take a clone of that SAME receiver, so
-    /// at most one worker (and one upstream fetch) exists per instant
-    /// — repeated or concurrent requests cannot accumulate unbounded
-    /// threads. The slot clears when the last receiver drops or the
-    /// result is consumed (recv consumes; each waiter gets its own
-    /// cloned receiver so all observe the same result).
-    fn single_flight_receiver(&self) -> Result<EntitlementFetchSlot, RpcError> {
+    /// SINGLE-FLIGHT bounded fetch (Codex PR#9 rounds 4+5, P1): the
+    /// first caller spawns ONE detached worker and parks the BROADCAST
+    /// slot; concurrent callers take a clone of that slot and every
+    /// waiter observes the SAME outcome — the worker stores the
+    /// result once and signals the condvar; each waiter clones it.
+    /// At most one worker (and one upstream fetch) exists per instant.
+    fn single_flight_slot(&self) -> Result<EntitlementFetchSlot, RpcError> {
         let mut slot = self.in_flight.lock().expect("in-flight slot lock");
         if let Some(existing) = slot.as_ref() {
             return Ok(Arc::clone(existing));
@@ -183,20 +190,50 @@ impl EntitlementProvider {
         let Some(adapter) = self.current() else {
             return Err(RpcError::new(
                 RpcErrorCode::Internal,
-                "single-flight receiver requested with no adapter installed",
+                "single-flight slot requested with no adapter installed",
             ));
         };
-        let (tx, rx) = mpsc::channel();
-        std::thread::spawn(move || {
-            let _ = tx.send(adapter.fetch());
+        let shared: EntitlementFetchSlot = Arc::new(EntitlementFetchShared {
+            result: Mutex::new(None),
+            done: std::sync::Condvar::new(),
         });
-        let shared = Arc::new(Mutex::new(rx));
+        let worker_shared = Arc::clone(&shared);
+        std::thread::spawn(move || {
+            let outcome = adapter.fetch().map_err(|error| error.to_string());
+            let mut result = worker_shared.result.lock().expect("fetch result lock");
+            *result = Some(outcome);
+            worker_shared.done.notify_all();
+        });
         *slot = Some(Arc::clone(&shared));
         Ok(shared)
     }
 
-    /// Clears the single-flight slot (called after a consumed result,
-    /// so the next request starts a fresh worker).
+    /// Waits on the broadcast slot for the outcome, budget-bounded:
+    /// `Ok(Some(outcome))` when the worker finished inside the
+    /// budget (the SAME clone for every waiter — broadcast);
+    /// `Ok(None)` on the budget timeout (the worker may still land
+    /// for the next waiter).
+    fn wait_for_outcome(
+        &self,
+        slot: &EntitlementFetchSlot,
+        budget: Duration,
+    ) -> Option<Result<VpnEntitlements, String>> {
+        let guard = slot.result.lock().expect("fetch result lock");
+        if guard.is_some() {
+            return guard.deref().clone();
+        }
+        let (result, _timeout) = slot
+            .done
+            .wait_timeout_while(guard, budget, |r| r.is_none())
+            .expect("fetch condvar");
+        result.deref().clone()
+    }
+
+    /// Clears the single-flight slot when no waiter still holds it is
+    /// determinable cheaply — the next request starts a fresh worker
+    /// once the slot is cleared by the LAST waiter to observe the
+    /// outcome (the caller clears after consuming; a racing earlier
+    /// timeout leaves the slot for the landed result to be observed).
     fn clear_single_flight(&self) {
         self.in_flight.lock().expect("in-flight slot lock").take();
     }
@@ -432,14 +469,31 @@ impl SelectionEngine {
         let budget = std::time::Duration::from_millis(
             self.config.server_selection.entitlement_fetch_budget_ms,
         );
-        let rx = self.entitlement.single_flight_receiver()?;
-        let result = rx
-            .lock()
-            .expect("single-flight receiver lock")
-            .recv_timeout(budget);
-        self.entitlement.clear_single_flight();
+        let slot = self.entitlement.single_flight_slot()?;
+        let outcome = self.entitlement.wait_for_outcome(&slot, budget);
+        // The slot clears only when the outcome LANDED for this waiter;
+        // a budget-timeout waiter leaves it (the landed result serves
+        // the next waiter — broadcast).
+        if outcome.is_some() {
+            self.entitlement.clear_single_flight();
+        }
+        let Some(result) = outcome else {
+            tracing::warn!(
+                budget_ms = self.config.server_selection.entitlement_fetch_budget_ms,
+                "entitlement composition exceeded its RPC-deadline budget; refusing \
+                 (fail-closed: an installed adapter's tier must never be guessed)"
+            );
+            return Err(RpcError::new(
+                RpcErrorCode::EntitlementMissing,
+                format!(
+                    "the entitlement read exceeded its {} ms budget — the account tier \
+                     cannot be composed safely; retry shortly",
+                    self.config.server_selection.entitlement_fetch_budget_ms
+                ),
+            ));
+        };
         match result {
-            Ok(Ok(entitlements)) => {
+            Ok(entitlements) => {
                 if entitlements.vpn_access != VpnAccess::Active {
                     return Err(RpcError::new(
                         RpcErrorCode::EntitlementMissing,
@@ -459,31 +513,10 @@ impl SelectionEngine {
                 self.entitlement.store_snapshot(entitlements.clone());
                 Ok(Some(entitlements))
             }
-            Ok(Err(error)) => Err(match error {
-                EntitlementsError::Transport(detail) => RpcError::new(
-                    RpcErrorCode::NetworkUnavailable,
-                    format!("entitlements read failed: {detail}"),
-                ),
-                other => RpcError::new(
-                    RpcErrorCode::Internal,
-                    format!("entitlements read failed: {other}"),
-                ),
-            }),
-            Err(_) => {
-                tracing::warn!(
-                    budget_ms = self.config.server_selection.entitlement_fetch_budget_ms,
-                    "entitlement composition exceeded its RPC-deadline budget; refusing \
-                     (fail-closed: an installed adapter's tier must never be guessed)"
-                );
-                Err(RpcError::new(
-                    RpcErrorCode::EntitlementMissing,
-                    format!(
-                        "the entitlement read exceeded its {} ms budget — the account tier \
-                         cannot be composed safely; retry shortly",
-                        self.config.server_selection.entitlement_fetch_budget_ms
-                    ),
-                ))
-            }
+            Err(detail) => Err(RpcError::new(
+                RpcErrorCode::NetworkUnavailable,
+                format!("entitlements read failed: {detail}"),
+            )),
         }
     }
 
@@ -754,17 +787,27 @@ impl SelectionEngine {
         let entitlements = self.entitlement_composition()?;
         let pf_entitled = Self::pf_entitlement(entitlements.as_ref());
         let account_tier = Self::account_tier(entitlements.as_ref());
-        // The GATEWAY authorization (Codex PR#9 round 4, P1): a gateway
-        // target requires the business/organization entitlement — the
-        // tier stage alone admits any online gateway within the numeric
-        // tier. None (login-free) and Some(false) both refuse; only an
-        // affirmative is_business proceeds.
-        if matches!(target, ConnectTarget::Gateway { .. })
-            && !entitlements
-                .as_ref()
-                .and_then(|snapshot| snapshot.is_business)
-                .unwrap_or(false)
-        {
+        // The GATEWAY authorization (Codex PR#9 rounds 4+5, P1): a
+        // gateway target requires the business/organization
+        // entitlement — AND an exact SERVER target that names a
+        // gateway LOGICAL requires it identically (the round-4 gate
+        // matched only the Gateway wire variant, so `select server
+        // <gateway-logical>` bypassed it; the core's exact-Server arm
+        // has no fleet-type restriction). None (login-free) and
+        // Some(false) both refuse; only an affirmative proceeds.
+        let is_business = entitlements
+            .as_ref()
+            .and_then(|snapshot| snapshot.is_business)
+            .unwrap_or(false);
+        let target_names_gateway = match target {
+            ConnectTarget::Gateway { .. } => true,
+            ConnectTarget::Server { server } => catalog
+                .logical_servers
+                .iter()
+                .any(|logical| logical.name == *server && logical.is_gateway()),
+            _ => false,
+        };
+        if target_names_gateway && !is_business {
             return Err(RpcError::new(
                 RpcErrorCode::EntitlementMissing,
                 "gateway targets require a Proton Business (organization) entitlement — \
@@ -796,6 +839,26 @@ impl SelectionEngine {
                     &self.balanced_weights(),
                 )
                 .map_err(group_error_to_rpc)?;
+                // The PAID-LOCATION gate (Codex PR#9 round 5, P1): the
+                // registry classifies every protonwire:fastest-*
+                // regional group as PaidLocationSelection — choosing a
+                // location IS the paid capability, so a non-paid plan
+                // refuses outright rather than relying on the per-server
+                // tier filter (a region containing a tier-0 server
+                // would otherwise select under a free account).
+                if resolved.group.entitlement
+                    == protonwire_core::groups::GroupEntitlement::PaidLocationSelection
+                    && entitlements
+                        .as_ref()
+                        .and_then(|snapshot| snapshot.plan_tier)
+                        != Some(PlanTier::Paid)
+                {
+                    return Err(RpcError::new(
+                        RpcErrorCode::EntitlementMissing,
+                        "regional location selection requires a paid plan — this account's \
+                         plan does not include choosing a location",
+                    ));
+                }
                 let provenance = GroupProvenance {
                     group_id: group_id.clone(),
                     origin: resolved.group.origin.as_str().to_owned(),
@@ -1909,11 +1972,35 @@ mod tests {
         );
     }
 
-    /// The same composition over a mixed field: a free account's
-    /// fastest-europe winner is a FREE-tier member and the FR-22 report
-    /// accounts the paid members (CH#10) to the account-tier stage.
+    /// The same composition over a mixed field — now BOTH arms of the
+    /// round-5 paid-location gate: a FREE account's fastest-europe
+    /// REFUSES (choosing a location IS the paid capability); a PAID
+    /// account's winner is a free-tier member with the FR-22 report
+    /// accounting the other members to the account-tier stage.
     #[test]
     fn free_account_ranks_only_free_tier_members() {
+        let engine = default_engine();
+        engine
+            .entitlement()
+            .install(Arc::new(FakeEntitlements::free()));
+        let error = engine
+            .resolve(
+                &ConnectTarget::Group {
+                    group_id: "protonwire:fastest-europe".into(),
+                },
+                &modifiers(),
+            )
+            .expect_err("a free account may not choose a location (the regional gate)");
+        assert_eq!(error.code, RpcErrorCode::EntitlementMissing);
+        assert!(
+            error.message.contains("paid plan"),
+            "the refusal names the capability: {error}"
+        );
+
+        // The tier-ranking half rides a NON-regional group (the
+        // registry classifies fastest-country PlanDependent, not
+        // PaidLocationSelection) so the free fixture still reaches
+        // the account-tier stage.
         let engine = default_engine();
         engine
             .entitlement()
@@ -1921,11 +2008,11 @@ mod tests {
         let result = engine
             .resolve(
                 &ConnectTarget::Group {
-                    group_id: "protonwire:fastest-europe".into(),
+                    group_id: "proton:fastest-country".into(),
                 },
                 &modifiers(),
             )
-            .expect("the fixture's Europe keeps free-tier members");
+            .expect("the non-regional group serves the free account");
         assert_eq!(result.winner.name, "GB#1", "official order over tier 0");
         assert_eq!(result.winner.tier, 0);
         assert!(
@@ -2131,6 +2218,9 @@ mod tests {
     #[test]
     fn group_selection_honors_excluded_country_modifiers() {
         let engine = default_engine();
+        engine
+            .entitlement()
+            .install(Arc::new(FakeEntitlements::paid()));
         let result = engine
             .resolve(
                 &ConnectTarget::Group {
@@ -2155,6 +2245,9 @@ mod tests {
     #[test]
     fn group_selection_honors_required_feature_modifiers() {
         let engine = default_engine();
+        engine
+            .entitlement()
+            .install(Arc::new(FakeEntitlements::paid()));
         let result = engine
             .resolve(
                 &ConnectTarget::Group {
@@ -2240,6 +2333,9 @@ mod tests {
     #[test]
     fn group_selection_honors_the_protocol_modifier_without_an_override() {
         let engine = default_engine();
+        engine
+            .entitlement()
+            .install(Arc::new(FakeEntitlements::paid()));
         let error = engine
             .resolve(
                 &ConnectTarget::Group {
@@ -2269,6 +2365,9 @@ mod tests {
     #[test]
     fn group_selection_rides_the_registry_discipline() {
         let engine = default_engine();
+        engine
+            .entitlement()
+            .install(Arc::new(FakeEntitlements::paid()));
         let error = engine
             .resolve(
                 &ConnectTarget::Group {
@@ -2855,7 +2954,10 @@ mod tests {
     impl EntitlementsApi for FakeEntitlements {
         fn fetch(
             &self,
-        ) -> Result<protonwire_api::entitlements::VpnEntitlements, EntitlementsError> {
+        ) -> Result<
+            protonwire_api::entitlements::VpnEntitlements,
+            protonwire_api::entitlements::EntitlementsError,
+        > {
             protonwire_api::entitlements::VpnEntitlements::from_wire_bytes(self.body.as_bytes())
         }
     }
