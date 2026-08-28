@@ -866,10 +866,13 @@ pub struct SelectionResult {
     /// The selection-plane features the request carried (rendered
     /// tokens, required then optional).
     pub requested_features: Vec<String>,
-    /// Requested-but-not-applied features. Empty at selection time BY
-    /// CONSTRUCTION for selection-plane features — selection either
-    /// satisfies them (the winner carries them) or refuses; the
-    /// connection-plane family (`netshield`, `nat`, `lan-access`,
+    /// Requested-but-not-applied features. For REQUIRED features the
+    /// difference is empty by construction — selection satisfies them
+    /// (the winner carries them) or refuses. OPTIONAL features are
+    /// prefer-not-require (they weight ranking, never eliminate), so
+    /// the winner may legitimately lack one; the difference reports
+    /// exactly those, through the core's one evaluation vocabulary.
+    /// The connection-plane family (`netshield`, `nat`, `lan-access`,
     /// protocol-at-tunnel, the port-forwarding REQUEST) is composed by
     /// the M4 tunnel (FR-23E's boundary), and its differences land
     /// here from the connection transition, never from a query.

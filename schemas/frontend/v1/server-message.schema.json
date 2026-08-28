@@ -1590,7 +1590,7 @@
           "$ref": "#/$defs/SelectionCatalogProvenance"
         },
         "feature_difference": {
-          "description": "Requested-but-not-applied features. Empty at selection time BY\nCONSTRUCTION for selection-plane features — selection either\nsatisfies them (the winner carries them) or refuses; the\nconnection-plane family (`netshield`, `nat`, `lan-access`,\nprotocol-at-tunnel, the port-forwarding REQUEST) is composed by\nthe M4 tunnel (FR-23E's boundary), and its differences land\nhere from the connection transition, never from a query.",
+          "description": "Requested-but-not-applied features. For REQUIRED features the\ndifference is empty by construction — selection satisfies them\n(the winner carries them) or refuses. OPTIONAL features are\nprefer-not-require (they weight ranking, never eliminate), so\nthe winner may legitimately lack one; the difference reports\nexactly those, through the core's one evaluation vocabulary.\nThe connection-plane family (`netshield`, `nat`, `lan-access`,\nprotocol-at-tunnel, the port-forwarding REQUEST) is composed by\nthe M4 tunnel (FR-23E's boundary), and its differences land\nhere from the connection transition, never from a query.",
           "type": "array",
           "items": {
             "type": "string"

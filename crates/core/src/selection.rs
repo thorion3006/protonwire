@@ -1105,10 +1105,7 @@ fn required_features_stage(
     constraints
         .required_features
         .iter()
-        .any(|feature| match feature {
-            FeatureConstraint::PortForwarding => !pf_holds_for(server, context),
-            other => !catalog_feature_holds(server, *other),
-        })
+        .any(|feature| !feature_holds(server, *feature, context))
         .then_some(FilterStage::RequiredFeatures)
 }
 
@@ -1122,6 +1119,24 @@ fn pf_holds_for(server: &LogicalServer, context: &SelectionContext) -> bool {
             .port_forwarding_capable
             .as_ref()
             .is_some_and(|capable| capable.contains(&server.id))
+}
+
+/// Whether a feature constraint holds for a server under a context —
+/// the ONE evaluation vocabulary the required-features stage, the
+/// balanced feature-match term, and the daemon's FR-23T difference
+/// report all share (Codex PR#9 round 8: the daemon reports the
+/// requested-but-absent optional features through this, so it can
+/// never disagree with what the stages themselves checked). The PF
+/// arm is the composed seam; every other arm reads the catalog bit.
+pub fn feature_holds(
+    server: &LogicalServer,
+    feature: FeatureConstraint,
+    context: &SelectionContext,
+) -> bool {
+    match feature {
+        FeatureConstraint::PortForwarding => pf_holds_for(server, context),
+        other => catalog_feature_holds(server, other),
+    }
 }
 
 /// Whether an online physical exposes the required protocol (the
@@ -1560,10 +1575,7 @@ fn optional_match_ratio(
     }
     let held = optional
         .iter()
-        .filter(|feature| match feature {
-            FeatureConstraint::PortForwarding => pf_holds_for(server, context),
-            other => catalog_feature_holds(server, **other),
-        })
+        .filter(|feature| feature_holds(server, **feature, context))
         .count();
     held as f32 / optional.len() as f32
 }
@@ -1708,6 +1720,37 @@ mod tests {
         assert_eq!(
             RankingPolicy::parse("load").unwrap(),
             RankingPolicy::LowestLoad
+        );
+    }
+
+    /// `feature_holds` is THE shared evaluation vocabulary (Codex PR#9
+    /// round 8: the daemon's FR-23T difference report consumes it, so
+    /// the required stage, the feature-match term, and the daemon can
+    /// never disagree about what a server supports): the catalog arms
+    /// read the bits; the PF arm is the composed seam — fail-closed
+    /// under an uncomposed context, exactly as the required stage
+    /// treats it.
+    #[test]
+    fn feature_holds_is_the_shared_evaluation_vocabulary() {
+        let body = r#"{"Code":1000,"StatusID":"t","LogicalServers":[{
+            "ID":"s1","Name":"X#1","EntryCountry":"GB","ExitCountry":"GB",
+            "Tier":0,"Features":4,"Status":1,"Load":10,"Score":1.0,
+            "Servers":[]}]}"#;
+        let catalog = protonwire_store::catalog::CatalogDocument::from_bytes(body.as_bytes())
+            .expect("the minimal document parses");
+        let server = &catalog.logical_servers[0];
+        let context = SelectionContext::default();
+        assert!(
+            feature_holds(server, FeatureConstraint::P2p, &context),
+            "the catalog p2p bit"
+        );
+        assert!(
+            !feature_holds(server, FeatureConstraint::Tor, &context),
+            "no bit, no hold"
+        );
+        assert!(
+            !feature_holds(server, FeatureConstraint::PortForwarding, &context),
+            "PF is the composed seam: uncomposed context stays fail-closed"
         );
     }
 

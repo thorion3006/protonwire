@@ -28,7 +28,12 @@
 //!    CAPABILITY source composes as the EMPTY SET — no per-server PF
 //!    source exists until M6's NAT-PMP lane supplies one, so a PF
 //!    request under entitlement eliminates every candidate with the
-//!    structured FR-22 report. Never fabricated.
+//!    structured FR-22 report. Never fabricated. The SAME snapshot's
+//!    recorded allowances (p2p/secure-core/tor = `Some(plan is
+//!    paid)`) gate the REQUEST: a request naming a capability the
+//!    plan lacks refuses typed before the core runs (the fourth
+//!    member of the request-gate family — gateway, regional, PF;
+//!    the tier stage stays the candidate filter).
 //! 4. **The bounded on-demand prober** (U5's executor seam): for a
 //!    latency-dependent ranking the engine derives the shortlist from
 //!    the hard-filtered candidates in official order (Proton score,
@@ -573,6 +578,65 @@ impl SelectionEngine {
             .map(|tier| tier.min(i64::from(i8::MAX)) as i8)
     }
 
+    /// The plan-feature capability a request names but the plan
+    /// lacks (Codex PR#9 round 8, P1): the recorded allowances
+    /// (`FeatureAllowances`: p2p/secure-core/tor = `Some(plan is
+    /// paid)` — the parity vocabulary `servers.p2p|tor|secure-core:
+    /// entitlement: paid`) gate the REQUEST the way the gateway
+    /// business gate and the paid-location gate gate theirs — the
+    /// per-server tier stage stays the CANDIDATE filter (the
+    /// entitlements model's recorded boundary); this is the
+    /// request-level refusal FR-23S's "precise entitlement error"
+    /// names. `None` (no snapshot) refuses fail-closed — the family
+    /// semantics (gateway, regional, PF). BOTH arms name the
+    /// capability (the PF precedent: an optional request still
+    /// weights ranking toward it). Returns the capability token and
+    /// its allowance; `None` = every named capability is allowed.
+    fn unmet_capability(
+        entitlements: Option<&VpnEntitlements>,
+        request: &SelectionRequest,
+    ) -> Option<(&'static str, Option<bool>)> {
+        let allowances = entitlements.map(|snapshot| &snapshot.features);
+        let constraints = &request.constraints;
+        [
+            (
+                matches!(request.target, Target::SecureCore { .. })
+                    || constraints
+                        .required_features
+                        .contains(&FeatureConstraint::SecureCore)
+                    || constraints
+                        .optional_features
+                        .contains(&FeatureConstraint::SecureCore),
+                "secure-core",
+                allowances.and_then(|features| features.secure_core),
+            ),
+            (
+                constraints
+                    .required_features
+                    .contains(&FeatureConstraint::P2p)
+                    || constraints
+                        .optional_features
+                        .contains(&FeatureConstraint::P2p),
+                "p2p",
+                allowances.and_then(|features| features.p2p),
+            ),
+            (
+                constraints
+                    .required_features
+                    .contains(&FeatureConstraint::Tor)
+                    || constraints
+                        .optional_features
+                        .contains(&FeatureConstraint::Tor),
+                "tor",
+                allowances.and_then(|features| features.tor),
+            ),
+        ]
+        .into_iter()
+        .find_map(|(named, capability, allowance)| {
+            (named && allowance != Some(true)).then_some((capability, allowance))
+        })
+    }
+
     /// The CACHED entitlement tier for network-free surfaces (the
     /// built-in listing, Codex PR#9 round 4, P2): reads the last
     /// successfully composed snapshot without initiating any traffic.
@@ -933,6 +997,23 @@ impl SelectionEngine {
             ),
         };
 
+        // The plan-feature capability gate (Codex PR#9 round 8, P1):
+        // the fourth member of the request-gate family (the gateway
+        // business gate, the paid-location gate, the PF composition) —
+        // a request naming p2p/tor/secure-core under a plan without
+        // the capability refuses typed BEFORE the core runs (the tier
+        // stage stays the candidate filter; the pre-fix gap handed a
+        // free account a tier-0 P2P selection).
+        if let Some((capability, _)) = Self::unmet_capability(entitlements.as_ref(), &request) {
+            return Err(RpcError::new(
+                RpcErrorCode::EntitlementMissing,
+                format!(
+                    "{capability} selection requires a paid plan — this account's plan does \
+                     not include the {capability} capability"
+                ),
+            ));
+        }
+
         // FR-23T's "when relevant": the physical country reports when
         // the group's semantics used it, or when the caller named it
         // explicitly (a named value is provenance the caller asked to
@@ -1040,10 +1121,27 @@ impl SelectionEngine {
                 },
             },
             requested_features,
-            // Selection-plane features are all-or-refused; the
-            // connection-plane family is M4's (FR-23E's boundary, on
-            // the field's wire docs).
-            feature_difference: Vec::new(),
+            // FR-23T's difference (Codex PR#9 round 8, P2):
+            // requested-but-not-applied. Required features are
+            // satisfy-or-refuse (their difference is empty by
+            // construction); the OPTIONAL arm is prefer-not-require —
+            // the ranking may legitimately prefer a server lacking
+            // one, and the difference REPORTS it through the core's
+            // one evaluation vocabulary, never a hard-coded empty
+            // claiming every request was satisfied. The
+            // connection-plane family stays M4's (FR-23E's boundary).
+            feature_difference: modifiers
+                .optional_features
+                .iter()
+                .filter(|feature| {
+                    !protonwire_core::selection::feature_holds(
+                        winner.server,
+                        wire_feature(**feature),
+                        &context,
+                    )
+                })
+                .map(|feature| feature.as_str().to_owned())
+                .collect(),
         }))
     }
 
@@ -1143,37 +1241,59 @@ impl SelectionEngine {
             ..SelectionContext::default()
         };
         match resolve_group(entry.id, None, &sources, weights) {
-            Ok(resolved) => match protonwire_core::selection::filter_candidates(
-                catalog,
-                &resolved.request,
-                &context,
-            ) {
-                Ok((survivors, _)) if !survivors.is_empty() => GroupAvailability {
-                    available: true,
-                    reason: None,
-                },
-                Ok((_, report)) => {
-                    // FR-23S's "precise entitlement" reason: when the
-                    // tier stage is what emptied the pool, that is the
-                    // availability answer — not the generic
-                    // no-eligible-server.
-                    let tier_bound = report.stages().iter().any(|(stage, count)| {
-                        *stage == protonwire_core::selection::FilterStage::AccountTier && *count > 0
-                    });
-                    if tier_bound {
-                        unavailable("account-tier")
+            Ok(resolved) => {
+                // The capability gate's availability twin (Codex
+                // PR#9 round 8): a group whose resolved request names
+                // a plan-gated capability (the secure-core group's
+                // routed target; any p2p/tor constraint a group
+                // merges) reports the SAME entitlement reasons
+                // resolve() refuses with — availability agrees with
+                // the gate (the round-6 invariant), read from the
+                // CACHED snapshot (the listing's network-free
+                // contract).
+                if let Some((_, allowance)) = Self::unmet_capability(
+                    self.entitlement.cached_snapshot().as_ref(),
+                    &resolved.request,
+                ) {
+                    return unavailable(if allowance.is_some() {
+                        "entitlement"
                     } else {
-                        unavailable("no-eligible-server")
+                        "entitlement-composition-missing"
+                    });
+                }
+                match protonwire_core::selection::filter_candidates(
+                    catalog,
+                    &resolved.request,
+                    &context,
+                ) {
+                    Ok((survivors, _)) if !survivors.is_empty() => GroupAvailability {
+                        available: true,
+                        reason: None,
+                    },
+                    Ok((_, report)) => {
+                        // FR-23S's "precise entitlement" reason: when the
+                        // tier stage is what emptied the pool, that is the
+                        // availability answer — not the generic
+                        // no-eligible-server.
+                        let tier_bound = report.stages().iter().any(|(stage, count)| {
+                            *stage == protonwire_core::selection::FilterStage::AccountTier
+                                && *count > 0
+                        });
+                        if tier_bound {
+                            unavailable("account-tier")
+                        } else {
+                            unavailable("no-eligible-server")
+                        }
                     }
+                    Err(SelectionError::PhysicalCountryRequired) => {
+                        unavailable("physical-country-required")
+                    }
+                    Err(SelectionError::RequiresEntitlementComposition) => {
+                        unavailable("entitlement-composition-missing")
+                    }
+                    Err(_) => unavailable("no-eligible-server"),
                 }
-                Err(SelectionError::PhysicalCountryRequired) => {
-                    unavailable("physical-country-required")
-                }
-                Err(SelectionError::RequiresEntitlementComposition) => {
-                    unavailable("entitlement-composition-missing")
-                }
-                Err(_) => unavailable("no-eligible-server"),
-            },
+            }
             // Registry-internal resolution failures (none constructible
             // from the frozen catalog with a None override) stay in the
             // no-eligible-server family.
@@ -1338,18 +1458,24 @@ fn wire_features(
     required: &[SelectionFeature],
     optional: &[SelectionFeature],
 ) -> (Vec<FeatureConstraint>, Vec<FeatureConstraint>) {
-    let map = |feature: SelectionFeature| match feature {
+    (
+        required.iter().copied().map(wire_feature).collect(),
+        optional.iter().copied().map(wire_feature).collect(),
+    )
+}
+
+/// Maps ONE wire feature token onto the core's vocabulary (the
+/// slice-level [`wire_features`] and the FR-23T difference report
+/// share this — one mapping, never a second table).
+fn wire_feature(feature: SelectionFeature) -> FeatureConstraint {
+    match feature {
         SelectionFeature::P2p => FeatureConstraint::P2p,
         SelectionFeature::Tor => FeatureConstraint::Tor,
         SelectionFeature::SecureCore => FeatureConstraint::SecureCore,
         SelectionFeature::Streaming => FeatureConstraint::Streaming,
         SelectionFeature::Ipv6 => FeatureConstraint::Ipv6,
         SelectionFeature::PortForwarding => FeatureConstraint::PortForwarding,
-    };
-    (
-        required.iter().copied().map(map).collect(),
-        optional.iter().copied().map(map).collect(),
-    )
+    }
 }
 
 /// Maps the wire protocol vocabulary onto the core's.
@@ -2072,6 +2198,258 @@ mod tests {
             elapsed < Duration::from_millis(2_000),
             "the configured budget (not the far deadline) bounds the wait (measured \
              {elapsed:?})"
+        );
+    }
+
+    /// Codex PR#9 round 8 (P1, the capability gate): a FREE account's
+    /// plan does not include the p2p/tor/secure-core capabilities
+    /// (`FeatureAllowances`: `Some(plan is paid)`; the parity
+    /// vocabulary `servers.p2p|tor|secure-core: entitlement: paid`) —
+    /// a request NAMING one refuses typed (FR-23S's precise
+    /// entitlement error), the same family shape as the gateway
+    /// business gate and the paid-location gate. Pre-fix the tier
+    /// stage was the only gate, so the fixture's tier-0 GB-P2P handed
+    /// a free account a successful P2P selection.
+    #[test]
+    fn free_account_cannot_select_the_p2p_special_class() {
+        let engine = default_engine();
+        engine
+            .entitlement()
+            .install(Arc::new(FakeEntitlements::free()));
+        let error = engine
+            .resolve(
+                &ConnectTarget::Special {
+                    class: SpecialClass::P2p,
+                },
+                &modifiers(),
+            )
+            .expect_err("the free plan does not include the p2p capability");
+        assert_eq!(error.code, RpcErrorCode::EntitlementMissing);
+        assert!(
+            error.message.contains("p2p capability"),
+            "the refusal names the capability: {error}"
+        );
+    }
+
+    /// The `--require` arm of the same gate.
+    #[test]
+    fn free_account_cannot_require_tor() {
+        let engine = default_engine();
+        engine
+            .entitlement()
+            .install(Arc::new(FakeEntitlements::free()));
+        let error = engine
+            .resolve(
+                &ConnectTarget::Fastest,
+                &SelectionModifiers {
+                    required_features: vec![SelectionFeature::Tor],
+                    ..modifiers()
+                },
+            )
+            .expect_err("requiring tor is naming the capability");
+        assert_eq!(error.code, RpcErrorCode::EntitlementMissing);
+        assert!(error.message.contains("tor capability"), "{error}");
+    }
+
+    /// The `--prefer` arm (BOTH arms gate — the PF precedent: an
+    /// optional request still weights ranking toward the capability,
+    /// and the winner can carry it).
+    #[test]
+    fn free_account_cannot_prefer_p2p() {
+        let engine = default_engine();
+        engine
+            .entitlement()
+            .install(Arc::new(FakeEntitlements::free()));
+        let error = engine
+            .resolve(
+                &ConnectTarget::Fastest,
+                &SelectionModifiers {
+                    optional_features: vec![SelectionFeature::P2p],
+                    ..modifiers()
+                },
+            )
+            .expect_err("preferring p2p is naming the capability");
+        assert_eq!(error.code, RpcErrorCode::EntitlementMissing);
+    }
+
+    /// The routed Secure Core target names the secure-core capability.
+    /// Pre-fix a free account reached the TIER stage's
+    /// no-eligible-server refusal — the wrong error family for a plan
+    /// gate (FR-23S: the precise entitlement error).
+    #[test]
+    fn free_account_cannot_select_secure_core_routing() {
+        let engine = default_engine();
+        engine
+            .entitlement()
+            .install(Arc::new(FakeEntitlements::free()));
+        let error = engine
+            .resolve(
+                &ConnectTarget::SecureCore {
+                    entry_country: None,
+                    exit_country: None,
+                },
+                &modifiers(),
+            )
+            .expect_err("secure-core routing is a paid capability");
+        assert_eq!(error.code, RpcErrorCode::EntitlementMissing);
+        assert!(
+            error.message.contains("secure-core capability") && error.message.contains("paid plan"),
+            "the refusal names the capability and the plan: {error}"
+        );
+    }
+
+    /// PAID keeps every special selection (the non-regression arm of
+    /// the gate).
+    #[test]
+    fn paid_account_keeps_special_selections() {
+        let engine = default_engine();
+        engine
+            .entitlement()
+            .install(Arc::new(FakeEntitlements::paid()));
+        let p2p = engine
+            .resolve(
+                &ConnectTarget::Special {
+                    class: SpecialClass::P2p,
+                },
+                &modifiers(),
+            )
+            .expect("the paid plan includes p2p");
+        assert_eq!(p2p.winner.name, "GB-P2P");
+        let secure_core = engine
+            .resolve(
+                &ConnectTarget::SecureCore {
+                    entry_country: None,
+                    exit_country: None,
+                },
+                &modifiers(),
+            )
+            .expect("the paid plan includes secure-core routing");
+        assert_eq!(secure_core.winner.name, "CH-SE#1");
+    }
+
+    /// The family semantics (gateway, regional, PF): no composed
+    /// snapshot → fail-closed — the fourth member of the gate family
+    /// refuses uncomposed capability requests too. Pre-fix the
+    /// login-free p2p special selected GB-P2P.
+    #[test]
+    fn specials_without_a_composed_snapshot_refuse_fail_closed() {
+        let engine = default_engine();
+        let error = engine
+            .resolve(
+                &ConnectTarget::Special {
+                    class: SpecialClass::P2p,
+                },
+                &modifiers(),
+            )
+            .expect_err("an uncomposed snapshot cannot prove the capability");
+        assert_eq!(error.code, RpcErrorCode::EntitlementMissing);
+    }
+
+    /// Availability AGREES with the capability gate (the round-6
+    /// invariant: never visible-available while connecting refuses):
+    /// the secure-core group reads the entitlement reasons under a
+    /// missing and a free cached snapshot, and available under a paid
+    /// one.
+    #[test]
+    fn special_group_availability_agrees_with_the_capability_gate() {
+        // No snapshot: unknown entitlement, fail-closed.
+        let engine = default_engine();
+        let listing = engine.groups_catalog().expect("the registry serves");
+        let max_security = listing
+            .groups
+            .iter()
+            .find(|group| group.id == "proton:max-security")
+            .expect("the secure-core group is listed");
+        assert!(!max_security.availability.available);
+        assert_eq!(
+            max_security.availability.reason.as_deref(),
+            Some("entitlement-composition-missing")
+        );
+
+        // A FREE cached snapshot (one resolve primes the cache — the
+        // round-6 pattern): the precise entitlement reason.
+        let engine = default_engine();
+        engine
+            .entitlement()
+            .install(Arc::new(FakeEntitlements::free()));
+        let _ = engine.resolve(&country("CH"), &modifiers());
+        let listing = engine.groups_catalog().expect("the registry serves");
+        let max_security = listing
+            .groups
+            .iter()
+            .find(|group| group.id == "proton:max-security")
+            .expect("the secure-core group is listed");
+        assert!(!max_security.availability.available);
+        assert_eq!(
+            max_security.availability.reason.as_deref(),
+            Some("entitlement"),
+            "free plans read the entitlement reason, never a false available"
+        );
+
+        // A PAID cached snapshot: available.
+        let engine = default_engine();
+        engine
+            .entitlement()
+            .install(Arc::new(FakeEntitlements::paid()));
+        engine
+            .resolve(&country("GB"), &modifiers())
+            .expect("the paid resolve primes the cache");
+        let listing = engine.groups_catalog().expect("the registry serves");
+        let max_security = listing
+            .groups
+            .iter()
+            .find(|group| group.id == "proton:max-security")
+            .expect("the secure-core group is listed");
+        assert!(max_security.availability.available);
+    }
+
+    /// Codex PR#9 round 8 (P2, the difference): optional features
+    /// never eliminate (they feed the feature-match term), so the
+    /// winner may legitimately lack one — FR-23T's
+    /// `feature_difference` must REPORT it, never a hard-coded empty
+    /// vector claiming every request was satisfied.
+    #[test]
+    fn optional_features_absent_from_the_winner_report_their_difference() {
+        // Streaming carries no plan allowance (not in the gate's
+        // vocabulary) — a login-free selection succeeds and the
+        // winner lacks the bit: the difference says so.
+        let engine = default_engine();
+        let result = engine
+            .resolve(
+                &ConnectTarget::Fastest,
+                &SelectionModifiers {
+                    optional_features: vec![SelectionFeature::Streaming],
+                    ..modifiers()
+                },
+            )
+            .expect("optional features never eliminate");
+        assert_eq!(result.winner.name, "GB#1", "official order");
+        assert_eq!(
+            result.feature_difference,
+            vec!["streaming".to_owned()],
+            "the requested-but-absent optional feature is reported"
+        );
+
+        // The p2p arm under a PAID plan (the gate passes): the
+        // official-order winner GB#1 lacks the p2p bit GB-P2P carries.
+        let engine = default_engine();
+        engine
+            .entitlement()
+            .install(Arc::new(FakeEntitlements::paid()));
+        let result = engine
+            .resolve(
+                &ConnectTarget::Fastest,
+                &SelectionModifiers {
+                    optional_features: vec![SelectionFeature::P2p],
+                    ..modifiers()
+                },
+            )
+            .expect("the paid plan may prefer p2p");
+        assert_eq!(result.winner.name, "GB#1");
+        assert_eq!(
+            result.feature_difference,
+            vec!["p2p".to_owned()],
+            "preferred-but-absent is provenance, not silence"
         );
     }
 
@@ -3041,7 +3419,8 @@ mod tests {
     /// The random policy draws on OS entropy through the daemon
     /// (RandomEntropyRequired is unreachable here) and the special
     /// classes map onto the feature constraints (p2p selects the P2P
-    /// server).
+    /// server — under a PAID plan: the round-8 capability gate makes
+    /// the special classes entitlement-carried).
     #[test]
     fn random_draws_os_entropy_and_specials_map_to_features() {
         let engine = default_engine();
@@ -3051,6 +3430,10 @@ mod tests {
         assert_eq!(result.selector.policy, "random");
         assert!(result.winner.signals.proton_score.is_some());
 
+        let engine = default_engine();
+        engine
+            .entitlement()
+            .install(Arc::new(FakeEntitlements::paid()));
         let p2p = engine
             .resolve(
                 &ConnectTarget::Special {
@@ -3058,7 +3441,7 @@ mod tests {
                 },
                 &modifiers(),
             )
-            .expect("the p2p class selects");
+            .expect("the p2p class selects under a paid plan");
         assert_eq!(p2p.winner.name, "GB-P2P", "the feature bit filtered");
         assert_eq!(p2p.selector.target, "p2p");
     }
