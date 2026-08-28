@@ -1897,4 +1897,54 @@ budget" mutant). RUST PASS, no P1; its two P3 track items join the
 P3 list (the zero-remainder edge test; the sections.rs budget doc's
 stale 10 s framing).
 
+## 2026-08-28 — Codex PR#9 round 8 (post-completion, pre-merge)
+
+TWO findings, both verified GENUINE against the recorded contracts
+(FR-23H/FR-23S, DoD item 6's entitlement-aware special selections,
+the parity vocabulary `servers.p2p|tor|secure-core: entitlement:
+paid`), fixed red-first at 287736e:
+
+- **P1 — the plan-feature capability gate.** `FeatureAllowances`
+  were composed but never enforced: the tier stage was the only
+  gate, so the fixture's tier-0 GB-P2P handed a FREE account a
+  successful P2P selection, and a free Secure Core request died at
+  the tier stage's no-eligible-server instead of FR-23S's precise
+  entitlement error. The daemon now gates the REQUEST
+  (`unmet_capability`): a request naming p2p/tor/secure-core (the
+  Special classes, `--require`/`--prefer`, the routed target,
+  groups merging such constraints — max-security) under an
+  allowance that is not `Some(true)` refuses typed
+  EntitlementMissing BEFORE the core runs — the fourth member of
+  the request-gate family (gateway business r4/5, paid-location
+  r5/6, PF composition), fail-closed on an uncomposed snapshot.
+  The tier stage stays the CANDIDATE filter (the entitlements
+  model's recorded boundary, restated in its module doc). The
+  AVAILABILITY twin reads the same rule from the cached snapshot
+  (`entitlement` / `entitlement-composition-missing`) — the r6
+  agreement invariant extended to the special groups. Deliberate
+  behavior change, disclosed: login-free special selections now
+  refuse fail-closed (family semantics);
+  `random_draws_os_entropy_and_specials_map_to_features` moved to
+  the paid fixture.
+- **P2 — FR-23T's `feature_difference`** hard-coded `Vec::new()`
+  under a wire doc claiming selection "satisfies or refuses" —
+  false for the OPTIONAL arm (optional features weight ranking,
+  never eliminate). The core now exposes `feature_holds` — the ONE
+  evaluation vocabulary the required stage, the feature-match term,
+  and the daemon's difference report share (both private dispatch
+  sites refactored onto it) — and the daemon reports the
+  requested-but-absent optional features through it; wire doc
+  rewritten, schemas regenerated.
+
+Pins: eight daemon tests (the four free refusals, the paid
+non-regression, the fail-closed login-free, availability agreement
+across the three snapshot states, difference reporting on both
+arms) + the core vocabulary pin. RUST PASS on all seven review
+gates, no P1; track items: the group_availability triple
+lock-acquisition (joins the listing-reads P3), the optional-tor
+naming pin (P3), plus the r7 pair. The precedence note (free +
+`--require secure-core` now reads EntitlementMissing where it read
+the Standard-fleet contradiction — both typed, gate-before-core)
+is deliberate.
+
 
