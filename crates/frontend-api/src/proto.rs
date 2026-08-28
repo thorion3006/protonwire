@@ -259,6 +259,29 @@ pub enum Request {
     /// configured writable store, and persistence health when the
     /// writable-store half reports one.
     GetAccount,
+    /// Resolve a selection WITHOUT connecting (M3 U6, FR-23T): the
+    /// daemon composes the cached catalog (strict load), the S8
+    /// entitlement seams, FR-23Q's physical-country sources, and the
+    /// bounded on-demand prober, then answers with the full
+    /// provenance-carrying result. A pure query — no tunnel state
+    /// changes, no events (FR-123's connection-group status fields
+    /// ride the M4 connection transition, not a query).
+    Select {
+        /// The connection-target grammar (shared with `connect`).
+        target: ConnectTarget,
+        /// The §9.3 selection-plane modifiers.
+        modifiers: SelectionModifiers,
+    },
+    /// The built-in connection-group catalog (M3 U6, FR-23I/U): served
+    /// from core's generated registry — no network request, no
+    /// hard-coded client lists. Each entry carries its FR-23S
+    /// availability evaluation against the current cached catalog.
+    GroupsList,
+    /// One group's full definition (FR-23U `group show`).
+    GroupShow {
+        /// The stable namespaced group id.
+        id: String,
+    },
 }
 
 /// A secret value crossing the request boundary (a password, a TOTP
@@ -336,6 +359,30 @@ pub enum RequestResult {
     Account {
         /// The account facts.
         account: AccountStatus,
+    },
+    /// Reply to [`Request::Select`]: the resolved selection with
+    /// FR-23T's provenance fields end to end. The winner is the
+    /// best-ranked candidate; a successful reply always carries one
+    /// (every refusal path is an [`RpcError`]). Boxed: the full
+    /// provenance set is large, and this result enum travels through
+    /// the session writer — indirection keeps every other variant
+    /// cheap.
+    Selected {
+        /// The selection result.
+        result: Box<SelectionResult>,
+    },
+    /// Reply to [`Request::GroupsList`]: the built-in catalog with the
+    /// registry's provenance stamps and per-group availability.
+    Groups {
+        /// The full group catalog (every entry, registry order).
+        catalog: GroupsCatalog,
+    },
+    /// Reply to [`Request::GroupShow`]: one group's full definition.
+    /// Boxed alongside [`RequestResult::Selected`] — the detail
+    /// document's string set is large, and this enum travels cloned.
+    Group {
+        /// The group's details.
+        group: Box<GroupDetails>,
     },
 }
 
@@ -534,6 +581,383 @@ pub enum PersistenceHealth {
         /// Value-free failure summary.
         reason: String,
     },
+}
+
+// ---------------------------------------------------------------------------
+// The U6 selection/groups wire family (M3 PR-4; FR-23T/FR-23U/FR-23S)
+// ---------------------------------------------------------------------------
+
+/// A selection-plane feature constraint (§9.3's `--require` family and
+/// the optional slot the balanced feature-match term consumes). The
+/// forbidden throughput signals do not exist here — `speed` is rejected
+/// at the ranking-mode vocabulary, never modeled as a feature.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum SelectionFeature {
+    /// P2P-friendly (catalog bit).
+    P2p,
+    /// Tor over VPN (catalog bit).
+    Tor,
+    /// Secure Core (catalog bit; under a Standard-fleet target this is
+    /// the typed contradiction — Secure Core connectivity is a routed
+    /// TARGET).
+    SecureCore,
+    /// Streaming-capable where exposed (catalog bit).
+    Streaming,
+    /// IPv6-capable (catalog bit).
+    Ipv6,
+    /// Port-forwarding-capable (NO catalog bit: evaluates against the
+    /// daemon-composed entitlement and per-server capability seams;
+    /// FR-23H/FR-87 refuse typed while either is uncomposed).
+    PortForwarding,
+}
+
+impl SelectionFeature {
+    /// The stable token (shared by `--require` values, the requested
+    /// feature list, and error messages).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SelectionFeature::P2p => "p2p",
+            SelectionFeature::Tor => "tor",
+            SelectionFeature::SecureCore => "secure-core",
+            SelectionFeature::Streaming => "streaming",
+            SelectionFeature::Ipv6 => "ipv6",
+            SelectionFeature::PortForwarding => "port-forwarding",
+        }
+    }
+}
+
+/// A required protocol as a selection constraint (§9.4's vocabulary;
+/// FR-23P's protocol-compatibility stage). `smart` is deliberately
+/// absent — smart-protocol resolution is the connection plane's (M4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum SelectionProtocol {
+    /// WireGuard over UDP.
+    WireguardUdp,
+    /// WireGuard over TCP.
+    WireguardTcp,
+    /// TLS-based Stealth.
+    Stealth,
+}
+
+/// The §9.3 selection-plane modifiers a [`Request::Select`] carries.
+/// Connection-plane modifiers (`--netshield`, `--kill-switch`,
+/// `--nat`, `--vpn-accelerator`, `--dns`, `--lan-access`) are
+/// deliberately NOT here: selection never composes them — the tunnel
+/// does (FR-23E's composition boundary, recorded on
+/// [`SelectionResult::feature_difference`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SelectionModifiers {
+    /// The ranking policy (`official`|`balanced`|`load`|`latency`;
+    /// `speed` and the other forbidden throughput signals are rejected
+    /// typed by the daemon's parse).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub by: Option<String>,
+    /// An explicit per-request physical country (FR-23Q's first
+    /// source; uppercase ISO 3166-1 alpha-2 — non-canonical input
+    /// refuses typed, never approximated).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub physical_country: Option<String>,
+    /// Never select these countries (FR-21).
+    pub excluded_countries: Vec<String>,
+    /// Never select these states/regions (FR-21A).
+    pub excluded_states: Vec<String>,
+    /// Never select these cities (FR-21A).
+    pub excluded_cities: Vec<String>,
+    /// Never select these logical servers by name (FR-21A).
+    pub excluded_servers: Vec<String>,
+    /// Required features (T-4/FR-23H).
+    pub required_features: Vec<SelectionFeature>,
+    /// Optional features — never eliminate; feed the balanced
+    /// feature-match term.
+    pub optional_features: Vec<SelectionFeature>,
+    /// Required protocol (FR-23P's protocol stage).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub required_protocol: Option<SelectionProtocol>,
+}
+
+/// Which FR-23Q source supplied the physical country.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum PhysicalCountrySource {
+    /// An explicit per-request value (`--physical-country`).
+    ExplicitRequest,
+    /// The configured `connection_groups.physical_country`.
+    Config,
+    /// The cached Proton user-location country (obtained through Muon
+    /// while disconnected; read from the daemon's cache — this request
+    /// performs no location fetch).
+    CachedLocation,
+}
+
+/// The resolved physical country with its source (FR-23T carries both;
+/// the country code is coarse location, not an IP — the redaction rules
+/// for the fine-grained location payload do not apply to it, and
+/// FR-23T explicitly requires the value on the selection surface).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct PhysicalCountryValue {
+    /// The uppercase ISO 3166-1 alpha-2 code.
+    pub country: String,
+    /// Which source supplied it.
+    pub source: PhysicalCountrySource,
+}
+
+/// The catalog revisions a selection ran against (FR-23T's "catalog
+/// revision" — disambiguated per the m3-plan U6 reading: the SERVER
+/// catalog is the revision field's primary meaning; a group selection
+/// additionally carries the group registry's own revision stamp).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SelectionCatalogProvenance {
+    /// The cached server catalog revision's `ETag`, when one is cached.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub server_catalog_etag: Option<String>,
+    /// When the server catalog revision was fetched (Unix seconds);
+    /// absent when no catalog is cached (a selection then refuses —
+    /// never fabricates a revision).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub server_catalog_fetched_unix: Option<u64>,
+    /// The connection-group registry's catalog revision stamp, present
+    /// on group selections only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub group_catalog_revision: Option<String>,
+}
+
+/// A resolved group's identity and policy provenance (FR-23T's
+/// `group_id`/`origin`; T-33's status-visible override).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct GroupProvenance {
+    /// The stable namespaced group id.
+    pub group_id: String,
+    /// The group's origin (`proton`|`protonwire`).
+    pub origin: String,
+    /// How the effective ranking policy was chosen
+    /// (`catalog-default`|`declared-override`).
+    pub policy_provenance: String,
+}
+
+/// The selector the request resolved to, after target grammar and
+/// group-definition mapping (FR-23T's "resolved selector").
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ResolvedSelector {
+    /// The target kind token: `fastest`, `random`, `country`,
+    /// `countries`, `state`, `city`, `server`, `gateway`, `p2p`,
+    /// `tor`, `secure-core`, or `group`.
+    pub target: String,
+    /// The kind's parameter when it names one (the country code, the
+    /// state/city/server/gateway name, the group id; the pinned
+    /// entry/exit countries for `secure-core` render as `CH->SE`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    /// The effective ranking policy token
+    /// (`official`|`balanced`|`load`|`latency`|`random`).
+    pub policy: String,
+}
+
+/// One hard-filter stage's accounting (FR-22's structured report, wire
+/// form; stages with zero eliminations are omitted).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct StageReport {
+    /// The stage's stable label (the selection core's evaluation-order
+    /// vocabulary, e.g. `offline`, `target-geography`,
+    /// `physical-country-exclusion`, `required-features`).
+    pub stage: String,
+    /// Candidates this stage eliminated.
+    pub eliminated: usize,
+}
+
+/// FR-22's structured account of where every candidate went.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct HardFiltersReport {
+    /// Candidates that entered the pipeline.
+    pub considered: usize,
+    /// Candidates still eligible after every stage.
+    pub survivors: usize,
+    /// The per-stage counts, in the evaluation order (nonzero stages
+    /// only).
+    pub stages: Vec<StageReport>,
+}
+
+/// The per-term decomposition of a balanced ranking (FR-16's formula,
+/// wire form; lower is better).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct WeightedBreakdownWire {
+    /// `load_weight × normalized_load`.
+    pub load_term: f32,
+    /// `latency_weight × normalized_latency`.
+    pub latency_term: f32,
+    /// Zero until connection statistics exist (post-M4).
+    pub stability_term: f32,
+    /// `feature_weight × (1 − match_ratio)`.
+    pub feature_match_term: f32,
+    /// Zero until connection statistics exist (post-M4).
+    pub history_term: f32,
+    /// The weighted sum (lower is better).
+    pub total: f32,
+}
+
+/// The scoring signals behind the winning candidate (FR-23T/FR-14:
+/// status must identify the policy AND the signal provenance).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct WinnerSignals {
+    /// The signal provenance: `catalog-only` (Proton-exposed catalog
+    /// fields alone), `probe-observed` (plus the bounded on-demand
+    /// prober's latency), or `weighted-breakdown` (the balanced
+    /// decomposition).
+    pub provenance: String,
+    /// The catalog's opaque Proton score, when exposed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proton_score: Option<f32>,
+    /// The Proton-exposed load percentage, when present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub load: Option<i8>,
+    /// The latency observation, when one served the ranking
+    /// (milliseconds).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latency_ms: Option<u64>,
+    /// The balanced decomposition, when the balanced policy ranked the
+    /// winner.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub weighted: Option<WeightedBreakdownWire>,
+}
+
+/// The winning server (FR-23T; FR-23D's both-ends rule for Secure Core
+/// rides `entry_country`/`exit_country`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct SelectedServer {
+    /// The logical server ID.
+    pub id: String,
+    /// The display name (`UK#42`, `CH-SE#1`, ...).
+    pub name: String,
+    /// The route's entry country (equals the exit outside Secure
+    /// Core).
+    pub entry_country: String,
+    /// The exit country — the canonical selector.
+    pub exit_country: String,
+    /// The city, when exposed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub city: Option<String>,
+    /// The minimum plan tier (0 free .. 3 PM).
+    pub tier: i8,
+    /// The signals that ranked it.
+    pub signals: WinnerSignals,
+}
+
+/// The full selection result — FR-23T's field set, end to end.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct SelectionResult {
+    /// The catalog revisions the selection ran against.
+    pub catalog: SelectionCatalogProvenance,
+    /// The group identity and policy provenance, on group selections
+    /// only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub group: Option<GroupProvenance>,
+    /// The resolved selector (target + effective policy).
+    pub selector: ResolvedSelector,
+    /// The applied hard filters (FR-22's structured report).
+    pub hard_filters: HardFiltersReport,
+    /// The physical country that excluded exits, with its source —
+    /// present only when the request's semantics used it (FR-23T's
+    /// "when relevant").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub physical_country: Option<PhysicalCountryValue>,
+    /// The winning server.
+    pub winner: SelectedServer,
+    /// The selection-plane features the request carried (rendered
+    /// tokens, required then optional).
+    pub requested_features: Vec<String>,
+    /// Requested-but-not-applied features. For REQUIRED features the
+    /// difference is empty by construction — selection satisfies them
+    /// (the winner carries them) or refuses. OPTIONAL features are
+    /// prefer-not-require (they weight ranking, never eliminate), so
+    /// the winner may legitimately lack one; the difference reports
+    /// exactly those, through the core's one evaluation vocabulary.
+    /// The connection-plane family (`netshield`, `nat`, `lan-access`,
+    /// protocol-at-tunnel, the port-forwarding REQUEST) is composed by
+    /// the M4 tunnel (FR-23E's boundary), and its differences land
+    /// here from the connection transition, never from a query.
+    pub feature_difference: Vec<String>,
+}
+
+/// A group's FR-23S availability evaluation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct GroupAvailability {
+    /// Whether the group resolves to at least one eligible candidate
+    /// over the current cached catalog.
+    pub available: bool,
+    /// The structured reason when unavailable: `no-catalog` (nothing
+    /// cached yet), `physical-country-required` (FR-23Q),
+    /// `entitlement-composition-missing` (a PF-requiring group with
+    /// the entitlement seam uncomposed — none exist in the v1 catalog),
+    /// or `no-eligible-server` (the FR-22 report eliminated
+    /// everything).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// One built-in group as the list surface serves it (FR-23U).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct GroupSummary {
+    /// The stable namespaced id (FR-23J).
+    pub id: String,
+    /// The display label.
+    pub label: String,
+    /// `proton` or `protonwire`.
+    pub origin: String,
+    /// The definition's verification source.
+    pub definition_source: String,
+    /// What entitlement the group needs.
+    pub entitlement: String,
+    /// The catalog-declared ranking policy token.
+    pub ranking_policy: String,
+    /// The request-time ranking overrides the catalog declares.
+    pub allowed_ranking_overrides: Vec<String>,
+    /// The FR-23S availability evaluation.
+    pub availability: GroupAvailability,
+}
+
+/// The full built-in group catalog reply (FR-23I/U).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct GroupsCatalog {
+    /// The group registry's catalog revision stamp.
+    pub catalog_revision: String,
+    /// The regional taxonomy's revision identity.
+    pub taxonomy_revision: String,
+    /// Every built-in group, registry order.
+    pub groups: Vec<GroupSummary>,
+}
+
+/// One group's full definition (`group show`; §7.3B's minimum
+/// preserved representation, wire form).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct GroupDetails {
+    /// The summary fields (id, label, origin, entitlement, policy,
+    /// overrides, availability).
+    pub summary: GroupSummary,
+    /// Built-ins are immutable (FR-23M).
+    pub immutable: bool,
+    /// The connection type the target addresses, when the kind does
+    /// not imply it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub connection_type: Option<String>,
+    /// The target kind token (`fastest`, `fastest-in-country`,
+    /// `fastest-in-region`, `random`, `secure-core`).
+    pub target: String,
+    /// The target's parameter when it names one (the country, the
+    /// region; a Secure Core route renders `CH->SE`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_detail: Option<String>,
+    /// The `protocol` override token, when set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub protocol_override: Option<String>,
+    /// The remaining catalog-declared overrides, verbatim pairs
+    /// (connection-time parameters — the M4 tunnel composes them).
+    pub connection_overrides: Vec<[String; 2]>,
+    /// The catalog's selection-authority annotation, when set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selection_authority: Option<String>,
+    /// The definition's evidence sources.
+    pub sources: Vec<String>,
 }
 
 /// Reply to a request.
@@ -1247,5 +1671,284 @@ mod tests {
         );
         assert_eq!(data["writable_store"]["declared"], "auto");
         assert!(data.get("persistence_health").is_none());
+    }
+
+    /// M3 U6: the selection surface rides the flat request shape —
+    /// kebab-case method token, the target and modifiers beside the
+    /// id; the feature and protocol vocabularies render kebab-case.
+    #[test]
+    fn u6_select_request_shape() {
+        let json = serde_json::to_value(&Request::Select {
+            target: ConnectTarget::Country {
+                country: "GB".into(),
+            },
+            modifiers: SelectionModifiers {
+                by: Some("balanced".into()),
+                physical_country: Some("DE".into()),
+                excluded_countries: vec!["US".into()],
+                excluded_states: Vec::new(),
+                excluded_cities: Vec::new(),
+                excluded_servers: Vec::new(),
+                required_features: vec![SelectionFeature::PortForwarding],
+                optional_features: vec![SelectionFeature::P2p],
+                required_protocol: Some(SelectionProtocol::WireguardUdp),
+            },
+        })
+        .unwrap();
+        assert_eq!(json["method"], "select");
+        assert_eq!(json["params"]["target"]["kind"], "country");
+        assert_eq!(json["params"]["modifiers"]["by"], "balanced");
+        assert_eq!(json["params"]["modifiers"]["physical_country"], "DE");
+        assert_eq!(
+            json["params"]["modifiers"]["required_features"][0],
+            "port-forwarding"
+        );
+        assert_eq!(json["params"]["modifiers"]["optional_features"][0], "p2p");
+        assert_eq!(
+            json["params"]["modifiers"]["required_protocol"],
+            "wireguard-udp"
+        );
+        // Round-trips.
+        let back: Request = serde_json::from_value(json).unwrap();
+        assert!(matches!(back, Request::Select { .. }));
+
+        // The unit-shaped group methods carry no params at all; the
+        // show method carries its id.
+        assert_eq!(
+            serde_json::to_value(&Request::GroupsList).unwrap()["method"],
+            "groups-list"
+        );
+        let show = serde_json::to_value(&Request::GroupShow {
+            id: "proton:fastest-country".into(),
+        })
+        .unwrap();
+        assert_eq!(show["method"], "group-show");
+        assert_eq!(show["params"]["id"], "proton:fastest-country");
+    }
+
+    /// M3 U6 / FR-23T: the Selected result's wire shape — every
+    /// FR-23T field present, absent optionals OFF the wire (a group
+    /// selection carries the group provenance and the registry stamp;
+    /// the feature difference is empty by the FR-23E boundary).
+    #[test]
+    fn u6_selected_result_carries_the_fr23t_field_set() {
+        let result = SelectionResult {
+            catalog: SelectionCatalogProvenance {
+                server_catalog_etag: Some("\"rev-9\"".into()),
+                server_catalog_fetched_unix: Some(1_771_000_000),
+                group_catalog_revision: Some("groups-2026-08".into()),
+            },
+            group: Some(GroupProvenance {
+                group_id: "protonwire:fastest-europe".into(),
+                origin: "protonwire".into(),
+                policy_provenance: "declared-override".into(),
+            }),
+            selector: ResolvedSelector {
+                target: "countries".into(),
+                detail: None,
+                policy: "latency".into(),
+            },
+            hard_filters: HardFiltersReport {
+                considered: 20,
+                survivors: 1,
+                stages: vec![
+                    StageReport {
+                        stage: "offline".into(),
+                        eliminated: 3,
+                    },
+                    StageReport {
+                        stage: "target-geography".into(),
+                        eliminated: 16,
+                    },
+                ],
+            },
+            physical_country: Some(PhysicalCountryValue {
+                country: "GB".into(),
+                source: PhysicalCountrySource::ExplicitRequest,
+            }),
+            winner: SelectedServer {
+                id: "id-CH#10".into(),
+                name: "CH#10".into(),
+                entry_country: "CH".into(),
+                exit_country: "CH".into(),
+                city: Some("Zurich".into()),
+                tier: 2,
+                signals: WinnerSignals {
+                    provenance: "probe-observed".into(),
+                    proton_score: Some(1.42),
+                    load: Some(42),
+                    latency_ms: Some(18),
+                    weighted: None,
+                },
+            },
+            requested_features: vec!["port-forwarding".into()],
+            feature_difference: Vec::new(),
+        };
+        let json = serde_json::to_value(RequestResult::Selected {
+            result: Box::new(result),
+        })
+        .unwrap();
+        assert_eq!(json["result"], "selected");
+        let data = &json["data"]["result"];
+        assert_eq!(data["catalog"]["server_catalog_etag"], "\"rev-9\"");
+        assert_eq!(data["catalog"]["group_catalog_revision"], "groups-2026-08");
+        assert_eq!(data["group"]["group_id"], "protonwire:fastest-europe");
+        assert_eq!(data["group"]["policy_provenance"], "declared-override");
+        assert_eq!(data["selector"]["target"], "countries");
+        assert_eq!(data["selector"]["policy"], "latency");
+        assert!(data["selector"].get("detail").is_none());
+        assert_eq!(data["hard_filters"]["considered"], 20);
+        assert_eq!(data["hard_filters"]["survivors"], 1);
+        assert_eq!(
+            data["hard_filters"]["stages"][1]["stage"],
+            "target-geography"
+        );
+        assert_eq!(data["hard_filters"]["stages"][1]["eliminated"], 16);
+        assert_eq!(data["physical_country"]["country"], "GB");
+        assert_eq!(data["physical_country"]["source"], "explicit-request");
+        assert_eq!(data["winner"]["name"], "CH#10");
+        assert_eq!(data["winner"]["signals"]["provenance"], "probe-observed");
+        assert_eq!(data["winner"]["signals"]["latency_ms"], 18);
+        assert!(data["winner"]["signals"].get("weighted").is_none());
+        assert_eq!(data["requested_features"][0], "port-forwarding");
+        assert_eq!(data["feature_difference"], serde_json::json!([]));
+        // Round-trips.
+        let back: RequestResult = serde_json::from_value(json).unwrap();
+        assert!(matches!(back, RequestResult::Selected { .. }));
+
+        // The no-group shape: group provenance and the registry stamp
+        // stay OFF the wire entirely (never null-fabricated).
+        let bare = SelectionResult {
+            catalog: SelectionCatalogProvenance {
+                server_catalog_etag: None,
+                server_catalog_fetched_unix: None,
+                group_catalog_revision: None,
+            },
+            group: None,
+            physical_country: None,
+            selector: ResolvedSelector {
+                target: "fastest".into(),
+                detail: None,
+                policy: "official".into(),
+            },
+            hard_filters: HardFiltersReport {
+                considered: 1,
+                survivors: 1,
+                stages: Vec::new(),
+            },
+            winner: SelectedServer {
+                id: "id".into(),
+                name: "GB#1".into(),
+                entry_country: "GB".into(),
+                exit_country: "GB".into(),
+                city: None,
+                tier: 0,
+                signals: WinnerSignals {
+                    provenance: "catalog-only".into(),
+                    proton_score: None,
+                    load: None,
+                    latency_ms: None,
+                    weighted: None,
+                },
+            },
+            requested_features: Vec::new(),
+            feature_difference: Vec::new(),
+        };
+        let json = serde_json::to_value(RequestResult::Selected {
+            result: Box::new(bare),
+        })
+        .unwrap();
+        let data = &json["data"]["result"];
+        assert!(data.get("group").is_none());
+        assert!(data.get("physical_country").is_none());
+        assert!(data["catalog"].as_object().map(|o| o.is_empty()) == Some(true));
+        assert!(data["winner"].get("city").is_none());
+    }
+
+    /// M3 U6 / FR-23S/U: the groups catalog and group-details wire
+    /// shapes — availability reasons are structured tokens, the
+    /// registry's revision stamps ride the catalog reply.
+    #[test]
+    fn u6_groups_wire_shapes() {
+        let catalog = GroupsCatalog {
+            catalog_revision: "rev-a".into(),
+            taxonomy_revision: "un-m49@2026".into(),
+            groups: vec![GroupSummary {
+                id: "proton:fastest-country".into(),
+                label: "Fastest country".into(),
+                origin: "proton".into(),
+                definition_source: "proton-api".into(),
+                entitlement: "plan-dependent".into(),
+                ranking_policy: "proton-score".into(),
+                allowed_ranking_overrides: Vec::new(),
+                availability: GroupAvailability {
+                    available: true,
+                    reason: None,
+                },
+            }],
+        };
+        let json = serde_json::to_value(RequestResult::Groups { catalog }).unwrap();
+        assert_eq!(json["result"], "groups");
+        let data = &json["data"]["catalog"];
+        assert_eq!(data["catalog_revision"], "rev-a");
+        assert_eq!(data["taxonomy_revision"], "un-m49@2026");
+        let group = &data["groups"][0];
+        assert_eq!(group["id"], "proton:fastest-country");
+        assert_eq!(group["origin"], "proton");
+        assert_eq!(group["ranking_policy"], "proton-score");
+        assert_eq!(group["availability"]["available"], true);
+        assert!(group["availability"].get("reason").is_none());
+        let back: RequestResult = serde_json::from_value(json).unwrap();
+        assert!(matches!(back, RequestResult::Groups { .. }));
+
+        // An unavailable group carries its structured reason.
+        let unavailable = GroupAvailability {
+            available: false,
+            reason: Some("physical-country-required".into()),
+        };
+        let json = serde_json::to_value(unavailable).unwrap();
+        assert_eq!(json["reason"], "physical-country-required");
+
+        // The details shape: the verbatim override pairs and the
+        // evidence sources ride `group show`.
+        let details = GroupDetails {
+            summary: GroupSummary {
+                id: "proton:gaming".into(),
+                label: "Gaming".into(),
+                origin: "proton".into(),
+                definition_source: "official-client-compat".into(),
+                entitlement: "target-and-feature-dependent".into(),
+                ranking_policy: "proton-score".into(),
+                allowed_ranking_overrides: Vec::new(),
+                availability: GroupAvailability {
+                    available: true,
+                    reason: None,
+                },
+            },
+            immutable: true,
+            connection_type: Some("standard".into()),
+            target: "fastest".into(),
+            target_detail: None,
+            protocol_override: None,
+            connection_overrides: vec![["nat".into(), "moderate".into()]],
+            selection_authority: None,
+            sources: vec!["android-initial-profiles".into()],
+        };
+        let json = serde_json::to_value(RequestResult::Group {
+            group: Box::new(details),
+        })
+        .unwrap();
+        assert_eq!(json["result"], "group");
+        let data = &json["data"]["group"];
+        assert_eq!(data["summary"]["id"], "proton:gaming");
+        assert_eq!(data["immutable"], true);
+        assert_eq!(data["connection_type"], "standard");
+        assert_eq!(data["target"], "fastest");
+        assert_eq!(data["connection_overrides"][0][0], "nat");
+        assert_eq!(data["connection_overrides"][0][1], "moderate");
+        assert_eq!(data["sources"][0], "android-initial-profiles");
+        assert!(data.get("protocol_override").is_none());
+        let back: RequestResult = serde_json::from_value(json).unwrap();
+        assert!(matches!(back, RequestResult::Group { .. }));
     }
 }

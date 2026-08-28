@@ -1,5 +1,26 @@
 # Milestone 3 Plan — Server Selection
 
+> **COMPLETED (2026-08-26).** Every unit in this plan landed: U1
+> through U7, delivered as the planned four-PR stack — PR-1
+> (`m3/selection-core`, PR #5), PR-2 (`m3/group-registry`, PR #6),
+> PR-3 (`m3/secure-core-latency`, PR #8), and PR-4
+> (`m3/select-surface`, the top branch). Per-PR verdicts, close
+> passes, incidents, and the open-at-merge items are the review-log
+> entries dated 2026-08-25 through 2026-08-26 in
+> `docs/review-log.md` (the M3 MILESTONE entry surveys the stack as a
+> whole). PR-4's branch carries 9 implementation commits over PR-3's
+> fix-lane tip plus this close pass's commits. The normative exit
+> held: the 20k timed test measured ~105 ms against the 500 ms bar at
+> PR-1's close (~4.8x headroom), the T-1..T-4/T-11/T-28..T-34 classes
+> are green, and fmt/clippy/tests/doc/xtask gates ran green on every
+> PR. Two clauses landed with recorded deltas: §9.5's
+> `--entry-country`/`--exit-country` flag forms are not yet spellable
+> at the CLI (the wire, engine, and resolver carry both ends; the
+> flag surface rides M4's connect-time lane), and FR-23U's pin/unpin
+> and copy-to-profile actions ride M6's profile lane by design. The
+> text below is the normative plan as written before execution and is
+> intentionally unchanged.
+
 Branch stack: `m3/selection-core` from master (`5fd53d7`, M2 merged). Normative
 scope: PRD §18 M3, §7.3/7.3A, §9.2–9.5, §11.1–11.3; the implementation plan's
 M3 exit (selection ≤500 ms on 20k synthetic servers; group suite T-28..T-33

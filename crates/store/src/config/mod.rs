@@ -259,6 +259,30 @@ impl SystemConfig {
                     .to_owned(),
             );
         }
+        // The probe-round deadline must leave the RPC round trip room:
+        // the IPC request deadline is 10 s, so a round configured up to
+        // it (or past it) answers with the transport timeout instead of
+        // a selection — the Codex PR-9 bound. The floor keeps a round
+        // from degenerating into never-probe (a sanity bar, disclosed).
+        if let Some(violation) = ipc_budget_violation(
+            "server_selection.latency_probe.round_deadline_ms",
+            u64::from(self.server_selection.latency_probe.round_deadline_ms),
+            "the whole probe round must finish",
+        ) {
+            violations.push(violation);
+        }
+        // The entitlement composition budget shares the IPC-deadline
+        // logic (Codex PR#9, P1): the adapter's fetch timeout is 30 s;
+        // the per-request composition must give up (tier-None) inside
+        // the 10 s request deadline, leaving headroom for the
+        // selection itself.
+        if let Some(violation) = ipc_budget_violation(
+            "server_selection.entitlement_fetch_budget_ms",
+            self.server_selection.entitlement_fetch_budget_ms,
+            "the entitlement composition must stay",
+        ) {
+            violations.push(violation);
+        }
         if self.features.port_forwarding && self.features.nat == NatMode::Moderate {
             violations.push(
                 "features.port_forwarding is incompatible with features.nat=moderate".to_owned(),
@@ -409,6 +433,14 @@ impl SystemConfig {
                 Authority::System,
             ),
             (
+                "server_selection.latency_probe.round_deadline_ms",
+                Authority::System,
+            ),
+            (
+                "server_selection.entitlement_fetch_budget_ms",
+                Authority::System,
+            ),
+            (
                 "server_selection.latency_probe.parallelism",
                 Authority::System,
             ),
@@ -510,6 +542,22 @@ impl SystemConfig {
             ("profiles.default.selection.require", Authority::PerUser),
         ]
     }
+}
+
+/// One selection-plane budget that must fit under the IPC request
+/// deadline (10 s — the IPC client's default request timeout; store
+/// cannot depend on the ipc crate, so the bar is recorded here, once,
+/// for every budget the selection plane composes per request). The
+/// ceiling leaves the RPC round trip its own room; the floor keeps a
+/// budget from degenerating into never-run. One message template for
+/// both budget fields the Codex PR-9 rounds added.
+fn ipc_budget_violation(field: &str, value: u64, purpose: &str) -> Option<String> {
+    (!(250..=9_500).contains(&value)).then(|| {
+        format!(
+            "{field} must be between 250 and 9500 (found {value}) — {purpose} under the \
+             10 s IPC request deadline"
+        )
+    })
 }
 
 /// Configuration loading failures.
@@ -1084,6 +1132,40 @@ mod tests {
         config.schema_version = 2;
         config.server_selection.latency_probe.background_scan = true;
         assert!(config.validate().is_err());
+    }
+
+    /// The Codex PR-9 probe-round bound: a deadline configured at (or
+    /// past) the 10 s IPC request deadline would answer `--by latency`
+    /// with the transport timeout — the violation names the bar.
+    #[test]
+    fn probe_round_deadline_must_leave_the_rpc_round_trip_room() {
+        let mut config = SystemConfig::default();
+        config.schema_version = 2;
+        config.server_selection.latency_probe.round_deadline_ms = 10_000;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("round_deadline_ms"),
+            "the violation names the field: {err}"
+        );
+        assert!(
+            err.contains("10 s IPC request deadline"),
+            "the violation cites the bar: {err}"
+        );
+
+        let mut config = SystemConfig::default();
+        config.schema_version = 2;
+        config.server_selection.latency_probe.round_deadline_ms = 100;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("round_deadline_ms"), "the floor too: {err}");
+
+        // The default sits well under the RPC deadline.
+        let mut config = SystemConfig::default();
+        config.schema_version = 2;
+        assert_eq!(
+            config.server_selection.latency_probe.round_deadline_ms,
+            8000
+        );
+        assert!(config.validate().is_ok());
     }
 
     #[test]

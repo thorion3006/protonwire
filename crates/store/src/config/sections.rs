@@ -212,7 +212,7 @@ impl Default for AccountSection {
 }
 
 /// Server-selection section.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct ServerSelectionSection {
     /// Metadata cache policy.
@@ -223,6 +223,30 @@ pub struct ServerSelectionSection {
     pub balanced_weights: BalancedWeights,
     /// Secure Core defaults.
     pub secure_core: SecureCoreSection,
+    /// The RPC-deadline budget for the per-request entitlement
+    /// composition (Codex PR#9, P1): the adapter's own fetch timeout
+    /// is 30 s but the IPC request deadline is 10 s — a slow
+    /// entitlement endpoint degrades the request to tier-None within
+    /// this budget instead of poisoning the client connection.
+    /// Validated below the 10 s IPC bar.
+    #[serde(default = "default_entitlement_fetch_budget_ms")]
+    pub entitlement_fetch_budget_ms: u64,
+}
+
+fn default_entitlement_fetch_budget_ms() -> u64 {
+    6_000
+}
+
+impl Default for ServerSelectionSection {
+    fn default() -> Self {
+        Self {
+            metadata_cache: MetadataCacheSection::default(),
+            latency_probe: LatencyProbeSection::default(),
+            balanced_weights: BalancedWeights::default(),
+            secure_core: SecureCoreSection::default(),
+            entitlement_fetch_budget_ms: default_entitlement_fetch_budget_ms(),
+        }
+    }
 }
 
 /// Metadata cache policy. The refresh interval floor is a hard product rule:
@@ -272,6 +296,14 @@ pub struct LatencyProbeSection {
     pub max_candidates: u32,
     /// Per-probe timeout.
     pub timeout_ms: u32,
+    /// TOTAL wall-clock bound on one probe round — the whole round
+    /// (every endpoint combined) must finish inside this, stopping
+    /// fresh probes at the deadline and keeping the answered prefix.
+    /// Sits deliberately under the 10 s IPC request deadline so a
+    /// `--by latency` request answers within the RPC timeout (the
+    /// Codex PR-9 arithmetic: 20 candidates × 750 ms ≈ 15 s
+    /// serialized would otherwise exceed it).
+    pub round_deadline_ms: u32,
     /// Concurrency bound.
     pub parallelism: u32,
     /// Minimum age before a cached result is reused.
@@ -288,6 +320,7 @@ impl Default for LatencyProbeSection {
             enabled: true,
             max_candidates: 20,
             timeout_ms: 750,
+            round_deadline_ms: 8000,
             parallelism: 4,
             result_min_age_minutes: 15,
             background_scan: false,

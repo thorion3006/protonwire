@@ -437,13 +437,18 @@ pub struct ResolvedGroup {
 /// `latency` maps onto the latency ranking policy — the observations
 /// arrive via [`SelectionContext::latency`] at selection time (the
 /// bounded on-demand prober's table; an empty one refuses typed
-/// THERE, never a silent substitute here).
-fn to_selection_policy(policy: GroupRankingPolicy) -> RankingPolicy {
+/// THERE, never a silent substitute here). `balanced` composes the
+/// CALLER-supplied weights (P2-2's pinned precedence, resolved before
+/// this function: request-explicit weights (profiles, M6 — none in
+/// v1) > catalog-declared weights (a future group catalog that pins
+/// weights owns its groups' semantics per FR-23P; v1 declares none) >
+/// the user's `server_selection.balanced_weights` > the built-in
+/// defaults. The caller passes whichever of those won; this function
+/// never re-derives the precedence).
+fn to_selection_policy(policy: GroupRankingPolicy, weights: &WeightedSignals) -> RankingPolicy {
     match policy {
         GroupRankingPolicy::ProtonScore => RankingPolicy::Official,
-        GroupRankingPolicy::Balanced => RankingPolicy::Balanced {
-            weights: WeightedSignals::DEFAULT,
-        },
+        GroupRankingPolicy::Balanced => RankingPolicy::Balanced { weights: *weights },
         GroupRankingPolicy::Load => RankingPolicy::LowestLoad,
         GroupRankingPolicy::RandomCountryThenServer => RankingPolicy::Random,
         GroupRankingPolicy::Latency => RankingPolicy::Latency,
@@ -480,10 +485,14 @@ fn declared_overrides(group: &GroupEntry) -> String {
 /// outright; regional groups honor exactly their declared list).
 /// `physical` carries FR-23Q's three sources — the resolver composes
 /// the precedence and the selection core enforces the rest.
+/// `balanced_weights` is the composed weight set any `balanced` policy
+/// (catalog default or declared override) runs under — the precedence
+/// is recorded on the private `to_selection_policy` helper's docs.
 pub fn resolve_group(
     id: &str,
     ranking_override: Option<&str>,
     physical: &PhysicalCountrySources<'_>,
+    balanced_weights: &WeightedSignals,
 ) -> Result<ResolvedGroup, GroupError> {
     let group = group(id).ok_or_else(|| GroupError::UnknownGroup { id: id.to_owned() })?;
 
@@ -499,7 +508,7 @@ pub fn resolve_group(
 
     let (policy, policy_provenance) = match ranking_override {
         None => (
-            to_selection_policy(group.ranking_policy),
+            to_selection_policy(group.ranking_policy, balanced_weights),
             PolicyProvenance::CatalogDefault,
         ),
         Some(mode) => {
@@ -524,7 +533,7 @@ pub fn resolve_group(
                 });
             }
             (
-                to_selection_policy(requested),
+                to_selection_policy(requested, balanced_weights),
                 PolicyProvenance::DeclaredOverride,
             )
         }
@@ -591,14 +600,17 @@ pub enum GroupSelectionError {
 
 /// Resolves and selects in one call over the cached catalog (FR-23R:
 /// no network — the catalog bytes are the daemon's cached document).
+/// `balanced_weights` composes every balanced policy exactly as
+/// [`resolve_group`] records.
 pub fn select_group<'a>(
     catalog: &'a CatalogDocument,
     id: &str,
     ranking_override: Option<&str>,
     physical: &PhysicalCountrySources<'_>,
+    balanced_weights: &WeightedSignals,
     context: &SelectionContext,
 ) -> Result<SelectionOutcome<'a>, GroupSelectionError> {
-    let resolved = resolve_group(id, ranking_override, physical)?;
+    let resolved = resolve_group(id, ranking_override, physical, balanced_weights)?;
     Ok(crate::selection::select(
         catalog,
         &resolved.request,
@@ -837,7 +849,12 @@ mod tests {
     };
 
     fn resolve(id: &str) -> Result<ResolvedGroup, GroupError> {
-        resolve_group(id, None, &PhysicalCountrySources::default())
+        resolve_group(
+            id,
+            None,
+            &PhysicalCountrySources::default(),
+            &WeightedSignals::DEFAULT,
+        )
     }
 
     /// T-28: the canonical catalog resolves — every group maps onto
@@ -920,8 +937,13 @@ mod tests {
                 "{id}"
             );
             for mode in ["official", "balanced", "load"] {
-                let err =
-                    resolve_group(id, Some(mode), &PhysicalCountrySources::default()).unwrap_err();
+                let err = resolve_group(
+                    id,
+                    Some(mode),
+                    &PhysicalCountrySources::default(),
+                    &WeightedSignals::DEFAULT,
+                )
+                .unwrap_err();
                 assert_eq!(
                     err,
                     GroupError::RankingOverrideForbidden {
@@ -956,6 +978,7 @@ mod tests {
             "proton:random-country",
             Some("load"),
             &PhysicalCountrySources::default(),
+            &WeightedSignals::DEFAULT,
         )
         .unwrap_err();
         assert_eq!(
@@ -975,8 +998,13 @@ mod tests {
     fn speed_overrides_are_the_signal_rejection_on_both_namespaces() {
         for id in ["proton:fastest-country", "protonwire:fastest-europe"] {
             for signal in ["speed", "estimated-throughput"] {
-                let err = resolve_group(id, Some(signal), &PhysicalCountrySources::default())
-                    .unwrap_err();
+                let err = resolve_group(
+                    id,
+                    Some(signal),
+                    &PhysicalCountrySources::default(),
+                    &WeightedSignals::DEFAULT,
+                )
+                .unwrap_err();
                 assert_eq!(
                     err,
                     GroupError::UnsupportedRankingSignal {
@@ -1024,6 +1052,7 @@ mod tests {
             "protonwire:fastest-europe",
             Some("load"),
             &PhysicalCountrySources::default(),
+            &WeightedSignals::DEFAULT,
         )
         .unwrap();
         assert_eq!(load.request.policy, RankingPolicy::LowestLoad);
@@ -1033,6 +1062,7 @@ mod tests {
             "protonwire:fastest-europe",
             Some("balanced"),
             &PhysicalCountrySources::default(),
+            &WeightedSignals::DEFAULT,
         )
         .unwrap();
         assert_eq!(
@@ -1051,6 +1081,7 @@ mod tests {
                 "protonwire:fastest-europe",
                 Some(undeclared),
                 &PhysicalCountrySources::default(),
+                &WeightedSignals::DEFAULT,
             )
             .unwrap_err();
             assert_eq!(
@@ -1069,10 +1100,61 @@ mod tests {
             "protonwire:fastest-europe",
             Some("latency"),
             &PhysicalCountrySources::default(),
+            &WeightedSignals::DEFAULT,
         )
         .unwrap();
         assert_eq!(err.request.policy, RankingPolicy::Latency);
         assert_eq!(err.policy_provenance, PolicyProvenance::DeclaredOverride);
+    }
+
+    /// P2-2 (pinned, M3 PR-4): a DeclaredOverride to `balanced` runs
+    /// under the CALLER-composed weights — the v1 catalog declares no
+    /// weight values, so the composed set the daemon passes (the user's
+    /// `server_selection.balanced_weights`) is what the group runs
+    /// under. The full precedence is recorded on
+    /// [`to_selection_policy`]: request-explicit (profiles, M6) >
+    /// catalog-declared (none in v1; a future declared value would own
+    /// the group's semantics per FR-23P) > user config > defaults.
+    /// Mutation-verified: with the weights parameter ignored (the
+    /// pre-fix `WeightedSignals::DEFAULT` mapping), BOTH arms of this
+    /// test fail.
+    #[test]
+    fn a_declared_balanced_override_composes_the_caller_weights() {
+        let custom = WeightedSignals {
+            load: 0.10,
+            latency: 0.60,
+            stability: 0.20,
+            feature_match: 0.10,
+            history: 0.00,
+        };
+        // The declared override path (--by balanced on a regional group).
+        let resolved = resolve_group(
+            "protonwire:fastest-europe",
+            Some("balanced"),
+            &PhysicalCountrySources::default(),
+            &custom,
+        )
+        .unwrap();
+        assert_eq!(
+            resolved.request.policy,
+            RankingPolicy::Balanced { weights: custom },
+            "the override must run under the caller's composed weights, not the defaults"
+        );
+        assert_eq!(
+            resolved.policy_provenance,
+            PolicyProvenance::DeclaredOverride
+        );
+
+        // A non-balanced override is untouched by the weights (the
+        // parameter must not leak into other policies).
+        let load = resolve_group(
+            "protonwire:fastest-europe",
+            Some("load"),
+            &PhysicalCountrySources::default(),
+            &custom,
+        )
+        .unwrap();
+        assert_eq!(load.request.policy, RankingPolicy::LowestLoad);
     }
 
     /// FR-23Q: explicit request → explicit config → cached Muon
@@ -1117,8 +1199,13 @@ mod tests {
             config: Some("DE"),
             cached_location: None,
         };
-        let resolved =
-            resolve_group("proton:fastest-excluding-my-country", None, &sources).unwrap();
+        let resolved = resolve_group(
+            "proton:fastest-excluding-my-country",
+            None,
+            &sources,
+            &WeightedSignals::DEFAULT,
+        )
+        .unwrap();
         assert!(resolved.request.constraints.exclude_physical_country);
         assert_eq!(
             resolved.request.constraints.physical_country,
@@ -1129,6 +1216,7 @@ mod tests {
             "proton:fastest-excluding-my-country",
             None,
             &PhysicalCountrySources::default(),
+            &WeightedSignals::DEFAULT,
         )
         .unwrap();
         assert_eq!(none.request.constraints.physical_country, None);
@@ -1251,6 +1339,7 @@ mod tests {
             "proton:fastest-country",
             None,
             &sources(None),
+            &WeightedSignals::DEFAULT,
             &SelectionContext::default(),
         )
         .unwrap();
@@ -1269,6 +1358,7 @@ mod tests {
             "proton:fastest-excluding-my-country",
             None,
             &sources(Some("GB")),
+            &WeightedSignals::DEFAULT,
             &SelectionContext::default(),
         )
         .unwrap();
@@ -1285,6 +1375,7 @@ mod tests {
             "proton:fastest-excluding-my-country",
             None,
             &sources(None),
+            &WeightedSignals::DEFAULT,
             &SelectionContext::default(),
         )
         .unwrap_err();
@@ -1302,6 +1393,7 @@ mod tests {
             "proton:fastest-excluding-my-country",
             None,
             &sources(Some("gb")),
+            &WeightedSignals::DEFAULT,
             &SelectionContext::default(),
         )
         .unwrap_err();
@@ -1330,6 +1422,7 @@ mod tests {
             "protonwire:fastest-north-america",
             None,
             &sources(None),
+            &WeightedSignals::DEFAULT,
             &SelectionContext::default(),
         )
         .unwrap();
@@ -1349,6 +1442,7 @@ mod tests {
             "protonwire:fastest-europe",
             None,
             &sources(None),
+            &WeightedSignals::DEFAULT,
             &SelectionContext::default(),
         )
         .unwrap();
@@ -1377,6 +1471,7 @@ mod tests {
             "protonwire:fastest-europe",
             Some("load"),
             &sources(None),
+            &WeightedSignals::DEFAULT,
             &SelectionContext::default(),
         )
         .unwrap();
@@ -1387,6 +1482,7 @@ mod tests {
             "protonwire:fastest-europe",
             Some("load"),
             &PhysicalCountrySources::default(),
+            &WeightedSignals::DEFAULT,
         )
         .unwrap();
         assert_eq!(
@@ -1410,6 +1506,7 @@ mod tests {
             "proton:streaming-us",
             None,
             &sources(None),
+            &WeightedSignals::DEFAULT,
             &SelectionContext::default(),
         )
         .unwrap();
@@ -1441,6 +1538,7 @@ mod tests {
             "proton:random-country",
             None,
             &sources(None),
+            &WeightedSignals::DEFAULT,
             &context,
         )
         .unwrap();
@@ -1449,6 +1547,7 @@ mod tests {
             "proton:random-country",
             None,
             &sources(None),
+            &WeightedSignals::DEFAULT,
             &context,
         )
         .unwrap();
@@ -1471,6 +1570,7 @@ mod tests {
             "proton:random-country",
             None,
             &sources(None),
+            &WeightedSignals::DEFAULT,
             &SelectionContext::default(),
         )
         .unwrap_err();
@@ -1504,6 +1604,7 @@ mod tests {
             "proton:max-security",
             None,
             &sources(None),
+            &WeightedSignals::DEFAULT,
             &SelectionContext::default(),
         )
         .unwrap();

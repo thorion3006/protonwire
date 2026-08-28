@@ -4,9 +4,11 @@
 //! full catalog — FR-18), prior observations, and the budget state, it
 //! decides WHICH endpoints to probe NOW and which prior results to
 //! reuse. The EXECUTOR is an injected seam (`ProbeExecutor`): the
-//! daemon (PR-4/M4) supplies the real transport — TCP/UDP connect by
-//! default, ICMP only behind an explicit opt-in that requires
-//! CAP_NET_RAW, which the core never assumes. No background scanning:
+//! daemon supplies the real transport — the TCP connect-timing
+//! executor landed with M3 PR-4's U6 (`apps/daemon/src/selection.rs`);
+//! ICMP remains a config VALUE honored fail-closed there (its
+//! raw-socket executor is deliberately unwired, and CAP_NET_RAW is the
+//! daemon's call, never assumed here). No background scanning:
 //! every probe run is caller-initiated. An unanswered probe is NEVER
 //! proof an endpoint is offline — a timeout is simply the absence of
 //! an observation (FR-19B); the planner keeps the prior value.
@@ -52,8 +54,10 @@ impl Default for ProbeBudget {
     }
 }
 
-/// The per-endpoint prior state the planner consults.
-#[derive(Debug, Clone, Copy)]
+/// The per-endpoint prior state the planner consults. The all-zero
+/// row (no observation, never attempted) is the legitimate unknown
+/// endpoint state.
+#[derive(Debug, Clone, Copy, Default)]
 pub struct EndpointState {
     /// The last observation, when one exists.
     pub observation: Option<Observation>,
@@ -118,14 +122,27 @@ pub fn plan_run(
             Some(EndpointState {
                 observation: Some(obs),
                 observed_at_ms,
-                ..
+                last_attempt_ms,
             }) => {
-                // The reuse window measures from the OBSERVATION time
-                // (Codex PR#8, P2): a stale RTT whose refresh attempt
-                // timed out ages out regardless of attempt recency.
-                let age = Duration::from_millis(now_ms.saturating_sub(*observed_at_ms));
-                if age < budget.min_reuse_age {
+                let attempt_age = Duration::from_millis(now_ms.saturating_sub(*last_attempt_ms));
+                let obs_age = Duration::from_millis(now_ms.saturating_sub(*observed_at_ms));
+                if obs_age < budget.min_reuse_age {
+                    // Fresh observation: REUSE — no probe is issued, so
+                    // the attempt clock is irrelevant here (the reuse
+                    // window measures from the OBSERVATION time, Codex
+                    // PR#8, P2).
                     ProbeDecision::Reuse(*obs)
+                } else if attempt_age < budget.min_probe_interval {
+                    // STALE observation with a recent attempt: the
+                    // hammering guard applies (Codex PR#9 round 3, P1:
+                    // the pre-fix arm decided Probe solely on
+                    // observation staleness, ignoring the attempt
+                    // clock, so a concurrent round or the next request
+                    // after a failed refresh re-probed the same stale
+                    // endpoint inside the interval). The prior
+                    // observation still serves selection via the
+                    // rate-limited passthrough.
+                    ProbeDecision::RateLimited
                 } else {
                     ProbeDecision::Probe
                 }
@@ -160,24 +177,29 @@ pub fn plan_run(
     decisions
 }
 
-/// Executes one planned run: probes every `Probe` endpoint through
-/// the executor (polling `cancelled` between endpoints), returning
-/// the merged observation table — reused priors plus fresh answers.
-/// An unanswered probe contributes NOTHING for that endpoint (the
-/// prior observation, when one exists, is what the caller keeps —
-/// never an offline verdict).
+/// Executes one planned run in SHORTLIST order — the caller's ranked
+/// priority (the PR-3 review's P2-4: the decision map is key-ordered,
+/// so iterating it let cancellation cut the high-priority prefix and
+/// keep the lexicographically-first tail). Probes every `Probe`
+/// endpoint through the executor (polling `cancelled` between
+/// endpoints), returning the merged observation table — reused priors
+/// plus fresh answers. An unanswered probe contributes NOTHING for that
+/// endpoint (the prior observation, when one exists, is what the caller
+/// keeps — never an offline verdict).
 pub fn run_planned(
+    shortlist: &[String],
     decisions: &BTreeMap<String, ProbeDecision>,
     state: &BTreeMap<String, EndpointState>,
     executor: &mut dyn ProbeExecutor,
-) -> BTreeMap<String, Observation> {
+) -> ProbeRun {
     let mut table = BTreeMap::new();
-    for (endpoint, decision) in decisions {
-        match decision {
-            ProbeDecision::Reuse(obs) => {
+    let mut attempted = Vec::new();
+    for endpoint in shortlist {
+        match decisions.get(endpoint) {
+            Some(ProbeDecision::Reuse(obs)) => {
                 table.insert(endpoint.clone(), *obs);
             }
-            ProbeDecision::RateLimited => {
+            Some(ProbeDecision::RateLimited) => {
                 if let Some(EndpointState {
                     observation: Some(obs),
                     ..
@@ -186,17 +208,40 @@ pub fn run_planned(
                     table.insert(endpoint.clone(), *obs);
                 }
             }
-            ProbeDecision::Probe => {
+            Some(ProbeDecision::Probe) => {
                 if executor.cancelled() {
                     break;
                 }
+                attempted.push(endpoint.clone());
                 if let Some(rtt) = executor.probe(endpoint) {
                     table.insert(endpoint.clone(), Observation { rtt });
                 }
             }
+            // An endpoint the planner never decided (a shortlist the
+            // planner was not given) is not this run's business.
+            None => {}
         }
     }
-    table
+    ProbeRun {
+        observations: table,
+        attempted,
+    }
+}
+
+/// One planned run's outcome: the merged observation table (reused
+/// priors plus fresh answers) AND the endpoints whose `probe()` was
+/// actually started — the reservation-release contract (Codex PR#9
+/// P2: a deadline cut before an endpoint's turn means its daemon-side
+/// reservation must be released; an attempted-but-unanswered endpoint
+/// keeps its reservation — the hammering guard's contract).
+#[derive(Debug, Clone)]
+pub struct ProbeRun {
+    /// The merged observations, keyed by logical id.
+    pub observations: BTreeMap<String, Observation>,
+    /// The endpoints whose `probe()` actually started (answered or
+    /// not) — reservations for OTHER planned endpoints should be
+    /// released by the caller.
+    pub attempted: Vec<String>,
 }
 
 #[cfg(test)]
@@ -315,27 +360,54 @@ mod tests {
         );
     }
 
-    /// Codex PR#8 (P2): the reuse window measures from the
-    /// OBSERVATION time, not the attempt time — a stale RTT whose
-    /// refresh attempt is RECENT (timed out, clock written back) must
-    /// not read as fresh. Pre-fix, the age came from last_attempt_ms,
-    /// so repeated failed refreshes kept an arbitrarily old RTT alive
-    /// indefinitely.
+    /// Codex PR#8 (P2) + PR#9 round 3 (P1): the reuse window measures
+    /// from the OBSERVATION time, not the attempt time — a stale RTT
+    /// whose refresh attempt is RECENT (timed out, clock written back)
+    /// must not read as fresh, AND the recent attempt rate-limits the
+    /// re-probe (the hammering guard). Pre-fix, the age came from
+    /// last_attempt_ms, so repeated failed refreshes kept an
+    /// arbitrarily old RTT alive indefinitely.
     #[test]
     fn a_stale_observation_with_a_recent_failed_refresh_is_not_fresh() {
         let shortlist = vec!["a".to_owned()];
-        // Observed 400s ago (stale), last attempted 10s ago (a failed
-        // refresh wrote the clock). The pre-fix code computed age from
-        // the attempt: 10s < 300s → Reuse — the dead RTT read fresh.
-        let state: BTreeMap<_, _> = [endpoint_full("a", Some(42), 10_000, 1_000)].into();
-        let now = 401_000;
+        // Observed 399s ago (stale), last ATTEMPTED 10s ago (a failed
+        // refresh wrote the clock). Pre-fix computed age from the
+        // attempt: 10s < 300s → Reuse — the dead RTT read fresh.
+        let state: BTreeMap<_, _> = [endpoint_full("a", Some(42), 390_000, 1_000)].into();
+        let now = 400_000;
         let decisions = plan_run(&shortlist, &state, &ProbeBudget::default(), now);
         assert_eq!(
             decisions["a"],
-            ProbeDecision::Probe,
-            "the reuse window measures from the OBSERVATION (400s old = stale), not the \
-             recent failed attempt"
+            ProbeDecision::RateLimited,
+            "stale observation + recent attempt: the hammering guard holds (the prior \
+             RTT still serves via the passthrough); the attempt age never refreshes \
+             the observation"
         );
+    }
+
+    /// Codex PR#9 round 3 (P1): a stale-observation endpoint whose
+    /// attempt is INSIDE the interval must not be re-probed — the
+    /// pre-fix arm decided Probe solely on observation staleness,
+    /// ignoring the attempt clock (duplicate probing for the most
+    /// common state: a prior failed refresh).
+    #[test]
+    fn a_stale_observation_inside_the_attempt_interval_is_rate_limited_not_probed() {
+        let shortlist = vec!["a".to_owned()];
+        // Observed 429s ago (stale — would probe on staleness alone),
+        // attempted 30s ago (inside the 60 s interval).
+        let state: BTreeMap<_, _> = [endpoint_full("a", Some(42), 370_000, 1_000)].into();
+        let now = 400_000;
+        let decisions = plan_run(&shortlist, &state, &ProbeBudget::default(), now);
+        assert_eq!(
+            decisions["a"],
+            ProbeDecision::RateLimited,
+            "the hammering guard gates STALE-observation re-probes too, not just \
+             never-answered endpoints"
+        );
+        // Past the interval: the refresh may proceed.
+        let now = 440_000;
+        let decisions = plan_run(&shortlist, &state, &ProbeBudget::default(), now);
+        assert_eq!(decisions["a"], ProbeDecision::Probe);
     }
 
     /// The RateLimited passthrough (GAP-2): a prior observation
@@ -369,7 +441,8 @@ mod tests {
             ProbeDecision::RateLimited,
             "the cap (8 probes budgeted before it) skips the 9th"
         );
-        let table = run_planned(&decisions, &state, &mut AnswerAll);
+        let run = run_planned(&shortlist, &decisions, &state, &mut AnswerAll);
+        let table = &run.observations;
         assert_eq!(
             table.get("zz"),
             Some(&Observation {
@@ -392,10 +465,57 @@ mod tests {
         }
         let decisions: BTreeMap<_, _> = [("a".to_owned(), ProbeDecision::Probe)].into();
         let state = BTreeMap::new();
-        let table = run_planned(&decisions, &state, &mut TimeoutAll);
+        let shortlist = vec!["a".to_owned()];
+        let run = run_planned(&shortlist, &decisions, &state, &mut TimeoutAll);
+        let table = &run.observations;
         assert!(
             !table.contains_key("a"),
             "a timeout is the absence of an observation, never an offline verdict (FR-19B)"
+        );
+    }
+
+    /// The priority-order seam (the PR-3 review's P2-4 track item,
+    /// landed in PR-4): execution follows the SHORTLIST order — the
+    /// caller's ranked priority — never the decision map's key order.
+    /// Against the pre-fix key-ordered iteration this was RED: a
+    /// cancel-after-one executor kept the lexicographically-first
+    /// endpoint ("a") and cut the high-priority one ("z").
+    #[test]
+    fn execution_follows_shortlist_priority_not_key_order() {
+        struct CancelAfterOne {
+            answered: usize,
+        }
+        impl ProbeExecutor for CancelAfterOne {
+            fn probe(&mut self, _endpoint: &str) -> Option<Duration> {
+                self.answered += 1;
+                Some(Duration::from_millis(10))
+            }
+            fn cancelled(&mut self) -> bool {
+                self.answered >= 1
+            }
+        }
+        // Priority order z BEFORE a; key order is the reverse.
+        let shortlist = vec!["z".to_owned(), "a".to_owned()];
+        let decisions: BTreeMap<_, _> = [
+            ("a".to_owned(), ProbeDecision::Probe),
+            ("z".to_owned(), ProbeDecision::Probe),
+        ]
+        .into();
+        let state = BTreeMap::new();
+        let run = run_planned(
+            &shortlist,
+            &decisions,
+            &state,
+            &mut CancelAfterOne { answered: 0 },
+        );
+        let table = &run.observations;
+        assert!(
+            table.contains_key("z"),
+            "the HIGH-priority endpoint is probed first (shortlist order)"
+        );
+        assert!(
+            !table.contains_key("a"),
+            "cancellation cuts the low-priority tail, never the prefix"
         );
     }
 
@@ -421,7 +541,14 @@ mod tests {
         ]
         .into();
         let state = BTreeMap::new();
-        let table = run_planned(&decisions, &state, &mut CancelAfterOne { answered: 0 });
+        let shortlist = vec!["a".to_owned(), "b".to_owned()];
+        let run = run_planned(
+            &shortlist,
+            &decisions,
+            &state,
+            &mut CancelAfterOne { answered: 0 },
+        );
+        let table = &run.observations;
         assert_eq!(table.len(), 1, "the answered prefix survives");
         assert!(table.contains_key("a"));
     }
