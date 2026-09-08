@@ -1948,3 +1948,49 @@ the Standard-fleet contradiction — both typed, gate-before-core)
 is deliberate.
 
 
+## 2026-09-08 — Codex PR#9 round 9 (post-completion, pre-merge)
+
+TWO P1 findings, both verified GENUINE against the record, fixed
+red-first at 4fb01e8:
+
+- **P1a — exact-name capability parity.** An exact-SERVER target
+  carried no capability constraint, so `select server GB-P2P`
+  selected under a FREE account while `select p2p` refused — the r5
+  gateway-parity lesson (exact names must not bypass a gate the
+  class enforces) applied to the round-8 capability gate.
+  `unmet_capability` now classifies the named logical's gated bits
+  from the catalog, and the gate-review hardening folded in before
+  push: the fold runs across EVERY same-named logical (the store
+  parses no name-uniqueness constraint; first-match classification
+  would let a later duplicate carry the bit — same quantifier as
+  the r5 gateway gate's `.any()`), and Secure Core classifies by
+  the core's own fleet vocabulary (the routed shape OR the bit — a
+  tier-0 bit-less CH→SE logical is a Secure Core server). Pin:
+  `exact_name_classification_folds_duplicates_and_route_shapes`
+  (both shapes selected under free pre-fix — red analytic per the
+  gate review's construction; the shape is identical).
+- **P1b — FR-23G's backend authority.** "For a free plan,
+  ProtonWire must request... backend-authorized random server
+  changes" — the registry's `proton-backend-when-required`
+  annotation whose core resolver test says the daemon boundary must
+  honor it was never examined: free/uncomposed random requests drew
+  LOCAL entropy and returned a locally invented winner. The backend
+  change-server path lands with the session lane; until then local
+  random NEVER simulates it — non-paid/uncomposed random (the
+  Random target, the proton:random-country group) refuses typed
+  NotImplemented (fail-closed); PAID keeps local random (the
+  authority binds when-required). The availability twin reads
+  `backend-selection-required` from the cached snapshot — never a
+  false available while connecting refuses (the r6 invariant).
+  Disclosed behavior change: login-free random now refuses
+  (`random_draws_os_entropy` moved to the paid fixture).
+  `GroupAvailability`'s reason-vocabulary doc was stale (r6's
+  entitlement/account-tier tokens missing) — refreshed wholesale
+  with the new token; schemas regenerated.
+
+Pins: five new tests + the classification-hardening pin + one
+updated. RUST PASS on all six review gates, no P1; the gate
+review's two P3 hardening items are LANDED in the same commit
+(duplicate-fold + route-shape SC), leaving no new track items from
+this round beyond the standing list.
+
