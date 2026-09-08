@@ -887,10 +887,14 @@ pub struct GroupAvailability {
     pub available: bool,
     /// The structured reason when unavailable: `no-catalog` (nothing
     /// cached yet), `physical-country-required` (FR-23Q),
-    /// `entitlement-composition-missing` (a PF-requiring group with
-    /// the entitlement seam uncomposed — none exist in the v1 catalog),
-    /// or `no-eligible-server` (the FR-22 report eliminated
-    /// everything).
+    /// `entitlement-composition-missing` (a plan-gated capability
+    /// with no composed entitlement snapshot),
+    /// `entitlement`/`account-tier` (the plan gate / the per-server
+    /// tier stage emptied the pool — FR-23S's precise reasons),
+    /// `backend-selection-required` (FR-23G: random selection under
+    /// a non-paid plan is backend-authorized, not locally
+    /// selectable), or `no-eligible-server` (the FR-22 report
+    /// eliminated everything).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
 }

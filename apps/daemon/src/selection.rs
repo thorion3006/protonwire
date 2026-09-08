@@ -590,14 +590,48 @@ impl SelectionEngine {
     /// names. `None` (no snapshot) refuses fail-closed — the family
     /// semantics (gateway, regional, PF). BOTH arms name the
     /// capability (the PF precedent: an optional request still
-    /// weights ranking toward it). Returns the capability token and
-    /// its allowance; `None` = every named capability is allowed.
+    /// weights ranking toward it). EXACT-SERVER names classify from
+    /// the catalog (round 9, P1 — the r5 gateway-parity lesson
+    /// generalized): naming a p2p/tor/secure-core logical exactly is
+    /// that capability's selection; no spelling bypasses the gate.
+    /// Returns the capability token and its allowance; `None` =
+    /// every named capability is allowed.
     fn unmet_capability(
         entitlements: Option<&VpnEntitlements>,
         request: &SelectionRequest,
+        catalog: &CatalogDocument,
     ) -> Option<(&'static str, Option<bool>)> {
         let allowances = entitlements.map(|snapshot| &snapshot.features);
         let constraints = &request.constraints;
+        // The exact-name classification: the named logical's own
+        // gated bits — Secure Core by the core's own fleet
+        // vocabulary (the routed shape OR the bit), p2p/tor by the
+        // bits — folded across EVERY same-named logical (the store
+        // parses no name-uniqueness constraint and the core's exact
+        // arm matches all of them; first-match classification would
+        // let a later duplicate carry the gate past a free account —
+        // the gate-review hardening, fail-closed like the r5
+        // gateway gate's `.any()`). An unknown name classifies
+        // nothing — the core's exact-Server arm refuses it typed.
+        // Group requests never carry an exact target, so the
+        // availability twin's classification arm is unreachable.
+        let (exact_secure_core, exact_p2p, exact_tor) = match &request.target {
+            Target::Server(name) => {
+                let mut classified = (false, false, false);
+                for logical in catalog
+                    .logical_servers
+                    .iter()
+                    .filter(|logical| logical.name == *name)
+                {
+                    classified.0 |=
+                        logical.is_secure_core_route() || logical.features.secure_core();
+                    classified.1 |= logical.features.p2p();
+                    classified.2 |= logical.features.tor();
+                }
+                classified
+            }
+            _ => (false, false, false),
+        };
         [
             (
                 matches!(request.target, Target::SecureCore { .. })
@@ -606,7 +640,8 @@ impl SelectionEngine {
                         .contains(&FeatureConstraint::SecureCore)
                     || constraints
                         .optional_features
-                        .contains(&FeatureConstraint::SecureCore),
+                        .contains(&FeatureConstraint::SecureCore)
+                    || exact_secure_core,
                 "secure-core",
                 allowances.and_then(|features| features.secure_core),
             ),
@@ -616,7 +651,8 @@ impl SelectionEngine {
                     .contains(&FeatureConstraint::P2p)
                     || constraints
                         .optional_features
-                        .contains(&FeatureConstraint::P2p),
+                        .contains(&FeatureConstraint::P2p)
+                    || exact_p2p,
                 "p2p",
                 allowances.and_then(|features| features.p2p),
             ),
@@ -626,7 +662,8 @@ impl SelectionEngine {
                     .contains(&FeatureConstraint::Tor)
                     || constraints
                         .optional_features
-                        .contains(&FeatureConstraint::Tor),
+                        .contains(&FeatureConstraint::Tor)
+                    || exact_tor,
                 "tor",
                 allowances.and_then(|features| features.tor),
             ),
@@ -1003,14 +1040,41 @@ impl SelectionEngine {
         // a request naming p2p/tor/secure-core under a plan without
         // the capability refuses typed BEFORE the core runs (the tier
         // stage stays the candidate filter; the pre-fix gap handed a
-        // free account a tier-0 P2P selection).
-        if let Some((capability, _)) = Self::unmet_capability(entitlements.as_ref(), &request) {
+        // free account a tier-0 P2P selection). Round 9: exact-SERVER
+        // names classify from the catalog — no spelling bypasses.
+        if let Some((capability, _)) =
+            Self::unmet_capability(entitlements.as_ref(), &request, &catalog)
+        {
             return Err(RpcError::new(
                 RpcErrorCode::EntitlementMissing,
                 format!(
                     "{capability} selection requires a paid plan — this account's plan does \
                      not include the {capability} capability"
                 ),
+            ));
+        }
+
+        // FR-23G's backend authority (Codex PR#9 round 9, P1): random
+        // selection under a non-paid (or uncomposed) plan is
+        // BACKEND-authorized — "For a free plan, ProtonWire must
+        // request... backend-authorized random server changes" — the
+        // registry's `proton-backend-when-required` annotation the
+        // core's resolver test hands to this boundary. The backend
+        // path lands with the session lane; until then local random
+        // NEVER simulates it (fail-closed). Paid plans keep local
+        // random — the authority binds when-required.
+        if request.policy == RankingPolicy::Random
+            && entitlements
+                .as_ref()
+                .and_then(|snapshot| snapshot.plan_tier)
+                != Some(PlanTier::Paid)
+        {
+            return Err(RpcError::new(
+                RpcErrorCode::NotImplemented,
+                "random selection for a non-paid plan is backend-authorized (FR-23G — the \
+                 registry's proton-backend-when-required authority); the backend \
+                 change-server path lands with the session lane — local random serves \
+                 paid plans",
             ));
         }
 
@@ -1254,12 +1318,28 @@ impl SelectionEngine {
                 if let Some((_, allowance)) = Self::unmet_capability(
                     self.entitlement.cached_snapshot().as_ref(),
                     &resolved.request,
+                    catalog,
                 ) {
                     return unavailable(if allowance.is_some() {
                         "entitlement"
                     } else {
                         "entitlement-composition-missing"
                     });
+                }
+                // FR-23G's authority twin (round 9): random selection
+                // under a non-paid plan is backend-authorized —
+                // resolve() refuses it locally, and availability
+                // reports the same from the cached snapshot (never a
+                // false available while connecting refuses).
+                if resolved.request.policy == RankingPolicy::Random
+                    && self
+                        .entitlement
+                        .cached_snapshot()
+                        .as_ref()
+                        .and_then(|snapshot| snapshot.plan_tier)
+                        != Some(PlanTier::Paid)
+                {
+                    return unavailable("backend-selection-required");
                 }
                 match protonwire_core::selection::filter_candidates(
                     catalog,
@@ -1975,6 +2055,12 @@ mod tests {
         }
     }
 
+    fn server(name: &str) -> ConnectTarget {
+        ConnectTarget::Server {
+            server: name.to_owned(),
+        }
+    }
+
     /// The happy path: a direct official select over the planted
     /// catalog answers with the FULL FR-23T field set — the revisions,
     /// the resolved selector, the FR-22 report, and the winning server
@@ -2451,6 +2537,246 @@ mod tests {
             vec!["p2p".to_owned()],
             "preferred-but-absent is provenance, not silence"
         );
+    }
+
+    /// Codex PR#9 round 9 (P1, exact-name parity): the r5 gateway
+    /// lesson generalized — an exact name must not bypass the
+    /// capability gate `select p2p` enforces; the named logical's
+    /// gated bits classify from the catalog. Pre-fix
+    /// `select server GB-P2P` selected under a FREE account (the
+    /// tier-0 logical carries no constraint for `unmet_capability`
+    /// to see).
+    #[test]
+    fn free_account_cannot_name_a_p2p_logical_exactly() {
+        let engine = default_engine();
+        engine
+            .entitlement()
+            .install(Arc::new(FakeEntitlements::free()));
+        let error = engine
+            .resolve(&server("GB-P2P"), &modifiers())
+            .expect_err("naming the p2p logical exactly is still a p2p selection");
+        assert_eq!(error.code, RpcErrorCode::EntitlementMissing);
+        assert!(
+            error.message.contains("p2p capability"),
+            "the refusal names the classified capability: {error}"
+        );
+
+        // The secure-core logical by name: the gate precedes the core
+        // (pre-fix this read the tier stage's no-eligible-server —
+        // the wrong error family for a plan gate).
+        let error = engine
+            .resolve(&server("CH-SE#1"), &modifiers())
+            .expect_err("naming the secure-core logical exactly is a secure-core selection");
+        assert_eq!(error.code, RpcErrorCode::EntitlementMissing);
+        assert!(error.message.contains("secure-core capability"), "{error}");
+
+        // PAID keeps the exact names (the non-regression arm).
+        let engine = default_engine();
+        engine
+            .entitlement()
+            .install(Arc::new(FakeEntitlements::paid()));
+        let result = engine
+            .resolve(&server("GB-P2P"), &modifiers())
+            .expect("the paid plan includes p2p");
+        assert_eq!(result.winner.name, "GB-P2P");
+    }
+
+    /// The classification hardening (round 9's gate review): the
+    /// store parses no name-uniqueness constraint and the core's
+    /// exact arm matches EVERY same-named logical, so classification
+    /// must fold across all of them (first-match would let a later
+    /// duplicate carry the p2p bit past a free account) — and Secure
+    /// Core classifies by the core's own fleet vocabulary (the
+    /// routed shape OR the bit: a tier-0 bit-less CH→SE logical IS
+    /// a Secure Core server). Pre-hardening both named shapes
+    /// SELECTED under a free account.
+    #[test]
+    fn exact_name_classification_folds_duplicates_and_route_shapes() {
+        let logical = |id: &str, name: &str, entry: &str, exit: &str, features: u64| {
+            serde_json::json!({
+                "ID": id, "Name": name, "City": "City", "State": null,
+                "EntryCountry": entry, "ExitCountry": exit, "Domain": null,
+                "Tier": 0, "Features": features, "Status": 1,
+                "Load": 10, "Score": 1.0, "HostCountry": null,
+                "GatewayName": null, "Translations": null,
+                "Servers": [{
+                    "ID": format!("{id}-p0"), "EntryIP": null, "ExitIP": null,
+                    "Domain": "phys.example", "Status": 1, "Label": "",
+                    "X25519PublicKey": null, "Signature": null, "Generation": null,
+                    "ServicesDownReason": null,
+                    "EntryPerProtocol": {
+                        "WireGuardUDP": { "IPv4": "192.0.2.10", "Ports": [443] },
+                        "WireGuardTCP": null, "WireGuardTLS": null,
+                        "OpenVPNUDP": null, "OpenVPNTCP": null
+                    }
+                }]
+            })
+        };
+        let body = serde_json::json!({
+            "Code": 1000, "Error": "", "StatusID": "test-status",
+            "LogicalServers": [
+                // A duplicate name whose SECOND entry carries the p2p
+                // bit (both tier 0 — first-match classification passes
+                // a free account).
+                logical("dup-a", "DUP#1", "GB", "GB", 0),
+                logical("dup-b", "DUP#1", "GB", "GB", 4),
+                // A tier-0 bit-less ROUTED logical: Secure Core by
+                // shape.
+                logical("route-a", "CH-XX#1", "CH", "SE", 0),
+            ]
+        })
+        .to_string();
+        let mut engine = default_engine();
+        engine.catalog_read = Box::new(move || {
+            Ok(Some(CachedCatalog {
+                schema_version: 1,
+                etag: Some("\"test-rev-1\"".to_owned()),
+                fetched_unix: 1_771_000_000,
+                body: body.clone(),
+            }))
+        });
+        engine
+            .entitlement()
+            .install(Arc::new(FakeEntitlements::free()));
+
+        let error = engine
+            .resolve(&server("DUP#1"), &modifiers())
+            .expect_err("the duplicate's second entry carries the p2p bit");
+        assert_eq!(error.code, RpcErrorCode::EntitlementMissing);
+        assert!(
+            error.message.contains("p2p capability"),
+            "the fold classified the duplicate: {error}"
+        );
+
+        let error = engine
+            .resolve(&server("CH-XX#1"), &modifiers())
+            .expect_err("the routed shape is Secure Core, bit or no bit");
+        assert_eq!(error.code, RpcErrorCode::EntitlementMissing);
+        assert!(
+            error.message.contains("secure-core capability"),
+            "the fleet vocabulary classified the route: {error}"
+        );
+    }
+
+    /// Codex PR#9 round 9 (P1, FR-23G): random selection for a
+    /// non-paid plan is BACKEND-authorized — "For a free plan,
+    /// ProtonWire must request... backend-authorized random server
+    /// changes" — the registry's `proton-backend-when-required`
+    /// authority the core's resolver test explicitly hands to the
+    /// daemon boundary. The backend path lands with the session
+    /// lane; local random NEVER simulates it (fail-closed until
+    /// then). Paid plans keep local random ("when-required").
+    #[test]
+    fn free_plan_random_is_backend_authorized_not_local() {
+        let engine = default_engine();
+        engine
+            .entitlement()
+            .install(Arc::new(FakeEntitlements::free()));
+        let error = engine
+            .resolve(&ConnectTarget::Random, &modifiers())
+            .expect_err("free-plan random is backend-authorized");
+        assert_eq!(error.code, RpcErrorCode::NotImplemented);
+        assert!(
+            error.message.contains("backend"),
+            "the refusal names the authority: {error}"
+        );
+
+        // The random-country GROUP (the registry entry carrying the
+        // authority annotation).
+        let error = engine
+            .resolve(
+                &ConnectTarget::Group {
+                    group_id: "proton:random-country".into(),
+                },
+                &modifiers(),
+            )
+            .expect_err("the group's authority annotation is honored");
+        assert_eq!(error.code, RpcErrorCode::NotImplemented);
+    }
+
+    /// The family semantics: an uncomposed snapshot cannot prove the
+    /// paid plan local random is entitled to — fail-closed.
+    #[test]
+    fn random_without_a_composed_snapshot_refuses_fail_closed() {
+        let engine = default_engine();
+        let error = engine
+            .resolve(&ConnectTarget::Random, &modifiers())
+            .expect_err("unknown plan -> the backend authority question is unanswered");
+        assert_eq!(error.code, RpcErrorCode::NotImplemented);
+    }
+
+    /// PAID keeps local random (the "when-required" arm: the
+    /// authority binds when the plan requires it, not always).
+    #[test]
+    fn paid_plan_keeps_local_random() {
+        let engine = default_engine();
+        engine
+            .entitlement()
+            .install(Arc::new(FakeEntitlements::paid()));
+        let result = engine
+            .resolve(&ConnectTarget::Random, &modifiers())
+            .expect("paid plans select randomly locally");
+        assert_eq!(result.selector.policy, "random");
+
+        let result = engine
+            .resolve(
+                &ConnectTarget::Group {
+                    group_id: "proton:random-country".into(),
+                },
+                &modifiers(),
+            )
+            .expect("the group serves the paid plan locally");
+        assert_eq!(result.selector.policy, "random");
+    }
+
+    /// Availability agrees with the FR-23G authority (the round-6
+    /// invariant): the random group reads backend-selection-required
+    /// under a missing and a free cached snapshot, available under a
+    /// paid one.
+    #[test]
+    fn random_group_availability_agrees_with_the_backend_authority() {
+        let find_random = |listing: GroupsCatalog| {
+            listing
+                .groups
+                .iter()
+                .find(|group| group.id == "proton:random-country")
+                .expect("the random group is listed")
+                .availability
+                .clone()
+        };
+        // No snapshot: unknown plan, fail-closed.
+        let engine = default_engine();
+        let availability = find_random(engine.groups_catalog().expect("the registry serves"));
+        assert!(!availability.available);
+        assert_eq!(
+            availability.reason.as_deref(),
+            Some("backend-selection-required")
+        );
+
+        // A FREE cached snapshot (one resolve primes the cache).
+        let engine = default_engine();
+        engine
+            .entitlement()
+            .install(Arc::new(FakeEntitlements::free()));
+        let _ = engine.resolve(&country("CH"), &modifiers());
+        let availability = find_random(engine.groups_catalog().expect("the registry serves"));
+        assert!(!availability.available);
+        assert_eq!(
+            availability.reason.as_deref(),
+            Some("backend-selection-required"),
+            "free plans read the backend authority, never a false available"
+        );
+
+        // A PAID cached snapshot: locally selectable.
+        let engine = default_engine();
+        engine
+            .entitlement()
+            .install(Arc::new(FakeEntitlements::paid()));
+        engine
+            .resolve(&country("GB"), &modifiers())
+            .expect("the paid resolve primes the cache");
+        let availability = find_random(engine.groups_catalog().expect("the registry serves"));
+        assert!(availability.available);
     }
 
     /// Codex PR-9 (P1, the entitlement tier): a FREE account's
@@ -3419,21 +3745,22 @@ mod tests {
     /// The random policy draws on OS entropy through the daemon
     /// (RandomEntropyRequired is unreachable here) and the special
     /// classes map onto the feature constraints (p2p selects the P2P
-    /// server — under a PAID plan: the round-8 capability gate makes
-    /// the special classes entitlement-carried).
+    /// server). Both arms under a PAID plan: the round-8 capability
+    /// gate and round-9's FR-23G backend authority make both
+    /// entitlement-carried (free/login-free random is
+    /// backend-authorized, not local).
     #[test]
     fn random_draws_os_entropy_and_specials_map_to_features() {
-        let engine = default_engine();
-        let result = engine
-            .resolve(&ConnectTarget::Random, &modifiers())
-            .expect("the daemon supplies entropy");
-        assert_eq!(result.selector.policy, "random");
-        assert!(result.winner.signals.proton_score.is_some());
-
         let engine = default_engine();
         engine
             .entitlement()
             .install(Arc::new(FakeEntitlements::paid()));
+        let result = engine
+            .resolve(&ConnectTarget::Random, &modifiers())
+            .expect("paid local random draws entropy");
+        assert_eq!(result.selector.policy, "random");
+        assert!(result.winner.signals.proton_score.is_some());
+
         let p2p = engine
             .resolve(
                 &ConnectTarget::Special {
