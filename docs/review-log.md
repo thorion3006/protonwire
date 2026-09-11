@@ -1994,3 +1994,52 @@ review's two P3 hardening items are LANDED in the same commit
 (duplicate-fold + route-shape SC), leaving no new track items from
 this round beyond the standing list.
 
+
+## 2026-09-11 — Codex PR#9 round 10 (post-completion, pre-merge)
+
+TWO findings, both verified GENUINE, fixed red-first at 9560cc7 —
+plus the rust-reviewer gate's own P1, fixed in the same commit:
+
+- **P1 — the entitlement seam's cross-account leak.** `install()`
+  swapped only the adapter cell: the in-flight slot AND the cached
+  snapshot of the OLD account survived a replacement, so a selection
+  for the NEW account could join the stale slot (especially after an
+  earlier waiter timed out and left it parked) and consume the
+  previous account's MaxTier/IsBusiness — paid-tier or gateway
+  selection under the wrong account. Fix: an adapter GENERATION
+  (bumped on install, which also drops the slot and the cache);
+  every slot carries its stamp; joiners compare stamps — a parked
+  older-generation slot is replaced with a fresh worker, never
+  joined.
+- **The gate's P1 — the post-wait write-back.** The stamp guards
+  JOINING, not the parked slot's own waiter's effects: a waiter
+  whose worker lands AFTER a replacement executed
+  store_snapshot/invalidate unconditionally — parking the OLD
+  account's snapshot into the NEW account's (post-clear) cache
+  (indefinitely: the listing is network-free), or symmetrically
+  wiping a fresh cache with a stale NoAccess. Fix: the post-wait
+  generation re-check — a landed outcome under an older stamp
+  refuses fail-closed ("belongs to a replaced account session") and
+  writes nothing.
+- **P2 — authoritative-unusable snapshots never withdraw the
+  cache.** A fetched NoAccess/Waitlisted or absent-MaxTier response
+  refused selection but left the last-good snapshot cached, so the
+  network-free listing kept reporting paid group availability the
+  newest authority withheld. Both refusal arms now invalidate the
+  cache. The distinction is pinned: a TRANSPORT failure (says
+  nothing about the account) keeps the last-known-good serving the
+  listing; Api/Malformed are parse-side, equally non-authoritative.
+
+Pins: the fresh-worker composition under a new stamp, the cache
+reset on swap, the late-landing race (DelayedEntitlements lands
+after the swap — pre-fix A's paid selection served AND parked in
+B's cache), NoAccess + absent-MaxTier invalidations, and the
+transport-keeps-cache distinction (a first-serves-then-fails
+adapter — a mutant invalidating on every error dies). New fixtures:
+no_access()/no_max_tier()/DelayedEntitlements/
+TransportFailingAfterFirstFetch. rust-reviewer: FAIL on gate 1
+(its own post-wait P1 — the fix-verdict loop held: no push or
+thread replies until the fix existed) → fixed in-commit and
+re-gated green; its P2+ pin landed with it. Note: the two-worker
+window on mismatched replacement (bounded, once per swap) is the
+disclosed soft edge of the generation scheme.
