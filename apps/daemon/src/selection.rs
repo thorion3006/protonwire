@@ -223,7 +223,8 @@ impl EntitlementProvider {
     /// load-bearing part: any slot still parked under an older stamp
     /// is orphaned even if a racing install interleaves. The WHOLE
     /// transition is ONE serialized step (round 11, P1 — under the
-    /// [`Self::transition`] lock, q.v.): no observer can see the new
+    /// transition lock; see the `transition` field's discipline
+    /// note): no observer can see the new
     /// adapter under the old generation, or the old generation under
     /// the new adapter, mid-swap.
     pub fn install(&self, api: Arc<dyn EntitlementsApi>) {
