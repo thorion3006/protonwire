@@ -2083,3 +2083,49 @@ every FR/round cross-reference, CLI/README drift — none).
 Gates: daemon 76+6, frontend-api 26, fmt/clippy clean, schema-gen
 regenerated. The close-pass rule is re-armed for any future round:
 each bot round lands real code, and the passes must follow.
+
+## 2026-09-11 — Codex PR#9 round 11 (post-completion, pre-merge)
+
+THREE findings, all verified GENUINE, fixed red-first at 0367738
+(the round fired mid-close-pass, before the r7-r10 passes' push had
+settled):
+
+- **P1 — the probe transport/endpoint mismatch.** The TCP connector
+  (`TcpStream::connect_timeout`) probed the WIREGUARD-UDP mapping's
+  endpoint FIRST — a UDP port cannot complete a TCP handshake on a
+  real network, so explicit latency and latency-weighted selections
+  refused for nearly every candidate (only first-mapped-ports that
+  happened to accept TCP answered). The injected test seams decided
+  answers, masking it. The endpoint resolution prefers the
+  TCP-COMPATIBLE mappings (TCP, then TLS; the same-host port
+  measures the same path), UDP kept as the last-resort attempt.
+- **P1 — replacement atomicity.** install() published the new
+  adapter BEFORE bumping the generation (a new-session/old-
+  generation window: a request could join a completed old-account
+  slot and pass the post-wait check), and the post-wait
+  check-to-write pair raced a replacement between them (the old
+  result repopulating the just-cleared cache). The whole transition
+  is ONE serialized step under a transition mutex (install:
+  adapter+generation+slot+cache; the composition: re-check through
+  the snapshot writes). The lock discipline is stated on the field —
+  the gate review corrected the commit's first lock-order claim (no
+  global order; statement-scoped guards; the slot path's torn reads
+  are safe via the stamp).
+- **P2 — resolved-request provenance.** `requested_features` was
+  built from the raw modifier arrays, so `select p2p` answered `[]`
+  while its hard filter applied p2p. The list now derives from the
+  RESOLVED request's constraints (target-implied, group-merged,
+  order-preserving dedupe), the inverse feature_token map pinned
+  against `as_str` (the gate review's parity pin), wire doc updated,
+  schemas regenerated.
+
+Pins: the port-recording TCP/TLS preference test (deterministic red
+— the UDP ports were recorded pre-fix), the three-arm provenance
+test (special target, group merge, dedupe), the six-variant token
+parity loop, and the 50-swap atomicity soak (analytic red,
+disclosed). RUST PASS with conditions — its two P2s (the dedupe,
+the stale wire doc) and parity pin landed in-commit; tracked: the
+secure-core target's empty requested_features (target-vs-feature
+vocabulary question, owner decision) and the group-optional
+difference mirror (unreachable today — no registry group declares
+optional features).
