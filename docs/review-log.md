@@ -2161,3 +2161,42 @@ RUST PASS with two P2 conditions — both landed in-commit (the
 one-lock fold + write-back re-validation; the None fallback), plus
 its P3s (the stated lock discipline; the parameter order). The
 round-11 doc-CI lesson held: cargo doc ran in the local gate set.
+
+## 2026-09-11 — Codex PR#9 round 13 (post-completion, pre-merge)
+
+A stack-wide check (the owner asked; #5/#6/#8 clean) surfaced TWO
+more P2 findings on PR #9, both verified GENUINE against the wire
+contracts, fixed red-first at 885d68d (+ the gate pin at fc232d1):
+
+- **P2 — the unvalidated explicit physical country.** The wire
+  contract on `--physical-country` is "uppercase ISO 3166-1 alpha-2
+  — non-canonical input refuses typed, never approximated," but the
+  value only validated when a target CONSUMED it (the
+  country-excluding groups) — `select fastest --physical-country
+  gb` succeeded and copied the lowercase value into
+  `PhysicalCountryValue` provenance. The modifier now validates at
+  the boundary, before the catalog read and every gate, through the
+  core's own grammar (`validate_country`, now exported — one
+  vocabulary, the feature_holds precedent).
+- **P2 — the unreachable dedicated refusal.** The taxonomy defines
+  `SecureCoreUnavailable` (exit 17, "No Secure Core route satisfies
+  the request") but the daemon mapped every empty candidate set to
+  the generic NoEligibleServer (exit 5). The error mapper is
+  REQUEST-AWARE now: ConstraintsNotSatisfied under a routed
+  SecureCore target returns the dedicated code, the FR-22 report
+  riding details; the PF arm derives from the resolved request's
+  constraints (the old modifier-only binding dropped — resolved ⊇
+  modifiers by the union merge, and a future PF-declaring group
+  would then fire the explanation where it genuinely applied).
+
+Pins: the non-canonical refusal (lowercase `gb` under fastest —
+pre-fix Ok with `gb` provenance; canonical GB still reports) and
+the dedicated code (a paid JP→GB request over the CH→SE-only
+fixture — pre-fix NoEligibleServer) + the gate review's combined
+PF+SC arm pin (fc232d1: the dedicated code keeps the M6
+explanation). RUST PASS, no P1/P2; tracked: the boundary-precedence
+extension (SC entry/exit and excluded_* countries still validate
+inside the core, after the gates — codes consistent once reached,
+pre-existing) and the standing list. The gate's taxonomy sweep
+confirmed no other defined code has landed semantics without an
+emitter — exit 17 was the last.
