@@ -380,14 +380,44 @@ impl EntitlementProvider {
 /// logical id, keyed by the LOGICAL id (the same key the latency table
 /// and the shortlist use — the executor resolves the id to a network
 /// endpoint fresh from the loaded catalog each run, so no stale
-/// address mapping is ever cached or logged).
+/// address mapping is ever cached or logged). The table is BOUND to
+/// the catalog revision it observed under (round 12, P2): a changed
+/// revision clears the state — logical ids can survive a refresh
+/// while their endpoints change, and an RTT against the old address
+/// must never rank the new catalog. The revision key and the states
+/// share ONE lock: the reconcile, the plan+reserve pair, and the
+/// write-back's revision re-validation all serialize — a round
+/// straddling a refresh can neither rank under nor write back into a
+/// revision its observations never belonged to (the gate review's
+/// write-back race). When the catalog carries no etag, the fetched
+/// timestamp is the revision key (etag-less refreshes still clear —
+/// the gate review's None fallback).
 ///
 /// In-memory by design for M3: the reuse windows are seconds-to-minutes
 /// and a restart re-probes under the same global bounds — persistence
 /// would outlive the addresses' meaning for no selection value.
 #[derive(Default)]
 struct ProbeTable {
-    state: Mutex<BTreeMap<String, EndpointState>>,
+    inner: Mutex<ProbeTableInner>,
+}
+
+#[derive(Default)]
+struct ProbeTableInner {
+    /// The revision key the observations were recorded under
+    /// ([`probe_revision_key`]).
+    revision: Option<(String, u64)>,
+    state: BTreeMap<String, EndpointState>,
+}
+
+/// The revision key for a loaded catalog: the etag when the server
+/// sent one (a same-etag refetch is the same body — observations
+/// stay valid), else the fetched timestamp (etag-less refreshes
+/// still change the key).
+fn probe_revision_key(etag: Option<&str>, fetched_unix: u64) -> (String, u64) {
+    match etag {
+        Some(etag) => (etag.to_owned(), 0),
+        None => (String::new(), fetched_unix),
+    }
 }
 
 /// The production wall clock in milliseconds (Unix epoch).
@@ -469,7 +499,12 @@ impl SelectionEngine {
     /// write-back contract (production callers never read it whole).
     #[cfg(test)]
     fn probe_state(&self) -> BTreeMap<String, EndpointState> {
-        self.probes.state.lock().expect("probe table lock").clone()
+        self.probes
+            .inner
+            .lock()
+            .expect("probe table lock")
+            .state
+            .clone()
     }
 
     /// The strict catalog read every selection runs against (FR-23R:
@@ -550,25 +585,34 @@ impl SelectionEngine {
         }
     }
 
-    /// Composes FR-23Q's sources and reports which one won.
-    fn physical_country(&self, explicit_request: Option<&str>) -> Option<PhysicalCountryValue> {
+    /// Composes FR-23Q's sources and reports which one won. The
+    /// cached arm consumes the REQUEST-SCOPED read (round 12, P2):
+    /// the caller read the location cache once and carries the
+    /// value, so the filtering and the reported provenance cannot
+    /// diverge on a mid-request refresh. Parameter order mirrors
+    /// [`PhysicalCountrySources`] (the gate review's readability
+    /// note).
+    fn physical_country_over(
+        explicit_request: Option<&str>,
+        config: Option<&str>,
+        cached_location: Option<&str>,
+    ) -> Option<PhysicalCountryValue> {
         if let Some(country) = explicit_request {
             return Some(PhysicalCountryValue {
                 country: country.to_owned(),
                 source: PhysicalCountrySource::ExplicitRequest,
             });
         }
-        if let Some(country) = self.config.connection_groups.physical_country.as_deref() {
+        if let Some(country) = config {
             return Some(PhysicalCountryValue {
                 country: country.to_owned(),
                 source: PhysicalCountrySource::Config,
             });
         }
-        self.cached_location_country()
-            .map(|country| PhysicalCountryValue {
-                country,
-                source: PhysicalCountrySource::CachedLocation,
-            })
+        cached_location.map(|country| PhysicalCountryValue {
+            country: country.to_owned(),
+            source: PhysicalCountrySource::CachedLocation,
+        })
     }
 
     /// Composes the S8 entitlement snapshot once per request
@@ -882,12 +926,35 @@ impl SelectionEngine {
     fn probe_round(
         &self,
         catalog: &CatalogDocument,
+        catalog_etag: Option<&str>,
+        catalog_fetched_unix: u64,
         shortlist: Vec<String>,
         request_deadline: Instant,
     ) -> BTreeMap<String, Duration> {
         let probe_config = &self.config.server_selection.latency_probe;
         if !probe_config.enabled || shortlist.is_empty() {
             return BTreeMap::new();
+        }
+        // The REVISION reconcile (round 12, P2 + the gate review's
+        // write-back race): observations are keyed by logical id, but
+        // a catalog refresh can keep the id while changing the
+        // endpoint — an RTT measured against the OLD address must
+        // never rank the NEW catalog (the table's own contract:
+        // nothing outlives the addresses' meaning). A changed
+        // revision key clears the table before this round plans; the
+        // key is the etag when the server sent one, else the fetched
+        // timestamp (etag-less refreshes still clear). ONE lock
+        // covers the reconcile, the plan+reserve pair, and the
+        // write-back's re-validation below — a concurrent round
+        // under a newer revision cannot have this round's
+        // observations written into its table.
+        let revision_key = probe_revision_key(catalog_etag, catalog_fetched_unix);
+        {
+            let mut inner = self.probes.inner.lock().expect("probe table lock");
+            if inner.revision.as_ref() != Some(&revision_key) {
+                inner.revision = Some(revision_key.clone());
+                inner.state.clear();
+            }
         }
         // The round deadline clamps to the REQUEST deadline's remainder
         // (Codex PR#9 round 3, P1): 6 s of entitlement composition plus
@@ -904,12 +971,16 @@ impl SelectionEngine {
         // `run_planned`'s rate-limited passthrough; the reservation
         // only advances attempt clocks, which that path never reads).
         let (state, decisions) = {
-            let mut guard = self.probes.state.lock().expect("probe table lock");
-            let state = guard.clone();
+            let mut inner = self.probes.inner.lock().expect("probe table lock");
+            let state = inner.state.clone();
             let decisions = plan_run(&shortlist, &state, &budget, now);
             for endpoint in &shortlist {
                 if decisions.get(endpoint) == Some(&ProbeDecision::Probe) {
-                    guard.entry(endpoint.clone()).or_default().last_attempt_ms = now;
+                    inner
+                        .state
+                        .entry(endpoint.clone())
+                        .or_default()
+                        .last_attempt_ms = now;
                 }
             }
             (state, decisions)
@@ -940,36 +1011,44 @@ impl SelectionEngine {
         // PR#9, P2: a deadline cut before an endpoint's turn must not
         // rate-limit it for the 60 s interval — the untouched endpoint
         // returns to probeable immediately; an attempted one keeps its
-        // reservation, the hammering guard's contract).
+        // reservation, the hammering guard's contract). The
+        // REVISION RE-VALIDATION (round 12's gate review): if a
+        // concurrent round already reconciled the table to a NEWER
+        // revision, this round's table writes are dropped — never
+        // written across revisions. THIS request still consumes its
+        // own merged observations below: they were measured against
+        // the catalog it loaded, a coherent view for its own ranking.
         let answered_at = (self.now_ms)();
         let attempted: std::collections::BTreeSet<&str> =
             run.attempted.iter().map(String::as_str).collect();
-        let mut guard = self.probes.state.lock().expect("probe table lock");
-        for endpoint in &shortlist {
-            if decisions.get(endpoint) != Some(&ProbeDecision::Probe) {
-                continue;
-            }
-            if !attempted.contains(endpoint.as_str()) {
-                // Never attempted: release the reservation — restore
-                // the prior clock (0 when the reservation created the
-                // entry; the pre-round value otherwise — the snapshot
-                // in `state` holds it).
-                match state.get(endpoint) {
-                    Some(prior) => {
-                        if let Some(entry) = guard.get_mut(endpoint) {
-                            entry.last_attempt_ms = prior.last_attempt_ms;
+        let mut inner = self.probes.inner.lock().expect("probe table lock");
+        if inner.revision.as_ref() == Some(&revision_key) {
+            for endpoint in &shortlist {
+                if decisions.get(endpoint) != Some(&ProbeDecision::Probe) {
+                    continue;
+                }
+                if !attempted.contains(endpoint.as_str()) {
+                    // Never attempted: release the reservation — restore
+                    // the prior clock (0 when the reservation created the
+                    // entry; the pre-round value otherwise — the snapshot
+                    // in `state` holds it).
+                    match state.get(endpoint) {
+                        Some(prior) => {
+                            if let Some(entry) = inner.state.get_mut(endpoint) {
+                                entry.last_attempt_ms = prior.last_attempt_ms;
+                            }
+                        }
+                        None => {
+                            inner.state.remove(endpoint);
                         }
                     }
-                    None => {
-                        guard.remove(endpoint);
-                    }
+                    continue;
                 }
-                continue;
-            }
-            if let Some(observation) = observed.get(endpoint) {
-                let entry = guard.entry(endpoint.clone()).or_default();
-                entry.observation = Some(*observation);
-                entry.observed_at_ms = answered_at;
+                if let Some(observation) = observed.get(endpoint) {
+                    let entry = inner.state.entry(endpoint.clone()).or_default();
+                    entry.observation = Some(*observation);
+                    entry.observed_at_ms = answered_at;
+                }
             }
         }
         // The latency table the ranking consumes: the run's merged
@@ -1097,16 +1176,22 @@ impl SelectionEngine {
                 .optional_features
                 .contains(&SelectionFeature::PortForwarding);
 
+        // The location cache is read ONCE per request (round 12,
+        // P2): the group arm FILTERS with this value and the FR-23T
+        // provenance block REPORTS it — a mid-request refresh can no
+        // longer decouple the two (pre-fix a refresh between the
+        // reads excluded one country while claiming another).
+        let cached_location = self.cached_location_country();
+
         // The group arm resolves through the registry (FR-23P's
         // override discipline, FR-23Q's sources, P2-2's weights); the
         // direct arm maps the grammar onto the core vocabulary.
         let (request, group) = match target {
             ConnectTarget::Group { group_id } => {
-                let cached_country = self.cached_location_country();
                 let sources = PhysicalCountrySources {
                     explicit_request: modifiers.physical_country.as_deref(),
                     config: self.config.connection_groups.physical_country.as_deref(),
-                    cached_location: cached_country.as_deref(),
+                    cached_location: cached_location.as_deref(),
                 };
                 let resolved = resolve_group(
                     group_id,
@@ -1209,10 +1294,16 @@ impl SelectionEngine {
         // FR-23T's "when relevant": the physical country reports when
         // the group's semantics used it, or when the caller named it
         // explicitly (a named value is provenance the caller asked to
-        // see even where no stage consumes it).
+        // see even where no stage consumes it). The cached arm reads
+        // the REQUEST-SCOPED value (round 12, P2) — the reported
+        // country is the country that filtered.
         let used_physical_country = request.constraints.exclude_physical_country;
         let physical_country = if used_physical_country || modifiers.physical_country.is_some() {
-            self.physical_country(modifiers.physical_country.as_deref())
+            Self::physical_country_over(
+                modifiers.physical_country.as_deref(),
+                self.config.connection_groups.physical_country.as_deref(),
+                cached_location.as_deref(),
+            )
         } else {
             None
         };
@@ -1235,7 +1326,13 @@ impl SelectionEngine {
         };
         if latency_weighted {
             let shortlist = self.probe_shortlist(&catalog, &request, &context);
-            context.latency = self.probe_round(&catalog, shortlist, request_deadline);
+            context.latency = self.probe_round(
+                &catalog,
+                etag.as_deref(),
+                fetched_unix,
+                shortlist,
+                request_deadline,
+            );
         }
 
         // The random policy draws on OS entropy.
@@ -3334,6 +3431,135 @@ mod tests {
         ] {
             assert_eq!(feature_token(wire_feature(feature)), feature.as_str());
         }
+    }
+
+    /// Codex PR#9 round 12 (P2, one location read): the group arm
+    /// read the cached location for FILTERING and the provenance
+    /// block re-read it — a refresh between the two reads filtered
+    /// with the OLD country while the result REPORTED the new one
+    /// (`fastest-excluding-my-country` excluding GB, selecting CH,
+    /// then claiming DE was the physical country). The country (and
+    /// its source) is read ONCE and carried through selection; the
+    /// reported value is the value that filtered.
+    #[test]
+    fn the_filtering_physical_country_is_the_reported_one() {
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut engine = engine_over(SystemConfig::default(), 1_000_000, never_answers);
+        engine.location_read = {
+            let reads = std::sync::Arc::clone(&reads);
+            Box::new(move || {
+                let read = reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(Some(CachedLocation {
+                    schema_version: 1,
+                    fetched_unix: 1_771_000_000,
+                    ip: String::new(),
+                    country: if read == 0 { "GB" } else { "DE" }.to_owned(),
+                    isp: String::new(),
+                    latitude: None,
+                    longitude: None,
+                }))
+            })
+        };
+        let result = engine
+            .resolve(
+                &ConnectTarget::Group {
+                    group_id: "proton:fastest-excluding-my-country".into(),
+                },
+                &modifiers(),
+            )
+            .expect("the excluding group selects");
+        assert_ne!(result.winner.exit_country, "GB", "GB was excluded");
+        let provenance = result
+            .physical_country
+            .expect("the exclusion used the physical country");
+        assert_eq!(
+            provenance.country, "GB",
+            "the REPORTED country is the one that FILTERED (a mid-request refresh \
+             to DE must not rewrite provenance)"
+        );
+        assert_eq!(
+            provenance.source,
+            PhysicalCountrySource::CachedLocation,
+            "the source carries too"
+        );
+        assert!(
+            reads.load(std::sync::atomic::Ordering::SeqCst) == 1,
+            "the location cache is read ONCE per request (observed {})",
+            reads.load(std::sync::atomic::Ordering::SeqCst)
+        );
+    }
+
+    /// Codex PR#9 round 12 (P2, revision-bound observations): the
+    /// probe table is keyed by logical id, but a catalog refresh can
+    /// keep the id while changing the endpoint — an RTT measured
+    /// against the OLD address must never rank the NEW catalog (the
+    /// table's own contract: nothing outlives the addresses'
+    /// meaning). A changed etag clears the table; the next
+    /// latency selection probes fresh instead of reusing the prior
+    /// revision's observations.
+    #[test]
+    fn a_catalog_revision_change_reprobes_the_observations() {
+        let etag: Arc<Mutex<String>> = Arc::new(Mutex::new("\"rev-a\"".to_owned()));
+        let fetched_unix = Arc::new(Mutex::new(1_771_000_000u64));
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let answers = {
+            let calls = std::sync::Arc::clone(&calls);
+            move |_addr: SocketAddr, _timeout: Duration| -> Option<Duration> {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Some(Duration::from_millis(5))
+            }
+        };
+        let mut engine = engine_over(SystemConfig::default(), 1_000_000, answers);
+        {
+            let etag = std::sync::Arc::clone(&etag);
+            let fetched_unix = std::sync::Arc::clone(&fetched_unix);
+            let body = catalog_body();
+            engine.catalog_read = Box::new(move || {
+                let etag = etag.lock().expect("etag holder").clone();
+                let fetched = *fetched_unix.lock().expect("fetched holder");
+                Ok(Some(CachedCatalog {
+                    schema_version: 1,
+                    etag: (!etag.is_empty()).then_some(etag),
+                    fetched_unix: fetched,
+                    body: body.clone(),
+                }))
+            });
+        }
+        let by_latency = SelectionModifiers {
+            by: Some("latency".into()),
+            ..modifiers()
+        };
+        engine
+            .resolve(&ConnectTarget::Fastest, &by_latency)
+            .expect("the first revision probes and selects");
+        let after_first = calls.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(after_first > 0, "the first round probed");
+
+        // The catalog refreshes: same ids, new revision.
+        *etag.lock().expect("etag holder") = "\"rev-b\"".to_owned();
+        engine
+            .resolve(&ConnectTarget::Fastest, &by_latency)
+            .expect("the second revision selects");
+        assert!(
+            calls.load(std::sync::atomic::Ordering::SeqCst) > after_first,
+            "the new revision probes fresh (pre-fix the reuse window served the \
+             old endpoints' observations)"
+        );
+
+        // The etag-None fallback (the gate review's arm): a server
+        // omitting the etag still refreshes — the fetched timestamp
+        // is the revision key.
+        *etag.lock().expect("etag holder") = String::new();
+        *fetched_unix.lock().expect("fetched holder") = 1_771_000_100;
+        let before_third = calls.load(std::sync::atomic::Ordering::SeqCst);
+        engine
+            .resolve(&ConnectTarget::Fastest, &by_latency)
+            .expect("the etag-less third revision selects");
+        assert!(
+            calls.load(std::sync::atomic::Ordering::SeqCst) > before_third,
+            "an etag-less refresh still probes fresh (the fetched timestamp is \
+             the revision key)"
+        );
     }
 
     /// Codex PR-9 (P1, the entitlement tier): a FREE account's
