@@ -2043,3 +2043,43 @@ thread replies until the fix existed) → fixed in-commit and
 re-gated green; its P2+ pin landed with it. Note: the two-worker
 window on mismatched replacement (bounded, once per swap) is the
 disclosed soft edge of the generation scheme.
+
+## 2026-09-11 — PR#9 close passes over rounds 7-10 (owner-requested, pre-merge)
+
+The stack's earlier refactor + doc close passes predate the four
+bot-review rounds; the owner asked whether they had run since. They
+had not — dispatched both over 4119a0e..9560cc7 (~1.4k insertions:
+the deadline clamp, the capability gate, exact-name classification +
+the FR-23G authority, the generation-bound seam).
+
+**Refactorer: PASS with 4 wins / 6 recorded rejections** (5ceb15c):
+the FR-23G predicate shared by the gate and its availability twin
+(one spelling — the r6 agreement invariant made structural; the
+twin's two cached reads become one), the names() closure in
+unmet_capability, the availability_of() test helper (9 in-range
+chains; the pre-range r6 sites deliberately untouched) + one
+name-level clarity rename, and the generation accessor at the
+load-before-lock site (order now stated). Rejections with reasons:
+GateOutcome unification, the two-field struct, the classification
+fold, the race-shape fixture merge, the single-site difference
+extraction, and the pre-range pf_entitlement/paid-location tri-state
+predicate (first item on the tracked listing-reads P3 lane).
+
+**Doc-writer: FAIL → fixed in-commit** — its P1: the wire doc on
+SelectionModifiers::optional_features still claimed "never
+eliminate," false since r8 for the plan-gated capabilities (the
+mirror image of the r8 feature_difference rewrite, missed then);
+caveat added, schemas regenerated. Its P2s: the
+entitlement-composition-missing token doc under-enumerated (also
+paid-location groups and the core's composition requirement), and
+the module-doc composition map missing r9/r10 (the FR-23G gate now
+in item 5; exact-name classification + the generation/invalidation
+scheme in item 3) — both landed; its P3 naming wobble (regional vs
+paid-location gate) resolved to "paid-location"; its P3-5 is r7's
+already-tracked sections.rs item. Everything else verified accurate
+(the seven reason tokens, the entitlements.rs allowance paragraph,
+every FR/round cross-reference, CLI/README drift — none).
+
+Gates: daemon 76+6, frontend-api 26, fmt/clippy clean, schema-gen
+regenerated. The close-pass rule is re-armed for any future round:
+each bot round lands real code, and the passes must follow.
