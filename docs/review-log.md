@@ -2129,3 +2129,35 @@ secure-core target's empty requested_features (target-vs-feature
 vocabulary question, owner decision) and the group-optional
 difference mirror (unreachable today — no registry group declares
 optional features).
+
+## 2026-09-11 — Codex PR#9 round 12 (post-completion, pre-merge)
+
+TWO P2 findings, both verified GENUINE, fixed red-first at fbb7770:
+
+- **P2 — the physical-country double-read.** The group arm read the
+  cached location for FILTERING; the FR-23T provenance block re-read
+  it — a location.json refresh between the reads excluded one
+  country while the result claimed another
+  (fastest-excluding-my-country excluding GB, selecting CH,
+  reporting DE); a transient second-read failure could omit the
+  provenance entirely. The location cache is read ONCE per request
+  now and the value carried through both consumers.
+- **P2 — revision-bound probe state.** The probe table keyed
+  observations by logical id alone — a catalog refresh keeping ids
+  but changing endpoints let the 15-minute reuse window rank the
+  NEW catalog with OLD-address RTTs, violating the table's own
+  contract. The table now records the revision key (etag when
+  present, else the fetched timestamp — etag-less refreshes still
+  clear) under ONE lock with the states: the reconcile clears on a
+  changed key, and the write-back RE-VALIDATES (a concurrent round
+  straddling a refresh cannot write its observations into a newer
+  revision's table — the straddling request still consumes its own
+  coherent merged view).
+
+Pins: the first-read-GB/then-DE location seam (the reported country
+is the country that filtered; the single-read contract) and the
+etag-swap re-probe test with the etag-None/fetched-timestamp arm.
+RUST PASS with two P2 conditions — both landed in-commit (the
+one-lock fold + write-back re-validation; the None fallback), plus
+its P3s (the stated lock discipline; the parameter order). The
+round-11 doc-CI lesson held: cargo doc ran in the local gate set.
