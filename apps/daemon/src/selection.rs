@@ -3689,6 +3689,37 @@ mod tests {
         );
     }
 
+    /// The gate review's pin for round 13's combined arm: a PF
+    /// request under a routed Secure Core target that no route
+    /// satisfies — the dedicated code STILL carries the M6
+    /// empty-capability sentence (the explanation belongs to the
+    /// requester whatever the target).
+    #[test]
+    fn an_unsatisfiable_secure_core_route_with_pf_keeps_the_explanation() {
+        let engine = default_engine();
+        engine
+            .entitlement()
+            .install(Arc::new(FakeEntitlements::paid()));
+        let error = engine
+            .resolve(
+                &ConnectTarget::SecureCore {
+                    entry_country: Some("JP".into()),
+                    exit_country: Some("GB".into()),
+                },
+                &SelectionModifiers {
+                    required_features: vec![SelectionFeature::PortForwarding],
+                    ..modifiers()
+                },
+            )
+            .expect_err("no JP→GB route exists in the fixture");
+        assert_eq!(error.code, RpcErrorCode::SecureCoreUnavailable);
+        assert!(
+            error.message.contains("port-forwarding"),
+            "the M6 explanation rides under the dedicated code: {error}"
+        );
+        assert!(error.details.is_some(), "the FR-22 report still rides");
+    }
+
     /// Codex PR-9 (P1, the entitlement tier): a FREE account's
     /// selection must never return a PAID-tier server. Pre-fix the
     /// context carried only the PF boolean — the full cached catalog
