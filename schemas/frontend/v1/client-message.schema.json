@@ -830,7 +830,7 @@
           }
         },
         "optional_features": {
-          "description": "Optional features — never eliminate; feed the balanced\nfeature-match term.",
+          "description": "Optional features — never eliminate CANDIDATES; they feed the\nbalanced feature-match term. The plan-gated capabilities\n(p2p, tor, secure-core) are the exception at the REQUEST\nlevel: naming one optionally still refuses typed when the\naccount's plan lacks it (fail-closed without a composed\nsnapshot) — the same capability gate the required arm meets.",
           "type": "array",
           "items": {
             "$ref": "#/$defs/SelectionFeature"

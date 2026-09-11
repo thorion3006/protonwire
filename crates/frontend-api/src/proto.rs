@@ -669,8 +669,12 @@ pub struct SelectionModifiers {
     pub excluded_servers: Vec<String>,
     /// Required features (T-4/FR-23H).
     pub required_features: Vec<SelectionFeature>,
-    /// Optional features — never eliminate; feed the balanced
-    /// feature-match term.
+    /// Optional features — never eliminate CANDIDATES; they feed the
+    /// balanced feature-match term. The plan-gated capabilities
+    /// (p2p, tor, secure-core) are the exception at the REQUEST
+    /// level: naming one optionally still refuses typed when the
+    /// account's plan lacks it (fail-closed without a composed
+    /// snapshot) — the same capability gate the required arm meets.
     pub optional_features: Vec<SelectionFeature>,
     /// Required protocol (FR-23P's protocol stage).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -887,8 +891,9 @@ pub struct GroupAvailability {
     pub available: bool,
     /// The structured reason when unavailable: `no-catalog` (nothing
     /// cached yet), `physical-country-required` (FR-23Q),
-    /// `entitlement-composition-missing` (a plan-gated capability
-    /// with no composed entitlement snapshot),
+    /// `entitlement-composition-missing` (no composed entitlement
+    /// snapshot — a plan-gated capability, a paid-location group, or
+    /// the core's composition requirement),
     /// `entitlement`/`account-tier` (the plan gate / the per-server
     /// tier stage emptied the pool — FR-23S's precise reasons),
     /// `backend-selection-required` (FR-23G: random selection under

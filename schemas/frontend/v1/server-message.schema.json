@@ -479,7 +479,7 @@
           "type": "boolean"
         },
         "reason": {
-          "description": "The structured reason when unavailable: `no-catalog` (nothing\ncached yet), `physical-country-required` (FR-23Q),\n`entitlement-composition-missing` (a plan-gated capability\nwith no composed entitlement snapshot),\n`entitlement`/`account-tier` (the plan gate / the per-server\ntier stage emptied the pool — FR-23S's precise reasons),\n`backend-selection-required` (FR-23G: random selection under\na non-paid plan is backend-authorized, not locally\nselectable), or `no-eligible-server` (the FR-22 report\neliminated everything).",
+          "description": "The structured reason when unavailable: `no-catalog` (nothing\ncached yet), `physical-country-required` (FR-23Q),\n`entitlement-composition-missing` (no composed entitlement\nsnapshot — a plan-gated capability, a paid-location group, or\nthe core's composition requirement),\n`entitlement`/`account-tier` (the plan gate / the per-server\ntier stage emptied the pool — FR-23S's precise reasons),\n`backend-selection-required` (FR-23G: random selection under\na non-paid plan is backend-authorized, not locally\nselectable), or `no-eligible-server` (the FR-22 report\neliminated everything).",
           "type": [
             "string",
             "null"

@@ -31,9 +31,16 @@
 //!    structured FR-22 report. Never fabricated. The SAME snapshot's
 //!    recorded allowances (p2p/secure-core/tor = `Some(plan is
 //!    paid)`) gate the REQUEST: a request naming a capability the
-//!    plan lacks refuses typed before the core runs (the fourth
-//!    member of the request-gate family — gateway, regional, PF;
-//!    the tier stage stays the candidate filter).
+//!    plan lacks — by target, `--require`/`--prefer`, or an EXACT
+//!    server name classified from the catalog — refuses typed before
+//!    the core runs (the fourth member of the request-gate family:
+//!    gateway, paid-location, PF; the tier stage stays the candidate
+//!    filter). The same composition is GENERATION-bound to its
+//!    adapter (round 10): a replaced account's in-flight fetch or
+//!    cached snapshot never serves the new one, and an
+//!    authoritative-unusable response (NoAccess/Waitlisted, absent
+//!    MaxTier) withdraws the cache while a transport failure keeps
+//!    the last-known-good.
 //! 4. **The bounded on-demand prober** (U5's executor seam): for a
 //!    latency-dependent ranking the engine derives the shortlist from
 //!    the hard-filtered candidates in official order (Proton score,
@@ -52,10 +59,12 @@
 //! 5. **The pure core** ([`protonwire_core::selection::select`] over
 //!    the registry-resolved or direct request): the daemon maps the
 //!    wire request onto the core vocabulary, supplies OS entropy for
-//!    the random policy, and maps every typed refusal onto the RPC
-//!    taxonomy — the FR-22 elimination report rides `details` on the
-//!    no-eligible-server family so clients can render which constraint
-//!    eliminated what.
+//!    the random policy — PAID plans only (FR-23G: non-paid or
+//!    uncomposed random is BACKEND-authorized and refuses typed
+//!    until the session lane's backend path lands) — and maps every
+//!    typed refusal onto the RPC taxonomy — the FR-22 elimination
+//!    report rides `details` on the no-eligible-server family so
+//!    clients can render which constraint eliminated what.
 //!
 //! The FR-23E composition boundary: selection composes ONLY
 //! selection-plane modifiers. The connection-plane family (`--netshield`,
@@ -211,7 +220,9 @@ impl EntitlementProvider {
     /// result once and signals the condvar; each waiter clones it.
     /// At most one worker (and one upstream fetch) exists per instant.
     fn single_flight_slot(&self) -> Result<EntitlementFetchSlot, RpcError> {
-        let current_generation = self.generation.load(std::sync::atomic::Ordering::SeqCst);
+        // Load BEFORE the lock (the order is load-bearing — a stamp
+        // read after the lock could adopt a post-install generation).
+        let current_generation = self.current_generation();
         let mut slot = self.in_flight.lock().expect("in-flight slot lock");
         // A slot stamped for a PREVIOUS adapter generation never
         // serves this account (round 10, P1) — fall through and
@@ -709,38 +720,27 @@ impl SelectionEngine {
             }
             _ => (false, false, false),
         };
+        // "BOTH arms name the capability" (the PF precedent), spelled
+        // once (the refactor close pass): required OR optional.
+        let names = |feature: FeatureConstraint| {
+            constraints.required_features.contains(&feature)
+                || constraints.optional_features.contains(&feature)
+        };
         [
             (
                 matches!(request.target, Target::SecureCore { .. })
-                    || constraints
-                        .required_features
-                        .contains(&FeatureConstraint::SecureCore)
-                    || constraints
-                        .optional_features
-                        .contains(&FeatureConstraint::SecureCore)
+                    || names(FeatureConstraint::SecureCore)
                     || exact_secure_core,
                 "secure-core",
                 allowances.and_then(|features| features.secure_core),
             ),
             (
-                constraints
-                    .required_features
-                    .contains(&FeatureConstraint::P2p)
-                    || constraints
-                        .optional_features
-                        .contains(&FeatureConstraint::P2p)
-                    || exact_p2p,
+                names(FeatureConstraint::P2p) || exact_p2p,
                 "p2p",
                 allowances.and_then(|features| features.p2p),
             ),
             (
-                constraints
-                    .required_features
-                    .contains(&FeatureConstraint::Tor)
-                    || constraints
-                        .optional_features
-                        .contains(&FeatureConstraint::Tor)
-                    || exact_tor,
+                names(FeatureConstraint::Tor) || exact_tor,
                 "tor",
                 allowances.and_then(|features| features.tor),
             ),
@@ -749,6 +749,19 @@ impl SelectionEngine {
         .find_map(|(named, capability, allowance)| {
             (named && allowance != Some(true)).then_some((capability, allowance))
         })
+    }
+
+    /// FR-23G's shared predicate (round 9 + the refactor close
+    /// pass): random selection under a non-paid (or uncomposed) plan
+    /// is BACKEND-authorized. resolve() refuses it locally and the
+    /// availability twin reports the same — ONE spelling so the gate
+    /// and its twin cannot drift (the round-6 agreement invariant).
+    fn random_requires_backend_authority(
+        request: &SelectionRequest,
+        entitlements: Option<&VpnEntitlements>,
+    ) -> bool {
+        request.policy == RankingPolicy::Random
+            && entitlements.and_then(|snapshot| snapshot.plan_tier) != Some(PlanTier::Paid)
     }
 
     /// The CACHED entitlement tier for network-free surfaces (the
@@ -1140,12 +1153,7 @@ impl SelectionEngine {
         // path lands with the session lane; until then local random
         // NEVER simulates it (fail-closed). Paid plans keep local
         // random — the authority binds when-required.
-        if request.policy == RankingPolicy::Random
-            && entitlements
-                .as_ref()
-                .and_then(|snapshot| snapshot.plan_tier)
-                != Some(PlanTier::Paid)
-        {
+        if Self::random_requires_backend_authority(&request, entitlements.as_ref()) {
             return Err(RpcError::new(
                 RpcErrorCode::NotImplemented,
                 "random selection for a non-paid plan is backend-authorized (FR-23G — the \
@@ -1391,12 +1399,13 @@ impl SelectionEngine {
                 // resolve() refuses with — availability agrees with
                 // the gate (the round-6 invariant), read from the
                 // CACHED snapshot (the listing's network-free
-                // contract).
-                if let Some((_, allowance)) = Self::unmet_capability(
-                    self.entitlement.cached_snapshot().as_ref(),
-                    &resolved.request,
-                    catalog,
-                ) {
+                // contract). ONE cached read feeds both twins (the
+                // refactor close pass): a concurrent invalidation
+                // between two reads could make them disagree.
+                let cached = self.entitlement.cached_snapshot();
+                if let Some((_, allowance)) =
+                    Self::unmet_capability(cached.as_ref(), &resolved.request, catalog)
+                {
                     return unavailable(if allowance.is_some() {
                         "entitlement"
                     } else {
@@ -1408,14 +1417,7 @@ impl SelectionEngine {
                 // resolve() refuses it locally, and availability
                 // reports the same from the cached snapshot (never a
                 // false available while connecting refuses).
-                if resolved.request.policy == RankingPolicy::Random
-                    && self
-                        .entitlement
-                        .cached_snapshot()
-                        .as_ref()
-                        .and_then(|snapshot| snapshot.plan_tier)
-                        != Some(PlanTier::Paid)
-                {
+                if Self::random_requires_backend_authority(&resolved.request, cached.as_ref()) {
                     return unavailable("backend-selection-required");
                 }
                 match protonwire_core::selection::filter_candidates(
@@ -2138,6 +2140,19 @@ mod tests {
         }
     }
 
+    /// One group's FR-23S availability from a listing (the refactor
+    /// close pass: the find-chain repeated across the availability
+    /// tests).
+    fn availability_of(listing: &GroupsCatalog, id: &str) -> GroupAvailability {
+        listing
+            .groups
+            .iter()
+            .find(|group| group.id == id)
+            .unwrap_or_else(|| panic!("group `{id}` is listed"))
+            .availability
+            .clone()
+    }
+
     /// The happy path: a direct official select over the planted
     /// catalog answers with the FULL FR-23T field set — the revisions,
     /// the resolved selector, the FR-22 report, and the winning server
@@ -2517,15 +2532,13 @@ mod tests {
     fn special_group_availability_agrees_with_the_capability_gate() {
         // No snapshot: unknown entitlement, fail-closed.
         let engine = default_engine();
-        let listing = engine.groups_catalog().expect("the registry serves");
-        let max_security = listing
-            .groups
-            .iter()
-            .find(|group| group.id == "proton:max-security")
-            .expect("the secure-core group is listed");
-        assert!(!max_security.availability.available);
+        let availability = availability_of(
+            &engine.groups_catalog().expect("the registry serves"),
+            "proton:max-security",
+        );
+        assert!(!availability.available);
         assert_eq!(
-            max_security.availability.reason.as_deref(),
+            availability.reason.as_deref(),
             Some("entitlement-composition-missing")
         );
 
@@ -2536,15 +2549,13 @@ mod tests {
             .entitlement()
             .install(Arc::new(FakeEntitlements::free()));
         let _ = engine.resolve(&country("CH"), &modifiers());
-        let listing = engine.groups_catalog().expect("the registry serves");
-        let max_security = listing
-            .groups
-            .iter()
-            .find(|group| group.id == "proton:max-security")
-            .expect("the secure-core group is listed");
-        assert!(!max_security.availability.available);
+        let availability = availability_of(
+            &engine.groups_catalog().expect("the registry serves"),
+            "proton:max-security",
+        );
+        assert!(!availability.available);
         assert_eq!(
-            max_security.availability.reason.as_deref(),
+            availability.reason.as_deref(),
             Some("entitlement"),
             "free plans read the entitlement reason, never a false available"
         );
@@ -2557,13 +2568,11 @@ mod tests {
         engine
             .resolve(&country("GB"), &modifiers())
             .expect("the paid resolve primes the cache");
-        let listing = engine.groups_catalog().expect("the registry serves");
-        let max_security = listing
-            .groups
-            .iter()
-            .find(|group| group.id == "proton:max-security")
-            .expect("the secure-core group is listed");
-        assert!(max_security.availability.available);
+        let availability = availability_of(
+            &engine.groups_catalog().expect("the registry serves"),
+            "proton:max-security",
+        );
+        assert!(availability.available);
     }
 
     /// Codex PR#9 round 8 (P2, the difference): optional features
@@ -2812,18 +2821,12 @@ mod tests {
     /// paid one.
     #[test]
     fn random_group_availability_agrees_with_the_backend_authority() {
-        let find_random = |listing: GroupsCatalog| {
-            listing
-                .groups
-                .iter()
-                .find(|group| group.id == "proton:random-country")
-                .expect("the random group is listed")
-                .availability
-                .clone()
-        };
         // No snapshot: unknown plan, fail-closed.
         let engine = default_engine();
-        let availability = find_random(engine.groups_catalog().expect("the registry serves"));
+        let availability = availability_of(
+            &engine.groups_catalog().expect("the registry serves"),
+            "proton:random-country",
+        );
         assert!(!availability.available);
         assert_eq!(
             availability.reason.as_deref(),
@@ -2836,7 +2839,10 @@ mod tests {
             .entitlement()
             .install(Arc::new(FakeEntitlements::free()));
         let _ = engine.resolve(&country("CH"), &modifiers());
-        let availability = find_random(engine.groups_catalog().expect("the registry serves"));
+        let availability = availability_of(
+            &engine.groups_catalog().expect("the registry serves"),
+            "proton:random-country",
+        );
         assert!(!availability.available);
         assert_eq!(
             availability.reason.as_deref(),
@@ -2852,7 +2858,10 @@ mod tests {
         engine
             .resolve(&country("GB"), &modifiers())
             .expect("the paid resolve primes the cache");
-        let availability = find_random(engine.groups_catalog().expect("the registry serves"));
+        let availability = availability_of(
+            &engine.groups_catalog().expect("the registry serves"),
+            "proton:random-country",
+        );
         assert!(availability.available);
     }
 
@@ -2900,18 +2909,14 @@ mod tests {
         engine
             .entitlement()
             .install(Arc::new(FakeEntitlements::free()));
-        let listing = engine.groups_catalog().expect("the registry serves");
-        let max_security = listing
-            .groups
-            .iter()
-            .find(|group| group.id == "proton:max-security")
-            .expect("the secure-core group is listed");
+        let availability = availability_of(
+            &engine.groups_catalog().expect("the registry serves"),
+            "proton:max-security",
+        );
         assert!(
-            !max_security.availability.available
-                && max_security.availability.reason.as_deref()
-                    == Some("entitlement-composition-missing"),
-            "the cache reset to the honest unknown: {:?}",
-            max_security.availability
+            !availability.available
+                && availability.reason.as_deref() == Some("entitlement-composition-missing"),
+            "the cache reset to the honest unknown: {availability:?}"
         );
     }
 
@@ -2944,17 +2949,14 @@ mod tests {
             error.message.contains("VPN access"),
             "names the access state: {error}"
         );
-        let listing = engine.groups_catalog().expect("the registry serves");
-        let max_security = listing
-            .groups
-            .iter()
-            .find(|group| group.id == "proton:max-security")
-            .expect("the secure-core group is listed");
+        let availability = availability_of(
+            &engine.groups_catalog().expect("the registry serves"),
+            "proton:max-security",
+        );
         assert_eq!(
-            max_security.availability.reason.as_deref(),
+            availability.reason.as_deref(),
             Some("entitlement-composition-missing"),
-            "the withdrawn availability is not served from cache: {:?}",
-            max_security.availability
+            "the withdrawn availability is not served from cache: {availability:?}"
         );
 
         // Same for an absent MaxTier (the S8 tri-state: no tier is
@@ -2970,17 +2972,14 @@ mod tests {
             error.message.contains("MaxTier"),
             "names the missing tier: {error}"
         );
-        let listing = engine.groups_catalog().expect("the registry serves");
-        let max_security = listing
-            .groups
-            .iter()
-            .find(|group| group.id == "proton:max-security")
-            .expect("the secure-core group is listed");
+        let availability = availability_of(
+            &engine.groups_catalog().expect("the registry serves"),
+            "proton:max-security",
+        );
         assert_eq!(
-            max_security.availability.reason.as_deref(),
+            availability.reason.as_deref(),
             Some("entitlement-composition-missing"),
-            "still invalidated: {:?}",
-            max_security.availability
+            "still invalidated: {availability:?}"
         );
     }
 
@@ -3016,17 +3015,14 @@ mod tests {
             "names the session boundary: {error}"
         );
         // And the cache: A's snapshot never parked.
-        let listing = engine.groups_catalog().expect("the registry serves");
-        let max_security = listing
-            .groups
-            .iter()
-            .find(|group| group.id == "proton:max-security")
-            .expect("the secure-core group is listed");
+        let availability = availability_of(
+            &engine.groups_catalog().expect("the registry serves"),
+            "proton:max-security",
+        );
         assert_eq!(
-            max_security.availability.reason.as_deref(),
+            availability.reason.as_deref(),
             Some("entitlement-composition-missing"),
-            "the late landing never wrote the new account's cache: {:?}",
-            max_security.availability
+            "the late landing never wrote the new account's cache: {availability:?}"
         );
     }
 
@@ -3050,16 +3046,13 @@ mod tests {
             .resolve(&country("GB"), &modifiers())
             .expect_err("the transport failure refuses the composition");
         assert_eq!(error.code, RpcErrorCode::NetworkUnavailable);
-        let listing = engine.groups_catalog().expect("the registry serves");
-        let max_security = listing
-            .groups
-            .iter()
-            .find(|group| group.id == "proton:max-security")
-            .expect("the secure-core group is listed");
+        let availability = availability_of(
+            &engine.groups_catalog().expect("the registry serves"),
+            "proton:max-security",
+        );
         assert!(
-            max_security.availability.available,
-            "the last-known-good snapshot serves the listing: {:?}",
-            max_security.availability
+            availability.available,
+            "the last-known-good snapshot serves the listing: {availability:?}"
         );
     }
 
@@ -4034,7 +4027,7 @@ mod tests {
     /// entitlement-carried (free/login-free random is
     /// backend-authorized, not local).
     #[test]
-    fn random_draws_os_entropy_and_specials_map_to_features() {
+    fn paid_plans_draw_os_entropy_and_specials_map_to_features() {
         let engine = default_engine();
         engine
             .entitlement()
