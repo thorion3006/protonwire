@@ -420,12 +420,21 @@ fn probe_revision_key(etag: Option<&str>, fetched_unix: u64) -> (String, u64) {
     }
 }
 
-/// The production wall clock in milliseconds (Unix epoch).
-fn system_now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_millis() as u64)
-        .unwrap_or(0)
+/// The daemon's start instant — the probe clock's epoch (round 14,
+/// P2).
+static DAEMON_STARTED_AT: std::sync::LazyLock<Instant> = std::sync::LazyLock::new(Instant::now);
+
+/// The production probe clock: MONOTONIC uptime milliseconds since
+/// daemon start — never the wall clock (round 14, P2: a backward
+/// wall-clock correction made every probe-table entry future-dated —
+/// saturating age 0, stale RTTs treated fresh and failed probes
+/// rate-limited until wall time caught up; the uptime clock cannot
+/// move backward, so future-dated entries cannot exist). The
+/// wall-clock epoch remains the CACHED documents' domain (fetched
+/// stamps, deadlines — S7's guarded scheduler), never this
+/// in-memory state.
+fn uptime_now_ms() -> u64 {
+    DAEMON_STARTED_AT.elapsed().as_millis() as u64
 }
 
 /// The production TCP connect: the unprivileged latency measurement
@@ -449,8 +458,9 @@ pub struct SelectionEngine {
     entitlement: EntitlementProvider,
     /// The bounded on-demand prober's state.
     probes: ProbeTable,
-    /// The clock the planner and the write-back share — injectable so
-    /// the rate-limit windows are testable.
+    /// The clock the planner and the write-back share — MONOTONIC
+    /// uptime milliseconds in production ([`uptime_now_ms`], round
+    /// 14), injectable so the rate-limit windows are testable.
     now_ms: Box<dyn Fn() -> u64 + Send + Sync>,
     /// The transport seam — the TCP connect above in production,
     /// injected in tests (the never-answers / always-answers arms).
@@ -479,7 +489,7 @@ impl SelectionEngine {
             config,
             entitlement: EntitlementProvider::default(),
             probes: ProbeTable::default(),
-            now_ms: Box::new(system_now_ms),
+            now_ms: Box::new(uptime_now_ms),
             connect: Box::new(tcp_connect),
             catalog_read: Box::new(move || {
                 CatalogCache::new(&cache_file).load_strict(&catalog_trust_root)
@@ -1018,6 +1028,13 @@ impl SelectionEngine {
         // written across revisions. THIS request still consumes its
         // own merged observations below: they were measured against
         // the catalog it loaded, a coherent view for its own ranking.
+        // (Round 14's gate review, mechanism note: an ENDPOINT-
+        // UNRESOLVABLE planned id — e.g. a UDP-only physical under
+        // the TCP connector — counts as attempted here (run_planned
+        // records the attempt before the executor's None) and KEEPS
+        // its reservation: inert for 60 s — the id has no endpoint to
+        // hammer — and the budget cannot be starved because the
+        // probe cap equals the shortlist cap.)
         let answered_at = (self.now_ms)();
         let attempted: std::collections::BTreeSet<&str> =
             run.attempted.iter().map(String::as_str).collect();
@@ -1749,14 +1766,14 @@ impl ProbeExecutor for TransportExecutor<'_> {
 }
 
 /// Resolves a logical id to the probe endpoint (an online physical's
-/// per-protocol IPv4 + port). The TCP-COMPATIBLE mappings come first
+/// per-protocol IPv4 + port). Only TCP-COMPATIBLE mappings resolve
 /// (TCP, then TLS) — the connector is a TCP handshake
 /// (`TcpStream::connect_timeout`), and a UDP mapping's port cannot
-/// complete one on a real network (round 11, P1: the UDP-first order
-/// made explicit latency selections refuse for nearly every
-/// candidate; the same-host TCP port measures the same path). The
-/// UDP mapping stays the LAST resort (legacy shapes; the injected
-/// test seams); the legacy `EntryIP` shape falls back to port 443.
+/// complete one on a real network (round 11 made TCP-first; round
+/// 14, P1 dropped the UDP last resort entirely: a guaranteed-fail
+/// handshake only burned the round's timeout budget — a UDP-only
+/// physical is honestly UNRESOLVED, the no-observation path). The
+/// legacy `EntryIP` shape falls back to port 443 (TCP-compatible).
 /// Unresolvable ids return `None` — absent data, never a guess.
 fn probe_endpoint(catalog: &CatalogDocument, logical_id: &str) -> Option<SocketAddr> {
     let server = catalog
@@ -1765,13 +1782,9 @@ fn probe_endpoint(catalog: &CatalogDocument, logical_id: &str) -> Option<SocketA
         .find(|server| server.id == logical_id)?;
     for physical in server.servers.iter().filter(|p| p.is_online()) {
         if let Some(map) = physical.entry_per_protocol.as_ref() {
-            for endpoint in [
-                map.wireguard_tcp.as_ref(),
-                map.wireguard_tls.as_ref(),
-                map.wireguard_udp.as_ref(),
-            ]
-            .into_iter()
-            .flatten()
+            for endpoint in [map.wireguard_tcp.as_ref(), map.wireguard_tls.as_ref()]
+                .into_iter()
+                .flatten()
             {
                 // A port-less endpoint map is skipped, not fatal: the
                 // next protocol's map may carry one.
@@ -2233,9 +2246,10 @@ mod tests {
     /// A synthetic catalog body: 6 logicals over 5 countries — GB pair
     /// (scores invert loads), CH, a Secure Core CH→SE route, a P2P GB
     /// server, and JP (Asia) for the regional groups. Every physical
-    /// is online with a WireGuard-UDP endpoint on TEST-NET-1 (never
-    /// routable — the injected connect seam decides answers, never the
-    /// network).
+    /// is online with WireGuard-UDP and TCP-probeable WireGuard-TCP
+    /// endpoints on TEST-NET-1 (never routable — the injected connect
+    /// seam decides answers, never the network; NO TLS endpoint —
+    /// the stealth tests' absence contract).
     fn catalog_body() -> String {
         // A test fixture row (one logical per call; the arity is the row).
         #[allow(clippy::too_many_arguments)]
@@ -2261,8 +2275,9 @@ mod tests {
                     "X25519PublicKey": null, "Signature": null, "Generation": null,
                     "ServicesDownReason": null,
                     "EntryPerProtocol": {
-                        "WireGuardUDP": { "IPv4": "192.0.2.10", "Ports": [443] },
-                        "WireGuardTCP": null, "WireGuardTLS": null,
+                        "WireGuardUDP": { "IPv4": "192.0.2.10", "Ports": [51820] },
+                        "WireGuardTCP": { "IPv4": "192.0.2.10", "Ports": [443] },
+                        "WireGuardTLS": null,
                         "OpenVPNUDP": null, "OpenVPNTCP": null
                     }
                 }]
@@ -2910,8 +2925,9 @@ mod tests {
                     "X25519PublicKey": null, "Signature": null, "Generation": null,
                     "ServicesDownReason": null,
                     "EntryPerProtocol": {
-                        "WireGuardUDP": { "IPv4": "192.0.2.10", "Ports": [443] },
-                        "WireGuardTCP": null, "WireGuardTLS": null,
+                        "WireGuardUDP": { "IPv4": "192.0.2.10", "Ports": [51820] },
+                        "WireGuardTCP": { "IPv4": "192.0.2.10", "Ports": [443] },
+                        "WireGuardTLS": null,
                         "OpenVPNUDP": null, "OpenVPNTCP": null
                     }
                 }]
@@ -3281,10 +3297,10 @@ mod tests {
     /// so explicit latency selections refused for nearly every
     /// candidate (the injected seams decided answers, masking the
     /// mismatch). The endpoint resolution prefers a TCP-COMPATIBLE
-    /// mapping (TCP, then TLS) for the TCP connector, keeping the
-    /// UDP mapping as the last-resort attempt (legacy shapes; the
-    /// injected seams). Pre-fix the recorded address carried the UDP
-    /// mapping's port.
+    /// mapping (TCP, then TLS) for the TCP connector — round 14
+    /// dropped the UDP last resort entirely (a guaranteed-fail
+    /// handshake only burned probe budget). Pre-fix the recorded
+    /// address carried the UDP mapping's port.
     #[test]
     fn the_tcp_probe_prefers_a_tcp_compatible_endpoint() {
         // Two logicals: one exposing UDP+TCP (TCP must win over UDP),
@@ -3720,6 +3736,189 @@ mod tests {
         assert!(error.details.is_some(), "the FR-22 report still rides");
     }
 
+    /// Codex PR#9 round 14 (P1, no incompatible transports): the
+    /// round-11 reorder kept the UDP mapping as a LAST-RESORT
+    /// endpoint — but the connector is TCP-only, so a UDP-only
+    /// physical's probe was a GUARANTEED-fail handshake burning the
+    /// round's timeout budget (the store's committed fixture has
+    /// exactly such physicals). A UDP-only candidate now resolves NO
+    /// endpoint — absent data, the honest no-observation — never an
+    /// incompatible attempt. Pre-fix the seam answered the UDP
+    /// endpoint and the selection succeeded on a probe that cannot
+    /// happen on a real network.
+    #[test]
+    fn a_udp_only_physical_is_never_tcp_probed() {
+        let body = serde_json::json!({
+            "Code": 1000, "Error": "", "StatusID": "t",
+            "LogicalServers": [{
+                "ID": "id-GB#1", "Name": "GB#1", "City": "City", "State": null,
+                "EntryCountry": "GB", "ExitCountry": "GB", "Domain": null,
+                "Tier": 0, "Features": 0, "Status": 1,
+                "Load": 10, "Score": 1.0, "HostCountry": null,
+                "GatewayName": null, "Translations": null,
+                "Servers": [{
+                    "ID": "id-GB#1-p0", "EntryIP": null, "ExitIP": null,
+                    "Domain": "phys.example", "Status": 1, "Label": "",
+                    "X25519PublicKey": null, "Signature": null, "Generation": null,
+                    "ServicesDownReason": null,
+                    "EntryPerProtocol": {
+                        "WireGuardUDP": { "IPv4": "192.0.2.10", "Ports": [51820] },
+                        "WireGuardTCP": null, "WireGuardTLS": null,
+                        "OpenVPNUDP": null, "OpenVPNTCP": null
+                    }
+                }]
+            }]
+        })
+        .to_string();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let answers = {
+            let calls = std::sync::Arc::clone(&calls);
+            move |_addr: SocketAddr, _timeout: Duration| -> Option<Duration> {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Some(Duration::from_millis(5))
+            }
+        };
+        let mut engine = engine_over(SystemConfig::default(), 1_000_000, answers);
+        engine.catalog_read = Box::new(move || {
+            Ok(Some(CachedCatalog {
+                schema_version: 1,
+                etag: Some("\"test-rev-1\"".to_owned()),
+                fetched_unix: 1_771_000_000,
+                body: body.clone(),
+            }))
+        });
+        let error = engine
+            .resolve(
+                &ConnectTarget::Fastest,
+                &SelectionModifiers {
+                    by: Some("latency".into()),
+                    ..modifiers()
+                },
+            )
+            .expect_err("no TCP-compatible endpoint exists — the latency data refuses");
+        assert_eq!(error.code, RpcErrorCode::NoEligibleServer);
+        assert!(
+            error.message.contains("latency"),
+            "the refusal names the data requirement: {error}"
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "no incompatible connect is ever attempted"
+        );
+    }
+
+    /// Codex PR#9 round 14 (P2, the monotonic probe clock): the probe
+    /// table's ages ran on WALL time — a backward clock correction
+    /// made every entry future-dated (saturating age 0: stale RTTs
+    /// fresh forever, failed probes rate-limited until wall time
+    /// caught up). The probe clock is now the daemon-UPTIME
+    /// monotonic clock (never moves backward). This pins the
+    /// contract: the default `now_ms` reads uptime-relative
+    /// milliseconds, not the epoch — pre-fix it read the wall clock
+    /// (~1.7e12).
+    #[test]
+    fn the_probe_clock_is_monotonic_uptime_not_wall_time() {
+        let engine = SelectionEngine::new(
+            Arc::new(SystemConfig::default()),
+            Path::new("/hermetic-unused"),
+            Path::new("/hermetic-unused"),
+        );
+        let first = (engine.now_ms)();
+        std::thread::sleep(Duration::from_millis(5));
+        let second = (engine.now_ms)();
+        assert!(
+            second >= first,
+            "the monotonic clock never moves backward ({first} -> {second})"
+        );
+        assert!(
+            second < 24 * 60 * 60 * 1000,
+            "uptime-relative, not epoch wall time (read {second})"
+        );
+    }
+
+    /// The gate review's companion pins for round 14: (a) the mixed
+    /// catalog — a UDP-only logical does not poison a round that also
+    /// carries a TCP-probeable one (the resolvable member serves, and
+    /// no incompatible connect is attempted); (b) the legacy
+    /// `EntryIP` fallback — a UDP-only map with a legacy entry IP
+    /// resolves to :443 (the TCP-compatible fallback arm, otherwise
+    /// uncovered: every other fixture sets EntryIP null).
+    #[test]
+    fn mixed_and_legacy_catalogs_probe_only_compatible_endpoints() {
+        let logical = |id: &str, name: &str, entry_ip: Option<&str>, with_tcp: bool| {
+            let tcp = with_tcp.then(|| serde_json::json!({ "IPv4": "192.0.2.11", "Ports": [443] }));
+            serde_json::json!({
+                "ID": id, "Name": name, "City": "City", "State": null,
+                "EntryCountry": "GB", "ExitCountry": "GB", "Domain": null,
+                "Tier": 0, "Features": 0, "Status": 1,
+                "Load": 10, "Score": 1.0, "HostCountry": null,
+                "GatewayName": null, "Translations": null,
+                "Servers": [{
+                    "ID": format!("{id}-p0"), "EntryIP": entry_ip, "ExitIP": null,
+                    "Domain": "phys.example", "Status": 1, "Label": "",
+                    "X25519PublicKey": null, "Signature": null, "Generation": null,
+                    "ServicesDownReason": null,
+                    "EntryPerProtocol": {
+                        "WireGuardUDP": { "IPv4": "192.0.2.10", "Ports": [51820] },
+                        "WireGuardTCP": tcp, "WireGuardTLS": null,
+                        "OpenVPNUDP": null, "OpenVPNTCP": null
+                    }
+                }]
+            })
+        };
+        let body = serde_json::json!({
+            "Code": 1000, "Error": "", "StatusID": "t",
+            "LogicalServers": [
+                // UDP-only, no legacy IP: unresolvable.
+                logical("id-GB#9", "GB#9", None, false),
+                // UDP-only WITH the legacy EntryIP: resolves :443.
+                logical("id-GB#8", "GB#8", Some("192.0.2.99"), false),
+                // TCP-capable: resolves its TCP map.
+                logical("id-GB#7", "GB#7", None, true),
+            ]
+        })
+        .to_string();
+        let seen: Arc<Mutex<Vec<u16>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorder = {
+            let seen = std::sync::Arc::clone(&seen);
+            move |addr: SocketAddr, _timeout: Duration| -> Option<Duration> {
+                seen.lock().expect("seen lock").push(addr.port());
+                Some(Duration::from_millis(5))
+            }
+        };
+        let mut engine = engine_over(SystemConfig::default(), 1_000_000, recorder);
+        engine.catalog_read = Box::new(move || {
+            Ok(Some(CachedCatalog {
+                schema_version: 1,
+                etag: Some("\"test-rev-1\"".to_owned()),
+                fetched_unix: 1_771_000_000,
+                body: body.clone(),
+            }))
+        });
+        let result = engine
+            .resolve(
+                &ConnectTarget::Country {
+                    country: "GB".into(),
+                },
+                &SelectionModifiers {
+                    by: Some("latency".into()),
+                    ..modifiers()
+                },
+            )
+            .expect("the TCP-probeable and legacy members serve the round");
+        let seen = seen.lock().expect("seen lock");
+        assert!(
+            seen.iter().all(|port| *port == 443),
+            "only compatible endpoints probed (observed {seen:?})"
+        );
+        assert!(
+            result.winner.name != "GB#9",
+            "the unresolvable member never wins a latency ranking: {:?}",
+            result.winner.name
+        );
+    }
+
     /// Codex PR-9 (P1, the entitlement tier): a FREE account's
     /// selection must never return a PAID-tier server. Pre-fix the
     /// context carried only the PF boolean — the full cached catalog
@@ -4082,8 +4281,8 @@ mod tests {
 
         // The agreeing arm: a user protocol matching the declared
         // override is NOT a conflict — the request proceeds under the
-        // group's stealth. The fixture's physicals expose WireGuard-UDP
-        // only, so "proceeds" is observable as the protocol-COMPATIBILITY
+        // group's stealth. The fixture's physicals expose no TLS
+        // endpoint, so "proceeds" is observable as the protocol-COMPATIBILITY
         // elimination (the merged constraint evaluating against the
         // catalog), never a merge refusal.
         let agreed = engine
@@ -4112,7 +4311,7 @@ mod tests {
 
     /// With no declared override, the user's protocol applies to the
     /// group selection (pre-fix it was dropped and the fixture's
-    /// GB#1 — a WireGuard-UDP-only server — won under a stealth
+    /// GB#1 — a server with no TLS endpoint — won under a stealth
     /// request).
     #[test]
     fn group_selection_honors_the_protocol_modifier_without_an_override() {
