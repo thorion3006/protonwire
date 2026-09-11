@@ -853,8 +853,12 @@ impl Target {
 
 /// ISO 3166-1 alpha-2, uppercase. Canonicalizing user input is the
 /// calling surface's job; the pure core refuses non-canonical input
-/// rather than approximating it (see the module docs).
-fn validate_country(code: &str) -> Result<(), SelectionError> {
+/// rather than approximating it (see the module docs). Exported for
+/// the daemon's MODIFIER-level validation (Codex PR#9 round 13): an
+/// explicit `--physical-country` must refuse typed even under a
+/// target that never consumes the constraint — one grammar, never a
+/// daemon-side re-derivation.
+pub fn validate_country(code: &str) -> Result<(), SelectionError> {
     if code.len() == 2 && code.bytes().all(|b| b.is_ascii_uppercase()) {
         Ok(())
     } else {
