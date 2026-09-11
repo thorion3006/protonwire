@@ -147,6 +147,13 @@ use protonwire_store::location::LocationCacheError;
 #[derive(Default)]
 pub struct EntitlementProvider {
     inner: RwLock<Option<Arc<dyn EntitlementsApi>>>,
+    /// The adapter GENERATION (Codex PR#9 round 10, P1): bumped on
+    /// every install — a slot stamped with an older generation
+    /// belongs to a PREVIOUS account and never serves a joiner under
+    /// the current one (the cross-account leak: the old account's
+    /// MaxTier/IsBusiness selecting paid-tier or gateways for the
+    /// new one).
+    generation: std::sync::atomic::AtomicU64,
     /// The in-flight fetch's broadcast slot (the single-flight seam):
     /// ONE worker, EVERY waiter observes the SAME outcome (Codex
     /// PR#9 round 5, P1 — mpsc is single-consumer; the first waiter
@@ -160,18 +167,33 @@ pub struct EntitlementProvider {
 /// The single-flight slot: the worker stores the result ONCE; every
 /// waiter takes a clone of the SAME outcome (broadcast semantics over
 /// a Mutex+Condvar pair). The error arm carries the structured
-/// RpcError (Clone) so variants survive the broadcast.
+/// RpcError (Clone) so variants survive the broadcast. The generation
+/// stamp binds the slot to the adapter it fetches FOR (round 10).
 type EntitlementFetchSlot = Arc<EntitlementFetchShared>;
 
 struct EntitlementFetchShared {
+    /// The adapter generation this slot's worker fetches under.
+    generation: u64,
     result: Mutex<Option<Result<VpnEntitlements, RpcError>>>,
     done: std::sync::Condvar,
 }
 
 impl EntitlementProvider {
-    /// Installs (or replaces) the entitlements adapter.
+    /// Installs (or replaces) the entitlements adapter. REPLACEMENT
+    /// invalidates everything the previous account composed (round
+    /// 10, P1): the in-flight slot is dropped (a joiner under the
+    /// new account would otherwise consume the old account's
+    /// entitlements — the parked-slot leak), and the cached snapshot
+    /// is dropped with it (the listing must not keep reporting the
+    /// old account's paid availability). The generation bump is the
+    /// load-bearing part: any slot still parked under an older stamp
+    /// is orphaned even if a racing install interleaves.
     pub fn install(&self, api: Arc<dyn EntitlementsApi>) {
         *self.inner.write().expect("entitlement provider lock") = Some(api);
+        self.generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        *self.in_flight.lock().expect("in-flight slot lock") = None;
+        *self.cached.lock().expect("entitlement cache lock") = None;
     }
 
     /// The current adapter, if the session lane has installed one.
@@ -189,8 +211,14 @@ impl EntitlementProvider {
     /// result once and signals the condvar; each waiter clones it.
     /// At most one worker (and one upstream fetch) exists per instant.
     fn single_flight_slot(&self) -> Result<EntitlementFetchSlot, RpcError> {
+        let current_generation = self.generation.load(std::sync::atomic::Ordering::SeqCst);
         let mut slot = self.in_flight.lock().expect("in-flight slot lock");
-        if let Some(existing) = slot.as_ref() {
+        // A slot stamped for a PREVIOUS adapter generation never
+        // serves this account (round 10, P1) — fall through and
+        // replace it with a fresh worker under the current stamp.
+        if let Some(existing) = slot.as_ref()
+            && existing.generation == current_generation
+        {
             return Ok(Arc::clone(existing));
         }
         let Some(adapter) = self.current() else {
@@ -200,6 +228,7 @@ impl EntitlementProvider {
             ));
         };
         let shared: EntitlementFetchSlot = Arc::new(EntitlementFetchShared {
+            generation: current_generation,
             result: Mutex::new(None),
             done: std::sync::Condvar::new(),
         });
@@ -276,10 +305,32 @@ impl EntitlementProvider {
         self.cached.lock().expect("entitlement cache lock").clone()
     }
 
+    /// The CURRENT adapter generation (the post-wait re-check's
+    /// source, round 10's gate review): a waiter that joined a
+    /// parked slot compares its stamp against this AFTER the wait —
+    /// a worker landing under an older stamp belongs to a replaced
+    /// account session and never writes (or withdraws) the cache,
+    /// never serves as the composition.
+    fn current_generation(&self) -> u64 {
+        self.generation.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     /// Stores a successfully composed snapshot for the network-free
     /// surfaces.
     fn store_snapshot(&self, snapshot: VpnEntitlements) {
         *self.cached.lock().expect("entitlement cache lock") = Some(snapshot);
+    }
+
+    /// Drops the cached snapshot (Codex PR#9 round 10, P2): an
+    /// authoritative-but-unusable response (NoAccess/Waitlisted, or
+    /// an absent MaxTier) withdraws whatever the last good
+    /// composition recorded — the network-free listing resets to the
+    /// honest unknown, never a paid availability the account no
+    /// longer has. A TRANSPORT failure does NOT call this: it says
+    /// nothing about the account, and the last-known-good snapshot
+    /// keeps serving the listing.
+    fn invalidate_cached_snapshot(&self) {
+        *self.cached.lock().expect("entitlement cache lock") = None;
     }
 }
 
@@ -537,9 +588,28 @@ impl SelectionEngine {
                 ),
             ));
         };
+        // The POST-WAIT generation re-check (round 10's gate review,
+        // P1): a waiter that joined a PARKED slot may observe its
+        // worker land after the session lane replaced the adapter —
+        // this outcome belongs to the PREVIOUS account. It must
+        // neither serve as the new account's composition nor write
+        // (or withdraw) its cache; the request refuses fail-closed
+        // and the retry composes under the current session.
+        if slot.generation != self.entitlement.current_generation() {
+            return Err(RpcError::new(
+                RpcErrorCode::EntitlementMissing,
+                "the entitlement snapshot belongs to a replaced account session — retry \
+                 the selection under the current one",
+            ));
+        }
         match result {
             Ok(entitlements) => {
                 if entitlements.vpn_access != VpnAccess::Active {
+                    // An AUTHORITATIVE no-access answer withdraws the
+                    // cached snapshot (round 10, P2): the network-free
+                    // listing must never keep reporting paid
+                    // availability the newest authority just refused.
+                    self.entitlement.invalidate_cached_snapshot();
                     return Err(RpcError::new(
                         RpcErrorCode::EntitlementMissing,
                         format!(
@@ -549,6 +619,9 @@ impl SelectionEngine {
                     ));
                 }
                 if entitlements.max_tier.is_none() {
+                    // Same invalidation: an unusable snapshot is not a
+                    // reason to keep serving the previous one.
+                    self.entitlement.invalidate_cached_snapshot();
                     return Err(RpcError::new(
                         RpcErrorCode::EntitlementMissing,
                         "the entitlement snapshot carries no MaxTier — the account tier \
@@ -560,7 +633,11 @@ impl SelectionEngine {
             }
             // The worker pre-mapped the variant (Transport →
             // NetworkUnavailable; Api/Malformed → Internal); the
-            // clone preserves it.
+            // clone preserves it. A transport failure says nothing
+            // ABOUT the account — the last-known-good cached snapshot
+            // keeps serving the network-free listing (round 10's
+            // distinction: authoritative-unusable invalidates,
+            // transport-unknown does not).
             Err(rpc) => Err(rpc),
         }
     }
@@ -2779,6 +2856,213 @@ mod tests {
         assert!(availability.available);
     }
 
+    /// Codex PR#9 round 10 (P1, adapter replacement): replacing the
+    /// provider must invalidate everything the PREVIOUS account
+    /// composed — a stale in-flight slot would hand the new account's
+    /// selections the old account's MaxTier/IsBusiness (the
+    /// cross-account leak: paid-tier or gateway selection under the
+    /// wrong account), and a stale cached snapshot would keep serving
+    /// the listing the old account's paid availability. Account A
+    /// never lands (its slot parks after a deadline-timeout); the
+    /// session lane swaps to account B — B's selection must compose
+    /// through a FRESH worker, never join A's slot. Pre-fix B's
+    /// resolve joined the parked slot and refused (A never lands).
+    #[test]
+    fn replacing_the_adapter_never_serves_the_previous_account() {
+        let engine = default_engine();
+        engine
+            .entitlement()
+            .install(Arc::new(NeverLandingEntitlements));
+        let _ = engine
+            .entitlement_composition(Instant::now() + Duration::from_millis(100))
+            .expect_err("account A never lands — the deadline refuses");
+
+        engine
+            .entitlement()
+            .install(Arc::new(FakeEntitlements::paid()));
+        let result = engine
+            .resolve(&ConnectTarget::Fastest, &modifiers())
+            .expect("the new account's composition is its own — no stale join");
+        assert_eq!(result.winner.name, "GB#1");
+
+        // The replacement also drops the CACHED snapshot: on a fresh
+        // engine, prime account A's paid cache, swap to account B —
+        // with no B composition yet, the listing must read the honest
+        // unknown, never A's paid availability (pre-fix max-security
+        // read available from A's primed cache).
+        let engine = default_engine();
+        engine
+            .entitlement()
+            .install(Arc::new(FakeEntitlements::paid()));
+        engine
+            .resolve(&country("GB"), &modifiers())
+            .expect("primes account A's cache");
+        engine
+            .entitlement()
+            .install(Arc::new(FakeEntitlements::free()));
+        let listing = engine.groups_catalog().expect("the registry serves");
+        let max_security = listing
+            .groups
+            .iter()
+            .find(|group| group.id == "proton:max-security")
+            .expect("the secure-core group is listed");
+        assert!(
+            !max_security.availability.available
+                && max_security.availability.reason.as_deref()
+                    == Some("entitlement-composition-missing"),
+            "the cache reset to the honest unknown: {:?}",
+            max_security.availability
+        );
+    }
+
+    /// Codex PR#9 round 10 (P2, the authoritative invalidation): a
+    /// successfully fetched but UNUSABLE snapshot (NoAccess /
+    /// Waitlisted, or an absent MaxTier) must invalidate the cached
+    /// one — the network-free listing never reports paid availability
+    /// the latest authoritative response just withdrew. Pre-fix the
+    /// old paid snapshot survived and max-security stayed available.
+    #[test]
+    fn unusable_snapshots_invalidate_the_cached_one() {
+        // Prime a PAID cache.
+        let engine = default_engine();
+        engine
+            .entitlement()
+            .install(Arc::new(FakeEntitlements::paid()));
+        engine
+            .resolve(&country("GB"), &modifiers())
+            .expect("primes the paid cache");
+
+        // The authoritative answer turns NoAccess.
+        engine
+            .entitlement()
+            .install(Arc::new(FakeEntitlements::no_access()));
+        let error = engine
+            .resolve(&country("GB"), &modifiers())
+            .expect_err("no VPN access refuses");
+        assert_eq!(error.code, RpcErrorCode::EntitlementMissing);
+        assert!(
+            error.message.contains("VPN access"),
+            "names the access state: {error}"
+        );
+        let listing = engine.groups_catalog().expect("the registry serves");
+        let max_security = listing
+            .groups
+            .iter()
+            .find(|group| group.id == "proton:max-security")
+            .expect("the secure-core group is listed");
+        assert_eq!(
+            max_security.availability.reason.as_deref(),
+            Some("entitlement-composition-missing"),
+            "the withdrawn availability is not served from cache: {:?}",
+            max_security.availability
+        );
+
+        // Same for an absent MaxTier (the S8 tri-state: no tier is
+        // not a tier — and not a reason to keep the old one).
+        engine
+            .entitlement()
+            .install(Arc::new(FakeEntitlements::no_max_tier()));
+        let error = engine
+            .resolve(&country("GB"), &modifiers())
+            .expect_err("no MaxTier refuses");
+        assert_eq!(error.code, RpcErrorCode::EntitlementMissing);
+        assert!(
+            error.message.contains("MaxTier"),
+            "names the missing tier: {error}"
+        );
+        let listing = engine.groups_catalog().expect("the registry serves");
+        let max_security = listing
+            .groups
+            .iter()
+            .find(|group| group.id == "proton:max-security")
+            .expect("the secure-core group is listed");
+        assert_eq!(
+            max_security.availability.reason.as_deref(),
+            Some("entitlement-composition-missing"),
+            "still invalidated: {:?}",
+            max_security.availability
+        );
+    }
+
+    /// The gate review's P1 on round 10 (the post-wait re-check): a
+    /// waiter that joined a PARKED slot may observe its worker land
+    /// AFTER the session lane replaced the adapter — the landed
+    /// outcome belongs to the PREVIOUS account and must neither
+    /// serve as the new account's composition nor write (or
+    /// withdraw) its cache. Account A lands late (500 ms); the swap
+    /// happens mid-wait; the selection refuses and the cache stays
+    /// empty. Pre-fix the resolve returned A's paid selection and
+    /// parked A's snapshot in B's cache.
+    #[test]
+    fn a_late_landing_from_a_replaced_account_never_writes_back() {
+        let engine = std::sync::Arc::new(default_engine());
+        engine
+            .entitlement()
+            .install(Arc::new(DelayedEntitlements::paid(500)));
+        let handle = {
+            let engine = std::sync::Arc::clone(&engine);
+            std::thread::spawn(move || engine.resolve(&ConnectTarget::Fastest, &modifiers()))
+        };
+        std::thread::sleep(Duration::from_millis(150));
+        engine
+            .entitlement()
+            .install(Arc::new(FakeEntitlements::free()));
+
+        let outcome = handle.join().expect("the resolver thread");
+        let error = outcome.expect_err("the landed outcome belongs to the replaced account");
+        assert_eq!(error.code, RpcErrorCode::EntitlementMissing);
+        assert!(
+            error.message.contains("replaced"),
+            "names the session boundary: {error}"
+        );
+        // And the cache: A's snapshot never parked.
+        let listing = engine.groups_catalog().expect("the registry serves");
+        let max_security = listing
+            .groups
+            .iter()
+            .find(|group| group.id == "proton:max-security")
+            .expect("the secure-core group is listed");
+        assert_eq!(
+            max_security.availability.reason.as_deref(),
+            Some("entitlement-composition-missing"),
+            "the late landing never wrote the new account's cache: {:?}",
+            max_security.availability
+        );
+    }
+
+    /// The round-10 DISTINCTION pin: a TRANSPORT failure says nothing
+    /// about the account — the last-known-good snapshot keeps serving
+    /// the network-free listing (a mutant invalidating on every error
+    /// must not survive). Within one session: the first fetch primes
+    /// the cache, the second fails transport.
+    #[test]
+    fn a_transport_failure_keeps_the_last_known_good_cache() {
+        let engine = default_engine();
+        engine
+            .entitlement()
+            .install(Arc::new(TransportFailingAfterFirstFetch {
+                served: std::sync::atomic::AtomicBool::new(false),
+            }));
+        engine
+            .resolve(&country("GB"), &modifiers())
+            .expect("the first fetch primes the paid cache");
+        let error = engine
+            .resolve(&country("GB"), &modifiers())
+            .expect_err("the transport failure refuses the composition");
+        assert_eq!(error.code, RpcErrorCode::NetworkUnavailable);
+        let listing = engine.groups_catalog().expect("the registry serves");
+        let max_security = listing
+            .groups
+            .iter()
+            .find(|group| group.id == "proton:max-security")
+            .expect("the secure-core group is listed");
+        assert!(
+            max_security.availability.available,
+            "the last-known-good snapshot serves the listing: {:?}",
+            max_security.availability
+        );
+    }
+
     /// Codex PR-9 (P1, the entitlement tier): a FREE account's
     /// selection must never return a PAID-tier server. Pre-fix the
     /// context carried only the PF boolean — the full cached catalog
@@ -3773,6 +4057,63 @@ mod tests {
         assert_eq!(p2p.selector.target, "p2p");
     }
 
+    /// An adapter whose fetch LANDS LATE (a paid snapshot after the
+    /// delay): the post-wait re-check race — the session lane swaps
+    /// the adapter while a waiter is parked on this worker's slot.
+    struct DelayedEntitlements {
+        delay_ms: u64,
+        body: &'static str,
+    }
+
+    impl DelayedEntitlements {
+        fn paid(delay_ms: u64) -> Self {
+            Self {
+                delay_ms,
+                body: FakeEntitlements::paid().body,
+            }
+        }
+    }
+
+    impl EntitlementsApi for DelayedEntitlements {
+        fn fetch(
+            &self,
+        ) -> Result<
+            protonwire_api::entitlements::VpnEntitlements,
+            protonwire_api::entitlements::EntitlementsError,
+        > {
+            std::thread::sleep(Duration::from_millis(self.delay_ms));
+            protonwire_api::entitlements::VpnEntitlements::from_wire_bytes(self.body.as_bytes())
+        }
+    }
+
+    /// Succeeds ONCE, then fails at the TRANSPORT layer — the
+    /// round-10 distinction pin: within one session, a
+    /// transport-unknown outcome never invalidates the cached
+    /// snapshot (a REPLACEMENT install always clears it — different
+    /// seam, pinned by the replacement tests).
+    struct TransportFailingAfterFirstFetch {
+        served: std::sync::atomic::AtomicBool,
+    }
+
+    impl EntitlementsApi for TransportFailingAfterFirstFetch {
+        fn fetch(
+            &self,
+        ) -> Result<
+            protonwire_api::entitlements::VpnEntitlements,
+            protonwire_api::entitlements::EntitlementsError,
+        > {
+            if self.served.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                Err(protonwire_api::entitlements::EntitlementsError::Transport(
+                    "synthetic transport outage".to_owned(),
+                ))
+            } else {
+                protonwire_api::entitlements::VpnEntitlements::from_wire_bytes(
+                    FakeEntitlements::paid().body.as_bytes(),
+                )
+            }
+        }
+    }
+
     /// An adapter whose fetch NEVER lands (the worker parks in a
     /// loop): isolates the WAITER-side timing from the worker side —
     /// the deadline-clamp tests measure when the waiter gives up,
@@ -3826,6 +4167,42 @@ mod tests {
                         "Status": 1, "ExpirationTime": 1820000000,
                         "PlanName": "free", "PlanTitle": "Proton Free",
                         "MaxTier": 0, "MaxConnect": 1, "Name": "synthetic",
+                        "GroupID": null, "IsBusiness": false, "NetShield": null
+                    }
+                }"#,
+            }
+        }
+
+        /// An authoritative NO-ACCESS answer (wire `Status: 0`) that
+        /// still carries a tier — the round-10 invalidation shape.
+        fn no_access() -> Self {
+            Self {
+                body: r#"{
+                    "Code": 1000, "Error": null, "Details": null,
+                    "Subscribed": 0, "Services": 1, "Delinquent": 0, "Credit": 0,
+                    "HasPaymentMethod": 0,
+                    "VPN": {
+                        "Status": 0, "ExpirationTime": 1820000000,
+                        "PlanName": "free", "PlanTitle": "Proton Free",
+                        "MaxTier": 3, "MaxConnect": 1, "Name": "synthetic",
+                        "GroupID": null, "IsBusiness": false, "NetShield": null
+                    }
+                }"#,
+            }
+        }
+
+        /// An ACTIVE answer with NO MaxTier (the S8 tri-state arm) —
+        /// the round-10 invalidation's second shape.
+        fn no_max_tier() -> Self {
+            Self {
+                body: r#"{
+                    "Code": 1000, "Error": null, "Details": null,
+                    "Subscribed": 0, "Services": 1, "Delinquent": 0, "Credit": 0,
+                    "HasPaymentMethod": 0,
+                    "VPN": {
+                        "Status": 1, "ExpirationTime": 1820000000,
+                        "PlanName": "free", "PlanTitle": "Proton Free",
+                        "MaxTier": null, "MaxConnect": 1, "Name": "synthetic",
                         "GroupID": null, "IsBusiness": false, "NetShield": null
                     }
                 }"#,
