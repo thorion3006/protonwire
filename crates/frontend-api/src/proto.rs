@@ -867,8 +867,11 @@ pub struct SelectionResult {
     pub physical_country: Option<PhysicalCountryValue>,
     /// The winning server.
     pub winner: SelectedServer,
-    /// The selection-plane features the request carried (rendered
-    /// tokens, required then optional).
+    /// The selection-plane features the RESOLVED request enforced
+    /// (rendered tokens, required then optional, deduplicated):
+    /// caller modifiers PLUS target-implied constraints (the special
+    /// targets inject theirs) and group-merged constraints — the
+    /// hard filters that actually ran, not the raw modifier list.
     pub requested_features: Vec<String>,
     /// Requested-but-not-applied features. For REQUIRED features the
     /// difference is empty by construction — selection satisfies them

@@ -156,6 +156,31 @@ use protonwire_store::location::LocationCacheError;
 #[derive(Default)]
 pub struct EntitlementProvider {
     inner: RwLock<Option<Arc<dyn EntitlementsApi>>>,
+    /// Serializes adapter REPLACEMENT against the composition path's
+    /// check-then-write pairs (Codex PR#9 round 11, P1): install()
+    /// holds it across the WHOLE transition (adapter + generation +
+    /// slot + cache — previously the adapter published before the
+    /// generation bumped, a window where a request saw the new
+    /// session under the old generation and consumed a completed
+    /// old-account slot through the post-wait check); the
+    /// composition's post-wait re-check + snapshot write hold it too
+    /// (a replacement landing between the check and the write could
+    /// repopulate the just-cleared cache with the old account's
+    /// result). A replacement either lands entirely BEFORE the check
+    /// (the stamp mismatches — the outcome refuses fail-closed) or
+    /// entirely AFTER (the write belongs to the session that was
+    /// current when the check passed).
+    ///
+    /// Lock discipline (the gate review's correction): there is NO
+    /// global order over inner/in_flight/cached — the invariant is
+    /// that install()'s guards over them are STATEMENT-scoped (never
+    /// nested inside one another, always inside `transition`), while
+    /// `single_flight_slot` nests in_flight → inner WITHOUT holding
+    /// `transition` (its torn reads are safe: a worker spawned under
+    /// an older stamp refuses at the post-wait re-check). Future code
+    /// must not nest inner → in_flight while holding `transition`
+    /// (it would cycle with the slot path).
+    transition: Mutex<()>,
     /// The adapter GENERATION (Codex PR#9 round 10, P1): bumped on
     /// every install — a slot stamped with an older generation
     /// belongs to a PREVIOUS account and never serves a joiner under
@@ -196,8 +221,13 @@ impl EntitlementProvider {
     /// is dropped with it (the listing must not keep reporting the
     /// old account's paid availability). The generation bump is the
     /// load-bearing part: any slot still parked under an older stamp
-    /// is orphaned even if a racing install interleaves.
+    /// is orphaned even if a racing install interleaves. The WHOLE
+    /// transition is ONE serialized step (round 11, P1 — under the
+    /// [`Self::transition`] lock, q.v.): no observer can see the new
+    /// adapter under the old generation, or the old generation under
+    /// the new adapter, mid-swap.
     pub fn install(&self, api: Arc<dyn EntitlementsApi>) {
+        let _guard = self.transition.lock().expect("entitlement transition lock");
         *self.inner.write().expect("entitlement provider lock") = Some(api);
         self.generation
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -605,7 +635,19 @@ impl SelectionEngine {
         // this outcome belongs to the PREVIOUS account. It must
         // neither serve as the new account's composition nor write
         // (or withdraw) its cache; the request refuses fail-closed
-        // and the retry composes under the current session.
+        // and the retry composes under the current session. The
+        // check AND the snapshot writes below hold the TRANSITION
+        // lock (round 11, P1 — install() swaps under the same lock):
+        // a replacement racing this pair either lands entirely
+        // BEFORE the check (the stamp mismatches — refuse) or
+        // entirely AFTER the write (the write belongs to the session
+        // that was current when the check passed); the old result
+        // can never repopulate the newly cleared cache.
+        let _transition = self
+            .entitlement
+            .transition
+            .lock()
+            .expect("entitlement transition lock");
         if slot.generation != self.entitlement.current_generation() {
             return Err(RpcError::new(
                 RpcErrorCode::EntitlementMissing,
@@ -1224,12 +1266,26 @@ impl SelectionEngine {
         } else {
             "catalog-only"
         };
-        let requested_features = modifiers
+        // FR-23T provenance derives from the RESOLVED request (round
+        // 11, P2): the special targets inject their constraint and
+        // groups merge theirs into the request the hard filters
+        // actually enforced — the raw modifier arrays under-report
+        // (`select p2p` used to answer `[]`). Order-preserving
+        // DEDUPE: a modifier naming the target's injected constraint
+        // (`select p2p --require p2p`) must not render twice (the
+        // gate-review P2).
+        let mut requested_features = Vec::new();
+        for feature in request
+            .constraints
             .required_features
             .iter()
-            .chain(modifiers.optional_features.iter())
-            .map(|feature| feature.as_str().to_owned())
-            .collect::<Vec<_>>();
+            .chain(request.constraints.optional_features.iter())
+        {
+            let token = feature_token(*feature);
+            if !requested_features.iter().any(|seen: &String| seen == token) {
+                requested_features.push(token.to_owned());
+            }
+        }
 
         Ok(Box::new(SelectionResult {
             catalog: SelectionCatalogProvenance {
@@ -1580,9 +1636,15 @@ impl ProbeExecutor for TransportExecutor<'_> {
 }
 
 /// Resolves a logical id to the probe endpoint (an online physical's
-/// per-protocol IPv4 + port, preferring WireGuard-UDP; the legacy
-/// `EntryIP` shape falls back to port 443). Unresolvable ids return
-/// `None` — absent data, never a guess.
+/// per-protocol IPv4 + port). The TCP-COMPATIBLE mappings come first
+/// (TCP, then TLS) — the connector is a TCP handshake
+/// (`TcpStream::connect_timeout`), and a UDP mapping's port cannot
+/// complete one on a real network (round 11, P1: the UDP-first order
+/// made explicit latency selections refuse for nearly every
+/// candidate; the same-host TCP port measures the same path). The
+/// UDP mapping stays the LAST resort (legacy shapes; the injected
+/// test seams); the legacy `EntryIP` shape falls back to port 443.
+/// Unresolvable ids return `None` — absent data, never a guess.
 fn probe_endpoint(catalog: &CatalogDocument, logical_id: &str) -> Option<SocketAddr> {
     let server = catalog
         .logical_servers
@@ -1591,9 +1653,9 @@ fn probe_endpoint(catalog: &CatalogDocument, logical_id: &str) -> Option<SocketA
     for physical in server.servers.iter().filter(|p| p.is_online()) {
         if let Some(map) = physical.entry_per_protocol.as_ref() {
             for endpoint in [
-                map.wireguard_udp.as_ref(),
                 map.wireguard_tcp.as_ref(),
                 map.wireguard_tls.as_ref(),
+                map.wireguard_udp.as_ref(),
             ]
             .into_iter()
             .flatten()
@@ -1634,6 +1696,20 @@ fn wire_feature(feature: SelectionFeature) -> FeatureConstraint {
         SelectionFeature::Streaming => FeatureConstraint::Streaming,
         SelectionFeature::Ipv6 => FeatureConstraint::Ipv6,
         SelectionFeature::PortForwarding => FeatureConstraint::PortForwarding,
+    }
+}
+
+/// The inverse map (the FR-23T requested-features provenance over
+/// the RESOLVED request's constraints — same tokens `as_str` emits,
+/// one table each way).
+fn feature_token(feature: FeatureConstraint) -> &'static str {
+    match feature {
+        FeatureConstraint::P2p => "p2p",
+        FeatureConstraint::Tor => "tor",
+        FeatureConstraint::SecureCore => "secure-core",
+        FeatureConstraint::Streaming => "streaming",
+        FeatureConstraint::Ipv6 => "ipv6",
+        FeatureConstraint::PortForwarding => "port-forwarding",
     }
 }
 
@@ -3054,6 +3130,209 @@ mod tests {
             availability.available,
             "the last-known-good snapshot serves the listing: {availability:?}"
         );
+    }
+
+    /// Codex PR#9 round 11 (P1, the compatible transport): the TCP
+    /// connector probed the WIREGUARD-UDP mapping's endpoint first —
+    /// a UDP port cannot complete a TCP handshake on a real network,
+    /// so explicit latency selections refused for nearly every
+    /// candidate (the injected seams decided answers, masking the
+    /// mismatch). The endpoint resolution prefers a TCP-COMPATIBLE
+    /// mapping (TCP, then TLS) for the TCP connector, keeping the
+    /// UDP mapping as the last-resort attempt (legacy shapes; the
+    /// injected seams). Pre-fix the recorded address carried the UDP
+    /// mapping's port.
+    #[test]
+    fn the_tcp_probe_prefers_a_tcp_compatible_endpoint() {
+        // Two logicals: one exposing UDP+TCP (TCP must win over UDP),
+        // one exposing only TLS+UDP (TLS must win over UDP — pins the
+        // full preference order, not just TCP-first).
+        let logical =
+            |id: &str, name: &str, udp_port: u16, tcp_port: Option<u16>, tls_port: Option<u16>| {
+                let tcp = tcp_port
+                    .map(|port| serde_json::json!({ "IPv4": "192.0.2.10", "Ports": [port] }))
+                    .unwrap_or(serde_json::json!(null));
+                let tls = tls_port
+                    .map(|port| serde_json::json!({ "IPv4": "192.0.2.10", "Ports": [port] }))
+                    .unwrap_or(serde_json::json!(null));
+                serde_json::json!({
+                    "ID": id, "Name": name, "City": "City", "State": null,
+                    "EntryCountry": "GB", "ExitCountry": "GB", "Domain": null,
+                    "Tier": 0, "Features": 0, "Status": 1,
+                    "Load": 10, "Score": 1.0, "HostCountry": null,
+                    "GatewayName": null, "Translations": null,
+                    "Servers": [{
+                        "ID": format!("{id}-p0"), "EntryIP": null, "ExitIP": null,
+                        "Domain": "phys.example", "Status": 1, "Label": "",
+                        "X25519PublicKey": null, "Signature": null, "Generation": null,
+                        "ServicesDownReason": null,
+                        "EntryPerProtocol": {
+                            "WireGuardUDP": { "IPv4": "192.0.2.10", "Ports": [udp_port] },
+                            "WireGuardTCP": tcp,
+                            "WireGuardTLS": tls, "OpenVPNUDP": null, "OpenVPNTCP": null
+                        }
+                    }]
+                })
+            };
+        let body = serde_json::json!({
+            "Code": 1000, "Error": "", "StatusID": "t",
+            "LogicalServers": [
+                logical("id-GB#1", "GB#1", 51820, Some(443), None),
+                logical("id-GB#2", "GB#2", 51900, None, Some(8443)),
+            ]
+        })
+        .to_string();
+        let seen: Arc<Mutex<Vec<u16>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorder = {
+            let seen = std::sync::Arc::clone(&seen);
+            move |addr: SocketAddr, _timeout: Duration| -> Option<Duration> {
+                seen.lock().expect("seen lock").push(addr.port());
+                Some(Duration::from_millis(5))
+            }
+        };
+        let mut engine = engine_over(SystemConfig::default(), 1_000_000, recorder);
+        engine.catalog_read = Box::new(move || {
+            Ok(Some(CachedCatalog {
+                schema_version: 1,
+                etag: Some("\"test-rev-1\"".to_owned()),
+                fetched_unix: 1_771_000_000,
+                body: body.clone(),
+            }))
+        });
+        let result = engine
+            .resolve(
+                &ConnectTarget::Fastest,
+                &SelectionModifiers {
+                    by: Some("latency".into()),
+                    ..modifiers()
+                },
+            )
+            .expect("the latency selection probes");
+        assert_eq!(result.winner.name, "GB#1");
+        let seen = seen.lock().expect("seen lock");
+        assert!(
+            seen.iter().all(|port| *port == 443 || *port == 8443),
+            "only TCP-compatible mapping ports are probed (observed {seen:?})"
+        );
+        assert!(
+            seen.contains(&8443),
+            "the TLS-only logical probed its TLS mapping, not its UDP one (observed {seen:?})"
+        );
+    }
+
+    /// Codex PR#9 round 11 (P1, atomic replacement): install()
+    /// published the new adapter BEFORE bumping the generation, and
+    /// the post-wait check-to-write pair could race a replacement
+    /// landing between them — windows in which the OLD account's
+    /// outcome could serve or repopulate under the NEW session.
+    /// Replacement is now ONE serialized transition (the transition
+    /// lock): install holds it across the whole swap; the
+    /// composition's re-check + snapshot write hold it too. Stress
+    /// pin: swaps racing landing workers — the cache never ends
+    /// holding the replaced account's snapshot. (The windows are
+    /// nanosecond interleavings — the red was analytic, per the bot's
+    /// construction; the pin guards the discipline.)
+    #[test]
+    fn replacement_is_atomic_with_the_generation_transition() {
+        for _ in 0..50 {
+            let engine = std::sync::Arc::new(default_engine());
+            engine
+                .entitlement()
+                .install(Arc::new(DelayedEntitlements::paid(20)));
+            let handle = {
+                let engine = std::sync::Arc::clone(&engine);
+                std::thread::spawn(move || engine.resolve(&ConnectTarget::Fastest, &modifiers()))
+            };
+            std::thread::sleep(Duration::from_millis(5));
+            engine
+                .entitlement()
+                .install(Arc::new(FakeEntitlements::free()));
+            let _ = handle.join().expect("the resolver thread");
+            assert_ne!(
+                engine
+                    .entitlement()
+                    .cached_snapshot()
+                    .and_then(|snapshot| snapshot.plan_tier),
+                Some(PlanTier::Paid),
+                "the replaced account's snapshot never survives the swap"
+            );
+        }
+    }
+
+    /// Codex PR#9 round 11 (P2, target-implied provenance): `select
+    /// p2p` injects the P2p constraint into the resolved request,
+    /// but `requested_features` was built from the RAW modifier
+    /// arrays — reporting `[]` for a dedicated special target whose
+    /// hard filter applied p2p. FR-23T provenance now derives from
+    /// the RESOLVED request (target-implied and group-merged
+    /// constraints included).
+    #[test]
+    fn requested_features_reports_target_implied_constraints() {
+        let engine = default_engine();
+        engine
+            .entitlement()
+            .install(Arc::new(FakeEntitlements::paid()));
+        let p2p = engine
+            .resolve(
+                &ConnectTarget::Special {
+                    class: SpecialClass::P2p,
+                },
+                &modifiers(),
+            )
+            .expect("the paid plan selects p2p");
+        assert_eq!(
+            p2p.requested_features,
+            vec!["p2p".to_owned()],
+            "the special target's injected constraint is provenance"
+        );
+
+        // Group-merged constraints report the same way: the regional
+        // group under a paid plan with --require p2p.
+        let result = engine
+            .resolve(
+                &ConnectTarget::Group {
+                    group_id: "protonwire:fastest-europe".into(),
+                },
+                &SelectionModifiers {
+                    required_features: vec![SelectionFeature::P2p],
+                    ..modifiers()
+                },
+            )
+            .expect("the paid plan selects the region");
+        assert_eq!(result.requested_features, vec!["p2p".to_owned()]);
+
+        // A modifier naming the target's injected constraint renders
+        // ONCE (the gate-review P2: pre-dedupe this answered
+        // ["p2p","p2p"]).
+        let result = engine
+            .resolve(
+                &ConnectTarget::Special {
+                    class: SpecialClass::P2p,
+                },
+                &SelectionModifiers {
+                    required_features: vec![SelectionFeature::P2p],
+                    ..modifiers()
+                },
+            )
+            .expect("the explicit require matches the injected constraint");
+        assert_eq!(result.requested_features, vec!["p2p".to_owned()]);
+    }
+
+    /// The inverse map parity pin (the gate review's P3, landed): the
+    /// feature_token table can drift from SelectionFeature::as_str
+    /// silently — one loop over all six variants closes the class.
+    #[test]
+    fn feature_token_mirrors_the_wire_vocabulary() {
+        for feature in [
+            SelectionFeature::P2p,
+            SelectionFeature::Tor,
+            SelectionFeature::SecureCore,
+            SelectionFeature::Streaming,
+            SelectionFeature::Ipv6,
+            SelectionFeature::PortForwarding,
+        ] {
+            assert_eq!(feature_token(wire_feature(feature)), feature.as_str());
+        }
     }
 
     /// Codex PR-9 (P1, the entitlement tier): a FREE account's

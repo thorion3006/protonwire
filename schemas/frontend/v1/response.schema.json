@@ -1309,7 +1309,7 @@
           ]
         },
         "requested_features": {
-          "description": "The selection-plane features the request carried (rendered\ntokens, required then optional).",
+          "description": "The selection-plane features the RESOLVED request enforced\n(rendered tokens, required then optional, deduplicated):\ncaller modifiers PLUS target-implied constraints (the special\ntargets inject theirs) and group-merged constraints — the\nhard filters that actually ran, not the raw modifier list.",
           "type": "array",
           "items": {
             "type": "string"
