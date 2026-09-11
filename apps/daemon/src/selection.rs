@@ -1115,6 +1115,24 @@ impl SelectionEngine {
         target: &ConnectTarget,
         modifiers: &SelectionModifiers,
     ) -> Result<Box<SelectionResult>, RpcError> {
+        // The explicit physical country validates AT THE BOUNDARY
+        // (round 13, P2): the wire contract is uppercase ISO 3166-1
+        // alpha-2, non-canonical input refuses typed — a target that
+        // never consumes the constraint must not smuggle the value
+        // into provenance unvalidated (`select fastest
+        // --physical-country gb` used to succeed and report `gb`).
+        // The core's own grammar, one vocabulary.
+        if let Some(country) = modifiers.physical_country.as_deref()
+            && protonwire_core::selection::validate_country(country).is_err()
+        {
+            return Err(RpcError::new(
+                RpcErrorCode::InvalidParams,
+                format!(
+                    "physical-country `{country}` is not a canonical uppercase ISO 3166-1 \
+                     alpha-2 code — non-canonical input refuses typed, never approximated"
+                ),
+            ));
+        }
         // ONE request deadline spans the entitlement composition AND
         // the probe round (Codex PR#9 round 3, P1): independent serial
         // budgets (6 s + 8 s defaults) exceeded the 10 s IPC request
@@ -1169,12 +1187,9 @@ impl SelectionEngine {
                  this account is not entitled to dedicated servers",
             ));
         }
-        let pf_requested = modifiers
-            .required_features
-            .contains(&SelectionFeature::PortForwarding)
-            || modifiers
-                .optional_features
-                .contains(&SelectionFeature::PortForwarding);
+        // (The PF-requested fact the error mapper needs is derived
+        // from the RESOLVED request's constraints inside it — group
+        // merges are unions, so the resolved set is the authority.)
 
         // The location cache is read ONCE per request (round 12,
         // P2): the group arm FILTERS with this value and the FR-23T
@@ -1341,7 +1356,7 @@ impl SelectionEngine {
         }
 
         let outcome = protonwire_core::selection::select(&catalog, &request, &context)
-            .map_err(|error| selection_error_to_rpc_pf_explained(error, pf_requested))?;
+            .map_err(|error| selection_error_to_rpc_explained(error, &request))?;
         let winner = outcome
             .ranked
             .first()
@@ -2155,26 +2170,56 @@ fn selection_error_to_rpc(error: SelectionError) -> RpcError {
     }
 }
 
-/// [`selection_error_to_rpc`] with the PF empty-capability composition's
-/// honest explanation attached when the request carried the
-/// port-forwarding constraint: the bare FR-22 report says
-/// "required-features" without saying WHY nothing passed, so the
-/// ConstraintsNotSatisfied message names the M6 capability source and
-/// the structured report still rides `details`.
-fn selection_error_to_rpc_pf_explained(error: SelectionError, pf_requested: bool) -> RpcError {
-    if pf_requested && let SelectionError::ConstraintsNotSatisfied { ref report } = error {
-        let mut enriched = RpcError::new(
-            RpcErrorCode::NoEligibleServer,
-            format!(
-                "no eligible server: {report}; the port-forwarding constraint \
-                 eliminated every candidate because no per-server \
-                 port-forwarding capability source exists yet (M6's NAT-PMP \
-                 lane supplies it — the composition is honestly empty, never \
-                 fabricated)"
-            ),
-        );
-        enriched.details = report_details(report);
-        return enriched;
+/// [`selection_error_to_rpc`] with the request's context attached:
+/// the dedicated `SecureCoreUnavailable` code for an unsatisfiable
+/// routed Secure Core request (round 13, P2 — the taxonomy defines
+/// it, exit 17; the generic NoEligibleServer/exit 5 hid it), and the
+/// PF empty-capability composition's honest explanation when the
+/// request carried the port-forwarding constraint (the bare FR-22
+/// report says "required-features" without saying WHY nothing
+/// passed). Both derive from the RESOLVED request — the authority
+/// the gates and the provenance already read. The FR-22 report rides
+/// `details` in every arm.
+fn selection_error_to_rpc_explained(error: SelectionError, request: &SelectionRequest) -> RpcError {
+    let pf_requested = request
+        .constraints
+        .required_features
+        .contains(&FeatureConstraint::PortForwarding)
+        || request
+            .constraints
+            .optional_features
+            .contains(&FeatureConstraint::PortForwarding);
+    if let SelectionError::ConstraintsNotSatisfied { ref report } = error {
+        if matches!(request.target, Target::SecureCore { .. }) {
+            let mut message = format!("no Secure Core route satisfies the request: {report}");
+            if pf_requested {
+                message.push_str(
+                    "; the port-forwarding constraint eliminated every candidate because \
+                     no per-server port-forwarding capability source exists yet (M6's \
+                     NAT-PMP lane supplies it — the composition is honestly empty, never \
+                     fabricated)",
+                );
+            }
+            return RpcError {
+                code: RpcErrorCode::SecureCoreUnavailable,
+                message,
+                details: report_details(report),
+            };
+        }
+        if pf_requested {
+            let mut enriched = RpcError::new(
+                RpcErrorCode::NoEligibleServer,
+                format!(
+                    "no eligible server: {report}; the port-forwarding constraint \
+                     eliminated every candidate because no per-server \
+                     port-forwarding capability source exists yet (M6's NAT-PMP \
+                     lane supplies it — the composition is honestly empty, never \
+                     fabricated)"
+                ),
+            );
+            enriched.details = report_details(report);
+            return enriched;
+        }
     }
     selection_error_to_rpc(error)
 }
@@ -3559,6 +3604,88 @@ mod tests {
             calls.load(std::sync::atomic::Ordering::SeqCst) > before_third,
             "an etag-less refresh still probes fresh (the fetched timestamp is \
              the revision key)"
+        );
+    }
+
+    /// Codex PR#9 round 13 (P2, the modifier's own validation): the
+    /// wire contract on `--physical-country` is "uppercase ISO
+    /// 3166-1 alpha-2 — non-canonical input refuses typed, never
+    /// approximated" — but a target that does not CONSUME the
+    /// constraint (e.g. `fastest`) never routed the value into the
+    /// core's validation, so `select fastest --physical-country gb`
+    /// SUCCEEDED and copied the lowercase value into provenance.
+    /// The modifier validates at the boundary now, regardless of
+    /// the target (the core's own grammar, one vocabulary).
+    #[test]
+    fn a_non_canonical_explicit_physical_country_refuses_typed() {
+        let engine = default_engine();
+        let error = engine
+            .resolve(
+                &ConnectTarget::Fastest,
+                &SelectionModifiers {
+                    physical_country: Some("gb".into()),
+                    ..modifiers()
+                },
+            )
+            .expect_err("non-canonical input refuses typed, never approximated");
+        assert_eq!(error.code, RpcErrorCode::InvalidParams);
+        assert!(
+            error.message.contains("gb"),
+            "the refusal names the input: {error}"
+        );
+
+        // The canonical form still selects and reports provenance.
+        let result = engine
+            .resolve(
+                &ConnectTarget::Fastest,
+                &SelectionModifiers {
+                    physical_country: Some("GB".into()),
+                    ..modifiers()
+                },
+            )
+            .expect("canonical input selects");
+        assert_eq!(
+            result
+                .physical_country
+                .as_ref()
+                .expect("explicit values report")
+                .country,
+            "GB"
+        );
+    }
+
+    /// Codex PR#9 round 13 (P2, the dedicated refusal): the wire
+    /// taxonomy defines `SecureCoreUnavailable` ("No Secure Core
+    /// route satisfies the request", exit 17) — unreachable, because
+    /// the daemon mapped every empty candidate set to the generic
+    /// `NoEligibleServer` (exit 5). A paid Secure Core request no
+    /// route satisfies now returns the dedicated code, the FR-22
+    /// report still riding `details`.
+    #[test]
+    fn an_unsatisfiable_secure_core_route_returns_the_dedicated_code() {
+        let engine = default_engine();
+        engine
+            .entitlement()
+            .install(Arc::new(FakeEntitlements::paid()));
+        // The fixture's only routed Secure Core entry is CH→SE; JP→GB
+        // has no candidate.
+        let error = engine
+            .resolve(
+                &ConnectTarget::SecureCore {
+                    entry_country: Some("JP".into()),
+                    exit_country: Some("GB".into()),
+                },
+                &modifiers(),
+            )
+            .expect_err("no JP→GB route exists in the fixture");
+        assert_eq!(
+            error.code,
+            RpcErrorCode::SecureCoreUnavailable,
+            "the dedicated code (pre-fix the generic NoEligibleServer): {error}"
+        );
+        assert!(
+            error.details.is_some(),
+            "the FR-22 report still rides details"
         );
     }
 
