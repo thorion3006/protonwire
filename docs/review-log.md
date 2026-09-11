@@ -2200,3 +2200,40 @@ inside the core, after the gates — codes consistent once reached,
 pre-existing) and the standing list. The gate's taxonomy sweep
 confirmed no other defined code has landed semantics without an
 emitter — exit 17 was the last.
+
+## 2026-09-11 — Codex PR#9 round 14 (post-completion, pre-merge)
+
+TWO findings, both verified GENUINE, fixed red-first at edd449e:
+
+- **P1 — the UDP last resort.** Round 11's TCP-first reorder kept
+  the UDP mapping as a fallback endpoint, but the connector is
+  TCP-only — a UDP-only physical's probe (the store's committed
+  fixture carries such shapes) was a guaranteed-fail handshake
+  burning the round's timeout budget. Only TCP-compatible mappings
+  resolve now (TCP, then TLS; the legacy EntryIP:443 fallback
+  stays): a UDP-only candidate is honestly UNRESOLVED — the
+  no-observation path, never an incompatible attempt.
+- **P2 — the wall-clock probe ages.** The probe table's ages ran on
+  epoch wall time — a backward clock correction (admin fix, VM
+  reset) made every entry future-dated: saturating age 0, stale
+  RTTs treated fresh and failed probes rate-limited until wall time
+  caught up. The probe clock is now the daemon-UPTIME MONOTONIC
+  clock (a LazyLock start instant) — future-dated entries cannot
+  exist. Wall time stays the cached documents' domain (S7's guarded
+  scheduler).
+
+Pins: the UDP-only refusal (pre-fix the seam ANSWERED the UDP
+endpoint — a selection succeeding on a probe that cannot happen on
+a real network; post-fix the typed latency-data refusal with ZERO
+connects), the monotonic-contract pin (the default clock reads
+uptime-relative ms, never ~1.7e12 epoch), and the gate review's
+companion pin (mixed catalog: a UDP-only member neither poisons the
+round nor wins the latency ranking; the EntryIP:443 fallback arm —
+previously uncovered — resolves). RUST PASS, no P1/P2; its P3s
+landed in-commit (stale prose corrected; the mechanism note below).
+**Mechanism correction, recorded per the gate review:** an
+endpoint-unresolvable PLANNED id counts as attempted (run_planned
+records before the executor's None) and KEEPS its 60 s reservation —
+inert (no endpoint to hammer), budget-safe (probe cap == shortlist
+cap), cleared by the revision reconcile; this round's first commit-
+message draft wrongly claimed those ids were released.
