@@ -29,7 +29,7 @@ use protonwire_client::{ClientError, ProtonwireClient};
     version,
     about = "ProtonWire — Proton VPN control plane for Linux"
 )]
-struct Cli {
+pub(crate) struct Cli {
     /// Daemon socket path (default: $PROTONWIRE_SOCKET or
     /// /run/protonwire/protonwire.sock).
     #[arg(long, global = true)]
@@ -97,6 +97,7 @@ mod parse_tests {
                 protocol,
                 dry_run,
                 json,
+                ..
             } => {
                 assert_eq!(target, ["country", "GB"]);
                 assert_eq!(by.as_deref(), Some("latency"));

@@ -39,9 +39,9 @@ pub use sections::{
     DnsMode, DnsPolicy, DnsSection, FeaturesSection, Ipv6Mode, Ipv6Section, KillSwitchMode,
     LanPolicy, LanSection, LatencyProbeSection, MetadataCacheSection, NatMode, NetShieldLevel,
     NetworkIntegrationMode, ProbeTransport, ProfileDefault, ProfileRanking, ProfileSelection,
-    ProfilesSection, ProtocolMode, ProtunSection, RegionalRanking, SecureCoreSection,
-    ServerSelectionSection, SplitRuleAction, SplitTunnelDomainRule, SplitTunnelDomains,
-    SplitTunnelMode, SplitTunnelSection, WritableSessionStore,
+    ProfilesSection, ProtocolMode, ProtunSection, RegionTaxonomy, RegionalRanking,
+    SecureCoreSection, ServerSelectionSection, SplitRuleAction, SplitTunnelDomainRule,
+    SplitTunnelDomains, SplitTunnelMode, SplitTunnelSection, WritableSessionStore,
 };
 
 /// Who may set a field (PRD section 10).
