@@ -4949,6 +4949,7 @@ name = "protonwire-daemon"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "getrandom 0.2.17",
  "nix 0.31.3",
  "protonwire-api",
  "protonwire-core",

@@ -15,9 +15,6 @@ path = "src/main.rs"
 workspace = true
 
 [dev-dependencies]
-# Test-only: minting a valid FR-7C session envelope for the systemd
-# startup-read arm (the production envelope lives in store).
-serde_json = { workspace = true }
 
 [dependencies]
 # SIGTERM/SIGINT/SIGHUP/SIGQUIT flag handler (M2 S12) — the TUI's R7-4
@@ -39,3 +36,10 @@ protonwire-store = { workspace = true }
 clap = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+# M3 U6: the FR-22 elimination report rides `RpcError::details` as
+# structured JSON (already everywhere in the lockfile).
+serde_json = { workspace = true }
+# M3 U6: the random selection policy's caller-supplied entropy — the
+# same OS-CSPRNG dependency core's scheduler uses (m2-plan decision 3;
+# already in the lockfile via protonwire-core, no version change).
+getrandom = "0.2"

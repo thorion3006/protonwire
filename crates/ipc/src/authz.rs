@@ -38,7 +38,16 @@ pub fn required_role(request: &Request) -> IpcRole {
         | Request::RefreshSession
         | Request::Logout
         | Request::SubmitCredential { .. }
-        | Request::GetAccount => IpcRole::AnyUser,
+        | Request::GetAccount
+        // M3 U6: the selection/groups surface is a read-only query
+        // family — it reads the daemon's cached catalog and registry,
+        // never mutates state, and performs no upstream request on the
+        // listing paths (FR-23R). The bounded on-demand prober a
+        // latency-ranked Select may run is the U5-bounded seam (rate
+        // limits, shortlist cap), not a privileged action.
+        | Request::Select { .. }
+        | Request::GroupsList
+        | Request::GroupShow { .. } => IpcRole::AnyUser,
         Request::Shutdown => IpcRole::Admin,
     }
 }
@@ -124,6 +133,17 @@ mod tests {
                 value: protonwire_frontend_api::SecretParam::new("v"),
             },
             Request::GetAccount,
+            // M3 U6: the selection/groups surface joins the user-level
+            // read-only family (FR-23R — the listing paths perform no
+            // upstream request; the query reads daemon-cached state).
+            Request::Select {
+                target: protonwire_frontend_api::ConnectTarget::Fastest,
+                modifiers: Default::default(),
+            },
+            Request::GroupsList,
+            Request::GroupShow {
+                id: "proton:fastest-country".into(),
+            },
         ] {
             assert_eq!(required_role(&req), IpcRole::AnyUser, "{req:?}");
         }
