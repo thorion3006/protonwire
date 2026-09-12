@@ -2237,3 +2237,64 @@ records before the executor's None) and KEEPS its 60 s reservation —
 inert (no endpoint to hammer), budget-safe (probe cap == shortlist
 cap), cleared by the revision reconcile; this round's first commit-
 message draft wrongly claimed those ids were released.
+
+## 2026-09-12 — Codex PR#9 round 15 (post-completion, pre-merge)
+
+FIVE findings (2x P1 + 3x P2 — the largest round), all verified
+GENUINE against the config schema, the resolver contract, and the
+CLI surface; fixed red-first at 52dd4de (+bf199a0):
+
+- **P1a — the stale round.** The r12 reconcile ran in its own lock
+  before planning and cleared on ANY mismatch with no ordering: a
+  round holding an OLD catalog reaching probe_round after a newer
+  round WIPED the newer observations, and its rejected write-back
+  stranded 60 s reservations in the newer table. The reconcile now
+  runs INSIDE the planning lock, ORDERED by the fetched timestamp
+  (ties under different keys concede — same-second refreshes are
+  unknowable): a stale round plans over an empty view, PROBES its
+  own catalog, reserves nothing, writes nothing. **The gate's own
+  two P1s on the first fix, fixed in-commit:** the stale branch
+  first returned empty DECISIONS (probing nothing — a latency
+  request refused LatencyDataUnavailable), and the red-first pin
+  was VACUOUS (park-then-read captured the swapped revision — the
+  gate ran it 10x and proved the stale path had zero coverage).
+  The repaired pin reads-then-parks and asserts the connect count
+  grew. A same-second etag tie is conceded, not wiped (the gate's
+  P2 folded in).
+- **P1b — configured Secure Core exclusions.** The operator's
+  excluded entry/exit jurisdictions were composed by nothing —
+  `select secure-core` returned routes through configured-excluded
+  countries. Unioned (deduped) into every resolved routed request
+  — direct and group (max-security) — via one shared helper, with
+  the AVAILABILITY TWIN (the gate's r6-invariant catch: the listing
+  evaluated the un-unioned request and reported the group available
+  while connecting refused).
+- **P2a — the regional default ranking.** The configured
+  regional_default_ranking had no effect (the resolver saw only
+  --by; a latency default never probed). It applies when no
+  explicit --by — ONLY to PaidLocationSelection groups (Proton
+  groups forbid overrides). Tracked (gate): the origin-coupling
+  note, and the availability/latency-default refusal widening.
+- **P2b — the dry-run surface.** `Command::Connect` parsed only
+  --by/--protocol, so the `connect --dry-run` alias rejected every
+  other documented modifier while presented as the select surface.
+  The full modifier set parses now; the dry-run populates them; the
+  non-dry-run arm refuses ALL of them (the gate's catch: three Vec
+  flags first escaped the discipline).
+- **P2c — the region taxonomy.** Any string validated while the
+  daemon resolved against the compiled registry regardless. A
+  parse-time VOCABULARY now (RegionTaxonomy, one spelling — the S3
+  discipline; the store's assert_rejected idiom forced the enum,
+  not a validate() check), with the daemon-side drift guard pinning
+  the id against the live registry's taxonomy_revision().
+
+Pins: SC exclusion refusals (entry, exit-through-group, control,
+availability twin), the regional default (applies, explicit wins,
+never leaks), the repaired stale round (read-then-park + the probe
+count), the CLI parse, the store vocabulary, the drift guard. The
+gate's tracked items: the origin-coupling guard, the
+latency-default availability widening, non-dry-run refusal pins for
+the new flags. Process note, honestly recorded: the first fix draft
+also INVERTED the write-back condition (caught by the existing
+answered-probes pin pre-push) and a clippy arity warning escaped a
+rushed push (bf199a0, caught watching CI).
