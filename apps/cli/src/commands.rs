@@ -995,6 +995,9 @@ fn connect_command(
 /// in the module's refusal style (`--dry-run` no longer appears — the
 /// M3 surface resolves it; `--by` without `--dry-run` waits for the M4
 /// tunnel's connect-time composition, as does `--protocol`).
+/// The arity is the flag set — each argument names one modifier the
+/// gate must cover (the same rationale as the test fixtures' rows).
+#[allow(clippy::too_many_arguments)]
 fn connect_modifier_refusal(
     by: &Option<String>,
     protocol: &Option<String>,
