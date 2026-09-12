@@ -406,6 +406,11 @@ struct ProbeTableInner {
     /// The revision key the observations were recorded under
     /// ([`probe_revision_key`]).
     revision: Option<(String, u64)>,
+    /// The catalog FETCHED TIMESTAMP the table was stamped under —
+    /// the ordering signal (round 15, P1): a round holding an older
+    /// catalog is stale and never wipes, re-stamps, or writes into a
+    /// newer table.
+    fetched_unix: u64,
     state: BTreeMap<String, EndpointState>,
 }
 
@@ -861,6 +866,38 @@ impl SelectionEngine {
             && entitlements.and_then(|snapshot| snapshot.plan_tier) != Some(PlanTier::Paid)
     }
 
+    /// The configured Secure Core exclusions (round 15, P1): the
+    /// operator's excluded entry/exit jurisdictions union (deduped)
+    /// into every resolved ROUTED request. Shared by resolve() and
+    /// the availability twin — one spelling so the listing can never
+    /// report available a route the resolver excludes (the round-6
+    /// agreement invariant, the gate review's catch).
+    fn union_configured_secure_core_exclusions(
+        request: &mut SelectionRequest,
+        config: &SystemConfig,
+    ) {
+        if !matches!(request.target, Target::SecureCore { .. }) {
+            return;
+        }
+        let secure_core = &config.server_selection.secure_core;
+        for (configured, sink) in [
+            (
+                &secure_core.excluded_entry_countries,
+                &mut request.constraints.excluded_entry_countries,
+            ),
+            (
+                &secure_core.excluded_exit_countries,
+                &mut request.constraints.excluded_exit_countries,
+            ),
+        ] {
+            for country in configured {
+                if !sink.contains(country) {
+                    sink.push(country.clone());
+                }
+            }
+        }
+    }
+
     /// The CACHED entitlement tier for network-free surfaces (the
     /// built-in listing, Codex PR#9 round 4, P2): reads the last
     /// successfully composed snapshot without initiating any traffic.
@@ -945,27 +982,23 @@ impl SelectionEngine {
         if !probe_config.enabled || shortlist.is_empty() {
             return BTreeMap::new();
         }
-        // The REVISION reconcile (round 12, P2 + the gate review's
-        // write-back race): observations are keyed by logical id, but
-        // a catalog refresh can keep the id while changing the
-        // endpoint — an RTT measured against the OLD address must
-        // never rank the NEW catalog (the table's own contract:
-        // nothing outlives the addresses' meaning). A changed
-        // revision key clears the table before this round plans; the
-        // key is the etag when the server sent one, else the fetched
-        // timestamp (etag-less refreshes still clear). ONE lock
-        // covers the reconcile, the plan+reserve pair, and the
-        // write-back's re-validation below — a concurrent round
-        // under a newer revision cannot have this round's
-        // observations written into its table.
+        // The REVISION reconcile, INSIDE the planning lock, ORDERED
+        // (round 12 + round 15's gate round, P1): observations are
+        // keyed by logical id, but a catalog refresh can keep the id
+        // while changing the endpoint — an RTT measured against the
+        // OLD address must never rank the NEW catalog (the table's
+        // own contract: nothing outlives the addresses' meaning). The
+        // revision key is the etag when the server sent one, else the
+        // fetched timestamp; the table records the FETCHED TIMESTAMP
+        // it was stamped under, and a round holding an OLDER catalog
+        // is STALE — it plans over an EMPTY view (no cross-revision
+        // reuse), reserves nothing, and its write-back is skipped
+        // entirely (pre-fix a late stale round WIPED the newer
+        // table's observations and could strand reservations its
+        // rejected write-back never released). The reconcile, the
+        // plan, and the reservation are ONE lock section — no refresh
+        // can interleave between them.
         let revision_key = probe_revision_key(catalog_etag, catalog_fetched_unix);
-        {
-            let mut inner = self.probes.inner.lock().expect("probe table lock");
-            if inner.revision.as_ref() != Some(&revision_key) {
-                inner.revision = Some(revision_key.clone());
-                inner.state.clear();
-            }
-        }
         // The round deadline clamps to the REQUEST deadline's remainder
         // (Codex PR#9 round 3, P1): 6 s of entitlement composition plus
         // an unclamped 8 s round would exceed the 10 s IPC bar; the
@@ -976,24 +1009,52 @@ impl SelectionEngine {
         let now = (self.now_ms)();
         let budget = self.probe_budget();
 
-        // Plan + reserve atomically. `state` is the same locked-now
-        // snapshot the plan ran over (its observations feed
-        // `run_planned`'s rate-limited passthrough; the reservation
-        // only advances attempt clocks, which that path never reads).
-        let (state, decisions) = {
+        // Plan + reserve atomically, reconciled under the same lock.
+        // `state` is the same locked-now snapshot the plan ran over
+        // (its observations feed `run_planned`'s rate-limited
+        // passthrough; the reservation only advances attempt clocks,
+        // which that path never reads).
+        let (state, decisions, stale_round) = {
             let mut inner = self.probes.inner.lock().expect("probe table lock");
-            let state = inner.state.clone();
-            let decisions = plan_run(&shortlist, &state, &budget, now);
-            for endpoint in &shortlist {
-                if decisions.get(endpoint) == Some(&ProbeDecision::Probe) {
-                    inner
-                        .state
-                        .entry(endpoint.clone())
-                        .or_default()
-                        .last_attempt_ms = now;
+            // STALE when the table was stamped under a strictly NEWER
+            // fetched stamp, OR when the stamps TIE under a different
+            // revision key (two refreshes completing in the same
+            // second — which is newer is unknowable, so the incoming
+            // round concedes: it plans fresh but never wipes, reserves,
+            // or writes; the observations serve only its own request).
+            let stale = inner.fetched_unix > catalog_fetched_unix
+                || (inner.fetched_unix == catalog_fetched_unix
+                    && inner
+                        .revision
+                        .as_ref()
+                        .is_some_and(|key| key != &revision_key));
+            if stale {
+                // Plan over an EMPTY VIEW and PROBE (the request still
+                // measures its own catalog — the gate review's P1:
+                // empty decisions probed nothing and refused), but
+                // never clear, re-stamp, reserve into, or write back
+                // into the other revision's table.
+                let decisions = plan_run(&shortlist, &BTreeMap::new(), &budget, now);
+                (BTreeMap::new(), decisions, true)
+            } else {
+                if inner.revision.as_ref() != Some(&revision_key) {
+                    inner.revision = Some(revision_key.clone());
+                    inner.fetched_unix = catalog_fetched_unix;
+                    inner.state.clear();
                 }
+                let state = inner.state.clone();
+                let decisions = plan_run(&shortlist, &state, &budget, now);
+                for endpoint in &shortlist {
+                    if decisions.get(endpoint) == Some(&ProbeDecision::Probe) {
+                        inner
+                            .state
+                            .entry(endpoint.clone())
+                            .or_default()
+                            .last_attempt_ms = now;
+                    }
+                }
+                (state, decisions, false)
             }
-            (state, decisions)
         };
 
         // Resolve the endpoints fresh from the loaded catalog (never a
@@ -1039,7 +1100,7 @@ impl SelectionEngine {
         let attempted: std::collections::BTreeSet<&str> =
             run.attempted.iter().map(String::as_str).collect();
         let mut inner = self.probes.inner.lock().expect("probe table lock");
-        if inner.revision.as_ref() == Some(&revision_key) {
+        if !stale_round && inner.revision.as_ref() == Some(&revision_key) {
             for endpoint in &shortlist {
                 if decisions.get(endpoint) != Some(&ProbeDecision::Probe) {
                     continue;
@@ -1218,16 +1279,34 @@ impl SelectionEngine {
         // The group arm resolves through the registry (FR-23P's
         // override discipline, FR-23Q's sources, P2-2's weights); the
         // direct arm maps the grammar onto the core vocabulary.
-        let (request, group) = match target {
+        let (mut request, group) = match target {
             ConnectTarget::Group { group_id } => {
                 let sources = PhysicalCountrySources {
                     explicit_request: modifiers.physical_country.as_deref(),
                     config: self.config.connection_groups.physical_country.as_deref(),
                     cached_location: cached_location.as_deref(),
                 };
+                // The configured REGIONAL default ranking (round 15,
+                // P2): with no explicit `--by`, a regional group
+                // (PaidLocationSelection) ranks under the operator's
+                // configured default — a `latency` default actually
+                // probes. Only the regional groups: a Proton-origin
+                // group refuses overrides, and its declared policy
+                // stands. ProtonScore (the default value) IS the
+                // catalog default — pass None.
+                let configured_regional_default = {
+                    let ranking = self.config.connection_groups.regional_default_ranking;
+                    (ranking != protonwire_store::config::RegionalRanking::ProtonScore
+                        && protonwire_core::groups::group(group_id).is_some_and(|entry| {
+                            entry.entitlement
+                                == protonwire_core::groups::GroupEntitlement::PaidLocationSelection
+                        }))
+                    .then(|| ranking.as_str().to_owned())
+                };
+                let ranking_override = modifiers.by.clone().or(configured_regional_default);
                 let resolved = resolve_group(
                     group_id,
-                    modifiers.by.as_deref(),
+                    ranking_override.as_deref(),
                     &sources,
                     &self.balanced_weights(),
                 )
@@ -1283,6 +1362,21 @@ impl SelectionEngine {
                 None,
             ),
         };
+
+        // The configured SECURE CORE exclusions (round 15, P1): the
+        // operator's excluded entry/exit jurisdictions union into
+        // EVERY routed Secure Core request — direct and group-resolved
+        // (max-security) — before filtering. Pre-fix the config was
+        // composed by nothing and `select secure-core` returned routes
+        // through configured-excluded countries.
+        Self::union_configured_secure_core_exclusions(&mut request, &self.config);
+
+        // The plan-feature capability gate (Codex PR#9 round 8, P1):
+        // the fourth member of the request-gate family (the gateway
+        // business gate, the paid-location gate, the PF composition) —
+        // a request naming p2p/tor/secure-core under a plan without
+        // the capability refuses typed BEFORE the core runs (the tier
+        // stage stays the candidate filter; the pre-fix gap handed a
 
         // The plan-feature capability gate (Codex PR#9 round 8, P1):
         // the fourth member of the request-gate family (the gateway
@@ -1576,7 +1670,12 @@ impl SelectionEngine {
             ..SelectionContext::default()
         };
         match resolve_group(entry.id, None, &sources, weights) {
-            Ok(resolved) => {
+            Ok(mut resolved) => {
+                // The configured SC-exclusion twin (round 15's gate
+                // review): the listing evaluates the SAME unioned
+                // request resolve() filters — never available while
+                // connecting refuses.
+                Self::union_configured_secure_core_exclusions(&mut resolved.request, &self.config);
                 // The capability gate's availability twin (Codex
                 // PR#9 round 8): a group whose resolved request names
                 // a plan-gated capability (the secure-core group's
@@ -3916,6 +4015,293 @@ mod tests {
             result.winner.name != "GB#9",
             "the unresolvable member never wins a latency ranking: {:?}",
             result.winner.name
+        );
+    }
+
+    /// Codex PR#9 round 15 (P1, configured SC exclusions): the
+    /// operator's secure-core excluded entry/exit countries were
+    /// never composed into a routed Secure Core request —
+    /// `select secure-core` happily returned a route through a
+    /// configured-excluded jurisdiction. The exclusions union into
+    /// EVERY resolved Secure Core request (direct and group-resolved)
+    /// before filtering.
+    #[test]
+    fn configured_secure_core_exclusions_apply_to_routed_requests() {
+        let mut config = SystemConfig::default();
+        config.server_selection.secure_core.excluded_entry_countries = vec!["CH".into()];
+        let engine = engine_over(config, 1_000_000, never_answers);
+        engine
+            .entitlement()
+            .install(Arc::new(FakeEntitlements::paid()));
+        // The fixture's only Secure Core route enters at CH.
+        let error = engine
+            .resolve(
+                &ConnectTarget::SecureCore {
+                    entry_country: None,
+                    exit_country: None,
+                },
+                &modifiers(),
+            )
+            .expect_err("the only entry country is configured-excluded");
+        assert_eq!(
+            error.code,
+            RpcErrorCode::SecureCoreUnavailable,
+            "the exclusion empties the routed set: {error}"
+        );
+
+        // The exit side and the group path (max-security resolves the
+        // routed target — the union applies there too): exclude SE
+        // instead, request the group, same refusal.
+        let mut config = SystemConfig::default();
+        config.server_selection.secure_core.excluded_exit_countries = vec!["SE".into()];
+        let engine = engine_over(config, 1_000_000, never_answers);
+        engine
+            .entitlement()
+            .install(Arc::new(FakeEntitlements::paid()));
+        let error = engine
+            .resolve(
+                &ConnectTarget::Group {
+                    group_id: "proton:max-security".into(),
+                },
+                &modifiers(),
+            )
+            .expect_err("the group's only route exits at SE");
+        assert_eq!(error.code, RpcErrorCode::SecureCoreUnavailable);
+
+        // The control: the default config still selects CH-SE#1.
+        let engine = default_engine();
+        engine
+            .entitlement()
+            .install(Arc::new(FakeEntitlements::paid()));
+        let result = engine
+            .resolve(
+                &ConnectTarget::SecureCore {
+                    entry_country: None,
+                    exit_country: None,
+                },
+                &modifiers(),
+            )
+            .expect("no exclusions configured — the route serves");
+        assert_eq!(result.winner.name, "CH-SE#1");
+
+        // The availability twin (the gate review's catch — the r6
+        // agreement invariant): the listing reports the group
+        // unavailable under the same exclusion resolve refuses by.
+        let mut config = SystemConfig::default();
+        config.server_selection.secure_core.excluded_entry_countries = vec!["CH".into()];
+        let engine = engine_over(config, 1_000_000, never_answers);
+        engine
+            .entitlement()
+            .install(Arc::new(FakeEntitlements::paid()));
+        engine
+            .resolve(&country("GB"), &modifiers())
+            .expect("primes the paid cache");
+        let availability = availability_of(
+            &engine.groups_catalog().expect("the registry serves"),
+            "proton:max-security",
+        );
+        assert!(
+            !availability.available,
+            "never available while connecting refuses: {availability:?}"
+        );
+    }
+
+    /// Codex PR#9 round 15 (P2, the regional default ranking): a
+    /// configured `connection_groups.regional_default_ranking` had no
+    /// effect — the resolver saw only the request's `--by`, so the
+    /// regional groups stayed on the catalog Proton-score policy and
+    /// latency defaults never probed. The configured default now
+    /// applies when the request supplies no explicit override — and
+    /// ONLY to the regional groups (a Proton-origin group would
+    /// refuse the override; it keeps its declared policy).
+    #[test]
+    fn the_configured_regional_default_ranking_applies_without_an_explicit_by() {
+        let mut config = SystemConfig::default();
+        config.connection_groups.regional_default_ranking =
+            protonwire_store::config::RegionalRanking::Balanced;
+        // Balanced with no latency term (the never-answers seam would
+        // refuse a latency-weighted ranking — the weight composition
+        // itself is pinned elsewhere).
+        config.server_selection.balanced_weights.latency = 0.0;
+        let engine = engine_over(config, 1_000_000, never_answers);
+        engine
+            .entitlement()
+            .install(Arc::new(FakeEntitlements::paid()));
+        let result = engine
+            .resolve(
+                &ConnectTarget::Group {
+                    group_id: "protonwire:fastest-europe".into(),
+                },
+                &modifiers(),
+            )
+            .expect("the regional group serves the paid account");
+        assert_eq!(
+            result.selector.policy, "balanced",
+            "the configured default replaces the catalog default (pre-fix proton-score)"
+        );
+
+        // An explicit --by wins over the configured default (`load` is
+        // among the declared regional overrides and needs no probing).
+        let result = engine
+            .resolve(
+                &ConnectTarget::Group {
+                    group_id: "protonwire:fastest-europe".into(),
+                },
+                &SelectionModifiers {
+                    by: Some("load".into()),
+                    ..modifiers()
+                },
+            )
+            .expect("the explicit override serves");
+        assert_eq!(result.selector.policy, "load");
+
+        // A NON-regional group never sees the configured default
+        // (proton:fastest-country forbids overrides — its declared
+        // policy stands).
+        let result = engine
+            .resolve(
+                &ConnectTarget::Group {
+                    group_id: "proton:fastest-country".into(),
+                },
+                &modifiers(),
+            )
+            .expect("the official group serves");
+        assert_eq!(
+            result.selector.policy, "official",
+            "the regional default never leaks into other groups (the catalog default's \
+             official-policy token)"
+        );
+    }
+
+    /// Codex PR#9 round 15 (P1, the stale round): a round holding an
+    /// OLD catalog that reaches probe_round AFTER a newer round
+    /// reconciled the table used to WIPE the newer observations (the
+    /// reconcile cleared on any mismatch, with no ordering) and
+    /// could strand reservations its rejected write-back never
+    /// released. The reconcile now runs INSIDE the planning lock and
+    /// is ORDERED by the fetched timestamp: a stale round plans over
+    /// an EMPTY view, reserves nothing, and writes nothing — the
+    /// newer table survives untouched.
+    #[test]
+    fn a_stale_round_never_wipes_or_pollutes_the_newer_table() {
+        let revision: Arc<Mutex<(String, u64)>> =
+            Arc::new(Mutex::new(("\"rev-a\"".to_owned(), 1_771_000_000u64)));
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let answers = {
+            let calls = std::sync::Arc::clone(&calls);
+            move |_addr: SocketAddr, _timeout: Duration| -> Option<Duration> {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Some(Duration::from_millis(5))
+            }
+        };
+        // A parks INSIDE its catalog read (400 ms) — no adapter games:
+        // the r10 generation semantics would refuse an account whose
+        // adapter was replaced mid-request, which is a different
+        // scenario. The FIRST reader CAPTURES the holder value BEFORE
+        // parking (read-then-park — the gate review caught the first
+        // draft's park-then-read reading the swapped value, making the
+        // pin vacuous); later readers see the holder's current value.
+        let first_reader_parked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut bare_engine = engine_over(SystemConfig::default(), 1_000_000, answers);
+        {
+            let revision = std::sync::Arc::clone(&revision);
+            let parked = std::sync::Arc::clone(&first_reader_parked);
+            let body = catalog_body();
+            bare_engine.catalog_read = Box::new(move || {
+                let (etag, fetched) = revision.lock().expect("revision holder").clone();
+                if !parked.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(400));
+                }
+                Ok(Some(CachedCatalog {
+                    schema_version: 1,
+                    etag: Some(etag),
+                    fetched_unix: fetched,
+                    body: body.clone(),
+                }))
+            });
+        }
+        let engine = std::sync::Arc::new(bare_engine);
+        engine
+            .entitlement()
+            .install(Arc::new(FakeEntitlements::paid()));
+        let by_latency = SelectionModifiers {
+            by: Some("latency".into()),
+            ..modifiers()
+        };
+        // A reads rev-a and parks in the catalog read.
+        let stale = {
+            let engine = std::sync::Arc::clone(&engine);
+            let by_latency = by_latency.clone();
+            std::thread::spawn(move || engine.resolve(&ConnectTarget::Fastest, &by_latency))
+        };
+        std::thread::sleep(Duration::from_millis(60));
+        // The catalog refreshes to rev-b (a NEWER fetched timestamp);
+        // B resolves fully under it.
+        *revision.lock().expect("revision holder") = ("\"rev-b\"".to_owned(), 1_771_000_100);
+        let fresh = {
+            let engine = std::sync::Arc::clone(&engine);
+            let by_latency = by_latency.clone();
+            std::thread::spawn(move || engine.resolve(&ConnectTarget::Fastest, &by_latency))
+        };
+        fresh
+            .join()
+            .expect("the fresh thread")
+            .expect("the fresh round probes under rev-b");
+        let fresh_state = engine.probe_state();
+        assert!(
+            !fresh_state.is_empty(),
+            "the fresh round recorded observations"
+        );
+        let calls_after_fresh = calls.load(std::sync::atomic::Ordering::SeqCst);
+
+        // A's catalog read lands (~400 ms) holding rev-a; its
+        // probe_round runs — STALE by the fetched timestamp. The
+        // newer table must survive intact.
+        let stale_outcome = stale.join().expect("the stale thread");
+        let after = engine.probe_state();
+        assert!(
+            stale_outcome.is_ok(),
+            "the stale round still PROBES its own catalog and consumes its own \
+             observations (the gate review's P1 — empty decisions refused): {:?}",
+            stale_outcome.err()
+        );
+        assert!(
+            calls.load(std::sync::atomic::Ordering::SeqCst) > calls_after_fresh,
+            "the stale round actually probed (the gate review's vacuous-pin catch: \
+             pre-fix its decisions were empty)"
+        );
+        let fingerprint = |state: &BTreeMap<String, EndpointState>| {
+            state
+                .iter()
+                .map(|(id, entry)| {
+                    (
+                        id.clone(),
+                        entry.observation.map(|observation| observation.rtt),
+                        entry.observed_at_ms,
+                        entry.last_attempt_ms,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            fingerprint(&after),
+            fingerprint(&fresh_state),
+            "the stale round neither wiped nor polluted the newer table"
+        );
+    }
+
+    /// The drift guard for round 15's taxonomy validation: the store
+    /// accepts exactly `un-m49-six-continent-view` (store cannot
+    /// depend on core, so the id lives there as a recorded constant)
+    /// — this pin, where BOTH sides are visible, fails the day the
+    /// compiled registry moves to a new taxonomy and forces the
+    /// store rule to move with it.
+    #[test]
+    fn the_compiled_registry_matches_the_validated_taxonomy_id() {
+        assert!(
+            protonwire_core::groups::taxonomy_revision().starts_with("un-m49-six-continent-view@"),
+            "the registry's taxonomy identity must carry the id the store validates: {}",
+            protonwire_core::groups::taxonomy_revision()
         );
     }
 

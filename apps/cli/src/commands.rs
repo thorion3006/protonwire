@@ -49,6 +49,31 @@ pub enum Command {
         #[arg(long)]
         by: Option<String>,
 
+        /// Explicit physical country (FR-23Q's first source).
+        #[arg(long, value_name = "COUNTRY_CODE")]
+        physical_country: Option<String>,
+
+        /// Excluded country (repeatable; FR-21).
+        #[arg(long = "exclude-country", value_name = "COUNTRY_CODE")]
+        exclude_countries: Vec<String>,
+
+        /// Excluded state or region (repeatable; FR-21A).
+        #[arg(long = "exclude-state", value_name = "STATE_OR_REGION")]
+        exclude_states: Vec<String>,
+
+        /// Excluded city (repeatable; FR-21A).
+        #[arg(long = "exclude-city", value_name = "CITY_NAME")]
+        exclude_cities: Vec<String>,
+
+        /// Excluded server name (repeatable; FR-21A).
+        #[arg(long = "exclude-server", value_name = "SERVER_NAME")]
+        exclude_servers: Vec<String>,
+
+        /// Required feature (repeatable: p2p|tor|secure-core|streaming|
+        /// ipv6|port-forwarding; T-4/FR-23H).
+        #[arg(long, value_name = "FEATURE")]
+        require: Vec<String>,
+
         /// Protocol override (smart|wireguard-udp|wireguard-tcp|stealth).
         #[arg(long)]
         protocol: Option<String>,
@@ -257,24 +282,30 @@ pub fn run(command: &Command, socket: Option<&Path>, no_input: bool) -> RunResul
         Command::Connect {
             target,
             by,
+            physical_country,
+            exclude_countries,
+            exclude_states,
+            exclude_cities,
+            exclude_servers,
+            require,
             protocol,
             dry_run,
             json,
         } => {
             // `--dry-run` is the M3 selection surface: resolve and
-            // print, never connect. The remaining modifiers ride it
-            // as selection constraints (--by ranks; --protocol
-            // filters — with no tunnel, both are pure selection).
+            // print, never connect — and it carries the FULL `select`
+            // modifier surface (round 15, P2: pre-fix clap rejected
+            // every modifier but --by/--protocol before this path).
             if *dry_run {
                 let target = ConnectTargetArgs::parse(target)?;
                 let modifiers = SelectionModifiers {
                     by: by.clone(),
-                    physical_country: None,
-                    excluded_countries: Vec::new(),
-                    excluded_states: Vec::new(),
-                    excluded_cities: Vec::new(),
-                    excluded_servers: Vec::new(),
-                    required_features: Vec::new(),
+                    physical_country: physical_country.clone(),
+                    excluded_countries: exclude_countries.clone(),
+                    excluded_states: exclude_states.clone(),
+                    excluded_cities: exclude_cities.clone(),
+                    excluded_servers: exclude_servers.clone(),
+                    required_features: parse_features(require)?,
                     optional_features: Vec::new(),
                     required_protocol: parse_protocol(protocol.as_deref())?,
                 };
@@ -283,7 +314,16 @@ pub fn run(command: &Command, socket: Option<&Path>, no_input: bool) -> RunResul
             // Declared-but-unhonored modifiers must refuse rather than
             // be discarded: sending the unmodified target would
             // silently ignore them once Connect lands (M4).
-            if let Some((flag, milestone)) = connect_modifier_refusal(by, protocol) {
+            if let Some((flag, milestone)) = connect_modifier_refusal(
+                by,
+                protocol,
+                physical_country,
+                exclude_countries,
+                exclude_states,
+                exclude_cities,
+                exclude_servers,
+                require,
+            ) {
                 return Err(ClientError::Rpc(RpcError::new(
                     RpcErrorCode::NotImplemented,
                     format!(
@@ -958,6 +998,12 @@ fn connect_command(
 fn connect_modifier_refusal(
     by: &Option<String>,
     protocol: &Option<String>,
+    physical_country: &Option<String>,
+    exclude_countries: &[String],
+    exclude_states: &[String],
+    exclude_cities: &[String],
+    exclude_servers: &[String],
+    require: &[String],
 ) -> Option<(&'static str, &'static str)> {
     if by.is_some() {
         Some((
@@ -966,6 +1012,18 @@ fn connect_modifier_refusal(
         ))
     } else if protocol.is_some() {
         Some(("--protocol", "milestone 4 — ProTUN engine"))
+    } else if physical_country.is_some() {
+        Some(("--physical-country", "milestone 4 — the connect path"))
+    } else if !exclude_countries.is_empty() {
+        Some(("--exclude-country", "milestone 4 — the connect path"))
+    } else if !exclude_states.is_empty() {
+        Some(("--exclude-state", "milestone 4 — the connect path"))
+    } else if !exclude_cities.is_empty() {
+        Some(("--exclude-city", "milestone 4 — the connect path"))
+    } else if !exclude_servers.is_empty() {
+        Some(("--exclude-server", "milestone 4 — the connect path"))
+    } else if !require.is_empty() {
+        Some(("--require", "milestone 4 — the connect path"))
     } else {
         None
     }
@@ -1216,6 +1274,51 @@ mod tests {
         assert_ne!(err.exit_code(), 1, "not the planned refusal: {err}");
     }
 
+    /// Codex PR#9 round 15 (P2, the dry-run alias's surface): `connect
+    /// --dry-run` is presented as the same selection surface as
+    /// `select`, but `Command::Connect` declared only `--by` and
+    /// `--protocol` — clap rejected every other documented modifier
+    /// before the dry-run path, and the path initialized them empty.
+    /// The full modifier set parses on both commands now (and the
+    /// non-dry-run arm refuses them with their milestone, the
+    /// declared-but-unhonored discipline).
+    #[test]
+    fn connect_dry_run_accepts_the_full_selection_modifier_surface() {
+        use clap::Parser;
+        let cli = crate::Cli::try_parse_from([
+            "protonwire",
+            "connect",
+            "group",
+            "proton:fastest-excluding-my-country",
+            "--physical-country",
+            "GB",
+            "--exclude-country",
+            "DE",
+            "--exclude-server",
+            "GB#2",
+            "--require",
+            "p2p",
+            "--by",
+            "latency",
+            "--dry-run",
+        ])
+        .expect("the dry-run alias carries the full select surface");
+        let Command::Connect {
+            physical_country,
+            exclude_countries,
+            exclude_servers,
+            require,
+            ..
+        } = cli.command
+        else {
+            panic!("the command parsed as Connect");
+        };
+        assert_eq!(physical_country.as_deref(), Some("GB"));
+        assert_eq!(exclude_countries, vec!["DE".to_owned()]);
+        assert_eq!(exclude_servers, vec!["GB#2".to_owned()]);
+        assert_eq!(require, vec!["p2p".to_owned()]);
+    }
+
     /// Review-fix V2's discipline, post-M3: `--by`/`--protocol` WITHOUT
     /// `--dry-run` still refuse with their planned milestone (the M4
     /// tunnel composes them at connect time) — a modifier may never be
@@ -1229,6 +1332,12 @@ mod tests {
                 Command::Connect {
                     target: fastest(),
                     by: Some("latency".into()),
+                    physical_country: None,
+                    exclude_countries: Vec::new(),
+                    exclude_states: Vec::new(),
+                    exclude_cities: Vec::new(),
+                    exclude_servers: Vec::new(),
+                    require: Vec::new(),
                     protocol: None,
                     dry_run: false,
                     json: false,
@@ -1240,6 +1349,12 @@ mod tests {
                 Command::Connect {
                     target: fastest(),
                     by: None,
+                    physical_country: None,
+                    exclude_countries: Vec::new(),
+                    exclude_states: Vec::new(),
+                    exclude_cities: Vec::new(),
+                    exclude_servers: Vec::new(),
+                    require: Vec::new(),
                     protocol: Some("stealth".into()),
                     dry_run: false,
                     json: false,
@@ -1300,6 +1415,12 @@ mod tests {
             Command::Connect {
                 target: vec!["fastest".to_string()],
                 by: Some("load".into()),
+                physical_country: None,
+                exclude_countries: Vec::new(),
+                exclude_states: Vec::new(),
+                exclude_cities: Vec::new(),
+                exclude_servers: Vec::new(),
+                require: Vec::new(),
                 protocol: None,
                 dry_run: true,
                 json: false,
@@ -1379,6 +1500,12 @@ mod tests {
             Command::Connect {
                 target: vec!["fastest".into()],
                 by: None,
+                physical_country: None,
+                exclude_countries: Vec::new(),
+                exclude_states: Vec::new(),
+                exclude_cities: Vec::new(),
+                exclude_servers: Vec::new(),
+                require: Vec::new(),
                 protocol: None,
                 dry_run: false,
                 json: false,
@@ -1386,6 +1513,12 @@ mod tests {
             Command::Connect {
                 target: vec!["fastest".into()],
                 by: None,
+                physical_country: None,
+                exclude_countries: Vec::new(),
+                exclude_states: Vec::new(),
+                exclude_cities: Vec::new(),
+                exclude_servers: Vec::new(),
+                require: Vec::new(),
                 protocol: None,
                 dry_run: false,
                 json: true,
@@ -1488,6 +1621,12 @@ mod tests {
                 Command::Connect {
                     target: vec!["fastest".to_string()],
                     by: None,
+                    physical_country: None,
+                    exclude_countries: Vec::new(),
+                    exclude_states: Vec::new(),
+                    exclude_cities: Vec::new(),
+                    exclude_servers: Vec::new(),
+                    require: Vec::new(),
                     protocol: None,
                     dry_run: false,
                     json: false,

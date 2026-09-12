@@ -386,6 +386,20 @@ vocabulary! {
     }
 }
 
+vocabulary! {
+    /// The region taxonomy id (Codex PR#9 round 15, P2): the compiled
+    /// catalog's UN M49 six-continent view is the ONLY taxonomy the
+    /// daemon resolves regional groups against — a different
+    /// configured value would silently select under a mapping the
+    /// operator never chose, so anything else rejects at parse. The
+    /// daemon's tests pin this id against the live registry's
+    /// `taxonomy_revision()` (store cannot depend on core).
+    RegionTaxonomy at "connection_groups.region_taxonomy", default Unm49SixContinentView {
+        /// The UN M49 six-continent view (the compiled registry).
+        Unm49SixContinentView => "un-m49-six-continent-view",
+    }
+}
+
 /// Connection-group section.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
@@ -393,8 +407,9 @@ pub struct ConnectionGroupsSection {
     /// Explicit physical-country override (ISO 3166-1 alpha-2), else the
     /// cached Muon user location is used.
     pub physical_country: Option<String>,
-    /// Region taxonomy id; must match the catalog.
-    pub region_taxonomy: String,
+    /// Region taxonomy id; must match the compiled catalog (see
+    /// [`RegionTaxonomy`]).
+    pub region_taxonomy: RegionTaxonomy,
     /// Default ranking of regional groups (see [`RegionalRanking`]).
     pub regional_default_ranking: RegionalRanking,
 }
@@ -403,7 +418,7 @@ impl Default for ConnectionGroupsSection {
     fn default() -> Self {
         Self {
             physical_country: None,
-            region_taxonomy: "un-m49-six-continent-view".into(),
+            region_taxonomy: RegionTaxonomy::default(),
             regional_default_ranking: RegionalRanking::ProtonScore,
         }
     }
@@ -1164,6 +1179,28 @@ mod tests {
             "schema_version: 2\nconnection_groups:\n  regional_default_ranking: speed\n",
             "connection_groups.regional_default_ranking",
             &["proton-score", "balanced", "load", "latency"],
+        );
+    }
+
+    /// Codex PR#9 round 15 (P2): `region_taxonomy` is documented as
+    /// "must match the catalog" but nothing enforced it — any value
+    /// validated, and the daemon silently resolved regional groups
+    /// against the compiled UN M49 registry regardless. The compiled
+    /// catalog's taxonomy id (`un-m49-six-continent-view` — the
+    /// registry's own `TAXONOMY_REVISION` prefix; the daemon pins the
+    /// equality in its own tests since store cannot depend on core)
+    /// is the only accepted value.
+    #[test]
+    fn region_taxonomy_must_match_the_compiled_registry() {
+        parse_doc(
+            "schema_version: 2\nconnection_groups:\n  region_taxonomy: un-m49-six-continent-view\n",
+        )
+        .validate()
+        .unwrap();
+        assert_rejected(
+            "schema_version: 2\nconnection_groups:\n  region_taxonomy: custom-continent-view\n",
+            "connection_groups.region_taxonomy",
+            &["un-m49-six-continent-view"],
         );
     }
 
