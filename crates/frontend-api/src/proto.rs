@@ -269,8 +269,11 @@ pub enum Request {
     Select {
         /// The connection-target grammar (shared with `connect`).
         target: ConnectTarget,
-        /// The §9.3 selection-plane modifiers.
-        modifiers: SelectionModifiers,
+        /// The §9.3 selection-plane modifiers. BOXED (round 16): the
+        /// two SC-exclusion fields grew the modifiers past
+        /// ClientMessage's variant-size discipline — serde and the
+        /// schema render `Box<T>` as `T` (wire-identical).
+        modifiers: Box<SelectionModifiers>,
     },
     /// The built-in connection-group catalog (M3 U6, FR-23I/U): served
     /// from core's generated registry — no network request, no
@@ -667,6 +670,13 @@ pub struct SelectionModifiers {
     pub excluded_cities: Vec<String>,
     /// Never select these logical servers by name (FR-21A).
     pub excluded_servers: Vec<String>,
+    /// Never ROUTE THROUGH these entry countries (FR-23C, Secure Core
+    /// targets only — every other target refuses them typed, FR-23F;
+    /// round 16: per-request exclusions, composing with the
+    /// administrator-wide config).
+    pub excluded_entry_countries: Vec<String>,
+    /// Never EXIT through these countries (FR-23C, Secure Core only).
+    pub excluded_exit_countries: Vec<String>,
     /// Required features (T-4/FR-23H).
     pub required_features: Vec<SelectionFeature>,
     /// Optional features — never eliminate CANDIDATES; they feed the
@@ -1694,17 +1704,19 @@ mod tests {
             target: ConnectTarget::Country {
                 country: "GB".into(),
             },
-            modifiers: SelectionModifiers {
+            modifiers: Box::new(SelectionModifiers {
                 by: Some("balanced".into()),
                 physical_country: Some("DE".into()),
                 excluded_countries: vec!["US".into()],
                 excluded_states: Vec::new(),
                 excluded_cities: Vec::new(),
                 excluded_servers: Vec::new(),
+                excluded_entry_countries: Vec::new(),
+                excluded_exit_countries: Vec::new(),
                 required_features: vec![SelectionFeature::PortForwarding],
                 optional_features: vec![SelectionFeature::P2p],
                 required_protocol: Some(SelectionProtocol::WireguardUdp),
-            },
+            }),
         })
         .unwrap();
         assert_eq!(json["method"], "select");

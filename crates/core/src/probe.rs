@@ -75,13 +75,19 @@ pub struct EndpointState {
 
 /// The executor seam: the daemon's real transport (TCP/UDP by
 /// default; ICMP only via its own CAP_NET_RAW-gated opt-in — never
-/// assumed here). `cancelled` is polled between endpoints.
-pub trait ProbeExecutor {
+/// assumed here). `cancelled` is polled between WINDOWS. `&self`
+/// with `Sync` — the run probes up to the configured parallelism
+/// concurrently (round 16, P2: the serial loop could not attempt the
+/// configured shortlist inside the round deadline — 20 candidates x
+/// 750 ms timeouts against an 8 s budget).
+pub trait ProbeExecutor: Sync {
     /// Probes one endpoint, returning the RTT on answer. A timeout is
-    /// `None` — never an offline verdict (FR-19B).
-    fn probe(&mut self, endpoint: &str) -> Option<Duration>;
-    /// Whether the run should stop before the next endpoint.
-    fn cancelled(&mut self) -> bool {
+    /// `None` — never an offline verdict (FR-19B). Called from the
+    /// run's worker threads — implementations must be thread-safe
+    /// over their shared state.
+    fn probe(&self, endpoint: &str) -> Option<Duration>;
+    /// Whether the run should stop before the next window.
+    fn cancelled(&self) -> bool {
         false
     }
 }
@@ -190,10 +196,45 @@ pub fn run_planned(
     shortlist: &[String],
     decisions: &BTreeMap<String, ProbeDecision>,
     state: &BTreeMap<String, EndpointState>,
-    executor: &mut dyn ProbeExecutor,
+    executor: &(dyn ProbeExecutor + Sync),
+    parallelism: usize,
 ) -> ProbeRun {
     let mut table = BTreeMap::new();
     let mut attempted = Vec::new();
+    // The probes execute in bounded-parallelism WINDOWS (round 16,
+    // P2): the whole window starts concurrently; `cancelled` is
+    // polled between windows; each probe's own timeout remains the
+    // caller's clamp (the daemon clamps to the round's remaining
+    // budget), so an in-flight window cannot overrun the round by
+    // more than one timeout. Attempted order stays shortlist order.
+    let parallelism = parallelism.max(1);
+    let mut window: Vec<&String> = Vec::with_capacity(parallelism);
+    let flush = |window: &mut Vec<&String>,
+                 table: &mut BTreeMap<String, Observation>,
+                 attempted: &mut Vec<String>| {
+        if window.is_empty() {
+            return;
+        }
+        attempted.extend(window.iter().map(|endpoint| (*endpoint).clone()));
+        let answers: Vec<Option<Observation>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = window
+                .iter()
+                .map(|endpoint| {
+                    scope.spawn(move || executor.probe(endpoint).map(|rtt| Observation { rtt }))
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().expect("a probe worker never panics"))
+                .collect()
+        });
+        for (endpoint, answer) in window.iter().zip(answers) {
+            if let Some(observation) = answer {
+                table.insert((*endpoint).clone(), observation);
+            }
+        }
+        window.clear();
+    };
     for endpoint in shortlist {
         match decisions.get(endpoint) {
             Some(ProbeDecision::Reuse(obs)) => {
@@ -212,9 +253,9 @@ pub fn run_planned(
                 if executor.cancelled() {
                     break;
                 }
-                attempted.push(endpoint.clone());
-                if let Some(rtt) = executor.probe(endpoint) {
-                    table.insert(endpoint.clone(), Observation { rtt });
+                window.push(endpoint);
+                if window.len() >= parallelism {
+                    flush(&mut window, &mut table, &mut attempted);
                 }
             }
             // An endpoint the planner never decided (a shortlist the
@@ -222,6 +263,7 @@ pub fn run_planned(
             None => {}
         }
     }
+    flush(&mut window, &mut table, &mut attempted);
     ProbeRun {
         observations: table,
         attempted,
@@ -417,7 +459,7 @@ mod tests {
     fn rate_limited_decisions_carry_prior_observations() {
         struct AnswerAll;
         impl ProbeExecutor for AnswerAll {
-            fn probe(&mut self, _endpoint: &str) -> Option<Duration> {
+            fn probe(&self, _endpoint: &str) -> Option<Duration> {
                 Some(Duration::from_millis(5))
             }
         }
@@ -441,7 +483,7 @@ mod tests {
             ProbeDecision::RateLimited,
             "the cap (8 probes budgeted before it) skips the 9th"
         );
-        let run = run_planned(&shortlist, &decisions, &state, &mut AnswerAll);
+        let run = run_planned(&shortlist, &decisions, &state, &AnswerAll, 1);
         let table = &run.observations;
         assert_eq!(
             table.get("zz"),
@@ -459,14 +501,14 @@ mod tests {
     fn an_unanswered_probe_contributes_nothing() {
         struct TimeoutAll;
         impl ProbeExecutor for TimeoutAll {
-            fn probe(&mut self, _endpoint: &str) -> Option<Duration> {
+            fn probe(&self, _endpoint: &str) -> Option<Duration> {
                 None
             }
         }
         let decisions: BTreeMap<_, _> = [("a".to_owned(), ProbeDecision::Probe)].into();
         let state = BTreeMap::new();
         let shortlist = vec!["a".to_owned()];
-        let run = run_planned(&shortlist, &decisions, &state, &mut TimeoutAll);
+        let run = run_planned(&shortlist, &decisions, &state, &TimeoutAll, 1);
         let table = &run.observations;
         assert!(
             !table.contains_key("a"),
@@ -483,15 +525,16 @@ mod tests {
     #[test]
     fn execution_follows_shortlist_priority_not_key_order() {
         struct CancelAfterOne {
-            answered: usize,
+            answered: std::sync::atomic::AtomicUsize,
         }
         impl ProbeExecutor for CancelAfterOne {
-            fn probe(&mut self, _endpoint: &str) -> Option<Duration> {
-                self.answered += 1;
+            fn probe(&self, _endpoint: &str) -> Option<Duration> {
+                self.answered
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 Some(Duration::from_millis(10))
             }
-            fn cancelled(&mut self) -> bool {
-                self.answered >= 1
+            fn cancelled(&self) -> bool {
+                self.answered.load(std::sync::atomic::Ordering::SeqCst) >= 1
             }
         }
         // Priority order z BEFORE a; key order is the reverse.
@@ -506,7 +549,10 @@ mod tests {
             &shortlist,
             &decisions,
             &state,
-            &mut CancelAfterOne { answered: 0 },
+            &CancelAfterOne {
+                answered: std::sync::atomic::AtomicUsize::new(0),
+            },
+            1,
         );
         let table = &run.observations;
         assert!(
@@ -524,15 +570,16 @@ mod tests {
     #[test]
     fn cancellation_stops_between_endpoints() {
         struct CancelAfterOne {
-            answered: usize,
+            answered: std::sync::atomic::AtomicUsize,
         }
         impl ProbeExecutor for CancelAfterOne {
-            fn probe(&mut self, _endpoint: &str) -> Option<Duration> {
-                self.answered += 1;
+            fn probe(&self, _endpoint: &str) -> Option<Duration> {
+                self.answered
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 Some(Duration::from_millis(10))
             }
-            fn cancelled(&mut self) -> bool {
-                self.answered >= 1
+            fn cancelled(&self) -> bool {
+                self.answered.load(std::sync::atomic::Ordering::SeqCst) >= 1
             }
         }
         let decisions: BTreeMap<_, _> = [
@@ -546,7 +593,10 @@ mod tests {
             &shortlist,
             &decisions,
             &state,
-            &mut CancelAfterOne { answered: 0 },
+            &CancelAfterOne {
+                answered: std::sync::atomic::AtomicUsize::new(0),
+            },
+            1,
         );
         let table = &run.observations;
         assert_eq!(table.len(), 1, "the answered prefix survives");

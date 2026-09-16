@@ -1067,14 +1067,20 @@ impl SelectionEngine {
             .collect();
         let connect = &self.connect;
         let transport = probe_config.transport;
-        let mut executor = TransportExecutor {
+        let executor = TransportExecutor {
             transport,
             timeout,
             endpoints,
             connect,
             round_deadline,
         };
-        let run = run_planned(&shortlist, &decisions, &state, &mut executor);
+        let run = run_planned(
+            &shortlist,
+            &decisions,
+            &state,
+            &executor,
+            probe_config.parallelism as usize,
+        );
         let observed = run.observations;
 
         // The write-back: observations only, plus the reservation
@@ -1414,6 +1420,38 @@ impl SelectionEngine {
                  registry's proton-backend-when-required authority); the backend \
                  change-server path lands with the session lane — local random serves \
                  paid plans",
+            ));
+        }
+
+        // The paid-location gate's DIRECT arms (Codex PR#9 round 16,
+        // P1): FR-23G permits a free plan only the fastest eligible
+        // connection and backend-authorized random changes — naming a
+        // location (country, state/region, city, or an exact server)
+        // is the paid capability HOWEVER it is addressed. The r5 gate
+        // covers the regional groups; these arms bypassed it, letting
+        // a free account `select country GB` over tier-0 members —
+        // locally simulated paid location selection. AFTER the
+        // capability gate (an exact server naming a gated feature
+        // keeps its more precise capability refusal); fail-closed
+        // uncomposed (the family semantics); the per-server tier
+        // stage stays the candidate filter for paid plans.
+        let names_location = matches!(
+            target,
+            ConnectTarget::Country { .. }
+                | ConnectTarget::State { .. }
+                | ConnectTarget::City { .. }
+                | ConnectTarget::Server { .. }
+        );
+        if names_location
+            && entitlements
+                .as_ref()
+                .and_then(|snapshot| snapshot.plan_tier)
+                != Some(PlanTier::Paid)
+        {
+            return Err(RpcError::new(
+                RpcErrorCode::EntitlementMissing,
+                "location selection requires a paid plan — a free plan selects the fastest \
+                 eligible server and backend-authorized random changes only (FR-23G)",
             ));
         }
 
@@ -1837,13 +1875,13 @@ struct TransportExecutor<'a> {
     transport: ProbeTransport,
     timeout: Duration,
     endpoints: BTreeMap<String, SocketAddr>,
-    connect: &'a dyn Fn(SocketAddr, Duration) -> Option<Duration>,
+    connect: &'a (dyn Fn(SocketAddr, Duration) -> Option<Duration> + Sync),
     /// When the whole round expires.
     round_deadline: Instant,
 }
 
 impl ProbeExecutor for TransportExecutor<'_> {
-    fn probe(&mut self, endpoint: &str) -> Option<Duration> {
+    fn probe(&self, endpoint: &str) -> Option<Duration> {
         match self.transport {
             ProbeTransport::TcpUdp => {
                 // No logging here: the id→address mapping is never
@@ -1859,7 +1897,7 @@ impl ProbeExecutor for TransportExecutor<'_> {
         }
     }
 
-    fn cancelled(&mut self) -> bool {
+    fn cancelled(&self) -> bool {
         Instant::now() >= self.round_deadline
     }
 }
@@ -2022,6 +2060,17 @@ fn merge_group_modifiers(
         .constraints
         .excluded_servers
         .extend(modifiers.excluded_servers.iter().cloned());
+    // The per-request Secure Core exclusions (round 16, P2): unioned
+    // onto the group's request — FR-23F refuses them typed if the
+    // group's target is not routed Secure Core.
+    request
+        .constraints
+        .excluded_entry_countries
+        .extend(modifiers.excluded_entry_countries.iter().cloned());
+    request
+        .constraints
+        .excluded_exit_countries
+        .extend(modifiers.excluded_exit_countries.iter().cloned());
     request
         .constraints
         .required_features
@@ -2111,6 +2160,11 @@ fn direct_request(
             excluded_states: modifiers.excluded_states.clone(),
             excluded_cities: modifiers.excluded_cities.clone(),
             excluded_servers: modifiers.excluded_servers.clone(),
+            // The per-request Secure Core exclusions (round 16, P2 —
+            // FR-23C over the wire): the core's own FR-23F rule
+            // refuses them typed under any non-Secure-Core target.
+            excluded_entry_countries: modifiers.excluded_entry_countries.clone(),
+            excluded_exit_countries: modifiers.excluded_exit_countries.clone(),
             required_features,
             optional_features,
             required_protocol,
@@ -2493,6 +2547,9 @@ mod tests {
     #[test]
     fn direct_official_select_carries_the_fr23t_field_set() {
         let engine = default_engine();
+        engine
+            .entitlement()
+            .install(Arc::new(FakeEntitlements::paid()));
         let result = engine
             .resolve(&country("GB"), &modifiers())
             .expect("the planted catalog selects");
@@ -2555,12 +2612,14 @@ mod tests {
     /// FR-23H at the daemon: a PF request with NO entitlement adapter
     /// installed (the session lane's cell is empty) is the typed
     /// missing-composition refusal — never a pass, never a guess.
+    /// (A FASTEST target: the round-16 location gate would otherwise
+    /// refuse a direct location target first.)
     #[test]
     fn pf_request_refuses_the_missing_composition_without_an_adapter() {
         let engine = default_engine();
         let error = engine
             .resolve(
-                &country("GB"),
+                &ConnectTarget::Fastest,
                 &SelectionModifiers {
                     required_features: vec![SelectionFeature::PortForwarding],
                     ..modifiers()
@@ -2623,7 +2682,9 @@ mod tests {
 
     /// An installed FREE entitlement refuses at the feature stage with
     /// the entitlement-first explanation (the capability question is
-    /// never reached for an unentitled account).
+    /// never reached for an unentitled account). (A FASTEST target:
+    /// the round-16 location gate would otherwise refuse a direct
+    /// location target first.)
     #[test]
     fn pf_request_under_a_free_entitlement_refuses_on_entitlement() {
         let engine = default_engine();
@@ -2632,7 +2693,7 @@ mod tests {
             .install(Arc::new(FakeEntitlements::free()));
         let error = engine
             .resolve(
-                &country("GB"),
+                &ConnectTarget::Fastest,
                 &SelectionModifiers {
                     required_features: vec![SelectionFeature::PortForwarding],
                     ..modifiers()
@@ -3449,6 +3510,9 @@ mod tests {
             }
         };
         let mut engine = engine_over(SystemConfig::default(), 1_000_000, recorder);
+        engine
+            .entitlement()
+            .install(Arc::new(FakeEntitlements::paid()));
         engine.catalog_read = Box::new(move || {
             Ok(Some(CachedCatalog {
                 schema_version: 1,
@@ -3987,6 +4051,9 @@ mod tests {
             }
         };
         let mut engine = engine_over(SystemConfig::default(), 1_000_000, recorder);
+        engine
+            .entitlement()
+            .install(Arc::new(FakeEntitlements::paid()));
         engine.catalog_read = Box::new(move || {
             Ok(Some(CachedCatalog {
                 schema_version: 1,
@@ -4305,6 +4372,149 @@ mod tests {
         );
     }
 
+    /// Codex PR#9 round 16 (P1, the direct location arms): FR-23G
+    /// permits a free plan ONLY the fastest eligible connection and
+    /// backend-authorized random changes — naming a location
+    /// (country/state/city/exact server) is the paid capability,
+    /// however it is addressed. The r5 gate covered the regional
+    /// groups; these direct arms bypassed it, so a free user could
+    /// `select country GB` (tier-0 members) — locally simulated paid
+    /// location selection. The gate refuses unless the plan is
+    /// composed-PAID (fail-closed uncomposed — the family semantics).
+    #[test]
+    fn free_accounts_cannot_name_direct_locations() {
+        let engine = default_engine();
+        engine
+            .entitlement()
+            .install(Arc::new(FakeEntitlements::free()));
+        let error = engine
+            .resolve(&country("GB"), &modifiers())
+            .expect_err("choosing a country is the paid capability");
+        assert_eq!(error.code, RpcErrorCode::EntitlementMissing);
+        assert!(
+            error.message.contains("location"),
+            "the refusal names the capability: {error}"
+        );
+
+        // The exact-server arm (a tier-0 logical — the bot's own
+        // shape).
+        let error = engine
+            .resolve(&server("GB#1"), &modifiers())
+            .expect_err("naming a server is naming a location");
+        assert_eq!(error.code, RpcErrorCode::EntitlementMissing);
+
+        // Uncomposed: fail-closed (the family semantics).
+        let engine = default_engine();
+        let error = engine
+            .resolve(&country("GB"), &modifiers())
+            .expect_err("an uncomposed snapshot cannot prove the paid plan");
+        assert_eq!(error.code, RpcErrorCode::EntitlementMissing);
+
+        // PAID keeps every direct arm (the control).
+        let engine = default_engine();
+        engine
+            .entitlement()
+            .install(Arc::new(FakeEntitlements::paid()));
+        let result = engine
+            .resolve(&country("GB"), &modifiers())
+            .expect("the paid plan chooses locations");
+        assert_eq!(result.winner.name, "GB#1");
+
+        // FASTEST stays THE free surface (FR-23G's own allowance).
+        let engine = default_engine();
+        engine
+            .entitlement()
+            .install(Arc::new(FakeEntitlements::free()));
+        let result = engine
+            .resolve(&ConnectTarget::Fastest, &modifiers())
+            .expect("fastest is the free plan's own mode");
+        assert_eq!(result.winner.name, "GB#1");
+    }
+
+    /// Codex PR#9 round 16 (P2, the SC exclusion wire fields): FR-23C
+    /// requires per-request entry/exit exclusions, but
+    /// SelectionModifiers carried none — only administrator-wide
+    /// config could constrain a single selection. The fields exist on
+    /// the wire now and compose into the core constraints (a non-SC
+    /// target carrying them refuses typed, FR-23F's own rule).
+    #[test]
+    fn per_request_secure_core_exclusions_ride_the_wire() {
+        let engine = default_engine();
+        engine
+            .entitlement()
+            .install(Arc::new(FakeEntitlements::paid()));
+        // Exclude the fixture's only entry — the routed request
+        // refuses with the dedicated code.
+        let error = engine
+            .resolve(
+                &ConnectTarget::SecureCore {
+                    entry_country: None,
+                    exit_country: None,
+                },
+                &SelectionModifiers {
+                    excluded_entry_countries: vec!["CH".into()],
+                    ..modifiers()
+                },
+            )
+            .expect_err("the only entry country is excluded by the REQUEST");
+        assert_eq!(error.code, RpcErrorCode::SecureCoreUnavailable);
+
+        // A non-SC target carrying them refuses typed (FR-23F).
+        let error = engine
+            .resolve(
+                &ConnectTarget::Fastest,
+                &SelectionModifiers {
+                    excluded_entry_countries: vec!["CH".into()],
+                    ..modifiers()
+                },
+            )
+            .expect_err("entry exclusions are Secure Core's alone (FR-23F)");
+        assert_eq!(error.code, RpcErrorCode::InvalidParams);
+    }
+
+    /// Codex PR#9 round 16 (P2, probe parallelism): the configured
+    /// `latency_probe.parallelism` (default 4) was declared and
+    /// validated but never read — the run executed serially, so with
+    /// the default 20 candidates x 750 ms timeouts against an 8 s
+    /// round deadline only the first ~10 could ever be attempted.
+    /// The pin: with parallelism 2 and four probeable endpoints, the
+    /// executor observes CONCURRENT probes (high-water >= 2 —
+    /// pre-fix the serial run's high-water is 1).
+    #[test]
+    fn probes_run_at_the_configured_parallelism() {
+        let in_flight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let high_water = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seam = {
+            let in_flight = std::sync::Arc::clone(&in_flight);
+            let high_water = std::sync::Arc::clone(&high_water);
+            move |_addr: SocketAddr, _timeout: Duration| -> Option<Duration> {
+                let now = in_flight.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                high_water.fetch_max(now, std::sync::atomic::Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(30));
+                in_flight.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                Some(Duration::from_millis(5))
+            }
+        };
+        let mut config = SystemConfig::default();
+        config.server_selection.latency_probe.parallelism = 2;
+        config.server_selection.latency_probe.max_candidates = 8;
+        let engine = engine_over(config, 1_000_000, seam);
+        let result = engine
+            .resolve(
+                &ConnectTarget::Fastest,
+                &SelectionModifiers {
+                    by: Some("latency".into()),
+                    ..modifiers()
+                },
+            )
+            .expect("the parallel round selects");
+        assert_eq!(result.winner.signals.provenance, "probe-observed");
+        assert!(
+            high_water.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+            "probes ran concurrently (high-water 1 = the serial pre-fix)"
+        );
+    }
+
     /// Codex PR-9 (P1, the entitlement tier): a FREE account's
     /// selection must never return a PAID-tier server. Pre-fix the
     /// context carried only the PF boolean — the full cached catalog
@@ -4313,6 +4523,14 @@ mod tests {
     /// The S8 `MaxTier` now composes onto the core's
     /// account-entitlement stage (FR-23P's own stage, ahead of online
     /// state) and the refusal's FR-22 report names it.
+    ///
+    /// ROUND 16, P1 rewrite: `country CH` under a free plan now
+    /// refuses EARLIER — the direct-location gate (FR-23G: naming a
+    /// location is the paid capability) fires before the core's tier
+    /// stage. The account-tier ELIMINATION semantics live on in the
+    /// fastest-country group arm of
+    /// `free_account_ranks_only_free_tier_members` (a group target is
+    /// not a named location); this test pins the gate.
     #[test]
     fn free_account_selection_eliminates_paid_tier_servers() {
         let engine = default_engine();
@@ -4321,19 +4539,11 @@ mod tests {
             .install(Arc::new(FakeEntitlements::free()));
         let error = engine
             .resolve(&country("CH"), &modifiers())
-            .expect_err("a free account cannot select the tier-2 CH#10");
-        assert_eq!(error.code, RpcErrorCode::NoEligibleServer);
-        let details = error.details.expect("the report rides details");
-        let tier_stage = details["stages"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|stage| stage["stage"] == "account-tier")
-            .expect("the eliminating stage is the entitlement tier");
-        assert_eq!(
-            tier_stage["eliminated"], 3,
-            "every tier-2 logical (CH#10, CH-SE#1, JP#1) — the entitlement stage precedes \
-             geography (FR-23P), so non-members above the tier charge here too"
+            .expect_err("a free account cannot name a location (FR-23G)");
+        assert_eq!(error.code, RpcErrorCode::EntitlementMissing);
+        assert!(
+            error.message.contains("location"),
+            "the round-16 gate names the capability: {error}"
         );
     }
 
@@ -4802,6 +5012,9 @@ mod tests {
     #[test]
     fn unsatisfiable_requests_carry_the_structured_report() {
         let engine = default_engine();
+        engine
+            .entitlement()
+            .install(Arc::new(FakeEntitlements::paid()));
         let error = engine
             .resolve(
                 &country("GB"),
@@ -4833,6 +5046,9 @@ mod tests {
     #[test]
     fn latency_probes_write_back_last_attempt_even_when_unanswered() {
         let engine = engine_over(SystemConfig::default(), 1_000_000, never_answers);
+        engine
+            .entitlement()
+            .install(Arc::new(FakeEntitlements::paid()));
 
         // The first latency select: nothing answers, so the ranking
         // refuses on its data requirement (never fabricated).
@@ -4977,6 +5193,12 @@ mod tests {
             )
         };
 
+        // The round-16 location gate: a direct country target needs a
+        // composed paid plan.
+        engine
+            .entitlement()
+            .install(Arc::new(FakeEntitlements::paid()));
+
         // `country GB` shortlists exactly the three GB logicals.
         let target = country("GB");
         let mods = SelectionModifiers {
@@ -5059,6 +5281,9 @@ mod tests {
             Some(Duration::from_millis(25))
         }
         let engine = engine_over(SystemConfig::default(), 1_000_000, answers as fn(_, _) -> _);
+        engine
+            .entitlement()
+            .install(Arc::new(FakeEntitlements::paid()));
         let result = engine
             .resolve(
                 &country("GB"),
@@ -5103,6 +5328,9 @@ mod tests {
         let mut config = SystemConfig::default();
         config.server_selection.latency_probe.transport = ProbeTransport::Icmp;
         let engine = engine_over(config, 1_000_000, answers as fn(_, _) -> _);
+        engine
+            .entitlement()
+            .install(Arc::new(FakeEntitlements::paid()));
         let error = engine
             .resolve(
                 &country("GB"),
@@ -5242,6 +5470,9 @@ mod tests {
         config.server_selection.balanced_weights.stability = 0.0;
         config.server_selection.balanced_weights.feature_match = 0.0;
         let engine = engine_over(config, 1_000_000, never_answers);
+        engine
+            .entitlement()
+            .install(Arc::new(FakeEntitlements::paid()));
         let result = engine
             .resolve(
                 &country("GB"),

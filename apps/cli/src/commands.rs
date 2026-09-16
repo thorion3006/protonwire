@@ -69,6 +69,16 @@ pub enum Command {
         #[arg(long = "exclude-server", value_name = "SERVER_NAME")]
         exclude_servers: Vec<String>,
 
+        /// Never route through these Secure Core ENTRY countries
+        /// (repeatable; FR-23C — Secure Core targets only, FR-23F).
+        #[arg(long = "exclude-entry-country", value_name = "COUNTRY_CODE")]
+        exclude_entry_countries: Vec<String>,
+
+        /// Never EXIT through these countries on Secure Core
+        /// (repeatable; FR-23C).
+        #[arg(long = "exclude-exit-country", value_name = "COUNTRY_CODE")]
+        exclude_exit_countries: Vec<String>,
+
         /// Required feature (repeatable: p2p|tor|secure-core|streaming|
         /// ipv6|port-forwarding; T-4/FR-23H).
         #[arg(long, value_name = "FEATURE")]
@@ -141,6 +151,16 @@ pub enum Command {
         /// Excluded server name (repeatable; FR-21A).
         #[arg(long = "exclude-server", value_name = "SERVER_NAME")]
         exclude_servers: Vec<String>,
+
+        /// Never route through these Secure Core ENTRY countries
+        /// (repeatable; FR-23C — Secure Core targets only, FR-23F).
+        #[arg(long = "exclude-entry-country", value_name = "COUNTRY_CODE")]
+        exclude_entry_countries: Vec<String>,
+
+        /// Never EXIT through these countries on Secure Core
+        /// (repeatable; FR-23C).
+        #[arg(long = "exclude-exit-country", value_name = "COUNTRY_CODE")]
+        exclude_exit_countries: Vec<String>,
 
         /// Required feature (repeatable: p2p|tor|secure-core|streaming|
         /// ipv6|port-forwarding; T-4/FR-23H).
@@ -287,6 +307,8 @@ pub fn run(command: &Command, socket: Option<&Path>, no_input: bool) -> RunResul
             exclude_states,
             exclude_cities,
             exclude_servers,
+            exclude_entry_countries,
+            exclude_exit_countries,
             require,
             protocol,
             dry_run,
@@ -305,6 +327,8 @@ pub fn run(command: &Command, socket: Option<&Path>, no_input: bool) -> RunResul
                     excluded_states: exclude_states.clone(),
                     excluded_cities: exclude_cities.clone(),
                     excluded_servers: exclude_servers.clone(),
+                    excluded_entry_countries: exclude_entry_countries.clone(),
+                    excluded_exit_countries: exclude_exit_countries.clone(),
                     required_features: parse_features(require)?,
                     optional_features: Vec::new(),
                     required_protocol: parse_protocol(protocol.as_deref())?,
@@ -322,6 +346,8 @@ pub fn run(command: &Command, socket: Option<&Path>, no_input: bool) -> RunResul
                 exclude_states,
                 exclude_cities,
                 exclude_servers,
+                exclude_entry_countries,
+                exclude_exit_countries,
                 require,
             ) {
                 return Err(ClientError::Rpc(RpcError::new(
@@ -353,6 +379,8 @@ pub fn run(command: &Command, socket: Option<&Path>, no_input: bool) -> RunResul
             exclude_states,
             exclude_cities,
             exclude_servers,
+            exclude_entry_countries,
+            exclude_exit_countries,
             require,
             protocol,
             dry_run: _,
@@ -366,6 +394,8 @@ pub fn run(command: &Command, socket: Option<&Path>, no_input: bool) -> RunResul
                 excluded_states: exclude_states.clone(),
                 excluded_cities: exclude_cities.clone(),
                 excluded_servers: exclude_servers.clone(),
+                excluded_entry_countries: exclude_entry_countries.clone(),
+                excluded_exit_countries: exclude_exit_countries.clone(),
                 required_features: parse_features(require)?,
                 optional_features: Vec::new(),
                 required_protocol: parse_protocol(protocol.as_deref())?,
@@ -1006,6 +1036,8 @@ fn connect_modifier_refusal(
     exclude_states: &[String],
     exclude_cities: &[String],
     exclude_servers: &[String],
+    exclude_entry_countries: &[String],
+    exclude_exit_countries: &[String],
     require: &[String],
 ) -> Option<(&'static str, &'static str)> {
     if by.is_some() {
@@ -1025,6 +1057,10 @@ fn connect_modifier_refusal(
         Some(("--exclude-city", "milestone 4 — the connect path"))
     } else if !exclude_servers.is_empty() {
         Some(("--exclude-server", "milestone 4 — the connect path"))
+    } else if !exclude_entry_countries.is_empty() {
+        Some(("--exclude-entry-country", "milestone 4 — the connect path"))
+    } else if !exclude_exit_countries.is_empty() {
+        Some(("--exclude-exit-country", "milestone 4 — the connect path"))
     } else if !require.is_empty() {
         Some(("--require", "milestone 4 — the connect path"))
     } else {
@@ -1340,6 +1376,8 @@ mod tests {
                     exclude_states: Vec::new(),
                     exclude_cities: Vec::new(),
                     exclude_servers: Vec::new(),
+                    exclude_entry_countries: Vec::new(),
+                    exclude_exit_countries: Vec::new(),
                     require: Vec::new(),
                     protocol: None,
                     dry_run: false,
@@ -1357,6 +1395,8 @@ mod tests {
                     exclude_states: Vec::new(),
                     exclude_cities: Vec::new(),
                     exclude_servers: Vec::new(),
+                    exclude_entry_countries: Vec::new(),
+                    exclude_exit_countries: Vec::new(),
                     require: Vec::new(),
                     protocol: Some("stealth".into()),
                     dry_run: false,
@@ -1397,6 +1437,8 @@ mod tests {
                 exclude_states: Vec::new(),
                 exclude_cities: Vec::new(),
                 exclude_servers: Vec::new(),
+                exclude_entry_countries: Vec::new(),
+                exclude_exit_countries: Vec::new(),
                 require: vec!["port-forwarding".into()],
                 protocol: Some("stealth".into()),
                 dry_run: true,
@@ -1423,6 +1465,8 @@ mod tests {
                 exclude_states: Vec::new(),
                 exclude_cities: Vec::new(),
                 exclude_servers: Vec::new(),
+                exclude_entry_countries: Vec::new(),
+                exclude_exit_countries: Vec::new(),
                 require: Vec::new(),
                 protocol: None,
                 dry_run: true,
@@ -1470,6 +1514,8 @@ mod tests {
                 exclude_states: Vec::new(),
                 exclude_cities: Vec::new(),
                 exclude_servers: Vec::new(),
+                exclude_entry_countries: Vec::new(),
+                exclude_exit_countries: Vec::new(),
                 require,
                 protocol,
                 dry_run: false,
@@ -1508,6 +1554,8 @@ mod tests {
                 exclude_states: Vec::new(),
                 exclude_cities: Vec::new(),
                 exclude_servers: Vec::new(),
+                exclude_entry_countries: Vec::new(),
+                exclude_exit_countries: Vec::new(),
                 require: Vec::new(),
                 protocol: None,
                 dry_run: false,
@@ -1521,6 +1569,8 @@ mod tests {
                 exclude_states: Vec::new(),
                 exclude_cities: Vec::new(),
                 exclude_servers: Vec::new(),
+                exclude_entry_countries: Vec::new(),
+                exclude_exit_countries: Vec::new(),
                 require: Vec::new(),
                 protocol: None,
                 dry_run: false,
@@ -1629,6 +1679,8 @@ mod tests {
                     exclude_states: Vec::new(),
                     exclude_cities: Vec::new(),
                     exclude_servers: Vec::new(),
+                    exclude_entry_countries: Vec::new(),
+                    exclude_exit_countries: Vec::new(),
                     require: Vec::new(),
                     protocol: None,
                     dry_run: false,
@@ -1669,6 +1721,8 @@ mod tests {
                     exclude_states: Vec::new(),
                     exclude_cities: Vec::new(),
                     exclude_servers: Vec::new(),
+                    exclude_entry_countries: Vec::new(),
+                    exclude_exit_countries: Vec::new(),
                     require: Vec::new(),
                     protocol: None,
                     dry_run: false,

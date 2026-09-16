@@ -366,7 +366,7 @@
                   "type": "object",
                   "properties": {
                     "modifiers": {
-                      "description": "The §9.3 selection-plane modifiers.",
+                      "description": "The §9.3 selection-plane modifiers. BOXED (round 16): the\ntwo SC-exclusion fields grew the modifiers past\nClientMessage's variant-size discipline — serde and the\nschema render `Box<T>` as `T` (wire-identical).",
                       "$ref": "#/$defs/SelectionModifiers"
                     },
                     "target": {
@@ -815,6 +815,20 @@
             "type": "string"
           }
         },
+        "excluded_entry_countries": {
+          "description": "Never ROUTE THROUGH these entry countries (FR-23C, Secure Core\ntargets only — every other target refuses them typed, FR-23F;\nround 16: per-request exclusions, composing with the\nadministrator-wide config).",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "excluded_exit_countries": {
+          "description": "Never EXIT through these countries (FR-23C, Secure Core only).",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
         "excluded_servers": {
           "description": "Never select these logical servers by name (FR-21A).",
           "type": "array",
@@ -867,6 +881,8 @@
         "excluded_states",
         "excluded_cities",
         "excluded_servers",
+        "excluded_entry_countries",
+        "excluded_exit_countries",
         "required_features",
         "optional_features"
       ]

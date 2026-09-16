@@ -424,7 +424,10 @@ impl ProtonwireClient {
         target: ConnectTarget,
         modifiers: protonwire_frontend_api::SelectionModifiers,
     ) -> Result<Box<protonwire_frontend_api::SelectionResult>, ClientError> {
-        match self.ipc.request(Request::Select { target, modifiers }) {
+        match self.ipc.request(Request::Select {
+            target,
+            modifiers: Box::new(modifiers),
+        }) {
             Ok(RequestResult::Selected { result }) => Ok(result),
             Ok(other) => Err(unexpected_result("select", other)),
             Err(error) => Err(map_request_error(error)),
@@ -1057,6 +1060,8 @@ mod tests {
                     excluded_states: Vec::new(),
                     excluded_cities: Vec::new(),
                     excluded_servers: Vec::new(),
+                    excluded_entry_countries: Vec::new(),
+                    excluded_exit_countries: Vec::new(),
                     required_features: vec![SelectionFeature::PortForwarding],
                     optional_features: vec![SelectionFeature::P2p],
                     required_protocol: Some(SelectionProtocol::Stealth),
