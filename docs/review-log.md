@@ -2415,3 +2415,34 @@ disclosed analytic reds — the r10/r12/r15 consistency pins stay
 green. RUST gate: PASS with the pin/message catches landed
 in-commit (flag-spelling names, the order-vacuity fix, the
 unpinned arms) — see rounds 17/18 entries.
+
+## 2026-09-16 — Codex PR#9 rounds 18-19 (post-completion, pre-merge)
+
+Round 18 (3x P2, fixed at 8ecc61a): single_flight_slot captures the
+generation/adapter/slot under the TRANSITION lock (an install
+completing between the old generation load and the slot lock spawned
+an old-stamped worker over the new adapter — its refused outcome
+left a stale slot that spawned a SECOND worker, defeating the
+one-worker bound); the ACTIVE-revision watermark (a same-second etag
+change made the r15 tie rule's first stamper permanent — the newer
+active revision re-probed forever; the watermark lets the active key
+REPLACE a tied table, non-active tied keys concede; red-verified by
+temporary revert); ONE entitlement snapshot per availability
+response (per-row rereads could mix accounts mid-listing — one
+clone, every entitlement fact derived from it, the dead helper
+removed).
+
+Round 19 (4x P2, fixed at b57bf61): the parallelism ceiling
+(1..=64 validated; the window reserves at most the shortlist length
+— u32::MAX would abort the first latency request); the dedicated
+PROTOCOL refusal (the LAST eliminating stage keys the code: protocol
+emptied what survived everything else -> ProtocolUnavailable/exit
+18, report riding details; two pre-existing pins updated to the
+dedicated code); the availability twin ('protocol-unavailable', the
+account-tier treatment); and the MONOTONIC watermark — the bot
+caught r18's own fix (arrival-order authority let a paused old-catalog
+round steal the watermark and replace the newer table): the
+watermark keys on the catalog-read SEQUENCE now, earlier reads'
+notes rejected. Pins: the ceiling, the dedicated code, the reason,
+and the watermark unit contract (the end-to-end interleaving
+unconstructible — both pause seams have guards — disclosed).
