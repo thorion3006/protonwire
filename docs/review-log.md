@@ -2446,3 +2446,43 @@ watermark keys on the catalog-read SEQUENCE now, earlier reads'
 notes rejected. Pins: the ceiling, the dedicated code, the reason,
 and the watermark unit contract (the end-to-end interleaving
 unconstructible — both pause seams have guards — disclosed).
+
+## 2026-09-16 — Codex PR#9 round 20 (post-completion, pre-merge)
+
+THREE P2 findings, all verified GENUINE, fixed red-first at 68d80db:
+
+- **P2 — the read-time sequence.** The r19 catalog-read sequence
+  stamped AFTER cached_catalog() returned — a request paused
+  mid-read could take a LARGER sequence than a later-started read,
+  winning the watermark with its stale key (clearing the newer
+  table). The stamp now precedes the load: read STARTS order
+  strictly, pause or not. (Analytic red — the pause sits between
+  adjacent statements; the r19 watermark unit pin holds, and the
+  field comment records why the unused-slot-on-refusal price is
+  correct.)
+- **P2 — the last-stage tier reason.** The account-tier availability
+  reason fired on ANY tier elimination — a free snapshot over a
+  pool where paid rows die at tier AND surviving tier-0 rows die at
+  protocol read 'account-tier' (upgrade advice!) though upgrading
+  would not make the survivors compatible. Both precise reasons now
+  key on the LAST eliminating stage, one rule for tier and
+  protocol; the protocol reason's plan-relative reading (no
+  SELECTABLE member under the current plan) documented.
+- **P2 — the FR-23F boundary (r17's tracked pair).**
+  'secure-core CH→CH' validated each side but not the cross-field
+  contradiction — the capability gate shadowed it for free accounts
+  (exit 4) while paid accounts reached the core's InvalidParams
+  (exit 2). The equality check is at the boundary now:
+  plan-independent semantics, the core's own check retained as
+  defense-in-depth.
+
+Pins: the mixed-pool tier test (location CH so tier-0 GB rows
+survive to protocol while paid rows die at tier — pre-fix
+account-tier) and the equal-sides refusal (free + CH→CH pre-fix
+EntitlementMissing). RUST gate PASS; its tier-positive-pin P2+ was
+ATTEMPTED and is genuinely unconstructible — resolve_group reads
+the FROZEN registry by id, so no synthetic entry can reach the
+filter path (the attempt read no-eligible-server through the
+unknown-group arm, caught before commit) — recorded as the tracked
+item it was tagged to be, with the registry seam as its named
+lane. Its doc-nit and comment-reword catches landed in-commit.
