@@ -1199,6 +1199,73 @@ impl SelectionEngine {
         target: &ConnectTarget,
         modifiers: &SelectionModifiers,
     ) -> Result<Box<SelectionResult>, RpcError> {
+        // A RANDOM target IS its own ranking (round 17, P1): a `--by`
+        // override is meaningless AND dangerous — it converted the
+        // policy before the target mapped to Fastest, so the FR-23G
+        // backend-authority gate (keyed on the RESOLVED policy)
+        // skipped and a free account got a locally-selected "random"
+        // winner. Refused for every plan.
+        if matches!(target, ConnectTarget::Random) && modifiers.by.is_some() {
+            return Err(RpcError::new(
+                RpcErrorCode::InvalidParams,
+                "`--by` does not apply to the random target — random IS the ranking (a free \
+                 plan's random selection is backend-authorized, FR-23G)",
+            ));
+        }
+        // Boundary country validation (round 13's tracked item,
+        // landed round 17, P2): every country-ish input the wire
+        // carries validates BEFORE any entitlement gate — a malformed
+        // request reads InvalidParams (exit 2) for EVERY plan
+        // (pre-fix the r16 location gate shadowed the core's
+        // validation for free accounts: exit 4). The core's own
+        // grammar, one vocabulary; the core re-validates the composed
+        // target as defense-in-depth.
+        let boundary_country = |field: &str, code: &str| -> Result<(), RpcError> {
+            if protonwire_core::selection::validate_country(code).is_err() {
+                return Err(RpcError::new(
+                    RpcErrorCode::InvalidParams,
+                    format!(
+                        "{field} `{code}` is not a canonical uppercase ISO 3166-1 alpha-2 \
+                         code — non-canonical input refuses typed, never approximated"
+                    ),
+                ));
+            }
+            Ok(())
+        };
+        if let ConnectTarget::Country { country } = target {
+            boundary_country("target country", country)?;
+        }
+        if let ConnectTarget::SecureCore {
+            entry_country,
+            exit_country,
+        } = target
+        {
+            if let Some(entry) = entry_country.as_deref() {
+                boundary_country("target entry country", entry)?;
+            }
+            if let Some(exit) = exit_country.as_deref() {
+                boundary_country("target exit country", exit)?;
+            }
+        }
+        for (field, code) in modifiers
+            .excluded_countries
+            .iter()
+            .map(|code| ("--exclude-country", code.as_str()))
+            .chain(
+                modifiers
+                    .excluded_entry_countries
+                    .iter()
+                    .map(|code| ("--exclude-entry-country", code.as_str())),
+            )
+            .chain(
+                modifiers
+                    .excluded_exit_countries
+                    .iter()
+                    .map(|code| ("--exclude-exit-country", code.as_str())),
+            )
+        {
+            boundary_country(field, code)?;
+        }
         // The explicit physical country validates AT THE BOUNDARY
         // (round 13, P2): the wire contract is uppercase ISO 3166-1
         // alpha-2, non-canonical input refuses typed — a target that
@@ -1206,16 +1273,8 @@ impl SelectionEngine {
         // into provenance unvalidated (`select fastest
         // --physical-country gb` used to succeed and report `gb`).
         // The core's own grammar, one vocabulary.
-        if let Some(country) = modifiers.physical_country.as_deref()
-            && protonwire_core::selection::validate_country(country).is_err()
-        {
-            return Err(RpcError::new(
-                RpcErrorCode::InvalidParams,
-                format!(
-                    "physical-country `{country}` is not a canonical uppercase ISO 3166-1 \
-                     alpha-2 code — non-canonical input refuses typed, never approximated"
-                ),
-            ));
+        if let Some(country) = modifiers.physical_country.as_deref() {
+            boundary_country("physical-country", country)?;
         }
         // ONE request deadline spans the entitlement composition AND
         // the probe round (Codex PR#9 round 3, P1): independent serial
@@ -4513,6 +4572,147 @@ mod tests {
             high_water.load(std::sync::atomic::Ordering::SeqCst) >= 2,
             "probes ran concurrently (high-water 1 = the serial pre-fix)"
         );
+    }
+
+    /// Codex PR#9 round 17 (P1, the random override): a RANDOM target
+    /// IS its own ranking — `select random --by official` used to
+    /// convert the policy to Official before the target mapped to
+    /// Fastest, so the FR-23G backend-authority gate (keyed on the
+    /// RESOLVED policy) skipped, and a free account got a
+    /// locally-selected "random" winner. The override refuses typed
+    /// now, for every plan.
+    #[test]
+    fn a_random_target_rejects_ranking_overrides() {
+        let engine = default_engine();
+        engine
+            .entitlement()
+            .install(Arc::new(FakeEntitlements::free()));
+        let error = engine
+            .resolve(
+                &ConnectTarget::Random,
+                &SelectionModifiers {
+                    by: Some("official".into()),
+                    ..modifiers()
+                },
+            )
+            .expect_err("--by cannot convert the random target (pre-fix: a local winner)");
+        assert_eq!(error.code, RpcErrorCode::InvalidParams);
+        assert!(
+            error.message.contains("random"),
+            "the refusal names the target's own semantics: {error}"
+        );
+
+        // The same refusal under a PAID plan — the constraint is not
+        // plan-dependent.
+        let engine = default_engine();
+        engine
+            .entitlement()
+            .install(Arc::new(FakeEntitlements::paid()));
+        let error = engine
+            .resolve(
+                &ConnectTarget::Random,
+                &SelectionModifiers {
+                    by: Some("load".into()),
+                    ..modifiers()
+                },
+            )
+            .expect_err("paid plans cannot override random either");
+        assert_eq!(error.code, RpcErrorCode::InvalidParams);
+    }
+
+    /// Codex PR#9 round 17 (P2, boundary precedence): a non-canonical
+    /// target country read differently by plan — the r16 location
+    /// gate shadowed the validation for free accounts
+    /// (EntitlementMissing/exit 4) while paid accounts reached the
+    /// core's InvalidParams/exit 2. Every country-ish wire input
+    /// validates at the boundary now, BEFORE any entitlement gate
+    /// (round 13's tracked item, landed).
+    #[test]
+    fn country_inputs_validate_before_entitlement_gates() {
+        let engine = default_engine();
+        engine
+            .entitlement()
+            .install(Arc::new(FakeEntitlements::free()));
+        let error = engine
+            .resolve(&country("gb"), &modifiers())
+            .expect_err("malformed input is InvalidParams for EVERY plan");
+        assert_eq!(
+            error.code,
+            RpcErrorCode::InvalidParams,
+            "pre-fix the location gate shadowed the validation (exit 4): {error}"
+        );
+
+        // The Secure Core entry arm...
+        let error = engine
+            .resolve(
+                &ConnectTarget::SecureCore {
+                    entry_country: Some("ch".into()),
+                    exit_country: None,
+                },
+                &modifiers(),
+            )
+            .expect_err("the entry country validates at the boundary");
+        assert_eq!(error.code, RpcErrorCode::InvalidParams);
+        // ...and the EXIT arm (the gate review's unpinned-arm catch).
+        let error = engine
+            .resolve(
+                &ConnectTarget::SecureCore {
+                    entry_country: None,
+                    exit_country: Some("se".into()),
+                },
+                &modifiers(),
+            )
+            .expect_err("the exit country validates at the boundary");
+        assert_eq!(error.code, RpcErrorCode::InvalidParams);
+
+        // The exclusion lists — under a target where a gate WOULD
+        // fire first for this free plan (the gate review's
+        // order-vacuity catch: under Fastest no gate intervenes, so
+        // the core's own validation already refused; under a direct
+        // country target the r16 location gate used to).
+        let error = engine
+            .resolve(
+                &country("GB"),
+                &SelectionModifiers {
+                    excluded_countries: vec!["gb".into()],
+                    ..modifiers()
+                },
+            )
+            .expect_err("the exclusion list validates before the location gate");
+        assert_eq!(
+            error.code,
+            RpcErrorCode::InvalidParams,
+            "pre-fix this arm read EntitlementMissing (the location gate): {error}"
+        );
+
+        // The Secure Core exclusion lists (round 16's wire fields —
+        // also unpinned).
+        let error = engine
+            .resolve(
+                &ConnectTarget::SecureCore {
+                    entry_country: None,
+                    exit_country: None,
+                },
+                &SelectionModifiers {
+                    excluded_entry_countries: vec!["ch".into()],
+                    ..modifiers()
+                },
+            )
+            .expect_err("the entry-exclusion list validates at the boundary");
+        assert_eq!(error.code, RpcErrorCode::InvalidParams);
+        let error = engine
+            .resolve(
+                &ConnectTarget::SecureCore {
+                    entry_country: None,
+                    exit_country: None,
+                },
+                &SelectionModifiers {
+                    excluded_exit_countries: vec!["se".into()],
+                    ..modifiers()
+                },
+            )
+            .expect_err("the exit-exclusion list validates at the boundary");
+        assert_eq!(error.code, RpcErrorCode::InvalidParams);
     }
 
     /// Codex PR-9 (P1, the entitlement tier): a FREE account's
