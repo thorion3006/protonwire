@@ -503,9 +503,13 @@ pub struct SelectionEngine {
     /// The bounded on-demand prober's state.
     probes: ProbeTable,
     /// The catalog-read sequence (round 19, P2): a monotonic counter
-    /// stamped per resolve()-time read — the probe table's
-    /// active-revision watermark keys on READ order, not arrival
-    /// order (a paused old-catalog round must not steal authority).
+    /// stamped per resolve() attempt (before the load — round 20: a
+    /// request refused before probing still consumes a slot; gaps
+    /// never invert order, and stamping only after a successful load
+    /// would reopen exactly the mid-read pause window) — the probe
+    /// table's active-revision watermark keys on READ order, not
+    /// arrival order (a paused old-catalog round must not steal
+    /// authority).
     catalog_read_seq: std::sync::atomic::AtomicU64,
     /// The clock the planner and the write-back share — MONOTONIC
     /// uptime milliseconds in production ([`uptime_now_ms`], round
@@ -1302,6 +1306,24 @@ impl SelectionEngine {
             if let Some(exit) = exit_country.as_deref() {
                 boundary_country("target exit country", exit)?;
             }
+            // The FR-23F cross-field rule at the boundary (round 20,
+            // P2 — r17's tracked pair): a route's entry and exit
+            // countries always DIFFER (the hop-through that defines
+            // Secure Core). Pre-fix this contradiction read
+            // EntitlementMissing for free accounts (the capability
+            // gate first) and InvalidParams only for paid —
+            // plan-dependent semantics for one malformed request.
+            if let (Some(entry), Some(exit)) = (entry_country.as_deref(), exit_country.as_deref())
+                && entry == exit
+            {
+                return Err(RpcError::new(
+                    RpcErrorCode::InvalidParams,
+                    format!(
+                        "a Secure Core route's entry and exit countries must differ — \
+                         `{entry}→{exit}` is not a route (FR-23F)"
+                    ),
+                ));
+            }
         }
         for (field, code) in modifiers
             .excluded_countries
@@ -1338,6 +1360,17 @@ impl SelectionEngine {
         // timeout. The probe round clamps its own configured deadline
         // to whatever this deadline leaves.
         let request_deadline = Instant::now() + Duration::from_millis(self.request_deadline_ms());
+        // The catalog-read SEQUENCE (round 19, P2; stamped BEFORE the
+        // load, round 20, P2): the monotonic ordering for the probe
+        // table's active-revision watermark — read order, not arrival
+        // order. Stamped BEFORE the load so a request paused mid-read
+        // can never sequence AFTER a read that started later (round
+        // 19 stamped after the load returned, leaving exactly that
+        // window for a stale key to take the larger sequence).
+        let catalog_seq = self
+            .catalog_read_seq
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
         let Some((etag, fetched_unix, catalog)) = self.cached_catalog()? else {
             return Err(RpcError::new(
                 RpcErrorCode::NoEligibleServer,
@@ -1345,13 +1378,6 @@ impl SelectionEngine {
                  (selection reads the cache; it never fetches)",
             ));
         };
-        // The catalog-read SEQUENCE (round 19, P2): the monotonic
-        // ordering for the probe table's active-revision watermark —
-        // read order, not arrival order.
-        let catalog_seq = self
-            .catalog_read_seq
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-            + 1;
 
         let (required_features, optional_features) =
             wire_features(&modifiers.required_features, &modifiers.optional_features);
@@ -1880,31 +1906,30 @@ impl SelectionEngine {
                         reason: None,
                     },
                     Ok((_, report)) => {
-                        // FR-23S's "precise entitlement" reason: when the
-                        // tier stage is what emptied the pool, that is the
-                        // availability answer — not the generic
-                        // no-eligible-server. The PROTOCOL stage gets the
-                        // same treatment (round 19, P2, the LAST
-                        // eliminating stage — protocol emptied what
-                        // survived everything else): a group whose
-                        // declared or requested protocol no member speaks
-                        // reads protocol-unavailable, never generically
-                        // empty.
-                        let tier_bound = report.stages().iter().any(|(stage, count)| {
-                            *stage == protonwire_core::selection::FilterStage::AccountTier
-                                && *count > 0
-                        });
-                        if tier_bound {
-                            unavailable("account-tier")
-                        } else if report
+                        // FR-23S's "precise entitlement" reason, keyed on
+                        // the LAST eliminating stage (round 20, P2): the
+                        // stage that emptied what survived everything
+                        // else names the availability answer. Tier: the
+                        // account-tier stage (upgrade advice — pre-fix an
+                        // ANY-tier test blamed tier even when the
+                        // surviving tier-0 rows died at protocol, where
+                        // upgrading would not help). Protocol (round 19):
+                        // no SELECTABLE member under the current plan
+                        // speaks the protocol (the gate review's
+                        // plan-relative reading — tier-killed members
+                        // never reached the stage).
+                        let last_eliminating = report
                             .stages()
                             .iter()
                             .rev()
                             .find(|(_, count)| *count > 0)
-                            .is_some_and(|(stage, _)| {
-                                *stage
-                                    == protonwire_core::selection::FilterStage::ProtocolCompatibility
-                            })
+                            .map(|(stage, _)| *stage);
+                        if last_eliminating
+                            == Some(protonwire_core::selection::FilterStage::AccountTier)
+                        {
+                            unavailable("account-tier")
+                        } else if last_eliminating
+                            == Some(protonwire_core::selection::FilterStage::ProtocolCompatibility)
                         {
                             unavailable("protocol-unavailable")
                         } else {
@@ -4936,6 +4961,72 @@ mod tests {
         assert!(
             error.details.is_some(),
             "the FR-22 report still rides details"
+        );
+    }
+
+    /// Codex PR#9 round 20 (P2, the last-stage tier rule): the
+    /// account-tier availability reason fired on ANY tier elimination
+    /// — a free snapshot over a pool where the paid rows die at tier
+    /// AND the surviving tier-0 rows die at protocol read
+    /// `account-tier` (upgrade advice!) though upgrading would not
+    /// make the survivors compatible. The tier reason now requires
+    /// tier to be the LAST eliminating stage, the protocol rule's
+    /// own discipline.
+    #[test]
+    fn account_tier_reason_requires_the_last_eliminating_stage() {
+        // Location CH: anti-censorship excludes CH physicals, so the
+        // tier-0 GB rows survive to the protocol stage (no TLS in
+        // the fixture) while the paid rows die at tier/server-type.
+        let engine = engine_with_location(SystemConfig::default(), "CH");
+        engine
+            .entitlement()
+            .install(Arc::new(FakeEntitlements::free()));
+        engine
+            .resolve(&country("GB"), &modifiers())
+            .expect_err("free + direct location refuses — but primes the cache");
+        let availability = availability_of(
+            &engine.groups_catalog().expect("the registry serves"),
+            "proton:anti-censorship",
+        );
+        assert!(!availability.available);
+        assert_eq!(
+            availability.reason.as_deref(),
+            Some("protocol-unavailable"),
+            "the last eliminating stage is protocol — upgrading would not help the \
+             surviving tier-0 rows (pre-fix: account-tier): {:?}",
+            availability
+        );
+    }
+
+    /// Codex PR#9 round 20 (P2, the FR-23F boundary item — r17's
+    /// tracked pair): `secure-core CH→CH` read EntitlementMissing for
+    /// free accounts (the capability gate first) but InvalidParams
+    /// for paid (the core's equality check) — plan-dependent
+    /// semantics for one malformed request. The cross-field check is
+    /// at the boundary now, with the other validations.
+    #[test]
+    fn equal_secure_core_sides_refuse_before_entitlement_gates() {
+        let engine = default_engine();
+        engine
+            .entitlement()
+            .install(Arc::new(FakeEntitlements::free()));
+        let error = engine
+            .resolve(
+                &ConnectTarget::SecureCore {
+                    entry_country: Some("CH".into()),
+                    exit_country: Some("CH".into()),
+                },
+                &modifiers(),
+            )
+            .expect_err("a route through itself is malformed for EVERY plan");
+        assert_eq!(
+            error.code,
+            RpcErrorCode::InvalidParams,
+            "pre-fix the capability gate shadowed it (exit 4): {error}"
+        );
+        assert!(
+            error.message.contains("differ"),
+            "names FR-23F's hop-through rule: {error}"
         );
     }
 
