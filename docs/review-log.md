@@ -2298,3 +2298,48 @@ the new flags. Process note, honestly recorded: the first fix draft
 also INVERTED the write-back condition (caught by the existing
 answered-probes pin pre-push) and a clippy arity warning escaped a
 rushed push (bf199a0, caught watching CI).
+
+## 2026-09-16 — Codex PR#9 round 16 (post-completion, pre-merge)
+
+THREE findings (P1 + 2x P2), all verified GENUINE, fixed red-first
+at 1d6b1ec:
+
+- **P1 — the direct-location arms.** FR-23G permits a free plan only
+  the fastest eligible connection and backend-authorized random
+  changes; naming a location (country/state/city/exact server) is
+  the paid capability HOWEVER addressed — but only the r5 regional
+  GROUP path checked it, so a free account could `select country GB`
+  over tier-0 members: locally simulated paid location selection.
+  The gate refuses unless composed-PAID, placed AFTER the capability
+  gate (an exact server naming a gated feature keeps its more
+  precise refusal). Deliberate, disclosed test fallout: the r1
+  tier-stage test now pins the gate (its stage semantics live on in
+  the fastest-country group arm — groups are not named locations);
+  the PF composition tests moved to FASTEST targets; the
+  direct-target tests install the paid fixture.
+- **P2 — per-request SC exclusions over IPC.** FR-23C's entry/exit
+  exclusions were config-only (no wire fields). SelectionModifiers
+  gains them (additive, default-empty; the Select request's
+  modifiers BOXED to hold ClientMessage's variant-size discipline —
+  wire-identical under serde and the schema), composing in both
+  arms; the core's FR-23F rule refuses them typed under non-SC
+  targets; the CLI exposes the flags on both select and connect.
+- **P2 — probe parallelism.** latency_probe.parallelism (default 4)
+  was declared and validated but never read — the serial run could
+  attempt only ~10 of 20 candidates inside the 8 s round deadline
+  (750 ms timeouts), the rest eliminated for missing latency.
+  run_planned now executes bounded-parallelism windows
+  (std::thread::scope; the executor trait &self + Sync; cancelled()
+  between windows; per-probe timeouts stay the round clamp;
+  attempted order stays shortlist order).
+
+Pins: the four-arm location test (free country + exact server, the
+uncomposed fail-closed, paid control, FASTEST-the-free-surface), the
+wire-exclusion pair (routed refusal with the dedicated code; the
+FR-23F typed refusal elsewhere), and the concurrency high-water pin
+(>= 2 in flight at parallelism 2; the serial pre-fix high-water is
+1). Process notes, honestly recorded: a batch of blind perl edits
+corrupted two test openings mid-round (repaired by hand before
+commit — the compile gate caught them); clippy discipline held
+pre-push this time (the cast, the unused mut, and the enum-size
+boxing all landed in the amended commit).
