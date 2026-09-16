@@ -207,8 +207,12 @@ pub fn run_planned(
     // caller's clamp (the daemon clamps to the round's remaining
     // budget), so an in-flight window cannot overrun the round by
     // more than one timeout. Attempted order stays shortlist order.
+    // The window never reserves more than the shortlist can fill
+    // (round 19, P2: an oversized configured parallelism sized the
+    // reservation itself).
     let parallelism = parallelism.max(1);
-    let mut window: Vec<&String> = Vec::with_capacity(parallelism);
+    let window_cap = parallelism.min(shortlist.len());
+    let mut window: Vec<&String> = Vec::with_capacity(window_cap);
     let flush = |window: &mut Vec<&String>,
                  table: &mut BTreeMap<String, Observation>,
                  attempted: &mut Vec<String>| {

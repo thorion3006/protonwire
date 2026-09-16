@@ -408,27 +408,35 @@ impl EntitlementProvider {
 #[derive(Default)]
 struct ProbeTable {
     inner: Mutex<ProbeTableInner>,
-    /// The ACTIVE revision watermark (round 18, P2): the revision key
-    /// of the most recent catalog a probe round has OBSERVED — the
-    /// daemon's current cache, as far as the table knows. On a
-    /// same-second etag TIE (ordering unknowable), the table defers
-    /// to the ACTIVE key: it replaces a tied table, while any other
-    /// tied key concedes (the r15 rule made the first stamper
-    /// permanent, so a newer ACTIVE revision that lost the tie race
-    /// re-probed forever — no reuse, no rate-limit).
-    active: Mutex<Option<(String, u64)>>,
+    /// The ACTIVE revision watermark (round 18, P2; MONOTONIC round
+    /// 19, P2): the revision key of the catalog observed by the
+    /// LATEST-Sequenced READ — not the latest arrival. On a
+    /// same-second etag TIE the table defers to the ACTIVE key: it
+    /// replaces a tied table, while any other tied key concedes.
+    /// A note from an EARLIER read (an old-catalog round that paused
+    /// and resumed after a newer read) is rejected — arrival order
+    /// would let it steal authority and replace the newer table.
+    active: Mutex<Option<(u64, (String, u64))>>,
 }
 
 impl ProbeTable {
-    /// Records the latest observed revision (called at each probe
-    /// round's entry, before planning).
-    fn note_active(&self, key: (String, u64)) {
-        *self.active.lock().expect("active revision lock") = Some(key);
+    /// Records the observed revision under its catalog-read sequence
+    /// — rejected when an earlier-sequence note already lost to a
+    /// later one (monotonic).
+    fn note_active(&self, seq: u64, key: (String, u64)) {
+        let mut active = self.active.lock().expect("active revision lock");
+        if active.as_ref().is_none_or(|(seen, _)| seq >= *seen) {
+            *active = Some((seq, key));
+        }
     }
 
-    /// The latest observed revision key, if any.
+    /// The LATEST-READ revision key, if any.
     fn active_key(&self) -> Option<(String, u64)> {
-        self.active.lock().expect("active revision lock").clone()
+        self.active
+            .lock()
+            .expect("active revision lock")
+            .as_ref()
+            .map(|(_, key)| key.clone())
     }
 }
 
@@ -494,6 +502,11 @@ pub struct SelectionEngine {
     entitlement: EntitlementProvider,
     /// The bounded on-demand prober's state.
     probes: ProbeTable,
+    /// The catalog-read sequence (round 19, P2): a monotonic counter
+    /// stamped per resolve()-time read — the probe table's
+    /// active-revision watermark keys on READ order, not arrival
+    /// order (a paused old-catalog round must not steal authority).
+    catalog_read_seq: std::sync::atomic::AtomicU64,
     /// The clock the planner and the write-back share — MONOTONIC
     /// uptime milliseconds in production ([`uptime_now_ms`], round
     /// 14), injectable so the rate-limit windows are testable.
@@ -525,6 +538,7 @@ impl SelectionEngine {
             config,
             entitlement: EntitlementProvider::default(),
             probes: ProbeTable::default(),
+            catalog_read_seq: std::sync::atomic::AtomicU64::new(0),
             now_ms: Box::new(uptime_now_ms),
             connect: Box::new(tcp_connect),
             catalog_read: Box::new(move || {
@@ -550,6 +564,18 @@ impl SelectionEngine {
             .lock()
             .expect("probe table lock")
             .state
+            .clone()
+    }
+
+    /// The table's stamped revision key — the test surface for the
+    /// watermark/adoption contracts (which revision owns the table).
+    #[cfg(test)]
+    fn probe_revision(&self) -> Option<(String, u64)> {
+        self.probes
+            .inner
+            .lock()
+            .expect("probe table lock")
+            .revision
             .clone()
     }
 
@@ -993,6 +1019,7 @@ impl SelectionEngine {
         catalog: &CatalogDocument,
         catalog_etag: Option<&str>,
         catalog_fetched_unix: u64,
+        catalog_seq: u64,
         shortlist: Vec<String>,
         request_deadline: Instant,
     ) -> BTreeMap<String, Duration> {
@@ -1028,9 +1055,10 @@ impl SelectionEngine {
         let budget = self.probe_budget();
 
         // The ACTIVE-revision watermark is recorded BEFORE planning
-        // (round 18, P2): this round's catalog is, as of now, the
-        // daemon's current cache as far as the table knows.
-        self.probes.note_active(revision_key.clone());
+        // (round 18, P2), MONOTONICALLY under the round's
+        // catalog-read SEQUENCE (round 19, P2): this round's catalog
+        // is current only if no later read has superseded it.
+        self.probes.note_active(catalog_seq, revision_key.clone());
 
         // Plan + reserve atomically, reconciled under the same lock.
         // `state` is the same locked-now snapshot the plan ran over
@@ -1317,6 +1345,13 @@ impl SelectionEngine {
                  (selection reads the cache; it never fetches)",
             ));
         };
+        // The catalog-read SEQUENCE (round 19, P2): the monotonic
+        // ordering for the probe table's active-revision watermark —
+        // read order, not arrival order.
+        let catalog_seq = self
+            .catalog_read_seq
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
 
         let (required_features, optional_features) =
             wire_features(&modifiers.required_features, &modifiers.optional_features);
@@ -1581,6 +1616,7 @@ impl SelectionEngine {
                 &catalog,
                 etag.as_deref(),
                 fetched_unix,
+                catalog_seq,
                 shortlist,
                 request_deadline,
             );
@@ -1847,13 +1883,30 @@ impl SelectionEngine {
                         // FR-23S's "precise entitlement" reason: when the
                         // tier stage is what emptied the pool, that is the
                         // availability answer — not the generic
-                        // no-eligible-server.
+                        // no-eligible-server. The PROTOCOL stage gets the
+                        // same treatment (round 19, P2, the LAST
+                        // eliminating stage — protocol emptied what
+                        // survived everything else): a group whose
+                        // declared or requested protocol no member speaks
+                        // reads protocol-unavailable, never generically
+                        // empty.
                         let tier_bound = report.stages().iter().any(|(stage, count)| {
                             *stage == protonwire_core::selection::FilterStage::AccountTier
                                 && *count > 0
                         });
                         if tier_bound {
                             unavailable("account-tier")
+                        } else if report
+                            .stages()
+                            .iter()
+                            .rev()
+                            .find(|(_, count)| *count > 0)
+                            .is_some_and(|(stage, _)| {
+                                *stage
+                                    == protonwire_core::selection::FilterStage::ProtocolCompatibility
+                            })
+                        {
+                            unavailable("protocol-unavailable")
                         } else {
                             unavailable("no-eligible-server")
                         }
@@ -2449,6 +2502,28 @@ fn selection_error_to_rpc_explained(error: SelectionError, request: &SelectionRe
             .optional_features
             .contains(&FeatureConstraint::PortForwarding);
     if let SelectionError::ConstraintsNotSatisfied { ref report } = error {
+        // The dedicated PROTOCOL refusal (round 19, P2): when the
+        // LAST eliminating stage is the protocol stage, protocol is
+        // what emptied the pool that survived everything else — the
+        // failure is a protocol incompatibility, exit 18, never the
+        // generic NoEligibleServer (exit 5). The FR-22 report still
+        // rides details; a protocol-eliminated SC request reads this
+        // too (the eliminating stage names the more precise reason).
+        if report
+            .stages()
+            .iter()
+            .rev()
+            .find(|(_, eliminated)| *eliminated > 0)
+            .is_some_and(|(stage, _)| {
+                *stage == protonwire_core::selection::FilterStage::ProtocolCompatibility
+            })
+        {
+            return RpcError {
+                code: RpcErrorCode::ProtocolUnavailable,
+                message: format!("no eligible server speaks the required protocol: {report}"),
+                details: report_details(report),
+            };
+        }
         if matches!(request.target, Target::SecureCore { .. }) {
             let mut message = format!("no Secure Core route satisfies the request: {report}");
             if pf_requested {
@@ -4821,6 +4896,109 @@ mod tests {
             after_second,
             "no third probe — the adopted observations are reused inside the window"
         );
+        assert_eq!(
+            engine.probe_revision(),
+            Some(("\"tie-b\"".to_owned(), 0)),
+            "the table carries the ADOPTED revision's key"
+        );
+    }
+
+    /// Codex PR#9 round 19 (P2, the dedicated protocol code): the
+    /// taxonomy defines `ProtocolUnavailable` (exit 18) for exactly
+    /// this case, but a protocol-eliminated selection mapped to the
+    /// generic NoEligibleServer (exit 5) — clients could not
+    /// distinguish a protocol incompatibility from exhausted
+    /// constraints. The first eliminating stage decides: protocol
+    /// -> ProtocolUnavailable; the FR-22 report still rides details.
+    #[test]
+    fn a_protocol_eliminated_selection_returns_the_dedicated_code() {
+        let engine = default_engine();
+        engine
+            .entitlement()
+            .install(Arc::new(FakeEntitlements::paid()));
+        // The fixture's physicals carry no TLS endpoint: a Stealth
+        // requirement eliminates every candidate at the protocol
+        // stage.
+        let error = engine
+            .resolve(
+                &country("GB"),
+                &SelectionModifiers {
+                    required_protocol: Some(SelectionProtocol::Stealth),
+                    ..modifiers()
+                },
+            )
+            .expect_err("no GB physical speaks Stealth in the fixture");
+        assert_eq!(
+            error.code,
+            RpcErrorCode::ProtocolUnavailable,
+            "pre-fix the generic NoEligibleServer: {error}"
+        );
+        assert!(
+            error.details.is_some(),
+            "the FR-22 report still rides details"
+        );
+    }
+
+    /// Codex PR#9 round 19 (P2, the availability twin): a group whose
+    /// declared protocol no eligible server speaks read the generic
+    /// no-eligible-server — the listing could not present the precise
+    /// protocol reason. The protocol stage gets the account-tier
+    /// treatment: `protocol-unavailable`.
+    #[test]
+    fn group_availability_names_the_protocol_reason() {
+        // anti-censorship declares the Stealth override AND the
+        // physical-country exclusion — a cached location satisfies
+        // the latter so the protocol stage is what empties the pool
+        // (the fixture's physicals carry no TLS endpoint).
+        let engine = engine_with_location(SystemConfig::default(), "GB");
+        engine
+            .entitlement()
+            .install(Arc::new(FakeEntitlements::paid()));
+        engine
+            .resolve(&country("GB"), &modifiers())
+            .expect("primes the paid cache");
+        let availability = availability_of(
+            &engine.groups_catalog().expect("the registry serves"),
+            "proton:anti-censorship",
+        );
+        assert!(
+            !availability.available,
+            "no member speaks the declared protocol"
+        );
+        assert_eq!(
+            availability.reason.as_deref(),
+            Some("protocol-unavailable"),
+            "pre-fix the generic no-eligible-server: {:?}",
+            availability
+        );
+    }
+
+    /// Codex PR#9 round 19 (P2, the watermark staleness): note_active
+    /// bound authority to REQUEST ARRIVAL — an old-catalog round that
+    /// paused after its read could overwrite the watermark AFTER a
+    /// newer same-second round adopted the table, then REPLACE the
+    /// newer table under its stolen authority. The watermark is
+    /// MONOTONIC now: bound to the catalog-read SEQUENCE, a note from
+    /// an earlier read is rejected. (The end-to-end interleaving is
+    /// unconstructible — both pause seams have their own guards, the
+    /// r10 generation semantics and the catalog park ordering — so
+    /// the contract pins at the table unit; the resolve-level tests
+    /// stay green under it.)
+    #[test]
+    fn a_late_note_cannot_steal_the_watermark() {
+        let table = ProbeTable::default();
+        // Read seq 1 observes key A; read seq 5 observes key B (a
+        // same-second refresh — the fetched stamps tie).
+        table.note_active(1, ("key-a".to_owned(), 100));
+        table.note_active(5, ("key-b".to_owned(), 100));
+        // Read seq 2 — PAUSED after seq 5's read — arrives LAST with
+        // the OLD key: rejected (monotonic), pre-fix it overwrote.
+        table.note_active(2, ("key-a".to_owned(), 100));
+        assert_eq!(
+            table.active_key(),
+            Some(("key-b".to_owned(), 100)),
+            "the watermark belongs to the LATEST READ, not the latest arrival"
+        );
     }
 
     /// Codex PR-9 (P1, the entitlement tier): a FREE account's
@@ -5201,7 +5379,11 @@ mod tests {
                 },
             )
             .expect_err("the fixture exposes no TLS endpoint");
-        assert_eq!(agreed.code, RpcErrorCode::NoEligibleServer);
+        assert_eq!(
+            agreed.code,
+            RpcErrorCode::ProtocolUnavailable,
+            "round 19: the dedicated protocol code, pre-fix the generic"
+        );
         let details = agreed.details.expect("FR-22 rides details");
         assert!(
             details["stages"]
@@ -5234,7 +5416,11 @@ mod tests {
                 },
             )
             .expect_err("the fixture exposes no TLS endpoint");
-        assert_eq!(error.code, RpcErrorCode::NoEligibleServer);
+        assert_eq!(
+            error.code,
+            RpcErrorCode::ProtocolUnavailable,
+            "round 19: the dedicated protocol code, pre-fix the generic"
+        );
         let details = error.details.expect("FR-22 rides details");
         assert!(
             details["stages"]

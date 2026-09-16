@@ -259,6 +259,19 @@ impl SystemConfig {
                     .to_owned(),
             );
         }
+        // The probe PARALLELISM ceiling (Codex PR#9 round 19, P2): the
+        // value sizes the worker window — an unbounded accepted value
+        // (u32::MAX) would allocate/vanishly-spawn on the first
+        // latency-ranked request. The floor is 1 (serial); the ceiling
+        // generous against any sane runner (the window is additionally
+        // clamped to the shortlist length at run time).
+        if !(1..=64).contains(&self.server_selection.latency_probe.parallelism) {
+            violations.push(format!(
+                "server_selection.latency_probe.parallelism must be between 1 and 64 (found {}) \
+                 — the worker window bound",
+                self.server_selection.latency_probe.parallelism
+            ));
+        }
         // The probe-round deadline must leave the RPC round trip room:
         // the IPC request deadline is 10 s, so a round configured up to
         // it (or past it) answers with the transport timeout instead of
@@ -1132,6 +1145,41 @@ mod tests {
         config.schema_version = 2;
         config.server_selection.latency_probe.background_scan = true;
         assert!(config.validate().is_err());
+    }
+
+    /// Codex PR#9 round 19 (P2): the probe PARALLELISM sized the
+    /// worker window's reservation with no ceiling — a u32::MAX value
+    /// passed validation and would abort the daemon on the first
+    /// latency-ranked request. 1..=64 now (the run-time window is
+    /// also clamped to the shortlist length, core-side).
+    #[test]
+    fn probe_parallelism_is_ceilinged() {
+        let mut config = SystemConfig::default();
+        config.schema_version = 2;
+        config.server_selection.latency_probe.parallelism = u32::MAX;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("latency_probe.parallelism"),
+            "the violation names the field: {err}"
+        );
+        assert!(
+            err.contains("between 1 and 64"),
+            "the violation cites the bounds: {err}"
+        );
+
+        let mut config = SystemConfig::default();
+        config.schema_version = 2;
+        config.server_selection.latency_probe.parallelism = 0;
+        assert!(
+            config.validate().is_err(),
+            "the floor too — never a serial-by-zero degenerate window"
+        );
+
+        // The ceiling boundary validates clean.
+        let mut config = SystemConfig::default();
+        config.schema_version = 2;
+        config.server_selection.latency_probe.parallelism = 64;
+        config.validate().unwrap();
     }
 
     /// The Codex PR-9 probe-round bound: a deadline configured at (or
