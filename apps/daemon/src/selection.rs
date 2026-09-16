@@ -251,8 +251,17 @@ impl EntitlementProvider {
     /// result once and signals the condvar; each waiter clones it.
     /// At most one worker (and one upstream fetch) exists per instant.
     fn single_flight_slot(&self) -> Result<EntitlementFetchSlot, RpcError> {
-        // Load BEFORE the lock (the order is load-bearing — a stamp
-        // read after the lock could adopt a post-install generation).
+        // The generation, the adapter, and the slot are captured
+        // under the TRANSITION lock (round 18, P2 — completing the
+        // r10/r11 discipline): pre-fix the generation load preceded
+        // any lock shared with install(), so an install completing
+        // in between spawned a worker holding an OLD stamp over the
+        // NEW adapter — the post-wait re-check refused its outcome
+        // fail-closed, but the stale-stamped slot then made the NEXT
+        // request spawn a second worker on the same adapter,
+        // defeating the one-worker bound. Lock order transition →
+        // in_flight, the same order install() takes — no cycle.
+        let _transition = self.transition.lock().expect("entitlement transition lock");
         let current_generation = self.current_generation();
         let mut slot = self.in_flight.lock().expect("in-flight slot lock");
         // A slot stamped for a PREVIOUS adapter generation never
@@ -399,6 +408,28 @@ impl EntitlementProvider {
 #[derive(Default)]
 struct ProbeTable {
     inner: Mutex<ProbeTableInner>,
+    /// The ACTIVE revision watermark (round 18, P2): the revision key
+    /// of the most recent catalog a probe round has OBSERVED — the
+    /// daemon's current cache, as far as the table knows. On a
+    /// same-second etag TIE (ordering unknowable), the table defers
+    /// to the ACTIVE key: it replaces a tied table, while any other
+    /// tied key concedes (the r15 rule made the first stamper
+    /// permanent, so a newer ACTIVE revision that lost the tie race
+    /// re-probed forever — no reuse, no rate-limit).
+    active: Mutex<Option<(String, u64)>>,
+}
+
+impl ProbeTable {
+    /// Records the latest observed revision (called at each probe
+    /// round's entry, before planning).
+    fn note_active(&self, key: (String, u64)) {
+        *self.active.lock().expect("active revision lock") = Some(key);
+    }
+
+    /// The latest observed revision key, if any.
+    fn active_key(&self) -> Option<(String, u64)> {
+        self.active.lock().expect("active revision lock").clone()
+    }
 }
 
 #[derive(Default)]
@@ -898,19 +929,6 @@ impl SelectionEngine {
         }
     }
 
-    /// The CACHED entitlement tier for network-free surfaces (the
-    /// built-in listing, Codex PR#9 round 4, P2): reads the last
-    /// successfully composed snapshot without initiating any traffic.
-    /// None when no snapshot exists — the listing reports the honest
-    /// unknown, never a guessed tier, never a blocked RPC.
-    fn cached_entitlement_tier(&self) -> Option<i8> {
-        self.entitlement
-            .cached_snapshot()
-            .as_ref()
-            .and_then(|snapshot| snapshot.max_tier)
-            .map(|tier| tier.min(i64::from(i8::MAX)) as i8)
-    }
-
     /// The PF entitlement fact off the same snapshot: the wire model
     /// carries no PF allowance field, so the composition rides the
     /// recorded paid-plan classification (the same rule the
@@ -1009,6 +1027,11 @@ impl SelectionEngine {
         let now = (self.now_ms)();
         let budget = self.probe_budget();
 
+        // The ACTIVE-revision watermark is recorded BEFORE planning
+        // (round 18, P2): this round's catalog is, as of now, the
+        // daemon's current cache as far as the table knows.
+        self.probes.note_active(revision_key.clone());
+
         // Plan + reserve atomically, reconciled under the same lock.
         // `state` is the same locked-now snapshot the plan ran over
         // (its observations feed `run_planned`'s rate-limited
@@ -1018,16 +1041,21 @@ impl SelectionEngine {
             let mut inner = self.probes.inner.lock().expect("probe table lock");
             // STALE when the table was stamped under a strictly NEWER
             // fetched stamp, OR when the stamps TIE under a different
-            // revision key (two refreshes completing in the same
-            // second — which is newer is unknowable, so the incoming
-            // round concedes: it plans fresh but never wipes, reserves,
-            // or writes; the observations serve only its own request).
-            let stale = inner.fetched_unix > catalog_fetched_unix
-                || (inner.fetched_unix == catalog_fetched_unix
-                    && inner
-                        .revision
-                        .as_ref()
-                        .is_some_and(|key| key != &revision_key));
+            // revision key that is NOT the active watermark (round 18:
+            // on a tie the ACTIVE revision — the current cache —
+            // REPLACES the table; only a non-active tied key (an
+            // older in-flight round) concedes: it plans fresh but
+            // never wipes, reserves, or writes).
+            let tie_and_not_active = inner.fetched_unix == catalog_fetched_unix
+                && inner
+                    .revision
+                    .as_ref()
+                    .is_some_and(|key| key != &revision_key)
+                && !self
+                    .probes
+                    .active_key()
+                    .is_some_and(|key| key == revision_key);
+            let stale = inner.fetched_unix > catalog_fetched_unix || tie_and_not_active;
             if stale {
                 // Plan over an EMPTY VIEW and PROBE (the request still
                 // measures its own catalog — the gate review's P1:
@@ -1683,7 +1711,12 @@ impl SelectionEngine {
     pub fn groups_catalog(&self) -> Result<GroupsCatalog, RpcError> {
         let cached = self.cached_catalog()?;
         let weights = self.balanced_weights();
-        let account_tier = self.cached_entitlement_tier();
+        // ONE entitlement snapshot for the whole response (round 18,
+        // P2): every row's tier and allowance facts derive from the
+        // same clone — a replacement or invalidation mid-listing can
+        // no longer mix the old account's tier with the new account's
+        // plan capabilities.
+        let snapshot = self.entitlement.cached_snapshot();
         let groups = protonwire_core::groups::all_groups()
             .iter()
             .map(|entry| {
@@ -1691,7 +1724,7 @@ impl SelectionEngine {
                     cached.as_ref().map(|(_, _, document)| document),
                     entry,
                     &weights,
-                    account_tier,
+                    snapshot.as_ref(),
                 );
                 group_summary(entry, availability)
             })
@@ -1709,12 +1742,14 @@ impl SelectionEngine {
     /// it). The account-entitlement tier composes like every select
     /// (FR-23P): a paid-location group under a free account reports
     /// the precise `account-tier` reason, never a false "available".
+    /// The CALLER's snapshot is the sole entitlement source (round
+    /// 18, P2 — one clone per response, never a mid-listing reread).
     fn group_availability(
         &self,
         catalog: Option<&CatalogDocument>,
         entry: &protonwire_core::groups::GroupEntry,
         weights: &WeightedSignals,
-        account_tier: Option<i8>,
+        entitlements: Option<&VpnEntitlements>,
     ) -> GroupAvailability {
         let Some(catalog) = catalog else {
             return GroupAvailability {
@@ -1727,16 +1762,12 @@ impl SelectionEngine {
         // plans regardless of member tiers — resolve() refuses the
         // same request, and availability must agree with it (the
         // tier-0-in-region shape read available under a cached free
-        // snapshot even though selecting it refuses). The cached
-        // snapshot's plan_tier is the network-free source; None (no
-        // snapshot) leaves the tier unknown — the paid-location answer
-        // is then unknown-unavailable, never a false available.
+        // snapshot even though selecting it refuses). The caller's
+        // snapshot is the network-free source; None (no snapshot)
+        // leaves the tier unknown — the paid-location answer is then
+        // unknown-unavailable, never a false available.
         if entry.entitlement == protonwire_core::groups::GroupEntitlement::PaidLocationSelection {
-            let paid = self
-                .entitlement
-                .cached_snapshot()
-                .as_ref()
-                .map(|snapshot| snapshot.plan_tier == Some(PlanTier::Paid));
+            let paid = entitlements.map(|snapshot| snapshot.plan_tier == Some(PlanTier::Paid));
             match paid {
                 Some(true) => {}
                 Some(false) => {
@@ -1753,6 +1784,7 @@ impl SelectionEngine {
                 }
             }
         }
+        let account_tier = Self::account_tier(entitlements);
         let cached_country = self.cached_location_country();
         let sources = PhysicalCountrySources {
             explicit_request: None,
@@ -1780,13 +1812,13 @@ impl SelectionEngine {
                 // merges) reports the SAME entitlement reasons
                 // resolve() refuses with — availability agrees with
                 // the gate (the round-6 invariant), read from the
-                // CACHED snapshot (the listing's network-free
-                // contract). ONE cached read feeds both twins (the
-                // refactor close pass): a concurrent invalidation
-                // between two reads could make them disagree.
-                let cached = self.entitlement.cached_snapshot();
+                // CALLER's snapshot (the listing's network-free
+                // contract — round 18, P2: ONE clone per response,
+                // never a mid-listing reread). The same snapshot
+                // feeds both twins: a concurrent invalidation between
+                // two reads could make them disagree.
                 if let Some((_, allowance)) =
-                    Self::unmet_capability(cached.as_ref(), &resolved.request, catalog)
+                    Self::unmet_capability(entitlements, &resolved.request, catalog)
                 {
                     return unavailable(if allowance.is_some() {
                         "entitlement"
@@ -1797,9 +1829,9 @@ impl SelectionEngine {
                 // FR-23G's authority twin (round 9): random selection
                 // under a non-paid plan is backend-authorized —
                 // resolve() refuses it locally, and availability
-                // reports the same from the cached snapshot (never a
-                // false available while connecting refuses).
-                if Self::random_requires_backend_authority(&resolved.request, cached.as_ref()) {
+                // reports the same from the caller's snapshot (never
+                // a false available while connecting refuses).
+                if Self::random_requires_backend_authority(&resolved.request, entitlements) {
                     return unavailable("backend-selection-required");
                 }
                 match protonwire_core::selection::filter_candidates(
@@ -1852,13 +1884,15 @@ impl SelectionEngine {
             ));
         };
         let weights = self.balanced_weights();
+        // One snapshot for the whole evaluation (round 18, P2).
+        let snapshot = self.entitlement.cached_snapshot();
         let availability = self.group_availability(
             self.cached_catalog()?
                 .as_ref()
                 .map(|(_, _, document)| document),
             entry,
             &weights,
-            self.cached_entitlement_tier(),
+            snapshot.as_ref(),
         );
         let (target, target_detail) = group_target_render(&entry.target);
         Ok(Box::new(GroupDetails {
@@ -4713,6 +4747,80 @@ mod tests {
             )
             .expect_err("the exit-exclusion list validates at the boundary");
         assert_eq!(error.code, RpcErrorCode::InvalidParams);
+    }
+
+    /// Codex PR#9 round 18 (P2, the tie watermark): a same-second
+    /// etag change made the FIRST stamper permanent — if the newer
+    /// ACTIVE revision lost the tie race, every request under it
+    /// planned empty, probed, and never wrote: no reuse, no
+    /// rate-limit, forever. The table now defers to the ACTIVE
+    /// revision (the latest observed): it REPLACES a tied table;
+    /// only non-active tied keys (older in-flight rounds) concede.
+    #[test]
+    fn a_tied_active_revision_adopts_the_table() {
+        let revision: Arc<Mutex<(String, u64)>> =
+            Arc::new(Mutex::new(("\"tie-a\"".to_owned(), 1_771_000_000u64)));
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let answers = {
+            let calls = std::sync::Arc::clone(&calls);
+            move |_addr: SocketAddr, _timeout: Duration| -> Option<Duration> {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Some(Duration::from_millis(5))
+            }
+        };
+        let mut engine = engine_over(SystemConfig::default(), 1_000_000, answers);
+        {
+            let revision = std::sync::Arc::clone(&revision);
+            let body = catalog_body();
+            engine.catalog_read = Box::new(move || {
+                let (etag, fetched) = revision.lock().expect("revision holder").clone();
+                Ok(Some(CachedCatalog {
+                    schema_version: 1,
+                    etag: Some(etag),
+                    fetched_unix: fetched,
+                    body: body.clone(),
+                }))
+            });
+        }
+        engine
+            .entitlement()
+            .install(Arc::new(FakeEntitlements::paid()));
+        let by_latency = SelectionModifiers {
+            by: Some("latency".into()),
+            ..modifiers()
+        };
+        // Stamp the table under tie-a.
+        engine
+            .resolve(&ConnectTarget::Fastest, &by_latency)
+            .expect("the first revision probes");
+        let after_first = calls.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(after_first > 0);
+
+        // The SAME-SECOND refresh: a different etag, an identical
+        // fetched stamp. The new revision is now the ACTIVE one.
+        *revision.lock().expect("revision holder") = ("\"tie-b\"".to_owned(), 1_771_000_000);
+        engine
+            .resolve(&ConnectTarget::Fastest, &by_latency)
+            .expect("the tied ACTIVE revision adopts the table");
+        let after_second = calls.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            after_second > after_first,
+            "the adoption probes fresh (pre-fix the tie made it stale forever)"
+        );
+        assert!(
+            !engine.probe_state().is_empty(),
+            "the ACTIVE revision's observations are WRITTEN (pre-fix: never)"
+        );
+
+        // And the third request under the same revision REUSES them.
+        engine
+            .resolve(&ConnectTarget::Fastest, &by_latency)
+            .expect("the adopted table serves reuse");
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            after_second,
+            "no third probe — the adopted observations are reused inside the window"
+        );
     }
 
     /// Codex PR-9 (P1, the entitlement tier): a FREE account's
