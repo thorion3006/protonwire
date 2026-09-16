@@ -2380,3 +2380,38 @@ unpinned-arm catches all landed in-commit, plus its flag-spelling
 message nit). RUST PASS; tracked: the FR-23F entry==exit
 cross-field rule still validates core-side (the next boundary
 item, same shape — contradictory pairs, not non-canonical codes).
+
+## 2026-09-16 — Codex PR#9 round 18 (post-completion, pre-merge)
+
+THREE P2 findings, all verified GENUINE, fixed at 8ecc61a:
+
+- **P2 — adapter capture under the transition.** single_flight_slot
+  loaded the generation before any lock shared with install() — an
+  install completing in between spawned an old-stamped worker over
+  the new adapter; the post-wait re-check refused its outcome, but
+  the stale slot then made the NEXT request spawn a second worker
+  on the same adapter (the one-worker bound defeated, bounded once
+  per race). The generation, adapter, and slot capture now holds
+  the transition lock (r10/r11's discipline completed).
+- **P2 — the active-revision tie watermark.** A same-second etag
+  change made the r15 tie rule's FIRST stamper permanent — the
+  newer ACTIVE revision, losing the tie race, re-probed forever
+  (no reuse, no rate-limit, never writing). The table now records
+  the ACTIVE revision watermark (noted at each round's entry): on
+  a tie the active key REPLACES the table; non-active tied keys
+  (older in-flight rounds) concede. Red-verified against the r15
+  rule by temporary revert — the reuse assert fails exactly there.
+- **P2 — one snapshot per availability response.** groups_catalog
+  reread the cached snapshot per row; a replacement/invalidation
+  mid-listing could mix the old account's tier with the new
+  account's allowances (a regional group reading available on a
+  dead paid tier). One clone per response now; group_availability
+  takes the caller's snapshot for every entitlement fact; the dead
+  cached_entitlement_tier helper removed.
+
+Pins: the tie-watermark test (deterministic, red-verified);
+(a)/(c) are nanosecond/mid-call windows with structural fixes and
+disclosed analytic reds — the r10/r12/r15 consistency pins stay
+green. RUST gate: PASS with the pin/message catches landed
+in-commit (flag-spelling names, the order-vacuity fix, the
+unpinned arms) — see rounds 17/18 entries.
