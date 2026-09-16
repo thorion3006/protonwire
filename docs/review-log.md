@@ -2343,3 +2343,40 @@ corrupted two test openings mid-round (repaired by hand before
 commit — the compile gate caught them); clippy discipline held
 pre-push this time (the cast, the unused mut, and the enum-size
 boxing all landed in the amended commit).
+
+## 2026-09-16 — Codex PR#9 round 17 (post-completion, pre-merge)
+
+TWO findings, both verified GENUINE, fixed red-first at fe84b88
+(the round fired during round 16's CI wait; the audit job also
+caught RUSTSEC-2026-0285 against rustls 0.23.43 — a semver
+lockfile bump to 0.23.45 at f857e20, no code change):
+
+- **P1 — the random override bypass.** A RANDOM target IS its own
+  ranking, but `select random --by official` converted the policy
+  BEFORE the target mapped to Fastest — the FR-23G backend-authority
+  gate (keyed on the RESOLVED policy) skipped, and a free account
+  got a locally-selected "random" winner. The override refuses
+  typed at the boundary now, for every plan. The gate review's
+  (target, --by) matrix sweep found no analogous shape: "random" is
+  not a parseable mode, Proton groups refuse overrides outright,
+  and every other gate keys on the wire target or the resolved
+  constraints, which --by cannot alter.
+- **P2 — boundary country validation (round 13's tracked item,
+  landed).** A non-canonical target read differently by plan: the
+  r16 location gate shadowed the core's validation for free
+  accounts (EntitlementMissing/exit 4) while paid accounts read
+  InvalidParams/exit 2. Every country-ish wire input — the Country
+  target, the SC entry/exit arms, the excluded / entry-excluded /
+  exit-excluded lists, the explicit physical country — validates at
+  the boundary before any entitlement gate (one closure over the
+  core's grammar; the core re-validates as defense-in-depth).
+
+Pins: the random-override refusal (free + `random --by official`
+pre-fix returned a LOCAL winner; the paid arm refuses identically)
+and the boundary validation (free + `country gb` pre-fix exit 4;
+the SC exit arm, the exclusion lists under a gated target, and the
+SC exclusion lists — the gate review's order-vacuity and
+unpinned-arm catches all landed in-commit, plus its flag-spelling
+message nit). RUST PASS; tracked: the FR-23F entry==exit
+cross-field rule still validates core-side (the next boundary
+item, same shape — contradictory pairs, not non-canonical codes).
