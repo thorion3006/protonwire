@@ -118,8 +118,7 @@ The Proton sparse registry and the `cargo xtask` alias are configured in
 
 Toolchain floor: Rust ≥ 1.97 (edition 2024) — the Proton registry crates
 the engines depend on do not compile below ~1.94 (probe record in
-`docs/spike-2026-08.md`). The Proton sparse registry and the
-`cargo xtask` alias are configured in `.cargo/config.toml`.
+`docs/spike-2026-08.md`).
 
 ```sh
 cargo build                 # everything except the GUI

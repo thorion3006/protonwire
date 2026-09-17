@@ -160,7 +160,7 @@ impl muon::rt::AsyncWrite for TokioIo {
 ///
 /// The `Monotonic` marker below is the one scoped `unsafe` exception in
 /// this crate's production code (mirroring the test-local exception the
-/// S6 wire seam already disclosed): muon 2.6.1's public surface cannot
+/// S6 wire seam already disclosed): muon 2.6.2's public surface cannot
 /// construct a `TimeCapabilities` without the empty marker assertion
 /// (`InstantFactory: Monotonic`), every Proton downstream integrator
 /// writes this exact impl (pvpnclient `muon.rs:52`, muon's own test

@@ -1194,7 +1194,7 @@ impl muon::ProvideInformation for CanaryFingerprint {
 }
 
 /// The real-muon emitter. What runs per assertion level — all REAL muon
-/// 2.6.1 code, offline, against the loopback responder:
+/// 2.6.2 code, offline, against the loopback responder:
 ///
 /// 1. `Client::builder(..).build()` — the real hyper transport over the
 ///    real tokio OS/runtime pieces (production `protonwire_api::runtime`).
@@ -1211,11 +1211,12 @@ impl muon::ProvideInformation for CanaryFingerprint {
 /// 5. `Client::get_session(missing-canary-key)` — the real
 ///    `muon::client` session-key site.
 /// 6. `AuthFlow::from_fork().with_selector(canary)` — the real
-///    `muon::auth::from_fork` selector sites (twice at info per the S0
-///    memo), as the FR-7L import path.
+///    `muon::auth::from_fork` selector sites (three at info at 2.6.2:
+///    acquisition secret/plain and polling — per the refresh survey),
+///    as the FR-7L import path.
 /// 7. A scripted `Set-Cookie` response header carrying the cookie
 ///    canary (sec rider, S4 round). PREMISE CORRECTED during landing:
-///    at pinned muon 2.6.1 the retry handler's DEBUG site formats the
+///    at pinned muon 2.6.2 the retry handler's DEBUG site formats the
 ///    response through `Display` (`received http::Response { status,
 ///    error_code }` — no headers), so no Set-Cookie value reaches any
 ///    writer even with the `muon::common::retry` cap removed; the step
@@ -1267,7 +1268,7 @@ struct RealMuonCanaryEmitter;
 
 impl protonwire_core::redact::canary::CanaryEmitter for RealMuonCanaryEmitter {
     fn name(&self) -> &'static str {
-        "muon-2.6.1"
+        "muon-2.6.2"
     }
 
     fn emit(&self, c: &protonwire_core::redact::canary::Canaries) {
