@@ -2620,3 +2620,59 @@ Owner decision before PR-1: the PersistentCache KEY SOURCE —
 (a) root-owned 0600 keyfile + audited AEAD (recommended),
 (b) keyring-derived, (c) defer (rejected: the cache holds a WG
 private key).
+
+## 2026-09-17 — PR#11 the upstream refresh (muon =2.6.2, toolchain 1.98.1)
+
+The post-M3 upstream sweep, opened as PR#11
+(`chore/upstream-refresh-2026-09`, three commits: 8f05c1d deps+docs,
+56c2c0d toolchain, 5cfe840 the review fix round). The load-bearing
+discovery, found by building not reading: **muon 2.6.3 is breaking in
+a patch number** — it starts the rand-0.10/time-capabilities redesign,
+and pvpnclient 3.0.3 (the newest protun v2.2.1's `~3.0.1` admits)
+does not compile against it (115 errors reproduced); protun v2.2.1's
+`muon = "2"` also excludes 3.0.0. The ceiling on the pinned protun is
+muon 2.6.2 + pvpnclient 3.0.3 — pinned. Plain `cargo update`
+advancing the proton-pfff family hits the same breakage: the Proton
+transitives are held at the M3-verified set (recorded in the spike
+survey §2026-09-17 so nobody retries blind). License re-audit: every
+registry release since the original audit, muon 3.0.0 and pvpnclient
+3.3.0 archives included, still carries no license — blocker stands,
+KNOWN_UNLICENSED unchanged at 17. Toolchain pin 1.97.1 → 1.98.1
+(nixpkgs 218c873, full substitution); floor 1.97 and the msrv job
+untouched by design.
+
+Gate round 1 (five gates, 2f89db7..56c2c0d): rust PASS (2×P2 track),
+sec PASS (1×P2 in-PR), nix PASS (1×P3 track), qa PASS (P2+ tracks),
+**doc FAIL — 5×P1**, all one class: the refresh bumped some
+pinned-muon strings but not the whole family (PRD:486; api-crate
+rustdocs auth.rs:2/lib.rs:12/:118, runtime.rs:163; wire.rs:1197/
+:1218/:1270 — the canary arm identity contradicting the redact.rs:645
+comment this PR itself updated). Sec's P2: the quick-xml audit
+ignores went dead (the refreshed lock resolves 0.42.0, past both
+advisories' ≥0.41 fix line) — the file's own revisit trigger had
+fired.
+
+Fix round 5cfe840 (the class, not the symptoms): the full pin-family
+sweep (all five P1s + the P2 stale-citation cluster — from_fork sites
+renumbered :73/:75/:184, redact names exactly one pinned version
+again), the quick-xml ignores dropped with a tombstone comment
+(audit exit 0 re-verified), the manifest tamper fixture re-derived
+from the new digest (last-hex-digit flip — comment true again), the
+spike survey's lock delta corrected to the measured shape (~90
+same-major bumps, 12 added — the secret-service 5.2.0 RustCrypto set
+on the keyring chain — 1 removed), README duplicate sentence dropped.
+Re-verified: fmt/clippy/29-29 tests --locked/xtask all/audit; re-
+verdicts doc PASS (grep clean; 1×P3 track) and sec RESOLVED. CI on
+5cfe840: 8/8 (fmt, clippy, test, msrv@1.97.1, xtask, audit, doc, gui).
+
+Track items (lane-owned, not this PR): fork-secret canary arm —
+extend the stub replay with the secret-path selector emission and/or
+drive `with_selector_and_secret` in the real arm (rides the M4 engine
+move, which also forces the from_fork polling-branch gap and the
+muon 3.x migration when protun releases); expect_value version-tamper
+unit (pre-existing manifest-gate gap); channel-release nixpkgs pin
+preference for the next toolchain bump; clippy no longer runs at the
+floor (accepted: 1.97-only clippy behavior is not a compat contract);
+redact.rs:645 temporal wording ("when the S4 arm lands" — it has).
+
+Awaiting the owner's merge call.
