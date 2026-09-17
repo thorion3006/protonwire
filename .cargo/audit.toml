@@ -4,7 +4,7 @@
 ignore = [
     # Marvin Attack (RSA timing sidechannel, medium 5.9). No fixed upgrade
     # exists anywhere upstream. Reached only through the pinned engine
-    # chain rsa <- pgp <- proton-srp <- muon =2.6.1, which the PRD pins
+    # chain rsa <- pgp <- proton-srp <- muon =2.6.2, which the PRD pins
     # exactly; patching means forking the engine. Revisit on every Muon
     # upgrade.
     "RUSTSEC-2023-0071",
