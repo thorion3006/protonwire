@@ -15,9 +15,11 @@
 //! * outer-socket marks before route commit, statistics, bounded capture,
 //!   and disconnect cleanup
 
+pub mod cache;
 pub mod params;
 pub mod translate;
 
+pub use cache::{CacheError, EncryptedCache, NullCache};
 pub use params::{PeerParams, TunnelParams};
 pub use translate::translate;
 
