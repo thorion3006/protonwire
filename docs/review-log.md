@@ -2486,3 +2486,35 @@ filter path (the attempt read no-eligible-server through the
 unknown-group arm, caught before commit) — recorded as the tracked
 item it was tagged to be, with the registry seam as its named
 lane. Its doc-nit and comment-reword catches landed in-commit.
+
+## 2026-09-17 — Codex PR#9 round 21 (post-completion, pre-merge)
+
+TWO findings — the first CHALLENGED with the record, the second
+TRACKD on its existing disposition (the severity-tuned rule's exit:
+not every bot round lands code):
+
+- **P1 — "wire the entitlement adapter into production" (CHALLENGED,
+  the round-6 finding re-derived).** The production SelectionEngine
+  constructs an empty EntitlementProvider — true, and it is one of
+  THREE deliberately empty cells (CatalogService, AuthProvider,
+  EntitlementProvider), each following the recorded session-lane
+  idiom: the login family guards through with_auth and answers the
+  typed no-engine-installed refusal for EVERY request (BeginLogin,
+  RefreshSession, Logout, FIDO). No production path constructs a
+  Muon session — the finding's "logged-in free account" cannot
+  exist in this build; the empty cell IS the documented login-free
+  M3 surface, and every capability gate since r8 fail-closes on
+  the uncomposed state. The install is M4's one-liner beside the
+  auth install when the session engine lands.
+- **P2 — sequential-fetch rate abuse (TRACKED, the existing item
+  strengthened).** Sequential Selects each fetch (single-flight
+  covers only concurrency) — the genuine abuse shape for the
+  unconditional-composition tracked item the PR-4 close already
+  dispositioned as the M6 session/PF lane's owner call ("it moves a
+  network read"). The bot's rate-abuse angle is recorded WITH that
+  item as the concrete shape: a per-account inter-fetch interval
+  (the probe table's 60 s hammering guard is the in-repo precedent)
+  or freshness-bounded reuse — decided alongside composition
+  gating, at the lane owning network-read policy. Unconstructible
+  today (no adapter installed), firing exactly when the session
+  lane lands.
