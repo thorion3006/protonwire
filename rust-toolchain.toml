@@ -1,5 +1,6 @@
-# Development toolchain pin. The workspace floor is the lowest *verified*
-# toolchain, 1.97 (the Proton registry crates do not compile below ~1.94;
-# probe record in docs/spike-2026-08.md). The CI msrv job pins 1.97.1.
+# Development toolchain pin (the workspace FLOOR is lower — see the
+# rust-version key in Cargo.toml; the CI msrv job pins the floor at
+# 1.97.1 because the Proton registry crates do not compile below ~1.94,
+# probe record in docs/spike-2026-08.md).
 [toolchain]
-channel = "1.97.1"
+channel = "1.98.1"
