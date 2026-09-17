@@ -2588,3 +2588,35 @@ Carried to their lanes: M4 lands ALL THREE provider-cell installs
 §9.5 flags; M6 owns the composition-gating/interval policy + the PF
 capability source + GAP-1's pin; the registry seam owns the
 availability unit pins.
+
+## 2026-09-17 — M4 planned (the ProTUN stacked-PR breakdown)
+
+The impl-planner pass over the plan §M4, the PRD's FR-27/T-20/
+IT-1/IT-13/IT-14/OQ-15, the protocol skeleton, and the M3-carried
+record. The stack (each PR one reviewer-sitting, opened early,
+merged bottom-up):
+
+- **PR-1 m4/params-translation** — FR-27's TunnelParams → protun
+  config mapping (hermetic, rust gate).
+- **PR-2 m4/encrypted-persistent-cache** — the three-value
+  PersistentCache (ciphertext-at-rest canary, zeroize, the
+  connection-thread budget; rust + SEC gates; the AEAD dep's audit
+  verdict in the PR description).
+- **PR-3 m4/tun-fd-lifecycle** — TUN/FD ownership + the §9.5
+  hardcoded-address contract test + the mark-before-commit seam +
+  THE NETNS IT HARNESS (IT-1; rust + SEC; the unsafe-or-crate TUN
+  decision rides here, hand-rolled ~30 lines recommended).
+- **PR-4 m4/connection-engine** — the Connection wrapper, all four
+  protocols with deterministic test peers (IT-14), LocalAgent
+  requested-vs-applied reconciliation (T-20), FR-23E's
+  connection-plane composition (rust + SEC).
+- **PR-5 m4/connect-surface** — the daemon connect lane: selection
+  winner → physical → engine, VpnState/events, active_owner_uid,
+  ALL THREE provider-cell installs (the r21 entitlement one-liner),
+  the §9.5 entry/exit flags, the r11 ipc-timeout pub + deadline
+  module (rust + SEC; the M4 exit test rides here).
+
+Owner decision before PR-1: the PersistentCache KEY SOURCE —
+(a) root-owned 0600 keyfile + audited AEAD (recommended),
+(b) keyring-derived, (c) defer (rejected: the cache holds a WG
+private key).
