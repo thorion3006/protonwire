@@ -37,9 +37,9 @@ upstream:
     source: https://github.com/ProtonVPN/protun/tree/v2.2.1
     license: GPL-3.0-or-later
   muon:
-    version: 2.6.1
-    source: https://rust-registry.proton.me/downloads/muon@2.6.1.crate
-    checksum_sha256: be9ba1f347e00a86119ff6b70d36356cce28c33fd000290cc1254bf4048155de
+    version: 2.6.2
+    source: https://rust-registry.proton.me/downloads/muon@2.6.2.crate
+    checksum_sha256: 63c7119344a07143093b5790d76e93c9e827e2a3a1bca1643a5951ffd2f8e3b3
     license: unresolved-release-blocker
     license_evidence: no-license-field-or-license-file-in-source-archive
   pvpnclient:
@@ -174,7 +174,7 @@ capabilities:
     entitlement: challenge-dependent
     sources: [protun_repo]
     tests: [T-15, E2E-12]
-    blocker: Pinned Muon 2.6.1 has no public actionable human-verification event or continuation flow.
+    blocker: Pinned Muon 2.6.2 has no public actionable human-verification event or continuation flow.
 
   - id: account.sso
     area: account

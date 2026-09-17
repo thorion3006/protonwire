@@ -9,13 +9,10 @@ clients (CLI, Ratatui TUI, Tauri GUI) speaking one versioned Unix-socket
 frontend API.
 
 Status: **Milestones 1 (Foundation), 2 (Muon auth + server cache), and
-3 (server selection) complete in code** — M1 merged to `master` via
-PR #3 (5baa12a); M2 merged via PR #4 (5fd53d7, the current `master`
-tip); M3 is delivered as a four-PR stack awaiting the owner's merge
-calls, bottom-up: PR #5 (`m3/selection-core`), PR #6
-(`m3/group-registry`), PR #8 (`m3/secure-core-latency`), and
-`m3/select-surface` (the top — selection IPC/daemon wiring plus the
-CLI surface). What builds and runs today:
+3 (server selection) complete and merged** — M1 via PR #3 (5baa12a);
+M2 via PR #4 (5fd53d7); M3 as the four-PR stack PR #5 / PR #6 / PR #8 /
+PR #9, merged bottom-up to `master` at 7d873c8 (2026-09-17). What builds
+and runs today:
 
 - the M1 surface: the daemon, the versioned Unix-socket frontend API,
   CLI/TUI/GUI clients over the shared SDK, validated system
@@ -58,8 +55,10 @@ specification set is:
 
 ## ⚠ Development builds only — no distribution
 
-The pinned Proton registry crates `muon 2.6.1` and `pvpnclient 3.0.3`
-carry no license manifest or bundled license text. Registry availability
+The pinned Proton registry crates `muon 2.6.2` and `pvpnclient 3.0.3`
+carry no license manifest or bundled license text (re-audited
+2026-09-17, covering every registry release since, including
+muon 3.0.0 and pvpnclient 3.3.0). Registry availability
 does not grant redistribution rights. **No binary or source distribution
 containing these crates may be published** until Proton supplies applicable
 terms for them and every transitive Proton crate (`COPYING.md`, PRD OQ-2,
@@ -91,7 +90,7 @@ ProtonWire builds on any mainstream Linux distribution — CI proves every
 commit on stock Ubuntu runners. Two supported paths:
 
 **Nix devshell (recommended, any distro with Nix installed)** — the
-entire toolchain (rustc 1.97.1, cargo, rustfmt, clippy, gcc,
+entire toolchain (rustc 1.98.1, cargo, rustfmt, clippy, gcc,
 cargo-audit, git) comes from the repo, nothing installed system-wide.
 With direnv it activates on entry:
 
@@ -107,7 +106,7 @@ Without direnv: `nix-shell` (or `nix-shell --arg gui true`).
 `rust-toolchain.toml` pins the version for rustup users:
 
 ```sh
-rustup toolchain install 1.97.1   # or your distro's rustc >= 1.97
+rustup toolchain install 1.98.1   # or your distro's rustc >= 1.97
 # C toolchain required (gcc/clang; the engine chain builds C code)
 # GUI only: libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev \
 #           libayatana-appindicator3-dev pkg-config

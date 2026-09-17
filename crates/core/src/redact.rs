@@ -287,15 +287,16 @@ pub struct SecretSuppressFilter {
 /// cap — the levels where that module logs FR-121-forbidden values — are
 /// dropped before formatting in every build at every runtime level.
 ///
-/// muon 2.6.1 has FIVE info-level disclosure sites beyond the PRD's
+/// muon 2.6.2 has FIVE info-level disclosure sites beyond the PRD's
 /// TOTP claim (all confirmed against the pinned sources):
 ///
 /// - `muon::auth::login` — TOTP code formatted into the message body
 ///   (`login.rs:271` feeding the `info!` at `:244`), username via Display
 ///   (`:66`), SRP session id (`:82`, `:86`), UID fields (`:115-157`),
 ///   `%auth` Display (`:262`).
-/// - `muon::auth::from_fork` — the fork selector, twice (`:54`, `:156`),
-///   UID fields, `%auth` (`:82`, `:187`).
+/// - `muon::auth::from_fork` — the fork selector three times (`:73`/`:75`
+///   acquisition — 2.6.2's fork-secret path splits the site — and `:184`
+///   polling), UID fields, `%auth` (`:110`, `:215`).
 /// - `muon::store` — `Auth` Debug output carrying user_id + UID
 ///   (`store.rs:206`, `:215`; token values are redacted upstream, the
 ///   IDs are not).
@@ -334,7 +335,7 @@ const MODULE_CAPS: [(&str, Level); 8] = [
     ("muon::client", Level::WARN),
     ("muon::transport", Level::ERROR),
     // S4 sec review round 1, premise CORRECTED by the S4 fix round's
-    // captured output: at pinned muon 2.6.1, retry.rs:42 logs
+    // captured output: at pinned muon 2.6.2, retry.rs:42 logs
     // `debug!("received {res}")` via DISPLAY — status + error_code
     // only, NO headers. The header-carrying Debug (res.rs:59-67, the
     // full HeaderMap with `Set-Cookie` un-stripped below CookieSender)
@@ -641,7 +642,7 @@ pub mod canary {
     /// dependency under test would emit, against the currently-installed
     /// subscriber (the harness installs the production stack first).
     pub trait CanaryEmitter {
-        /// Arm identity for failure messages (`"stub"` now; `"muon-2.6.1"`
+        /// Arm identity for failure messages (`"stub"` now; `"muon-2.6.2"`
         /// when the S4 arm lands).
         fn name(&self) -> &'static str;
         /// Emits the dependency's events, injecting every canary class.

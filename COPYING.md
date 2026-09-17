@@ -12,9 +12,12 @@ Proton AG. Proton, Proton VPN, ProTUN, and other names may be trademarks of thei
 respective owners.
 
 ProTUN and other third-party dependencies retain their own copyright notices and
-license terms. The audited Muon 2.6.1 and `pvpnclient` 3.0.3 registry archives
+license terms. The audited Muon 2.6.2 and `pvpnclient` 3.0.3 registry archives
 contain source but no manifest license declaration or bundled license text.
 Registry availability alone does not grant redistribution permission.
+Re-audited 2026-09-17: no Proton registry release since the original audit —
+including muon 2.6.3/3.0.0 and pvpnclient 3.1.0–3.3.0 — adds a license field
+or license text; the release blocker stands unchanged.
 Project release and redistribution must remain blocked until Proton supplies
 applicable terms for those packages and every transitive Proton crate, and all
 source/license obligations documented in the PRD have been cleared.

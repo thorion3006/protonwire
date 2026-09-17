@@ -63,7 +63,7 @@ protun = { git = "https://github.com/ProtonVPN/protun", rev = "12e7755a112f59b7b
     "local-agent",
 ] }
 # Muon pin from Proton's public sparse registry; configured in .cargo/config.toml.
-muon = { version = "=2.6.1", registry = "proton", default-features = false, features = [
+muon = { version = "=2.6.2", registry = "proton", default-features = false, features = [
     "transport-hyper",
     "lenient",
     "other-product",

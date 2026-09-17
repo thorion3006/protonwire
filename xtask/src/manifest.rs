@@ -571,7 +571,7 @@ fn check_upstream(doc: &Manifest, lock: &Lockfile) -> Vec<String> {
         Some(entry) => {
             violations.extend(expect_value(
                 entry.version.as_deref(),
-                "2.6.1",
+                "2.6.2",
                 "upstream.muon.version",
             ));
             violations.extend(expect_checksum(
@@ -580,7 +580,7 @@ fn check_upstream(doc: &Manifest, lock: &Lockfile) -> Vec<String> {
             ));
             violations.extend(expect_lock_checksum(
                 entry.checksum_sha256.as_deref(),
-                lock.checksum("muon", "2.6.1"),
+                lock.checksum("muon", "2.6.2"),
                 "upstream.muon.checksum_sha256",
             ));
         }
@@ -856,7 +856,7 @@ fn status_counts(doc: &Manifest) -> BTreeMap<String, usize> {
 mod tests {
     use super::*;
     /// A minimal lockfile fixture matching the good manifest's pins — the
-    /// real Cargo.lock carries the same two checksums for muon 2.6.1 and
+    /// real Cargo.lock carries the same two checksums for muon 2.6.2 and
     /// pvpnclient 3.0.3 (Proton sparse-registry entries) and the same git
     /// source for protun 2.2.1 (`git+…?rev=…#…`, the fragment being the
     /// commit Cargo actually resolved).
@@ -866,9 +866,9 @@ version = 4
 
 [[package]]
 name = \"muon\"
-version = \"2.6.1\"
+version = \"2.6.2\"
 source = \"sparse+https://rust-registry.proton.me/index/\"
-checksum = \"be9ba1f347e00a86119ff6b70d36356cce28c33fd000290cc1254bf4048155de\"
+checksum = \"63c7119344a07143093b5790d76e93c9e827e2a3a1bca1643a5951ffd2f8e3b3\"
 
 [[package]]
 name = \"pvpnclient\"
@@ -905,8 +905,8 @@ upstream:
     version: 2.2.1
     revision: 12e7755a112f59b7b843da79290b3de25febf653
   muon:
-    version: 2.6.1
-    checksum_sha256: be9ba1f347e00a86119ff6b70d36356cce28c33fd000290cc1254bf4048155de
+    version: 2.6.2
+    checksum_sha256: 63c7119344a07143093b5790d76e93c9e827e2a3a1bca1643a5951ffd2f8e3b3
   pvpnclient:
     version: 3.0.3
     checksum_sha256: 3c14ef052727e0204ec5e80cf8df50786db38a83b6a6557a188b78a4c264f380
@@ -1047,7 +1047,7 @@ capabilities:
         // A well-formed but wrong muon digest is tampering the shape check
         // cannot see (last hex digit flipped).
         let yaml = good_manifest_yaml().replacen(
-            "be9ba1f347e00a86119ff6b70d36356cce28c33fd000290cc1254bf4048155de",
+            "63c7119344a07143093b5790d76e93c9e827e2a3a1bca1643a5951ffd2f8e3b3",
             "be9ba1f347e00a86119ff6b70d36356cce28c33fd000290cc1254bf4048155df",
             1,
         );
@@ -1218,7 +1218,7 @@ capabilities:
         // The same package+version twice (a second source, no checksum):
         // indistinguishable from the real entry by the map key alone.
         let duplicated = format!(
-            "{}\n[[package]]\nname = \"muon\"\nversion = \"2.6.1\"\nsource = \"git+https://example.com/muon?rev=deadbeef\"\n",
+            "{}\n[[package]]\nname = \"muon\"\nversion = \"2.6.2\"\nsource = \"git+https://example.com/muon?rev=deadbeef\"\n",
             good_lockfile_text()
         );
         let outcome = Lockfile::parse(&duplicated);
@@ -1724,10 +1724,10 @@ capabilities:
         upstream.insert(
             "muon".to_string(),
             UpstreamEntry {
-                version: Some("2.6.1".to_string()),
+                version: Some("2.6.2".to_string()),
                 revision: None,
                 checksum_sha256: Some(
-                    "be9ba1f347e00a86119ff6b70d36356cce28c33fd000290cc1254bf4048155de".to_string(),
+                    "63c7119344a07143093b5790d76e93c9e827e2a3a1bca1643a5951ffd2f8e3b3".to_string(),
                 ),
             },
         );
