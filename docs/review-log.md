@@ -2518,3 +2518,73 @@ not every bot round lands code):
   gating, at the lane owning network-read policy. Unconstructible
   today (no adapter installed), firing exactly when the session
   lane lands.
+
+## 2026-09-17 — MILESTONE 3 MERGED (the four-PR stack, one go)
+
+The owner merged the stack bottom-up in one pass (all four at
+2026-09-17T12:03Z): #5 (m3/selection-core) → #6 (m3/group-registry)
+→ #8 (m3/secure-core-latency) → #9 (m3/select-surface). Master tip
+7d873c8. Post-merge verification: master synced, the full suite 29/29
+targets green, the xtask validation suite PASS (manifest/dep-graph/
+m49/groups-gen/schema checks all green; the two M8 stubs disclosed).
+
+The PR#9 bot-review saga in full — TWENTY-ONE rounds, every one
+dispositioned (fixed red-first, challenged with the record, or
+tracked on its named lane):
+
+- r1-r6 (pre-stack-merge): the entitlement tier stage, the
+  group-modifier merge, the probe deadline and reservations (r1);
+  the bounded composition + release (r2); fail-closed budgets + ONE
+  9s request deadline + the hammering guard (r3); snapshot
+  validation + the gateway gate + single-flight + the network-free
+  listing (r4); the broadcast slot + the paid-location gate +
+  exact-server gateway parity (r5); identity-checked clearing + the
+  availability gate + variant-preserving errors (r6). The
+  production-install finding challenged with the session-lane
+  deferral (re-challenged r21).
+- r7: the deadline clamp (budget min the request deadline's
+  remainder).
+- r8: the plan-feature capability gate (the fourth request-gate
+  family member) + feature_difference honesty + core feature_holds.
+- r9: exact-name classification (r5's lesson generalized; two gate
+  hardenings) + FR-23G's backend-random authority.
+- r10: adapter GENERATIONS + the post-wait re-check + authoritative
+  cache invalidation (the rust gate's own P1 fixed in-commit).
+- r11: TCP-compatible probe endpoints + install atomicity (the
+  transition mutex) + resolved-request provenance. Lesson: cargo doc
+  is a local gate.
+- r12: one location read per request + revision-bound probe state
+  (write-back re-validation; the gate's two conditions in-commit).
+- The r7-r10 close passes: refactorer 4 wins/6 rejections;
+  doc-writer P1+2xP2.
+- r13: boundary physical-country validation + SecureCoreUnavailable
+  (exit 17) reachable.
+- r14: TCP-only probe endpoints (UDP dropped) + the monotonic
+  uptime probe clock.
+- r15: the five-finding round — the stale-round ordering (the gate
+  caught my own two P1s: empty decisions; the vacuous pin), SC
+  exclusions + twin, the regional default, the dry-run surface, the
+  taxonomy vocabulary.
+- r16: the direct-location gate (FR-23G's missing arms) + wire SC
+  exclusions + probe parallelism (declared-never-read) + the rustls
+  RUSTSEC bump.
+- r17: random rejects --by + boundary country validation (r13's
+  tracked item).
+- r18: transition-locked adapter capture + the active-revision tie
+  watermark + one snapshot per availability response.
+- r19: the parallelism ceiling + ProtocolUnavailable (last
+  eliminating stage) + its availability twin + the MONOTONIC
+  watermark (the bot caught r18's arrival-order flaw).
+- r20: the read-time seq stamp + the last-stage tier rule + the
+  FR-23F boundary (r17's tracked pair). The tier-positive pin
+  proven unconstructible (registry seam tracked).
+- r21: the install P1 CHALLENGED (the round-6 finding re-derived —
+  three empty session-lane cells, no production login exists) + the
+  sequential-fetch rate-abuse P2 tracked (the M6 composition item
+  strengthened).
+
+Carried to their lanes: M4 lands ALL THREE provider-cell installs
+(the r21 one-liner) + the FR-23E connection-plane composition + the
+§9.5 flags; M6 owns the composition-gating/interval policy + the PF
+capability source + GAP-1's pin; the registry seam owns the
+availability unit pins.
