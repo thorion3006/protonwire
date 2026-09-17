@@ -43,7 +43,8 @@ distro where Nix is installed.
 for rustup users), a C toolchain, and for GUI work the webkit2gtk
 development packages (see README for the list). No Nix required.
 
-The shell pins the verified toolchain (rustc 1.97.1); `rust-toolchain.toml`
+The shell pins the verified toolchain (rustc 1.98.1; the workspace
+floor is 1.97 — see README); `rust-toolchain.toml`
 is inert inside it (no rustup) and only serves rustup-based contributors
 and CI, which installs its own pinned toolchains. A flake-based devshell
 is blocked until Nix's libgit2 supports this repository's reftable ref
