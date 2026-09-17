@@ -5191,8 +5191,10 @@ dependencies = [
 name = "protonwire-protocol"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "protun",
  "thiserror 2.0.20",
+ "tracing",
 ]
 
 [[package]]
