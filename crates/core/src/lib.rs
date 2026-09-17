@@ -8,8 +8,11 @@
 //! never depends on a client, a presentation framework, or a transport.
 
 pub mod error;
+pub mod groups;
+pub mod probe;
 pub mod redact;
 pub mod scheduler;
+pub mod selection;
 pub mod state;
 
 pub use error::CoreError;

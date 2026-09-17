@@ -91,10 +91,14 @@
 //!   manifest's own entitlement vocabulary (`servers.p2p`,
 //!   `servers.secure-core`, `servers.tor`: `entitlement: paid`) and the
 //!   pinned apple classification rule. These are plan-level summaries
-//!   for surfaces like FR-23G's "clear upgrade/entitlement errors"; the
-//!   authoritative connection gate remains the per-server tier
-//!   comparison `server.tier <= max_tier` (FR-23P), composed by the
-//!   selection layer from the raw `max_tier` this model also carries.
+//!   for surfaces like FR-23G's "clear upgrade/entitlement errors" —
+//!   and, since the selection plane's round-8 capability gate, the
+//!   REQUEST-level fact: a request naming a capability whose allowance
+//!   is not `Some(true)` refuses typed at the daemon boundary
+//!   (fail-closed, the request-gate family). The authoritative
+//!   CANDIDATE gate remains the per-server tier comparison
+//!   `server.tier <= max_tier` (FR-23P), composed by the selection
+//!   layer from the raw `max_tier` this model also carries.
 //! * `gateway` — the wire `IsBusiness` flag verbatim (FR-7O: Gateway
 //!   entitlement for an authenticated organization account; absent flag
 //!   → `None`).

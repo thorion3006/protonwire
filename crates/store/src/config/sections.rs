@@ -212,7 +212,7 @@ impl Default for AccountSection {
 }
 
 /// Server-selection section.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct ServerSelectionSection {
     /// Metadata cache policy.
@@ -223,6 +223,30 @@ pub struct ServerSelectionSection {
     pub balanced_weights: BalancedWeights,
     /// Secure Core defaults.
     pub secure_core: SecureCoreSection,
+    /// The RPC-deadline budget for the per-request entitlement
+    /// composition (Codex PR#9, P1): the adapter's own fetch timeout
+    /// is 30 s but the IPC request deadline is 10 s — a slow
+    /// entitlement endpoint degrades the request to tier-None within
+    /// this budget instead of poisoning the client connection.
+    /// Validated below the 10 s IPC bar.
+    #[serde(default = "default_entitlement_fetch_budget_ms")]
+    pub entitlement_fetch_budget_ms: u64,
+}
+
+fn default_entitlement_fetch_budget_ms() -> u64 {
+    6_000
+}
+
+impl Default for ServerSelectionSection {
+    fn default() -> Self {
+        Self {
+            metadata_cache: MetadataCacheSection::default(),
+            latency_probe: LatencyProbeSection::default(),
+            balanced_weights: BalancedWeights::default(),
+            secure_core: SecureCoreSection::default(),
+            entitlement_fetch_budget_ms: default_entitlement_fetch_budget_ms(),
+        }
+    }
 }
 
 /// Metadata cache policy. The refresh interval floor is a hard product rule:
@@ -272,6 +296,14 @@ pub struct LatencyProbeSection {
     pub max_candidates: u32,
     /// Per-probe timeout.
     pub timeout_ms: u32,
+    /// TOTAL wall-clock bound on one probe round — the whole round
+    /// (every endpoint combined) must finish inside this, stopping
+    /// fresh probes at the deadline and keeping the answered prefix.
+    /// Sits deliberately under the 10 s IPC request deadline so a
+    /// `--by latency` request answers within the RPC timeout (the
+    /// Codex PR-9 arithmetic: 20 candidates × 750 ms ≈ 15 s
+    /// serialized would otherwise exceed it).
+    pub round_deadline_ms: u32,
     /// Concurrency bound.
     pub parallelism: u32,
     /// Minimum age before a cached result is reused.
@@ -288,6 +320,7 @@ impl Default for LatencyProbeSection {
             enabled: true,
             max_candidates: 20,
             timeout_ms: 750,
+            round_deadline_ms: 8000,
             parallelism: 4,
             result_min_age_minutes: 15,
             background_scan: false,
@@ -353,6 +386,20 @@ vocabulary! {
     }
 }
 
+vocabulary! {
+    /// The region taxonomy id (Codex PR#9 round 15, P2): the compiled
+    /// catalog's UN M49 six-continent view is the ONLY taxonomy the
+    /// daemon resolves regional groups against — a different
+    /// configured value would silently select under a mapping the
+    /// operator never chose, so anything else rejects at parse. The
+    /// daemon's tests pin this id against the live registry's
+    /// `taxonomy_revision()` (store cannot depend on core).
+    RegionTaxonomy at "connection_groups.region_taxonomy", default Unm49SixContinentView {
+        /// The UN M49 six-continent view (the compiled registry).
+        Unm49SixContinentView => "un-m49-six-continent-view",
+    }
+}
+
 /// Connection-group section.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
@@ -360,8 +407,9 @@ pub struct ConnectionGroupsSection {
     /// Explicit physical-country override (ISO 3166-1 alpha-2), else the
     /// cached Muon user location is used.
     pub physical_country: Option<String>,
-    /// Region taxonomy id; must match the catalog.
-    pub region_taxonomy: String,
+    /// Region taxonomy id; must match the compiled catalog (see
+    /// [`RegionTaxonomy`]).
+    pub region_taxonomy: RegionTaxonomy,
     /// Default ranking of regional groups (see [`RegionalRanking`]).
     pub regional_default_ranking: RegionalRanking,
 }
@@ -370,7 +418,7 @@ impl Default for ConnectionGroupsSection {
     fn default() -> Self {
         Self {
             physical_country: None,
-            region_taxonomy: "un-m49-six-continent-view".into(),
+            region_taxonomy: RegionTaxonomy::default(),
             regional_default_ranking: RegionalRanking::ProtonScore,
         }
     }
@@ -1131,6 +1179,28 @@ mod tests {
             "schema_version: 2\nconnection_groups:\n  regional_default_ranking: speed\n",
             "connection_groups.regional_default_ranking",
             &["proton-score", "balanced", "load", "latency"],
+        );
+    }
+
+    /// Codex PR#9 round 15 (P2): `region_taxonomy` is documented as
+    /// "must match the catalog" but nothing enforced it — any value
+    /// validated, and the daemon silently resolved regional groups
+    /// against the compiled UN M49 registry regardless. The compiled
+    /// catalog's taxonomy id (`un-m49-six-continent-view` — the
+    /// registry's own `TAXONOMY_REVISION` prefix; the daemon pins the
+    /// equality in its own tests since store cannot depend on core)
+    /// is the only accepted value.
+    #[test]
+    fn region_taxonomy_must_match_the_compiled_registry() {
+        parse_doc(
+            "schema_version: 2\nconnection_groups:\n  region_taxonomy: un-m49-six-continent-view\n",
+        )
+        .validate()
+        .unwrap();
+        assert_rejected(
+            "schema_version: 2\nconnection_groups:\n  region_taxonomy: custom-continent-view\n",
+            "connection_groups.region_taxonomy",
+            &["un-m49-six-continent-view"],
         );
     }
 

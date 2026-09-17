@@ -70,8 +70,10 @@ const EXPECTED_GROUP_COUNT: usize = 14;
 /// The v1 catalog's canonical id set (docs/connection-groups.yaml): 8
 /// `proton:*` official groups plus 6 `protonwire:*` regional fastest groups.
 /// The count check alone would let a renamed entry through, so the set
-/// itself is pinned against schema-version-1 documents.
-const EXPECTED_GROUP_IDS: [&str; EXPECTED_GROUP_COUNT] = [
+/// itself is pinned against schema-version-1 documents. THE pin for the
+/// whole xtask crate: groups-gen's own tests assert against this array
+/// (pub(crate) so they can — no mirror copies).
+pub(crate) const EXPECTED_GROUP_IDS: [&str; EXPECTED_GROUP_COUNT] = [
     "proton:anti-censorship",
     "proton:fastest-country",
     "proton:fastest-excluding-my-country",
@@ -428,7 +430,7 @@ pub(crate) struct PhysicalCountry {
 
 #[derive(Deserialize)]
 pub(crate) struct RegionalTaxonomy {
-    id: Option<String>,
+    pub(crate) id: Option<String>,
     pub(crate) vendored_snapshot: Option<VendoredSnapshot>,
     pub(crate) primary_regions: Option<BTreeMap<String, PrimaryRegion>>,
 }
@@ -447,7 +449,7 @@ pub(crate) struct PrimaryRegion {
 
 #[derive(Deserialize)]
 struct Group {
-    id: Option<String>,
+    pub(crate) id: Option<String>,
     definition_source: Option<String>,
     immutable: Option<bool>,
     ranking_policy: Option<String>,
@@ -686,7 +688,7 @@ fn check_physical_country(doc: &GroupsFile) -> Vec<String> {
     violations
 }
 
-fn check_taxonomy(doc: &GroupsFile) -> Vec<String> {
+pub(crate) fn check_taxonomy(doc: &GroupsFile) -> Vec<String> {
     let mut violations = Vec::new();
     let Some(taxonomy) = &doc.regional_taxonomy else {
         return vec!["regional_taxonomy is missing".to_string()];
@@ -768,7 +770,7 @@ fn render_group_entry(entry: &serde_json::Value) -> String {
 /// structural rules it does NOT subsume (id set, namespaces, target-kind
 /// vocabulary, per-kind required fields, cross-references into
 /// contract/sources/taxonomy) stay in `check_groups`/`check_target`.
-fn check_golden_groups_table(raw: &serde_json::Value) -> Vec<String> {
+pub(crate) fn check_golden_groups_table(raw: &serde_json::Value) -> Vec<String> {
     let Some(entries) = raw.get("groups").and_then(serde_json::Value::as_array) else {
         // The `groups` structural rule already reports the missing list.
         return Vec::new();

@@ -1231,3 +1231,1290 @@ must cover the paths your commit touches, not your crate only.
   neither counting — 17 verdict rows (S0-S14, S5 as three slices); the
   cb33bd2/d44396e/ad51356/89bc163 hashes in the incident trilogy now
   name their commits.
+
+## 2026-08-25 — M3 PR-1 close (refactorer + doc-writer, pre-merge)
+
+The owed close pass on `m3/selection-core` (PR #5, U1, 7 commits over
+master `5fd53d7`) before the owner's merge call. The implementation
+and its verdicts were complete; this entry records the verdict chain,
+the close-pass work, and the items open at the merge call.
+
+### U1's verdict chain (as it stands on the PR)
+
+- **RUST PASS + QA CONFIRMED** — the qa round killed 4/4 named
+  mutations (per the PR record; the mutation table itself was never
+  posted in-thread — the one independently commit-evidenced mutation
+  is the P2's pre-fix shape below). **sec dispositioned
+  not-matching**: a pure-function unit with no ingress surface — no
+  I/O, no network, no trust boundary; every refusal typed at the
+  input schema.
+- **The verdict round's P2** — fixed @ `485cbaa`: the exact-refusal's
+  stage diagnosis took the first catalog-wide nonzero stage count, so
+  an online exact target eliminated by the user's own exclusion
+  misreported `offline` whenever any unrelated server was offline
+  (real catalogs always have some). The diagnosis now runs
+  `eliminating_stage` on the matched server itself; red-first pinned
+  as `exact_server_elimination_names_the_matched_servers_own_stage`.
+- **The nit follow-up** — `c0233c6`, with an honest self-correction
+  disclosure: `485cbaa`'s message claimed three review nits were
+  folded in, but the edits had not been made; `c0233c6` landed them
+  and said so in the open (the disclosure class this log polices).
+  The nits: the forbidden-signals attribution (the connection-groups
+  yaml contract, not the S6 catalog module), the NetShield non-goal
+  stated in the module docs, and `parse("latency")`'s intermediate
+  InvalidRankingMode state pinned until PR-3.
+- **Benchmark evidence**: `1aa5876` measured parse 120.1 ms / select
+  3.6 ms / total 123.7 ms against the 500 ms bar (~4x headroom); this
+  pass re-ran it at the refactored tree — parse 101.1 / select 3.6 /
+  total 104.7 ms (the PR description's 94-124 ms range reproduced).
+- **CI 8/8 at `c0233c6`**: audit, clippy, doc, fmt, gui, msrv, test,
+  xtask — all green.
+
+### The refactorer's pass (behavior-gated; suite identity proven)
+
+Survey-then-act over the PR diff; three restructures landed at
+`be97c68`, three candidates rejected with reasons. Landed:
+
+1. **`Target::matches_exact`** — the exact-match predicate existed
+   twice since the P2 fix (`target_stage`'s Server/Gateway arms and
+   `filter_candidates`' matched closure); one predicate now serves
+   the filter and the refusal diagnosis, so they cannot disagree
+   about what the request named.
+2. **`FilterStage::STAGES`** — the 15 stages were enumerated three
+   times (the enum, the `ORDER` array, `label`'s match arms); order
+   and label now pair in one table that `ordinal`, `label`, and the
+   report's stage list all derive from — a new stage lands in exactly
+   one place.
+3. **`ScoringSignals::catalog_only`** — the identical non-balanced
+   provenance construction in `rank_official` and `rank_lowest_load`
+   lifted to one constructor. PR-2's in-flight `rank_random` carries
+   a third copy of the same literal and can adopt it on rebase.
+
+Rejected, with reasons (the negative results are the deliverable):
+
+- **Sharing the Spec/build_catalog test builders**: no second
+  consumer — the S6 store fixtures are a recorded static document at
+  a different discipline (parse-contract testing, not synthetic
+  catalogs), and PR-2's in-flight tests reuse THIS module's builder
+  in place, so test-locality held. A feature-gated `test_util`
+  (the M1 `protonwire-ipc::test_util` precedent — PRD 6.1 fixes the
+  member list, so no crate) is the recorded shape if a second crate
+  ever needs synthetic catalogs.
+- **Extracting the benchmark LCG/splitmix mixer as a test-util**:
+  single test-local consumer; the mixer arithmetic is disclosed in
+  place with its low-bit-trap history. PR-2's production
+  `SeededDraw` duplicates the mixer constants — folding THAT is
+  PR-2's close pass (not preempted here).
+- **The SelectionError Display family**: the thiserror `#[error]`
+  attributes are already single-site per variant with distinct
+  wording per refusal; consolidating them would invent duplication
+  where none exists.
+
+Proof of behavior identity: temp-worktree `--locked` runs at
+`c0233c6` vs `be97c68` — identical per-target counts (29 targets,
+759 passed; core 127 + 1; durations differ). Gates re-run raw-exit
+in a temp worktree at `be97c68`: fmt, clippy `-D warnings`, test,
+xtask all, doc — every exit 0.
+
+### The doc-writer's audit
+
+- **m3-plan.md**: the stack mapping is consistent with what PR-1
+  delivered (U1 = the pure core; "zero new wire/CLI surface" is true
+  of the diff: selection.rs, one lib.rs line, the plan itself).
+  Frozen decisions 1-6 each traced to code (1 → the 20k fixture
+  shape and its pins; 2 → rank_official's sort and the ties test;
+  3 → OfficialScoreUnavailable; 4 → the LoadNotExposed charges under
+  both `load` and `balanced`; 5 → LatencyDataUnavailable and the
+  uniformly-zero stability/history terms; 6 → no NetShield variant
+  plus the port-forwarding entitlement seam); 7-8 are later-PR
+  lanes, unlanded by design. One wording ambiguity noted, plan text
+  left as normative: U1's `balanced` bullet says "missing-score
+  refusal per signal below" — the missing-SCORE refusal is
+  official-only (decision 3); balanced's missing-data dispositions
+  are decisions 4/5.
+- **selection.rs module-doc sweep** (the NetShield and
+  forbidden-signals claims were verified in the verdict round): one
+  completeness fix landed — the matching-discipline paragraph named
+  only CITY names as ASCII-case-insensitive; STATE names fold
+  identically (both via eq_fold). The "scoring-signal report marks
+  them absent" phrasing audited defensible (WeightedBreakdown's
+  field docs say "zero until data exists") and left. Cross-
+  references verified: the S6 caps 16,384/262,144;
+  `forbidden_ranking_signals` in the connection-groups yaml plus
+  FR-19's `speed`; `connection_groups.physical_country` in the
+  config authority table; the S6 catalog module docs do record the
+  port-forwarding field absence.
+- **README.md** (rode this pass; a stale merge-state claim of the
+  class the M2 doc audit policed): M2 is merged at `5fd53d7`
+  (master's tip) but the status line still said "awaiting the
+  owner's merge call" — corrected to the merged state.
+- **PR description vs branch**: verified accurate — the three
+  fail-closed online substages, the value-independent forbidden-key
+  check, 44 selection tests, and the timing range all reproduce; the
+  branch carried 7 commits over master (the work order's "8" was a
+  miscount; the PR API confirms 7). The description cannot be edited
+  from here; two things postdate it — this pass's commits, and the
+  open Codex findings below.
+
+### Open at the owner's merge call
+
+Two Codex threads on the PR remain UNRESOLVED (posted after open,
+reviewed commit `c0233c6`). Both premises verified against the code;
+both are behavior/design changes, outside this pass's
+behavior-preserving scope, so they are recorded, not dispositioned:
+
+1. **P1 — `--require secure-core` is unusable on filtered targets**:
+   `required_features = [SecureCore]` under Fastest/Country/etc. can
+   never succeed — the Standard-fleet type stage eliminates every
+   Secure Core logical first, then the feature stage eliminates
+   every Standard logical. The constraint works only through an
+   exact server name today. Candidate lane: PR-3's routed Secure
+   Core target (U4) or a type-filter carve-out — a design decision,
+   not a close-pass fix.
+2. **P2 — an exact server under the official policy refuses on a
+   missing Score**: a single matched candidate needs no ranking
+   decision, but `rank_official` refuses when ANY eligible candidate
+   lacks `Score`. Frozen decision 3 says "ANY eligible candidate" —
+   the current behavior IS the decision as written; the finding
+   argues an exact-target exemption. A carve-out changes a frozen
+   decision and is the owner's call to make or decline.
+   *(Resolution, post-close: the exemption was taken — `61e54db`,
+   red-first, OFFICIAL-only; decision 3 in docs/m3-plan.md now records
+   the exception inline so later stack PRs treat it as normative. The
+   round-2 tightening (`80e815a`) restricted the exemption to the
+   Official policy so it cannot bypass Balanced's weight validation or
+   Random's entropy requirement.)*
+
+## 2026-08-25 — M3 PR-2 close (refactorer + doc-writer, pre-merge)
+
+The owed close pass on `m3/group-registry` (PR #6, U2/U3, 8 commits
+over `m3/selection-core`@db2b7cf) before the owner's merge call. The
+implementation and its verdicts were complete; this entry records the
+verdict chain, the rebase story, the close-pass work, and the items
+open at the merge call.
+
+### U2/U3's verdict chain (as it stands on the PR)
+
+- **RUST PASS + QA CONFIRMED** — the mutation table: the resolver's
+  four named mutations each killed exactly their pin (FR-23Q
+  precedence inversion → the precedence pin; proton-override-ban
+  deletion → the T-33 pin; signal-check/permission-check swap → the
+  speed-class pin; region-membership bypass → both regional pins);
+  the random policy's country-shuffle deletion → the uniformity pin
+  ("country A led 1000 of 1000 draws"); plus the VERDICT's own
+  generation-side pair — a dropped yaml group → the golden gate
+  refuses, and taxonomy drift → passed both gates pre-fix (the
+  finding), refused inline by gate 1b after (the fix's own kill
+  test, run live by the verdict session). **sec dispositioned
+  not-matching**: no runtime ingress — build-time generation from
+  the committed, golden-validated yaml; the gates are the control
+  and were verified live.
+- **P2-1 — fixed @ 33024b6** (the rebase riders): groups-gen's own
+  gates now include the S13 taxonomy pin (gate 1b) — a drifted
+  `regional_taxonomy` is refused by standalone groups-gen, not only
+  by groups-validate elsewhere in `xtask all`. This closed THE
+  PLAN'S GAP: m3-plan U2 names S13's golden-document equality as the
+  validation gate but never required generation-side self-gating,
+  and the golden table covers only `groups` — the taxonomy half of
+  the contract had no generation-side refusal until the verdict
+  caught it.
+- **P2-2 — GAP (disclosed)**: no artifact in the repo, the PR, or
+  the branch's commit messages records what P2-2 was or how it was
+  dispositioned; the coordinator confirmed it is not recoverable and
+  directed an honest gap record here. P2-1 and P3 are
+  commit-evidenced (33024b6's message carries both); P2-2 is the one
+  verdict item this entry cannot trace — the owner should treat any
+  unposted P2-2 as unresolved at the merge call.
+- **P3 — folded @ 33024b6**: rank_random adopted the parent
+  close-pass's `catalog_only` constructor (the third copy be97c68's
+  message anticipated).
+- **CI 8/8 at `58174cd`**: audit, clippy, doc, fmt, gui, msrv, test,
+  xtask — all green.
+
+### The rebase story (and the bisect hazard it left)
+
+PR-2 was rebased twice as PR-1's tip moved (first onto `6567324` —
+be97c68's consolidations plus 61e54db's thread fixes; then onto
+`db2b7cf`). The select() conflict — 61e54db's exact-single-candidate
+if/else and be97c68's match restructuring against the resolver's
+added Random arm — was hand-repaired, and the repair left the Random
+arm stranded OUTSIDE the policy match: on the pushed branch,
+**46b4f79, 663ebae, and 7bea298 are individually red**
+(`cargo check --locked -p protonwire-core` at 7bea298 in a detached
+worktree: E0308, raw exit 101, "consider using a semicolon here" at
+the stranded arm). The riders commit 33024b6 moved the arm back
+inside the match, but its message names only gate 1b, check_taxonomy,
+and catalog_only — the structural repair rode undisclosed. Disclosed
+here; the history is pushed and stays (the F3 precedent). `git
+bisect` across 46b4f79..33024b6 will stop on the three red
+intermediates.
+
+### The doc-gate private-link fixes (and one mangle)
+
+The rustdoc gate caught intra-doc links to the private `registry`
+submodule in the new module docs: `b238eba` de-linked the first
+(`[`registry`]` → "the private `registry` submodule"), `58174cd` the
+two `[`registry::COUNTRY_REGIONS`]` forms — and 58174cd's own edit
+mangled the regional-membership paragraph ("the generated the
+generated … table table": the replacement collided with the
+sentence's existing framing; its message claimed "complete"). This
+pass fixed the sentence, and the triple-gate story is now stated
+everywhere it is asserted: groups_gen's module header still said
+"Two gates" after 1b landed (now three: 1, 1b, 2), and the GENERATED
+registry header named only the golden-table and m49 gates — the
+emitted header now names the taxonomy pin too (regenerated through
+the generator; only the header bytes changed, re-verified by
+`groups-gen --check`).
+
+### The refactorer's pass (behavior-gated; suite identity proven)
+
+Survey-then-act over the PR diff; two restructures landed, three
+candidates rejected with reasons. Landed:
+
+1. **The one mixer @ `85034d6`**: the benchmark's `Lcg` and the
+   production `SeededDraw` were byte-identical `next_u64` twins
+   (same LCG constants, same splitmix64 output mix) in one file —
+   the exact fold the PR-1 close pass deferred ("folding THAT is
+   PR-2's close pass"; the single-consumer rejection flipped with
+   two consumers). `SeededDraw` is the crate's single draw device,
+   gains `below()` (the bounded roll fisher_yates did inline), the
+   20k benchmark draws from it directly, and the low-bit-trap
+   history comment moved onto the shared device where both
+   consumers read it.
+2. **THE pin, not a mirror @ `1b794b4`**: groups-gen's test
+   `CANONICAL_IDS` was a hand-copied mirror of
+   `groups::EXPECTED_GROUP_IDS` (the S13 pin) — drift-prone in
+   exactly the way this codebase's pin families have bled before.
+   The test now imports the pin (`pub(crate)`, the same widening
+   the riders gave check_taxonomy/check_golden_groups_table). The
+   core-side `CANONICAL_IDS` stays a deliberate independent copy:
+   cross-crate, and an independent consumer-side list gives T-28
+   independent teeth — the pin cannot vouch for itself.
+
+Rejected, with reasons (the negative results are the deliverable):
+
+- **The fixture-builder fold**: the PR-1 close pass's premise ("PR-2's
+  tests reuse THIS module's builder in place") was false — PR-2 built
+  its own minimal `fixture_catalog`. Re-derived and still rejected:
+  the builders are not twins (selection's 16-field `Spec` exercises
+  every pipeline knob; groups's 4-tuple is a minimal envelope with a
+  protocol-map flag — different disciplines), and only the ~8-line
+  catalog envelope is genuinely shared. Flip trigger recorded: a
+  third synthetic-catalog consumer (PR-3's U4/U5 test modules)
+  hoists `Spec`/`build_catalog` into a `#[cfg(test)]` crate module
+  then.
+- **The override-check ladder**: arm-shaped, and its ORDER is pinned
+  behavior (signal-before-permission is mutation-tested); a
+  permission table cannot express the ordering. Each rung's refusal
+  class has its own kill test — the ladder is the design.
+- **groups_gen emitter internals**: the width-budget helpers already
+  share (`emit_struct_literal`/`emit_raw_list`); the 14-entry
+  repetition lives in the GENERATED file (gate-protected, never
+  hand-refactored); the yaml→variant token maps are arm-shaped
+  matches with per-field refusal contexts.
+
+Proof of behavior identity: temp-worktree `--locked` runs at
+`58174cd` vs `1b794b4` — identical per-target counts (29 targets,
+800 passed, 0 failed; core 163, xtask 104; durations differ).
+
+### The doc-writer's audit
+
+- **m3-plan U2/U3 vs delivery**: every U2 clause traced to code (the
+  five target kinds → the GroupTarget match incl. the
+  SecureCoreRoutingPending delegation; the four override classes;
+  PolicyProvenance; FR-23Q's three-source precedence; NAT/LAN
+  riding the definition as connection-time data), every U3 clause
+  to the generated tables and their pins (six memberships, the
+  60/50/51/41/16/29 distribution, the 021+013+029 composite both
+  ways, unmapped-and-ineligible end-to-end). Plan text is normative
+  and untouched; the P2-1 gap is recorded above.
+- **CONTRIBUTING**: the gates list's "registry freshness" mention
+  (7bea298) is accurate; the adjacent "27 test targets" count was
+  not — written in 93f8254 (M1 era) and stale since the M2 close's
+  own record said 29. Corrected to 29. README audited clean: it
+  claims merged reality only, and M3 remains unmerged.
+- **Module-doc sweep**: the FR-23Q precedence and override-class
+  claims were verdict-verified; §7.3B's "core representation must
+  preserve at least" list (which the GroupEntry doc cites) was
+  verified against the PRD — which surfaced open item 1 below.
+
+### Open at the owner's merge call
+
+1. **Codex P2 (posted after this pass began; reviewed commit
+   `58174cd`) — the registry discards the catalog/source
+   revisions.** Premise verified: the yaml carries a top-level
+   `catalog_revision` and per-source `revision` values; §7.3B's
+   minimum-preservation list explicitly ends with "source revision
+   or taxonomy revision", and T-28 names source/taxonomy revisions
+   as validated content — but `GroupEntry` retains the sources'
+   KEYS only (the generator has no revision fields). FR-23T's
+   "catalog revision" status field is ambiguous between the S6
+   server catalog and the groups catalog (m3-plan's U6 currently
+   reads it as the former). Extending the generator and registry is
+   additive but changes a verdict-complete surface — recorded, not
+   dispositioned. Candidate lanes: a small generator extension in
+   this PR, or PR-4's U6 where the FR-23T fields get composed.
+2. **P2-2's disposition** — the gap above; the owner should weigh it
+   with the merge call.
+3. **The stale base and the recurring select() conflict**: PR-1's
+   tip moved again mid-pass (`80e815a`, the round-2
+   official-only-exemption fix, landed while this pass ran) — PR-2's
+   base remains db2b7cf, one commit behind. The plan's rebase-on-
+   merge will re-touch the exact select() region this pass's rebase
+   story documents: keep the Random arm INSIDE the policy match,
+   immediately after the Balanced arm (the stranded-arm shape is
+   what reddened the three intermediates). Semantically the two
+   changes are aligned — 80e815a's message explicitly accounts for
+   "Random's entropy" as a validation the normal path enforces, and
+   no PR-2 pin contradicts the official-only exemption (every
+   Random pin drives a non-exact target). The PR description's
+   "composes with Random's added policy arm" claim predates
+   80e815a's semantic change and reads differently under it.
+4. PR-1's own open Codex threads (the `--require secure-core` P1;
+   the exact-server missing-Score P2) sit one PR down the stack and
+   remain that entry's items. *(Both were subsequently resolved on
+   PR #5 — see that entry's resolution note — as were its round-3
+   findings: the balanced-overflow refusal and the doc-sync, both at
+   758ffc2.)*
+
+## 2026-08-26 — M3 PR-3 verdict round (U4+U5) + fix lane
+
+SEC PASS / RUST PASS / QA CONFIRMED-WITH-GAPS on `m3/secure-core-latency`
+(741f7f8 → d739bb4 → 3a2b32d). Sec ran for real (the prober is the
+network-probing surface): core performs no I/O — the executor seam is
+uninjected until PR-4; the hammering math verified (per-endpoint attempt
+rate bounded at 1/60s no-obs, 1/300s with-obs); no SC-fleet bypass path
+exists (the fleet partition is pinned, same-country-both-sides is a typed
+refusal, entry/exit lists refuse on every other target). Four named
+mutations killed exactly (cap/guard/cancellation/timeouts-as-∞).
+
+Fix lane (this commit): the GAP-1 asymmetry pin
+(`observed_endpoints_between_the_two_windows_are_reused` — the
+discriminating 60s–300s window the mid-development reorder left
+unpinned; the threshold-swap mutant survived the whole 187-test suite),
+the GAP-2 passthrough pin
+(`rate_limited_decisions_carry_prior_observations` — the
+prior-survives-RateLimited arm was deletable green), the P2-1 doc
+mangle restored (PolicyProvenance's header line, lost in the WIP
+recovery — the 58174cd class), and the P2-2 dead variant redocumented
+(`RankingOverrideUnavailable`'s PR-3 condition is satisfied on this
+branch; the variant stays reserved with an honest doc, no constructor).
+
+Track items (PR-4 and named lanes): the priority-order seam
+(`run_planned` iterates the map in key order — the cap fills in
+priority order but cancellation can keep the LOW-priority prefix; fix
+shape: return the decisions in shortlist order — P2-4, an owner call
+for now-or-PR-4); the caller's `last_attempt_ms` write-back contract
+(including unanswered attempts — the daemon wrapper owns it, needs a
+test); FR-23E connection-plane composition (U6/M4); the
+budget-arm-vs-rate-arm labeling split (P3); the d739bb4 doc-gate bisect
+hazard (disclosed in 3a2b32d's message; recorded here per the F3
+precedent); the executor must not log the id→address mapping (PR-4
+sec).
+
+## 2026-08-26 — M3 PR-4 close (refactorer + doc-writer, pre-merge)
+
+The owed close pass on `m3/select-surface` (U6/U7, 9 implementation
+commits over `m3/secure-core-latency`@0bc0693: the PR-3 P2-4
+priority-order fix, the FR-87 capability seam, the P2-2 weights
+precedence, the wire family, the daemon engine, the SDK wrappers, the
+U7 CLI surface, a doc-gate de-link, and the verdict round's GAP-2 pin)
+before the owner's merge call. The branch's GitHub PR is not yet
+opened — the entry records the chain for that opening. The
+implementation and its verdicts were complete when this pass began;
+the GAP-2 pin (22c2797) landed after the verdict round.
+
+### U6/U7's verdict chain (as it stands on the branch)
+
+- **SEC PASS / RUST PASS / QA CONFIRMED-WITH-GAPS** — sec ran for
+  real (PR-4 is the surface that wires the prober to the network):
+  the executor resolves endpoints FRESH from the loaded catalog and
+  never logs the id→address mapping (the PR-3 track item, honored);
+  ICMP stays fail-closed with no raw socket and no assumed
+  CAP_NET_RAW; the entitlement adapter fetch is fail-closed typed.
+  QA's mutation kills, each commit-evidenced: the write-back deletion
+  (b1a6ae3), the capability-composition drop (b1a6ae3), the FR-23Q
+  config-first inversion (b1a6ae3), the P2-2 weights-parameter
+  ignore (8f7f988), and the P2-4 key-ordered signature (125bb00,
+  red observed pre-fix). The implementation also caught one real
+  defect pre-green (the direct arm dropped the modifier exclusion
+  lists — disclosed in b1a6ae3's message).
+- **The surviving mutant = GAP-2, pinned @ 22c2797**: deleting the
+  daemon's `.take(max_candidates)` passed the ENTIRE suite — the
+  core planner's own per-run cap masked it. The daemon cap uniquely
+  bounds the per-request address-resolution loop (`probe_endpoint`
+  is O(catalog) per id; uncapped, a latency select over a broad
+  target resolves every survivor). Pinned with a fixture EXCEEDING
+  the cap (6 survivors, cap 3): exactly 3 endpoints carry an attempt
+  clock, the other 3 eliminate at the FR-18 no-latency-observation
+  boundary (whose presence in the report is itself asserted).
+- **GAP-1 (tracked, not pinned)**: the entitlement-cell inversion
+  survives UNDER THE EMPTY CAPABILITY SET — with the set empty, the
+  paid and free daemon cells eliminate identically, so no daemon-side
+  test can discriminate them today. The CORE matrix is pinned
+  (`port_forwarding_under_entitlement_evaluates_the_capability_set`,
+  ab39b69); the daemon cell gains teeth when M6's capability source
+  exists and its lane must bring the pin.
+- **Sec's two P2-track items**: (1) the entitlement composition runs
+  UNCONDITIONALLY — `resolve()` fetches the adapter on every select,
+  whether or not a PF constraint is in the request; the tracked shape
+  is gating at the session lane that installs the adapter (compose
+  once, or fetch only when PF is requested) — an owner call for M6's
+  session/PF lane, not a close-pass change (it moves a network read).
+  (2) GAP-1 above (rides M6).
+- **The P3 list** (recorded; one fixed at this pass — see below):
+  the availability-vocabulary list missing the 4th token (FIXED at
+  the close pass: `GroupAvailability::reason`'s docs now name
+  `entitlement-composition-missing`, schemas regenerated); `--by
+  speed`'s CLI placement (features/protocols refuse CLI-side
+  pre-connection, `--by`'s vocabulary refuses daemon-side through
+  `RankingPolicy::parse` — consistent but split); the free-PF refusal
+  naming M6 (the ConstraintsNotSatisfied enrichment names the
+  capability source on BOTH arms — under a FREE entitlement the
+  eliminating fact is the entitlement, so the message over-names);
+  GroupsList's 14 location reads (`group_availability` reads the
+  location cache once per group — 14 strict loads per listing; the
+  hoist also de-duplicates the absent-warning); the unused
+  `latency_probe.parallelism` knob (config accepts the concurrency
+  bound; `run_planned` executes sequentially).
+- **The doc gate**: 1e17ed3 de-linked `resolve_group`'s parameter doc
+  from the private `to_selection_policy` (the b238eba class; plain
+  text, precedence record stays on the helper).
+- **Disclosed rider**: ab39b69's fmt gate reflowed two probe.rs call
+  sites that 125bb00 had landed unformatted (the bea8f4d class —
+  fmt must cover the paths a commit touches; caught and disclosed
+  one commit later inside the same PR).
+
+### The refactorer's pass (behavior-gated; suite identity proven)
+
+Survey-then-act over the PR diff (~19 files, 6.3k insertions); three
+restructures landed at `a9368cb`, five candidates rejected with
+reasons. Landed:
+
+1. **`group_summary()`** — the `GroupEntry`→`GroupSummary` field
+   mapping existed verbatim in `groups_catalog` and `group_details`
+   (~13 lines each, 450 lines apart); one mapping now serves the
+   list row and the show summary, so a registry field lands in
+   exactly one place (the FilterStage::STAGES precedent).
+2. **`stage_reports()`** — the FR-22 report's nonzero-stages
+   projection was expressed twice (the result's typed
+   `HardFiltersReport` and the refusal `details` JSON built the same
+   filter+map inline); one projection now backs both wire forms, so
+   they cannot disagree about which stages carry what. Byte
+   identity: `StageReport` serializes to the same keys/values the
+   `json!` literal produced.
+3. **`availability_line()`** — the CLI's list and show renderings
+   carried the identical 3-arm availability match; one renderer
+   serves both.
+
+Rejected, with reasons (the negative results are the deliverable):
+
+- **The fixture-sharing flip trigger did NOT flip.** The PR-2 close
+  pass recorded the trigger as "a third synthetic-catalog consumer
+  (PR-3's U4/U5 test modules) hoists `Spec`/`build_catalog` into a
+  `#[cfg(test)]` crate module". Re-derived on this tree: U4's tests
+  live in core selection.rs's test module and reuse `Spec`/
+  `build_catalog` in place (the trigger's premise — a NEW consumer —
+  never materialized), and U5 (probe.rs) needs no catalog at all
+  (state tables over logical ids). Within core there are still
+  exactly two builders at two disciplines (the 16-field pipeline-knob
+  `Spec`; groups' 4-tuple envelope). The daemon's `catalog_body()` is
+  a new builder but the THIRD discipline and cross-crate: it plants a
+  full `CachedCatalog` byte body (etag, schema version, fetched time)
+  through the strict-read seam, because the composition wall under
+  test is the byte-level parse + seam walk, not the in-memory model.
+  Sharing would require a feature-gated `test_util` (the M1
+  `protonwire-ipc::test_util` precedent shape) and collapsing three
+  disciplines to save one ~45-line fixed fixture. Updated trigger:
+  the in-crate hoist fires on a genuinely NEW in-core consumer; the
+  cross-crate `test_util` fires when a SECOND cross-crate composition
+  suite plants catalog bodies (M4's tunnel tests are the likely
+  first).
+- **The shortlist's official-order sort vs core `rank_official`**:
+  same key shape (score, load, id — decision 2), deliberately
+  different missing-data disciplines — the ranking REFUSES on a
+  missing score (FR-19A) while the shortlist tolerates-and-deprioritizes
+  (`unwrap_or(f32::MAX)`, because probing must proceed where the
+  ranking would refuse). A shared helper would couple the tolerant
+  discipline to the refusing one, and it is private core API.
+- **The SDK wrappers' match shape**: each wrapper's
+  request→`Ok(expected)`/`Ok(other)`→`unexpected_result`/`Err`→map
+  destructure names its own result variant and call-site label — the
+  M2 family's established idiom, three new members of eleven. A
+  macro/table would invent a DSL to save five lines per member and
+  diverge from the untouched eight.
+- **A flattened clap modifier-args struct shared by `select` and
+  `connect`**: the two surfaces carry deliberately different
+  vocabularies (§9.3's full selection-plane family vs `connect`'s
+  connection-plane subset — FR-23E's boundary, recorded on
+  `SelectionModifiers`); sharing would leak the full family onto
+  `connect`.
+- **The target/policy/token mapping ladders**
+  (`direct_request`, `direct_selector`, `group_target_render`,
+  `wire_features`, `protocol_token`, `policy_token`): arm-shaped,
+  single-site, per-arm content — the ladder is the design (the PR-2
+  override-ladder rejection class).
+
+Proof of behavior identity: temp-worktree `--locked` runs at 22c2797
+vs `a9368cb` — identical per-target counts (29 targets, 856 passed,
+0 failed; durations differ).
+
+### The doc-writer's audit
+
+- **m3-plan U6/U7 vs delivery**: every U6 clause traced (the wire
+  family schema-gen'd and additive-only with PROTOCOL_VERSION held
+  at 1 per the M2 S9 precedent; the daemon arms; FR-23T's field set
+  end-to-end, with the catalog-revision ambiguity resolved by
+  carrying BOTH stamps — PR-2's open item 1 answered where its
+  candidate lanes pointed). U7 with two recorded deltas: §9.5's
+  `--entry-country`/`--exit-country` flag forms are NOT spellable at
+  the CLI (the wire `ConnectTarget::SecureCore`, the engine, and the
+  selector rendering carry both ends; the flags ride M4's
+  connect-time lane — the c6f3200 message's "§9.5 grammar" claim
+  reads more broadly than the flag surface delivered), and FR-23U's
+  pin/unpin + copy-to-profile ride M6 by design. The completion
+  header landed on m3-plan.md (the M2 precedent shape); plan text
+  below it untouched.
+- **Module-doc sweep**: the daemon engine's header contract verified
+  accurate against the code (composition order, FR-23E boundary,
+  ICMP fail-closed, the write-back contract) — untouched. Three
+  fixes landed: probe.rs's executor paragraph said the daemon
+  "(PR-4/M4) supplies the real transport" — future tense against a
+  landed executor; now names PR-4's `TransportExecutor` and the
+  deliberately-unwired ICMP lane. The CLI main.rs header still said
+  "Milestone 1 implements `status`... every other command" — stale
+  since M2, drifted through M3; now states the M1/M2/M3 surfaces.
+  `GroupAvailability::reason`'s doc named three tokens where the
+  daemon serves four — `entitlement-composition-missing` added,
+  schemas regenerated (description-only diff, schema-gen green).
+- **README.md**: status now M1+M2 merged, M3 complete-in-code as the
+  four-branch stack AWAITING the owner's merge calls (branch names
+  listed; no PR number for the top — it is not yet opened), the M3
+  capability summary added, and the "no tunneling yet" honesty line
+  sharpened for the new surface (`select` resolves and prints;
+  `connect` without `--dry-run` refuses typed).
+
+### Open at the owner's merge call
+
+1. The branch's PR is not yet opened (the stack's first three are
+   PRs #5/#6/#8); this entry and the close-pass commits are what it
+   opens with.
+2. Sec's P2-track items (the unconditional entitlement composition —
+   session-lane gating; GAP-1 riding M6) and the four remaining P3s
+   above — recorded, not dispositioned (the close pass is
+   behavior-preserving).
+3. The §9.5 entry/exit-country flag surface (M4 lane) and the
+   milestone's own tracked items ride their named lanes.
+
+## 2026-08-26 — MILESTONE 3 COMPLETE (the four-PR stack)
+
+M3 (server selection) is delivered in code as the planned stack, all
+four branches verdict-complete and close-passed, none merged yet
+(every merge is the owner's call, bottom-up):
+
+- **PR-1 `m3/selection-core` (PR #5, U1)** — the pure core: FR-23P
+  hard filters with the FR-22 structured elimination report,
+  exact/special matching with the no-fallback invariant, the
+  official/balanced/load policies with SPEED-SORT REJECTION, the 20k
+  benchmark at ~105 ms against the 500 ms bar. RUST PASS + QA
+  CONFIRMED; the exact-refusal diagnosis P2 fixed red-first.
+- **PR-2 `m3/group-registry` (PR #6, U2/U3)** — the generated
+  registry (golden + taxonomy + M49 gates), FR-23Q physical-country
+  precedence, the T-33 ranking discipline, the six regional groups.
+  RUST PASS + QA CONFIRMED; P2-1's generation-side taxonomy gate
+  closed the plan's gap; P2-2's disposition is the honest unrecoverable
+  record.
+- **PR-3 `m3/secure-core-latency` (PR #8, U4/U5)** — routed Secure
+  Core targets and the bounded on-demand prober. SEC PASS / RUST
+  PASS / QA CONFIRMED-WITH-GAPS; the verdict round's two surviving
+  mutants (the window asymmetry, the RateLimited passthrough) pinned
+  in the fix lane.
+- **PR-4 `m3/select-surface` (U6/U7)** — the wire family (additive,
+  schema-regenerated, version held), the daemon selection engine
+  (catalog strict-read seam, FR-23Q composition, the entitlement +
+  empty-capability PF composition, the prober wiring with the
+  write-back contract), the SDK wrappers, and the U7 CLI surface.
+  SEC PASS / RUST PASS / QA CONFIRMED-WITH-GAPS; the surviving
+  shortlist-cap mutant pinned after the verdict round.
+
+The stack discipline worked as the owner rule intended: each PR was
+independently coherent and verdict-complete underneath the next
+(PR-1's exact-single-candidate exemption decision fed forward as
+normative text; PR-2's open P2 on catalog revisions was answered by
+PR-3's 7a897f8 and PR-4's dual-stamp provenance; PR-3's track items —
+priority order, the write-back contract, the no-logging executor —
+landed IN PR-4 with red-first pins), and the one wire-freeze-relevant
+step (U6's schema) landed last, after every behavior it exposes was
+pinned underneath it (the plan's own rollout rule).
+
+Incidents, honestly recorded:
+
+- **Two usage-limit wipeouts** hit in-flight M3 lanes (the M2
+  incident class — every lane killed silently). Recovery followed the
+  M2-established protocol: git-log autopsy per lane, salvage briefs,
+  red-recreation for salvaged WIP; PR-3's 0bc0693 records one
+  artifact (PolicyProvenance's header "lost in the WIP recovery"),
+  and the sequential-dispatch standing rule held afterwards.
+- **The moving-base rebases**: PR-1's tip moved repeatedly under the
+  stack (61e54db's exemption, 80e815a's tightening mid-PR-2-close,
+  and the later round-3 pair at 758ffc2) — PR-2's two rebases
+  hand-repaired one select() conflict and left the stranded
+  Random-arm bisect hazard (three individually-red intermediates,
+  disclosed in PR-2's entry); the merge-time rebase of PR-2 must keep
+  the Random arm inside the policy match (the recorded hazard shape).
+  PR-4 based itself on PR-3's fix-lane tip (0bc0693) and its own
+  verdict-round pin (22c2797) postdates the round — the GAP-2 story,
+  recorded in PR-4's entry, not a rebase.
+- **The bea8f4d fmt class recurred once in-PR** (125bb00's probe.rs
+  reflow, disclosed in ab39b69) — caught inside the PR, one commit
+  later.
+
+The M3 track items that name later milestones: FR-23E's
+connection-plane composition and the §9.5 entry/exit flags (M4);
+GAP-1's entitlement-cell pin, the per-server PF capability source,
+sec's session-lane gating of the entitlement fetch, FR-23U's
+pin/unpin and copy-to-profile (M6); E2E-23/24 (the M6 staging lane);
+the P3 list in PR-4's entry above.
+
+## 2026-08-27 — Codex PR#9 round 7 (post-completion, pre-merge)
+
+One P2, verified GENUINE and fixed red-first at 5dade73: the
+entitlement wait consumed its CONFIGURED budget
+(`entitlement_fetch_budget_ms`, validation ceiling 9500 ms)
+independently of the 9 s request deadline `resolve()` arms — a slow
+fetch could overrun the daemon's own deadline toward the IPC
+client's 10 s timeout before selection or reply work began,
+contradicting the round-3 one-deadline invariant the code itself
+documents. `entitlement_composition` now takes the request deadline
+and min()-clamps the wait to its REMAINDER (the configured budget
+only tightens, never extends); the timeout warn/error report the
+EFFECTIVE clamped wait; the refusal stays the fail-closed typed
+EntitlementMissing. Pins: the clamp arm (E0061 red; ~250 ms refusal
+under a nearly-spent deadline with a never-landing adapter) and the
+budget arm (250 ms floor binding under a far deadline, lower AND
+upper bounds — the upper kills the reviewer's "deadline replaces
+budget" mutant). RUST PASS, no P1; its two P3 track items join the
+P3 list (the zero-remainder edge test; the sections.rs budget doc's
+stale 10 s framing).
+
+## 2026-08-28 — Codex PR#9 round 8 (post-completion, pre-merge)
+
+TWO findings, both verified GENUINE against the recorded contracts
+(FR-23H/FR-23S, DoD item 6's entitlement-aware special selections,
+the parity vocabulary `servers.p2p|tor|secure-core: entitlement:
+paid`), fixed red-first at 287736e:
+
+- **P1 — the plan-feature capability gate.** `FeatureAllowances`
+  were composed but never enforced: the tier stage was the only
+  gate, so the fixture's tier-0 GB-P2P handed a FREE account a
+  successful P2P selection, and a free Secure Core request died at
+  the tier stage's no-eligible-server instead of FR-23S's precise
+  entitlement error. The daemon now gates the REQUEST
+  (`unmet_capability`): a request naming p2p/tor/secure-core (the
+  Special classes, `--require`/`--prefer`, the routed target,
+  groups merging such constraints — max-security) under an
+  allowance that is not `Some(true)` refuses typed
+  EntitlementMissing BEFORE the core runs — the fourth member of
+  the request-gate family (gateway business r4/5, paid-location
+  r5/6, PF composition), fail-closed on an uncomposed snapshot.
+  The tier stage stays the CANDIDATE filter (the entitlements
+  model's recorded boundary, restated in its module doc). The
+  AVAILABILITY twin reads the same rule from the cached snapshot
+  (`entitlement` / `entitlement-composition-missing`) — the r6
+  agreement invariant extended to the special groups. Deliberate
+  behavior change, disclosed: login-free special selections now
+  refuse fail-closed (family semantics);
+  `random_draws_os_entropy_and_specials_map_to_features` moved to
+  the paid fixture.
+- **P2 — FR-23T's `feature_difference`** hard-coded `Vec::new()`
+  under a wire doc claiming selection "satisfies or refuses" —
+  false for the OPTIONAL arm (optional features weight ranking,
+  never eliminate). The core now exposes `feature_holds` — the ONE
+  evaluation vocabulary the required stage, the feature-match term,
+  and the daemon's difference report share (both private dispatch
+  sites refactored onto it) — and the daemon reports the
+  requested-but-absent optional features through it; wire doc
+  rewritten, schemas regenerated.
+
+Pins: eight daemon tests (the four free refusals, the paid
+non-regression, the fail-closed login-free, availability agreement
+across the three snapshot states, difference reporting on both
+arms) + the core vocabulary pin. RUST PASS on all seven review
+gates, no P1; track items: the group_availability triple
+lock-acquisition (joins the listing-reads P3), the optional-tor
+naming pin (P3), plus the r7 pair. The precedence note (free +
+`--require secure-core` now reads EntitlementMissing where it read
+the Standard-fleet contradiction — both typed, gate-before-core)
+is deliberate.
+
+
+## 2026-09-08 — Codex PR#9 round 9 (post-completion, pre-merge)
+
+TWO P1 findings, both verified GENUINE against the record, fixed
+red-first at 4fb01e8:
+
+- **P1a — exact-name capability parity.** An exact-SERVER target
+  carried no capability constraint, so `select server GB-P2P`
+  selected under a FREE account while `select p2p` refused — the r5
+  gateway-parity lesson (exact names must not bypass a gate the
+  class enforces) applied to the round-8 capability gate.
+  `unmet_capability` now classifies the named logical's gated bits
+  from the catalog, and the gate-review hardening folded in before
+  push: the fold runs across EVERY same-named logical (the store
+  parses no name-uniqueness constraint; first-match classification
+  would let a later duplicate carry the bit — same quantifier as
+  the r5 gateway gate's `.any()`), and Secure Core classifies by
+  the core's own fleet vocabulary (the routed shape OR the bit — a
+  tier-0 bit-less CH→SE logical is a Secure Core server). Pin:
+  `exact_name_classification_folds_duplicates_and_route_shapes`
+  (both shapes selected under free pre-fix — red analytic per the
+  gate review's construction; the shape is identical).
+- **P1b — FR-23G's backend authority.** "For a free plan,
+  ProtonWire must request... backend-authorized random server
+  changes" — the registry's `proton-backend-when-required`
+  annotation whose core resolver test says the daemon boundary must
+  honor it was never examined: free/uncomposed random requests drew
+  LOCAL entropy and returned a locally invented winner. The backend
+  change-server path lands with the session lane; until then local
+  random NEVER simulates it — non-paid/uncomposed random (the
+  Random target, the proton:random-country group) refuses typed
+  NotImplemented (fail-closed); PAID keeps local random (the
+  authority binds when-required). The availability twin reads
+  `backend-selection-required` from the cached snapshot — never a
+  false available while connecting refuses (the r6 invariant).
+  Disclosed behavior change: login-free random now refuses
+  (`random_draws_os_entropy` moved to the paid fixture).
+  `GroupAvailability`'s reason-vocabulary doc was stale (r6's
+  entitlement/account-tier tokens missing) — refreshed wholesale
+  with the new token; schemas regenerated.
+
+Pins: five new tests + the classification-hardening pin + one
+updated. RUST PASS on all six review gates, no P1; the gate
+review's two P3 hardening items are LANDED in the same commit
+(duplicate-fold + route-shape SC), leaving no new track items from
+this round beyond the standing list.
+
+
+## 2026-09-11 — Codex PR#9 round 10 (post-completion, pre-merge)
+
+TWO findings, both verified GENUINE, fixed red-first at 9560cc7 —
+plus the rust-reviewer gate's own P1, fixed in the same commit:
+
+- **P1 — the entitlement seam's cross-account leak.** `install()`
+  swapped only the adapter cell: the in-flight slot AND the cached
+  snapshot of the OLD account survived a replacement, so a selection
+  for the NEW account could join the stale slot (especially after an
+  earlier waiter timed out and left it parked) and consume the
+  previous account's MaxTier/IsBusiness — paid-tier or gateway
+  selection under the wrong account. Fix: an adapter GENERATION
+  (bumped on install, which also drops the slot and the cache);
+  every slot carries its stamp; joiners compare stamps — a parked
+  older-generation slot is replaced with a fresh worker, never
+  joined.
+- **The gate's P1 — the post-wait write-back.** The stamp guards
+  JOINING, not the parked slot's own waiter's effects: a waiter
+  whose worker lands AFTER a replacement executed
+  store_snapshot/invalidate unconditionally — parking the OLD
+  account's snapshot into the NEW account's (post-clear) cache
+  (indefinitely: the listing is network-free), or symmetrically
+  wiping a fresh cache with a stale NoAccess. Fix: the post-wait
+  generation re-check — a landed outcome under an older stamp
+  refuses fail-closed ("belongs to a replaced account session") and
+  writes nothing.
+- **P2 — authoritative-unusable snapshots never withdraw the
+  cache.** A fetched NoAccess/Waitlisted or absent-MaxTier response
+  refused selection but left the last-good snapshot cached, so the
+  network-free listing kept reporting paid group availability the
+  newest authority withheld. Both refusal arms now invalidate the
+  cache. The distinction is pinned: a TRANSPORT failure (says
+  nothing about the account) keeps the last-known-good serving the
+  listing; Api/Malformed are parse-side, equally non-authoritative.
+
+Pins: the fresh-worker composition under a new stamp, the cache
+reset on swap, the late-landing race (DelayedEntitlements lands
+after the swap — pre-fix A's paid selection served AND parked in
+B's cache), NoAccess + absent-MaxTier invalidations, and the
+transport-keeps-cache distinction (a first-serves-then-fails
+adapter — a mutant invalidating on every error dies). New fixtures:
+no_access()/no_max_tier()/DelayedEntitlements/
+TransportFailingAfterFirstFetch. rust-reviewer: FAIL on gate 1
+(its own post-wait P1 — the fix-verdict loop held: no push or
+thread replies until the fix existed) → fixed in-commit and
+re-gated green; its P2+ pin landed with it. Note: the two-worker
+window on mismatched replacement (bounded, once per swap) is the
+disclosed soft edge of the generation scheme.
+
+## 2026-09-11 — PR#9 close passes over rounds 7-10 (owner-requested, pre-merge)
+
+The stack's earlier refactor + doc close passes predate the four
+bot-review rounds; the owner asked whether they had run since. They
+had not — dispatched both over 4119a0e..9560cc7 (~1.4k insertions:
+the deadline clamp, the capability gate, exact-name classification +
+the FR-23G authority, the generation-bound seam).
+
+**Refactorer: PASS with 4 wins / 6 recorded rejections** (5ceb15c):
+the FR-23G predicate shared by the gate and its availability twin
+(one spelling — the r6 agreement invariant made structural; the
+twin's two cached reads become one), the names() closure in
+unmet_capability, the availability_of() test helper (9 in-range
+chains; the pre-range r6 sites deliberately untouched) + one
+name-level clarity rename, and the generation accessor at the
+load-before-lock site (order now stated). Rejections with reasons:
+GateOutcome unification, the two-field struct, the classification
+fold, the race-shape fixture merge, the single-site difference
+extraction, and the pre-range pf_entitlement/paid-location tri-state
+predicate (first item on the tracked listing-reads P3 lane).
+
+**Doc-writer: FAIL → fixed in-commit** — its P1: the wire doc on
+SelectionModifiers::optional_features still claimed "never
+eliminate," false since r8 for the plan-gated capabilities (the
+mirror image of the r8 feature_difference rewrite, missed then);
+caveat added, schemas regenerated. Its P2s: the
+entitlement-composition-missing token doc under-enumerated (also
+paid-location groups and the core's composition requirement), and
+the module-doc composition map missing r9/r10 (the FR-23G gate now
+in item 5; exact-name classification + the generation/invalidation
+scheme in item 3) — both landed; its P3 naming wobble (regional vs
+paid-location gate) resolved to "paid-location"; its P3-5 is r7's
+already-tracked sections.rs item. Everything else verified accurate
+(the seven reason tokens, the entitlements.rs allowance paragraph,
+every FR/round cross-reference, CLI/README drift — none).
+
+Gates: daemon 76+6, frontend-api 26, fmt/clippy clean, schema-gen
+regenerated. The close-pass rule is re-armed for any future round:
+each bot round lands real code, and the passes must follow.
+
+## 2026-09-11 — Codex PR#9 round 11 (post-completion, pre-merge)
+
+THREE findings, all verified GENUINE, fixed red-first at 0367738
+(the round fired mid-close-pass, before the r7-r10 passes' push had
+settled):
+
+- **P1 — the probe transport/endpoint mismatch.** The TCP connector
+  (`TcpStream::connect_timeout`) probed the WIREGUARD-UDP mapping's
+  endpoint FIRST — a UDP port cannot complete a TCP handshake on a
+  real network, so explicit latency and latency-weighted selections
+  refused for nearly every candidate (only first-mapped-ports that
+  happened to accept TCP answered). The injected test seams decided
+  answers, masking it. The endpoint resolution prefers the
+  TCP-COMPATIBLE mappings (TCP, then TLS; the same-host port
+  measures the same path), UDP kept as the last-resort attempt.
+- **P1 — replacement atomicity.** install() published the new
+  adapter BEFORE bumping the generation (a new-session/old-
+  generation window: a request could join a completed old-account
+  slot and pass the post-wait check), and the post-wait
+  check-to-write pair raced a replacement between them (the old
+  result repopulating the just-cleared cache). The whole transition
+  is ONE serialized step under a transition mutex (install:
+  adapter+generation+slot+cache; the composition: re-check through
+  the snapshot writes). The lock discipline is stated on the field —
+  the gate review corrected the commit's first lock-order claim (no
+  global order; statement-scoped guards; the slot path's torn reads
+  are safe via the stamp).
+- **P2 — resolved-request provenance.** `requested_features` was
+  built from the raw modifier arrays, so `select p2p` answered `[]`
+  while its hard filter applied p2p. The list now derives from the
+  RESOLVED request's constraints (target-implied, group-merged,
+  order-preserving dedupe), the inverse feature_token map pinned
+  against `as_str` (the gate review's parity pin), wire doc updated,
+  schemas regenerated.
+
+Pins: the port-recording TCP/TLS preference test (deterministic red
+— the UDP ports were recorded pre-fix), the three-arm provenance
+test (special target, group merge, dedupe), the six-variant token
+parity loop, and the 50-swap atomicity soak (analytic red,
+disclosed). RUST PASS with conditions — its two P2s (the dedupe,
+the stale wire doc) and parity pin landed in-commit; tracked: the
+secure-core target's empty requested_features (target-vs-feature
+vocabulary question, owner decision) and the group-optional
+difference mirror (unreachable today — no registry group declares
+optional features).
+
+## 2026-09-11 — Codex PR#9 round 12 (post-completion, pre-merge)
+
+TWO P2 findings, both verified GENUINE, fixed red-first at fbb7770:
+
+- **P2 — the physical-country double-read.** The group arm read the
+  cached location for FILTERING; the FR-23T provenance block re-read
+  it — a location.json refresh between the reads excluded one
+  country while the result claimed another
+  (fastest-excluding-my-country excluding GB, selecting CH,
+  reporting DE); a transient second-read failure could omit the
+  provenance entirely. The location cache is read ONCE per request
+  now and the value carried through both consumers.
+- **P2 — revision-bound probe state.** The probe table keyed
+  observations by logical id alone — a catalog refresh keeping ids
+  but changing endpoints let the 15-minute reuse window rank the
+  NEW catalog with OLD-address RTTs, violating the table's own
+  contract. The table now records the revision key (etag when
+  present, else the fetched timestamp — etag-less refreshes still
+  clear) under ONE lock with the states: the reconcile clears on a
+  changed key, and the write-back RE-VALIDATES (a concurrent round
+  straddling a refresh cannot write its observations into a newer
+  revision's table — the straddling request still consumes its own
+  coherent merged view).
+
+Pins: the first-read-GB/then-DE location seam (the reported country
+is the country that filtered; the single-read contract) and the
+etag-swap re-probe test with the etag-None/fetched-timestamp arm.
+RUST PASS with two P2 conditions — both landed in-commit (the
+one-lock fold + write-back re-validation; the None fallback), plus
+its P3s (the stated lock discipline; the parameter order). The
+round-11 doc-CI lesson held: cargo doc ran in the local gate set.
+
+## 2026-09-11 — Codex PR#9 round 13 (post-completion, pre-merge)
+
+A stack-wide check (the owner asked; #5/#6/#8 clean) surfaced TWO
+more P2 findings on PR #9, both verified GENUINE against the wire
+contracts, fixed red-first at 885d68d (+ the gate pin at fc232d1):
+
+- **P2 — the unvalidated explicit physical country.** The wire
+  contract on `--physical-country` is "uppercase ISO 3166-1 alpha-2
+  — non-canonical input refuses typed, never approximated," but the
+  value only validated when a target CONSUMED it (the
+  country-excluding groups) — `select fastest --physical-country
+  gb` succeeded and copied the lowercase value into
+  `PhysicalCountryValue` provenance. The modifier now validates at
+  the boundary, before the catalog read and every gate, through the
+  core's own grammar (`validate_country`, now exported — one
+  vocabulary, the feature_holds precedent).
+- **P2 — the unreachable dedicated refusal.** The taxonomy defines
+  `SecureCoreUnavailable` (exit 17, "No Secure Core route satisfies
+  the request") but the daemon mapped every empty candidate set to
+  the generic NoEligibleServer (exit 5). The error mapper is
+  REQUEST-AWARE now: ConstraintsNotSatisfied under a routed
+  SecureCore target returns the dedicated code, the FR-22 report
+  riding details; the PF arm derives from the resolved request's
+  constraints (the old modifier-only binding dropped — resolved ⊇
+  modifiers by the union merge, and a future PF-declaring group
+  would then fire the explanation where it genuinely applied).
+
+Pins: the non-canonical refusal (lowercase `gb` under fastest —
+pre-fix Ok with `gb` provenance; canonical GB still reports) and
+the dedicated code (a paid JP→GB request over the CH→SE-only
+fixture — pre-fix NoEligibleServer) + the gate review's combined
+PF+SC arm pin (fc232d1: the dedicated code keeps the M6
+explanation). RUST PASS, no P1/P2; tracked: the boundary-precedence
+extension (SC entry/exit and excluded_* countries still validate
+inside the core, after the gates — codes consistent once reached,
+pre-existing) and the standing list. The gate's taxonomy sweep
+confirmed no other defined code has landed semantics without an
+emitter — exit 17 was the last.
+
+## 2026-09-11 — Codex PR#9 round 14 (post-completion, pre-merge)
+
+TWO findings, both verified GENUINE, fixed red-first at edd449e:
+
+- **P1 — the UDP last resort.** Round 11's TCP-first reorder kept
+  the UDP mapping as a fallback endpoint, but the connector is
+  TCP-only — a UDP-only physical's probe (the store's committed
+  fixture carries such shapes) was a guaranteed-fail handshake
+  burning the round's timeout budget. Only TCP-compatible mappings
+  resolve now (TCP, then TLS; the legacy EntryIP:443 fallback
+  stays): a UDP-only candidate is honestly UNRESOLVED — the
+  no-observation path, never an incompatible attempt.
+- **P2 — the wall-clock probe ages.** The probe table's ages ran on
+  epoch wall time — a backward clock correction (admin fix, VM
+  reset) made every entry future-dated: saturating age 0, stale
+  RTTs treated fresh and failed probes rate-limited until wall time
+  caught up. The probe clock is now the daemon-UPTIME MONOTONIC
+  clock (a LazyLock start instant) — future-dated entries cannot
+  exist. Wall time stays the cached documents' domain (S7's guarded
+  scheduler).
+
+Pins: the UDP-only refusal (pre-fix the seam ANSWERED the UDP
+endpoint — a selection succeeding on a probe that cannot happen on
+a real network; post-fix the typed latency-data refusal with ZERO
+connects), the monotonic-contract pin (the default clock reads
+uptime-relative ms, never ~1.7e12 epoch), and the gate review's
+companion pin (mixed catalog: a UDP-only member neither poisons the
+round nor wins the latency ranking; the EntryIP:443 fallback arm —
+previously uncovered — resolves). RUST PASS, no P1/P2; its P3s
+landed in-commit (stale prose corrected; the mechanism note below).
+**Mechanism correction, recorded per the gate review:** an
+endpoint-unresolvable PLANNED id counts as attempted (run_planned
+records before the executor's None) and KEEPS its 60 s reservation —
+inert (no endpoint to hammer), budget-safe (probe cap == shortlist
+cap), cleared by the revision reconcile; this round's first commit-
+message draft wrongly claimed those ids were released.
+
+## 2026-09-12 — Codex PR#9 round 15 (post-completion, pre-merge)
+
+FIVE findings (2x P1 + 3x P2 — the largest round), all verified
+GENUINE against the config schema, the resolver contract, and the
+CLI surface; fixed red-first at 52dd4de (+bf199a0):
+
+- **P1a — the stale round.** The r12 reconcile ran in its own lock
+  before planning and cleared on ANY mismatch with no ordering: a
+  round holding an OLD catalog reaching probe_round after a newer
+  round WIPED the newer observations, and its rejected write-back
+  stranded 60 s reservations in the newer table. The reconcile now
+  runs INSIDE the planning lock, ORDERED by the fetched timestamp
+  (ties under different keys concede — same-second refreshes are
+  unknowable): a stale round plans over an empty view, PROBES its
+  own catalog, reserves nothing, writes nothing. **The gate's own
+  two P1s on the first fix, fixed in-commit:** the stale branch
+  first returned empty DECISIONS (probing nothing — a latency
+  request refused LatencyDataUnavailable), and the red-first pin
+  was VACUOUS (park-then-read captured the swapped revision — the
+  gate ran it 10x and proved the stale path had zero coverage).
+  The repaired pin reads-then-parks and asserts the connect count
+  grew. A same-second etag tie is conceded, not wiped (the gate's
+  P2 folded in).
+- **P1b — configured Secure Core exclusions.** The operator's
+  excluded entry/exit jurisdictions were composed by nothing —
+  `select secure-core` returned routes through configured-excluded
+  countries. Unioned (deduped) into every resolved routed request
+  — direct and group (max-security) — via one shared helper, with
+  the AVAILABILITY TWIN (the gate's r6-invariant catch: the listing
+  evaluated the un-unioned request and reported the group available
+  while connecting refused).
+- **P2a — the regional default ranking.** The configured
+  regional_default_ranking had no effect (the resolver saw only
+  --by; a latency default never probed). It applies when no
+  explicit --by — ONLY to PaidLocationSelection groups (Proton
+  groups forbid overrides). Tracked (gate): the origin-coupling
+  note, and the availability/latency-default refusal widening.
+- **P2b — the dry-run surface.** `Command::Connect` parsed only
+  --by/--protocol, so the `connect --dry-run` alias rejected every
+  other documented modifier while presented as the select surface.
+  The full modifier set parses now; the dry-run populates them; the
+  non-dry-run arm refuses ALL of them (the gate's catch: three Vec
+  flags first escaped the discipline).
+- **P2c — the region taxonomy.** Any string validated while the
+  daemon resolved against the compiled registry regardless. A
+  parse-time VOCABULARY now (RegionTaxonomy, one spelling — the S3
+  discipline; the store's assert_rejected idiom forced the enum,
+  not a validate() check), with the daemon-side drift guard pinning
+  the id against the live registry's taxonomy_revision().
+
+Pins: SC exclusion refusals (entry, exit-through-group, control,
+availability twin), the regional default (applies, explicit wins,
+never leaks), the repaired stale round (read-then-park + the probe
+count), the CLI parse, the store vocabulary, the drift guard. The
+gate's tracked items: the origin-coupling guard, the
+latency-default availability widening, non-dry-run refusal pins for
+the new flags. Process note, honestly recorded: the first fix draft
+also INVERTED the write-back condition (caught by the existing
+answered-probes pin pre-push) and a clippy arity warning escaped a
+rushed push (bf199a0, caught watching CI).
+
+## 2026-09-16 — Codex PR#9 round 16 (post-completion, pre-merge)
+
+THREE findings (P1 + 2x P2), all verified GENUINE, fixed red-first
+at 1d6b1ec:
+
+- **P1 — the direct-location arms.** FR-23G permits a free plan only
+  the fastest eligible connection and backend-authorized random
+  changes; naming a location (country/state/city/exact server) is
+  the paid capability HOWEVER addressed — but only the r5 regional
+  GROUP path checked it, so a free account could `select country GB`
+  over tier-0 members: locally simulated paid location selection.
+  The gate refuses unless composed-PAID, placed AFTER the capability
+  gate (an exact server naming a gated feature keeps its more
+  precise refusal). Deliberate, disclosed test fallout: the r1
+  tier-stage test now pins the gate (its stage semantics live on in
+  the fastest-country group arm — groups are not named locations);
+  the PF composition tests moved to FASTEST targets; the
+  direct-target tests install the paid fixture.
+- **P2 — per-request SC exclusions over IPC.** FR-23C's entry/exit
+  exclusions were config-only (no wire fields). SelectionModifiers
+  gains them (additive, default-empty; the Select request's
+  modifiers BOXED to hold ClientMessage's variant-size discipline —
+  wire-identical under serde and the schema), composing in both
+  arms; the core's FR-23F rule refuses them typed under non-SC
+  targets; the CLI exposes the flags on both select and connect.
+- **P2 — probe parallelism.** latency_probe.parallelism (default 4)
+  was declared and validated but never read — the serial run could
+  attempt only ~10 of 20 candidates inside the 8 s round deadline
+  (750 ms timeouts), the rest eliminated for missing latency.
+  run_planned now executes bounded-parallelism windows
+  (std::thread::scope; the executor trait &self + Sync; cancelled()
+  between windows; per-probe timeouts stay the round clamp;
+  attempted order stays shortlist order).
+
+Pins: the four-arm location test (free country + exact server, the
+uncomposed fail-closed, paid control, FASTEST-the-free-surface), the
+wire-exclusion pair (routed refusal with the dedicated code; the
+FR-23F typed refusal elsewhere), and the concurrency high-water pin
+(>= 2 in flight at parallelism 2; the serial pre-fix high-water is
+1). Process notes, honestly recorded: a batch of blind perl edits
+corrupted two test openings mid-round (repaired by hand before
+commit — the compile gate caught them); clippy discipline held
+pre-push this time (the cast, the unused mut, and the enum-size
+boxing all landed in the amended commit).
+
+## 2026-09-16 — Codex PR#9 round 17 (post-completion, pre-merge)
+
+TWO findings, both verified GENUINE, fixed red-first at fe84b88
+(the round fired during round 16's CI wait; the audit job also
+caught RUSTSEC-2026-0285 against rustls 0.23.43 — a semver
+lockfile bump to 0.23.45 at f857e20, no code change):
+
+- **P1 — the random override bypass.** A RANDOM target IS its own
+  ranking, but `select random --by official` converted the policy
+  BEFORE the target mapped to Fastest — the FR-23G backend-authority
+  gate (keyed on the RESOLVED policy) skipped, and a free account
+  got a locally-selected "random" winner. The override refuses
+  typed at the boundary now, for every plan. The gate review's
+  (target, --by) matrix sweep found no analogous shape: "random" is
+  not a parseable mode, Proton groups refuse overrides outright,
+  and every other gate keys on the wire target or the resolved
+  constraints, which --by cannot alter.
+- **P2 — boundary country validation (round 13's tracked item,
+  landed).** A non-canonical target read differently by plan: the
+  r16 location gate shadowed the core's validation for free
+  accounts (EntitlementMissing/exit 4) while paid accounts read
+  InvalidParams/exit 2. Every country-ish wire input — the Country
+  target, the SC entry/exit arms, the excluded / entry-excluded /
+  exit-excluded lists, the explicit physical country — validates at
+  the boundary before any entitlement gate (one closure over the
+  core's grammar; the core re-validates as defense-in-depth).
+
+Pins: the random-override refusal (free + `random --by official`
+pre-fix returned a LOCAL winner; the paid arm refuses identically)
+and the boundary validation (free + `country gb` pre-fix exit 4;
+the SC exit arm, the exclusion lists under a gated target, and the
+SC exclusion lists — the gate review's order-vacuity and
+unpinned-arm catches all landed in-commit, plus its flag-spelling
+message nit). RUST PASS; tracked: the FR-23F entry==exit
+cross-field rule still validates core-side (the next boundary
+item, same shape — contradictory pairs, not non-canonical codes).
+
+## 2026-09-16 — Codex PR#9 round 18 (post-completion, pre-merge)
+
+THREE P2 findings, all verified GENUINE, fixed at 8ecc61a:
+
+- **P2 — adapter capture under the transition.** single_flight_slot
+  loaded the generation before any lock shared with install() — an
+  install completing in between spawned an old-stamped worker over
+  the new adapter; the post-wait re-check refused its outcome, but
+  the stale slot then made the NEXT request spawn a second worker
+  on the same adapter (the one-worker bound defeated, bounded once
+  per race). The generation, adapter, and slot capture now holds
+  the transition lock (r10/r11's discipline completed).
+- **P2 — the active-revision tie watermark.** A same-second etag
+  change made the r15 tie rule's FIRST stamper permanent — the
+  newer ACTIVE revision, losing the tie race, re-probed forever
+  (no reuse, no rate-limit, never writing). The table now records
+  the ACTIVE revision watermark (noted at each round's entry): on
+  a tie the active key REPLACES the table; non-active tied keys
+  (older in-flight rounds) concede. Red-verified against the r15
+  rule by temporary revert — the reuse assert fails exactly there.
+- **P2 — one snapshot per availability response.** groups_catalog
+  reread the cached snapshot per row; a replacement/invalidation
+  mid-listing could mix the old account's tier with the new
+  account's allowances (a regional group reading available on a
+  dead paid tier). One clone per response now; group_availability
+  takes the caller's snapshot for every entitlement fact; the dead
+  cached_entitlement_tier helper removed.
+
+Pins: the tie-watermark test (deterministic, red-verified);
+(a)/(c) are nanosecond/mid-call windows with structural fixes and
+disclosed analytic reds — the r10/r12/r15 consistency pins stay
+green. RUST gate: PASS with the pin/message catches landed
+in-commit (flag-spelling names, the order-vacuity fix, the
+unpinned arms) — see rounds 17/18 entries.
+
+## 2026-09-16 — Codex PR#9 rounds 18-19 (post-completion, pre-merge)
+
+Round 18 (3x P2, fixed at 8ecc61a): single_flight_slot captures the
+generation/adapter/slot under the TRANSITION lock (an install
+completing between the old generation load and the slot lock spawned
+an old-stamped worker over the new adapter — its refused outcome
+left a stale slot that spawned a SECOND worker, defeating the
+one-worker bound); the ACTIVE-revision watermark (a same-second etag
+change made the r15 tie rule's first stamper permanent — the newer
+active revision re-probed forever; the watermark lets the active key
+REPLACE a tied table, non-active tied keys concede; red-verified by
+temporary revert); ONE entitlement snapshot per availability
+response (per-row rereads could mix accounts mid-listing — one
+clone, every entitlement fact derived from it, the dead helper
+removed).
+
+Round 19 (4x P2, fixed at b57bf61): the parallelism ceiling
+(1..=64 validated; the window reserves at most the shortlist length
+— u32::MAX would abort the first latency request); the dedicated
+PROTOCOL refusal (the LAST eliminating stage keys the code: protocol
+emptied what survived everything else -> ProtocolUnavailable/exit
+18, report riding details; two pre-existing pins updated to the
+dedicated code); the availability twin ('protocol-unavailable', the
+account-tier treatment); and the MONOTONIC watermark — the bot
+caught r18's own fix (arrival-order authority let a paused old-catalog
+round steal the watermark and replace the newer table): the
+watermark keys on the catalog-read SEQUENCE now, earlier reads'
+notes rejected. Pins: the ceiling, the dedicated code, the reason,
+and the watermark unit contract (the end-to-end interleaving
+unconstructible — both pause seams have guards — disclosed).
+
+## 2026-09-16 — Codex PR#9 round 20 (post-completion, pre-merge)
+
+THREE P2 findings, all verified GENUINE, fixed red-first at 68d80db:
+
+- **P2 — the read-time sequence.** The r19 catalog-read sequence
+  stamped AFTER cached_catalog() returned — a request paused
+  mid-read could take a LARGER sequence than a later-started read,
+  winning the watermark with its stale key (clearing the newer
+  table). The stamp now precedes the load: read STARTS order
+  strictly, pause or not. (Analytic red — the pause sits between
+  adjacent statements; the r19 watermark unit pin holds, and the
+  field comment records why the unused-slot-on-refusal price is
+  correct.)
+- **P2 — the last-stage tier reason.** The account-tier availability
+  reason fired on ANY tier elimination — a free snapshot over a
+  pool where paid rows die at tier AND surviving tier-0 rows die at
+  protocol read 'account-tier' (upgrade advice!) though upgrading
+  would not make the survivors compatible. Both precise reasons now
+  key on the LAST eliminating stage, one rule for tier and
+  protocol; the protocol reason's plan-relative reading (no
+  SELECTABLE member under the current plan) documented.
+- **P2 — the FR-23F boundary (r17's tracked pair).**
+  'secure-core CH→CH' validated each side but not the cross-field
+  contradiction — the capability gate shadowed it for free accounts
+  (exit 4) while paid accounts reached the core's InvalidParams
+  (exit 2). The equality check is at the boundary now:
+  plan-independent semantics, the core's own check retained as
+  defense-in-depth.
+
+Pins: the mixed-pool tier test (location CH so tier-0 GB rows
+survive to protocol while paid rows die at tier — pre-fix
+account-tier) and the equal-sides refusal (free + CH→CH pre-fix
+EntitlementMissing). RUST gate PASS; its tier-positive-pin P2+ was
+ATTEMPTED and is genuinely unconstructible — resolve_group reads
+the FROZEN registry by id, so no synthetic entry can reach the
+filter path (the attempt read no-eligible-server through the
+unknown-group arm, caught before commit) — recorded as the tracked
+item it was tagged to be, with the registry seam as its named
+lane. Its doc-nit and comment-reword catches landed in-commit.
+
+## 2026-09-17 — Codex PR#9 round 21 (post-completion, pre-merge)
+
+TWO findings — the first CHALLENGED with the record, the second
+TRACKD on its existing disposition (the severity-tuned rule's exit:
+not every bot round lands code):
+
+- **P1 — "wire the entitlement adapter into production" (CHALLENGED,
+  the round-6 finding re-derived).** The production SelectionEngine
+  constructs an empty EntitlementProvider — true, and it is one of
+  THREE deliberately empty cells (CatalogService, AuthProvider,
+  EntitlementProvider), each following the recorded session-lane
+  idiom: the login family guards through with_auth and answers the
+  typed no-engine-installed refusal for EVERY request (BeginLogin,
+  RefreshSession, Logout, FIDO). No production path constructs a
+  Muon session — the finding's "logged-in free account" cannot
+  exist in this build; the empty cell IS the documented login-free
+  M3 surface, and every capability gate since r8 fail-closes on
+  the uncomposed state. The install is M4's one-liner beside the
+  auth install when the session engine lands.
+- **P2 — sequential-fetch rate abuse (TRACKED, the existing item
+  strengthened).** Sequential Selects each fetch (single-flight
+  covers only concurrency) — the genuine abuse shape for the
+  unconditional-composition tracked item the PR-4 close already
+  dispositioned as the M6 session/PF lane's owner call ("it moves a
+  network read"). The bot's rate-abuse angle is recorded WITH that
+  item as the concrete shape: a per-account inter-fetch interval
+  (the probe table's 60 s hammering guard is the in-repo precedent)
+  or freshness-bounded reuse — decided alongside composition
+  gating, at the lane owning network-read policy. Unconstructible
+  today (no adapter installed), firing exactly when the session
+  lane lands.
