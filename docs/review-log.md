@@ -2676,3 +2676,13 @@ floor (accepted: 1.97-only clippy behavior is not a compat contract);
 redact.rs:645 temporal wording ("when the S4 arm lands" — it has).
 
 Awaiting the owner's merge call.
+
+Codex round 1 (the bot reviewed 56c2c0d, two commits behind tip):
+one P2 — remove the obsolete quick-xml advisory ignores
+(RUSTSEC-2026-0194/0195) from .cargo/audit.toml, now that the lock
+resolves quick-xml 0.42.0. Genuine for the commit it reviewed, already
+satisfied at tip: our own sec gate had flagged the identical finding
+and 5cfe840 dropped both entries (tombstone comment; audit exit 0;
+the `audit` CI job green). Replied in-thread with the evidence via
+pr-champion and resolved — zero open threads. The severity bar held:
+nothing new above P2, no code change required.
