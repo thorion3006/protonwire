@@ -1,5 +1,5 @@
 //! The Muon authentication adapter (M2 S4, T-15): `AuthenticationApi`
-//! over the pinned Muon 2.6.1 client.
+//! over the pinned Muon 2.6.2 client.
 //!
 //! State-machine mapping (spike memo Q1): Muon's login is a three-variant
 //! `LoginFlow`; the adapter keeps the session between calls and re-enters

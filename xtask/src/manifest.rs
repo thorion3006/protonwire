@@ -1048,7 +1048,7 @@ capabilities:
         // cannot see (last hex digit flipped).
         let yaml = good_manifest_yaml().replacen(
             "63c7119344a07143093b5790d76e93c9e827e2a3a1bca1643a5951ffd2f8e3b3",
-            "be9ba1f347e00a86119ff6b70d36356cce28c33fd000290cc1254bf4048155df",
+            "63c7119344a07143093b5790d76e93c9e827e2a3a1bca1643a5951ffd2f8e3b2",
             1,
         );
         let path = temp_yaml("checksum", &yaml);

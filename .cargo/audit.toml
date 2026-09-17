@@ -8,11 +8,7 @@ ignore = [
     # exactly; patching means forking the engine. Revisit on every Muon
     # upgrade.
     "RUSTSEC-2023-0071",
-    # quick-xml DoS advisories (high 7.5, fixed in >=0.41). quick-xml 0.38.4
-    # is resolved in the lockfile for a target/optional branch that no
-    # Linux build links (cargo tree finds no dependent on our targets), so
-    # the daemon and clients never execute it. Revisit if a member starts
-    # linking quick-xml or the referencing crate moves to 0.41.
-    "RUSTSEC-2026-0194",
-    "RUSTSEC-2026-0195",
 ]
+# The quick-xml ignores (RUSTSEC-2026-0194/0195) were dropped in the
+# 2026-09-17 refresh: the lockfile now resolves quick-xml 0.42.0, past
+# both advisories' >=0.41 fix line, so the entries were dead.

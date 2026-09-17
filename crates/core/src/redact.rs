@@ -677,8 +677,9 @@ pub mod canary {
                 token = %c.token,
                 "sending TOTP request with code: {}", c.totp
             );
-            // muon::auth::from_fork at info — the fork selector twice
-            // (from_fork.rs:54, :156), cookies along for the ride.
+            // muon::auth::from_fork at info — the fork selector three
+            // times (from_fork.rs:73/:75 acquisition, :184 polling),
+            // cookies along for the ride.
             tracing::event!(
                 target: "muon::auth::from_fork",
                 tracing::Level::INFO,
@@ -747,7 +748,7 @@ pub mod canary {
                 c.token
             );
             // muon::common::retry at DEBUG — emitted shape is the
-            // header-bearing WORST CASE (muon 2.6.1's actual line is
+            // header-bearing WORST CASE (muon 2.6.2's actual line is
             // Display: status/error_code only — the header-carrying
             // Debug is unlogged upstream; see the MODULE_CAPS entry's
             // engine-upgrade-trap-guard rationale). The stub pins the
@@ -1020,7 +1021,8 @@ mod suppression_policy_tests {
     #[test]
     fn muon_from_fork_store_common_auth_client_are_capped_at_warn() {
         let f = SecretSuppressFilter::for_build(false);
-        // from_fork: the fork selector at info (from_fork.rs:54, :156).
+        // from_fork: the fork selector at info (from_fork.rs:73, :75,
+        // :184 — acquisition secret/plain and polling).
         assert!(!f.allows("muon::auth::from_fork", &Level::INFO));
         // store: Auth Debug with user_id + UID (store.rs:206, :215).
         assert!(!f.allows("muon::store", &Level::INFO));
@@ -1036,7 +1038,7 @@ mod suppression_policy_tests {
 
     /// S4 sec review (round 1; premise corrected by the S4 fix round's
     /// captured output — see MODULE_CAPS): `muon::common::retry`'s
-    /// actual 2.6.1 line is Display (status only), but its header-bearing
+    /// actual 2.6.2 line is Display (status only), but its header-bearing
     /// Debug is one render away from live; the cap holds the class.
     #[test]
     fn muon_common_retry_is_capped_at_warn_in_every_build() {

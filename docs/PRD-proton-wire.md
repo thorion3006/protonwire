@@ -483,7 +483,7 @@ The application must not use:
 - resolvconf as a mandatory dependency
 - desktop network applets
 
-ProTUN commit `12e7755a112f59b7b843da79290b3de25febf653` (tagged `v2.2.1`) is the initial pin. That source tag does not include a Cargo lockfile, so ProtonWire's committed root lockfile is the authority: it initially resolves Muon `2.6.1` and `pvpnclient` `3.0.3` with their registry checksums. Upgrades require adapter tests, parity tests, dependency-license review, and release notes. Packet capture is disabled by default, size-bounded, permission-restricted, and requires explicit user action for each capture.
+ProTUN commit `12e7755a112f59b7b843da79290b3de25febf653` (tagged `v2.2.1`) is the initial pin. That source tag does not include a Cargo lockfile, so ProtonWire's committed root lockfile is the authority: it initially resolves Muon `2.6.2` and `pvpnclient` `3.0.3` with their registry checksums. Upgrades require adapter tests, parity tests, dependency-license review, and release notes. Packet capture is disabled by default, size-bounded, permission-restricted, and requires explicit user action for each capture.
 
 ### 6.6 Linux Network Integration {#66-linux-network-integration}
 

@@ -9,7 +9,7 @@
 //! The pinned crate is re-exported so the workspace lockfile governs its
 //! resolution and so this crate is the single place upstream API changes
 //! land. The trait skeletons below are the S0 deliverable
-//! (docs/spike-2026-08.md, "M2 S0"): they mirror the pinned Muon 2.6.1
+//! (docs/spike-2026-08.md, "M2 S0"): they mirror the pinned Muon 2.6.2
 //! surface, are deliberately synchronous and object-safe so core and the
 //! daemon keep their synchronous trust boundary and the standard `&dyn`
 //! seam-injection idiom, and carry no behavior yet. The S4 adapter
@@ -115,7 +115,7 @@ pub enum BlockedReason {
     /// Connection feedback: out of scope for the required flows.
     Feedback,
     /// A challenge shape pinned Muon cannot continue (e.g. recovery
-    /// codes, which Muon 2.6.1 does not model).
+    /// codes, which Muon 2.6.2 does not model).
     UnsupportedChallenge,
 }
 
