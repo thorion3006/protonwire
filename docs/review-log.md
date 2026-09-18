@@ -2718,23 +2718,29 @@ key collision). The gate's PR-3 note recorded: the tun-contract
 prefixes are the PRD's /32//128, never pvpnclient's internal
 24/112 netstack values.
 
-## 2026-09-17 — PR#12 bot round 1 (M4 PR-1): the four findings
+## 2026-09-17 — M4 PR-2 (m4/encrypted-persistent-cache): the encrypted three-value store
 
-All verified GENUINE, fixed red-first at 7d799a7: (P1) FR-32G/ER-11
-transport constraint — constrain_transports clears the non-selected
-lists and omits non-serving peers (Smart keeps all); (P1) NFR-16A
-zeroizing key storage — ClientPrivateKey(Arc<Zeroizing<String>>),
-shared clones, two-layer Debug redaction, Zeroizing decode
-intermediate; (P2) the post-skip recheck — serves_translated over
-the DECODED survivors refuses Unavailable when the malformed peer
-was the only transport carrier; (P2) SNI strategy propagation —
-the engine-agnostic SniStrategy rides TunnelParams onto ProTUN's
-enum (pre-fix hard-coded Random). Protocol gains Default (Smart).
+Stacked on PR-1 (#12); opened as PR #13. The owner's key-source
+decision (a) implemented: the root-owned 0600 keyfile (refusing to
+re-key a wrong-size one), XChaCha20-Poly1305 over per-key files
+(zero new code — the AEAD rides the boringtun pin, lock-verified),
+tamper/wrong-key as absence, the 64 KiB budget both sides, the
+NullCache for hermetic lanes.
 
-Parallel-lane coordination, recorded: the identical hardening pass
-appeared UNCOMMITTED in the shared worktree mid-PR-2, was
-withdrawn, then re-derived independently against the bot threads
-here. The cache branch (PR #13) is the other lane's active surface
-(its c462b69 addresses the gate round there); the branches divide
-cleanly — PR-1 fixes on m4/params-translation, PR-2 fixes on
-m4/encrypted-persistent-cache, no shared files at this round.
+The combined rust+SEC gate FAILED first (the fix-verdict loop held):
+its P1s — the read-side unbounded allocation and the keyfile
+temp-window/residue (0644-then-chmod; failure-path .tmp leak) —
+plus its P2s (the Zeroizing windows incl. put's plaintext; the
+unique temp suffix; the honest with_key_bytes doc) and its four
+missing pins (oversize read, failure residue, nonce freshness,
+concurrent coherence) ALL landed in-commit at ff66372. Its P3s:
+the explicit threat-model sentence and the non-unix set_private
+note — tracked to the PR-3 lane's doc pass.
+
+Shared-worktree incident, honestly recorded: a parallel lane's
+uncommitted hardening pass on params.rs/translate.rs appeared in
+the working tree mid-build and was withdrawn by its owner mid-read
+(files changed between two reads); two orphaned import lines were
+the only residue, removed here. The interrupted first push left an
+identical-tree duplicate on the remote (d9c1f87), superseded by the
+amended ff66372 via force-with-lease over the identical base.
