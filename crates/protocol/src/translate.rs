@@ -9,6 +9,8 @@ use protun::api::connection::{
     WgPeerPublicKey,
 };
 
+use zeroize::Zeroizing;
+
 use crate::ProtocolError;
 use crate::params::TunnelParams;
 
@@ -25,6 +27,10 @@ use crate::params::TunnelParams;
 /// * [`ProtocolError::InvalidPeer`] — a malformed peer key or entry
 ///   address: the peer is skipped ONLY when another well-formed peer
 ///   exists; a field error on the LAST well-formed peer refuses.
+/// * [`ProtocolError::Unavailable`] — the successfully decoded peer
+///   set cannot serve the requested transport (the post-skip
+///   recheck: the pre-flight may have passed on a peer that
+///   decoding then dropped).
 pub fn translate(params: &TunnelParams) -> Result<InitialConnectionConfig, ProtocolError> {
     // The dead-transport pre-flight AT the choke point (the gate
     // review's catch): every candidate lacking the requested
@@ -36,14 +42,22 @@ pub fn translate(params: &TunnelParams) -> Result<InitialConnectionConfig, Proto
         return Err(ProtocolError::Unavailable(params.protocol));
     }
     let peers = translate_peers(&params.peers)?;
-    let wg_private_key = match &params.client_private_key_base64 {
-        Some(key) => Some(decode_client_key(key)?),
+    // The POST-SKIP recheck (the bot round's P2): the pre-flight
+    // passed over the RAW set — a malformed peer may have been the
+    // only one carrying the requested transport's ports, and its
+    // skip above left a set that cannot serve the request. The
+    // recheck runs over the DECODED survivors.
+    if !serves_translated(&peers, params.protocol) {
+        return Err(ProtocolError::Unavailable(params.protocol));
+    }
+    let peers = constrain_transports(peers, params.protocol)?;
+    let wg_private_key = match &params.client_private_key {
+        Some(key) => Some(decode_client_key(key.expose())?),
         None => None,
     };
     // The connection mode is the SAME for every protocol in this
     // milestone: no LocalAgent session engine exists yet (the M4
-    // PR-4 lane wires `ConnectionMode::LocalAgent`); Smart versus
-    // explicit protocols steers only through the port sets below.
+    // PR-4 lane wires `ConnectionMode::LocalAgent`).
     let connection_mode = match wg_private_key {
         Some(key) => ConnectionMode::NoLocalAgent {
             wg_private_key: Some(key),
@@ -56,23 +70,97 @@ pub fn translate(params: &TunnelParams) -> Result<InitialConnectionConfig, Proto
             ));
         }
     };
+    let sni_strategy = match params.sni_strategy {
+        crate::params::SniStrategy::Random => protun::api::connection::SniStrategy::Random,
+        crate::params::SniStrategy::Top => protun::api::connection::SniStrategy::Top,
+    };
     Ok(InitialConnectionConfig {
         peers,
         network_available: params.network_available,
         pcap_file: None,
         connection_mode,
-        sni_strategy: protun::api::connection::SniStrategy::Random,
+        sni_strategy,
     })
 }
 
-/// Decodes the base64 client key into ProTUN's fixed-size type.
+/// Whether the decoded peer set serves the requested transport.
+fn serves_translated(peers: &[PeerInfo], protocol: crate::Protocol) -> bool {
+    let serves = |peer: &PeerInfo| match protocol {
+        crate::Protocol::Smart => {
+            !peer.udp_ports.is_empty() || !peer.tcp_ports.is_empty() || !peer.tls_ports.is_empty()
+        }
+        crate::Protocol::WireGuardUdp => !peer.udp_ports.is_empty(),
+        crate::Protocol::WireGuardTcp => !peer.tcp_ports.is_empty(),
+        crate::Protocol::Stealth => !peer.tls_ports.is_empty(),
+    };
+    peers.iter().any(serves)
+}
+
+/// FR-32G/ER-11 (the bot round's P1): `InitialConnectionConfig` has
+/// no separate protocol selector — a MANUAL request must constrain
+/// every peer to that transport by CLEARING the non-selected port
+/// lists (ProTUN stays free to pick any transport it can see; the
+/// translated config shows it exactly one). Peers that cannot serve
+/// the selected transport are OMITTED. Smart keeps every list
+/// (ProTUN's own cycling is the feature).
+fn constrain_transports(
+    peers: Vec<PeerInfo>,
+    protocol: crate::Protocol,
+) -> Result<Vec<PeerInfo>, ProtocolError> {
+    if matches!(protocol, crate::Protocol::Smart) {
+        return Ok(peers);
+    }
+    let mut constrained = Vec::with_capacity(peers.len());
+    for mut peer in peers {
+        match protocol {
+            crate::Protocol::WireGuardUdp => {
+                peer.tcp_ports.clear();
+                peer.tls_ports.clear();
+                if peer.udp_ports.is_empty() {
+                    continue;
+                }
+            }
+            crate::Protocol::WireGuardTcp => {
+                peer.udp_ports.clear();
+                peer.tls_ports.clear();
+                if peer.tcp_ports.is_empty() {
+                    continue;
+                }
+            }
+            crate::Protocol::Stealth => {
+                peer.udp_ports.clear();
+                peer.tcp_ports.clear();
+                if peer.tls_ports.is_empty() {
+                    continue;
+                }
+            }
+            crate::Protocol::Smart => unreachable!("the Smart arm returned above"),
+        }
+        constrained.push(peer);
+    }
+    if constrained.is_empty() {
+        return Err(ProtocolError::Unavailable(protocol));
+    }
+    Ok(constrained)
+}
+
+/// Decodes the base64 client key into ProTUN's fixed-size type. The
+/// decoded intermediate is Zeroizing (NFR-16A: no unzeroized key
+/// bytes on any path, including the length-error drop).
 fn decode_client_key(key: &str) -> Result<WgClientPrivateKey, ProtocolError> {
     use base64::Engine;
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(key)
-        .map_err(|error| ProtocolError::InvalidKey(format!("client key is not base64: {error}")))?;
-    WgClientPrivateKey::try_from(bytes)
-        .map_err(|_| ProtocolError::InvalidKey("client key is not 32 bytes".to_owned()))
+    let bytes = Zeroizing::new(
+        base64::engine::general_purpose::STANDARD
+            .decode(key)
+            .map_err(|error| {
+                ProtocolError::InvalidKey(format!("client key is not base64: {error}"))
+            })?,
+    );
+    let array: [u8; 32] = bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| ProtocolError::InvalidKey("client key is not 32 bytes".to_owned()))?;
+    Ok(WgClientPrivateKey(array))
 }
 
 /// Decodes one peer's key and address into ProTUN's types.
@@ -167,7 +255,8 @@ mod tests {
             peers,
             protocol: crate::Protocol::WireGuardUdp,
             network_available: true,
-            client_private_key_base64: Some(key_base64()),
+            client_private_key: Some(crate::params::ClientPrivateKey::new(key_base64())),
+            sni_strategy: crate::params::SniStrategy::default(),
         }
     }
 
@@ -185,7 +274,7 @@ mod tests {
     #[test]
     fn a_missing_client_key_refuses_typed() {
         let mut request = params(vec![peer("a", 0)]);
-        request.client_private_key_base64 = None;
+        request.client_private_key = None;
         let error = translate(&request).unwrap_err();
         assert!(matches!(error, ProtocolError::MissingKey(_)), "{error}");
     }
@@ -193,14 +282,16 @@ mod tests {
     #[test]
     fn a_malformed_client_key_refuses_typed() {
         let mut request = params(vec![peer("a", 0)]);
-        request.client_private_key_base64 = Some("not-base64!!!".to_owned());
+        request.client_private_key = Some(crate::params::ClientPrivateKey::new(
+            "not-base64!!!".to_owned(),
+        ));
         assert!(matches!(
             translate(&request),
             Err(ProtocolError::InvalidKey(_))
         ));
         // Right base64, wrong length: refused too, never padded.
         let mut request = params(vec![peer("a", 0)]);
-        request.client_private_key_base64 = Some("AAAA".to_owned());
+        request.client_private_key = Some(crate::params::ClientPrivateKey::new("AAAA".to_owned()));
         assert!(matches!(
             translate(&request),
             Err(ProtocolError::InvalidKey(_))
@@ -323,7 +414,9 @@ mod tests {
         );
     }
 
-    /// FR-7P/T-32: the private key never renders in Debug output.
+    /// FR-7P/T-32: the private key never renders in Debug output —
+    /// at BOTH layers now (the wrapper's own Debug and the params'
+    /// manual impl).
     #[test]
     fn tunnel_params_debug_never_renders_the_key() {
         let rendered = format!("{:?}", params(vec![peer("a", 0)]));
@@ -332,5 +425,84 @@ mod tests {
             !rendered.contains(&key_base64()),
             "the key bytes must not appear: {rendered}"
         );
+        let wrapper = format!("{:?}", crate::params::ClientPrivateKey::new(key_base64()));
+        assert_eq!(wrapper, "ClientPrivateKey([redacted])");
+    }
+
+    /// The bot round's P1 (FR-32G/ER-11): a MANUAL request
+    /// constrains every translated peer to that transport — the
+    /// non-selected port lists are CLEARED (ProTUN sees exactly one
+    /// transport) and peers that cannot serve it are OMITTED. Smart
+    /// keeps every list (ProTUN's cycling is the feature).
+    #[test]
+    fn a_manual_request_constrains_every_peer_to_one_transport() {
+        // UDP requested over a dual-transport peer: the tcp/tls lists
+        // clear in the OUTPUT (the input keeps composing freedom).
+        let config = translate(&params(vec![peer("dual", 0)])).unwrap();
+        assert_eq!(config.peers[0].udp_ports, vec![443, 1194]);
+        assert!(
+            config.peers[0].tcp_ports.is_empty() && config.peers[0].tls_ports.is_empty(),
+            "ProTUN must not see a non-requested transport: {:?}",
+            config.peers[0]
+        );
+
+        // A peer that cannot serve the requested transport is
+        // OMITTED; one that can survives.
+        let mut tcp_only = peer("tcp-only", 1);
+        tcp_only.udp_ports.clear();
+        let config = translate(&params(vec![peer("udp-ok", 0), tcp_only])).unwrap();
+        assert_eq!(config.peers.len(), 1);
+        assert_eq!(config.peers[0].peer_id, "udp-ok");
+
+        // Smart keeps every list.
+        let mut request = params(vec![peer("dual", 0)]);
+        request.protocol = crate::Protocol::Smart;
+        let config = translate(&request).unwrap();
+        assert!(!config.peers[0].tcp_ports.is_empty());
+        assert!(!config.peers[0].tls_ports.is_empty());
+    }
+
+    /// The bot round's P2: the post-skip recheck — the pre-flight
+    /// passed over the RAW set on a malformed peer that was the only
+    /// carrier of the requested transport; the recheck over the
+    /// DECODED survivors refuses Unavailable instead of starting a
+    /// dead cycle.
+    #[test]
+    fn the_only_transport_carrier_malformed_refuses_after_the_skip() {
+        let mut malformed_carrier = peer("carrier", 0);
+        malformed_carrier.public_key_base64 = "not-base64!!!".to_owned();
+        // A well-formed peer WITHOUT UDP ports (the requested
+        // transport): the pre-flight passes on the carrier's ports,
+        // the skip drops the carrier, and the survivors cannot serve.
+        let mut tcp_only = peer("tcp-only", 1);
+        tcp_only.udp_ports.clear();
+        let error = translate(&params(vec![malformed_carrier, tcp_only])).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                ProtocolError::Unavailable(crate::Protocol::WireGuardUdp)
+            ),
+            "the recheck over the decoded set: {error}"
+        );
+    }
+
+    /// The bot round's P2: the configured SNI strategy propagates —
+    /// Top maps through (pre-fix Random was hard-coded, silently
+    /// ignoring connection.protun.sni_strategy).
+    #[test]
+    fn the_configured_sni_strategy_propagates() {
+        let mut request = params(vec![peer("a", 0)]);
+        request.sni_strategy = crate::params::SniStrategy::Top;
+        let config = translate(&request).unwrap();
+        assert!(matches!(
+            config.sni_strategy,
+            protun::api::connection::SniStrategy::Top
+        ));
+        // The default stays Random.
+        let config = translate(&params(vec![peer("a", 0)])).unwrap();
+        assert!(matches!(
+            config.sni_strategy,
+            protun::api::connection::SniStrategy::Random
+        ));
     }
 }
