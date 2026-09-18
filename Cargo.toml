@@ -85,6 +85,14 @@ base64 = "0.22.1" # already in-graph via muon->proton-srp->bcrypt (lock v0.22.1)
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
+# --- Tunnel crypto (M4 PR-2: the persistent cache's AEAD) -------------------
+# The SAME AEAD the tunnel data plane uses (boringtun), already
+# in-graph via protun -> pvpnclient -> proton-boringtun: zero new
+# code, the WG-ecosystem audit rides the pin. XChaCha's 24-byte
+# nonce makes RANDOM nonces safe without a counter.
+chacha20poly1305 = "0.10"
+getrandom = "0.3" # already in-graph (ring/muon paths); OS randomness
+
 # --- System ---------------------------------------------------------------
 # `poll` backs the ipc tests' deterministic readability checks (WO-R4).
 nix = { version = "0.31", features = ["socket", "user", "fs", "signal", "poll"] }

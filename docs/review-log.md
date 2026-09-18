@@ -2717,3 +2717,30 @@ distinctness (the Debug pin can no longer pass on a client/peer
 key collision). The gate's PR-3 note recorded: the tun-contract
 prefixes are the PRD's /32//128, never pvpnclient's internal
 24/112 netstack values.
+
+## 2026-09-17 — M4 PR-2 (m4/encrypted-persistent-cache): the encrypted three-value store
+
+Stacked on PR-1 (#12); opened as PR #13. The owner's key-source
+decision (a) implemented: the root-owned 0600 keyfile (refusing to
+re-key a wrong-size one), XChaCha20-Poly1305 over per-key files
+(zero new code — the AEAD rides the boringtun pin, lock-verified),
+tamper/wrong-key as absence, the 64 KiB budget both sides, the
+NullCache for hermetic lanes.
+
+The combined rust+SEC gate FAILED first (the fix-verdict loop held):
+its P1s — the read-side unbounded allocation and the keyfile
+temp-window/residue (0644-then-chmod; failure-path .tmp leak) —
+plus its P2s (the Zeroizing windows incl. put's plaintext; the
+unique temp suffix; the honest with_key_bytes doc) and its four
+missing pins (oversize read, failure residue, nonce freshness,
+concurrent coherence) ALL landed in-commit at ff66372. Its P3s:
+the explicit threat-model sentence and the non-unix set_private
+note — tracked to the PR-3 lane's doc pass.
+
+Shared-worktree incident, honestly recorded: a parallel lane's
+uncommitted hardening pass on params.rs/translate.rs appeared in
+the working tree mid-build and was withdrawn by its owner mid-read
+(files changed between two reads); two orphaned import lines were
+the only residue, removed here. The interrupted first push left an
+identical-tree duplicate on the remote (d9c1f87), superseded by the
+amended ff66372 via force-with-lease over the identical base.
