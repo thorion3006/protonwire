@@ -51,8 +51,11 @@ pub mod tun_contract {
 }
 
 /// Protocol capability reporting.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Protocol {
+    /// Smart Protocol (ProTUN-chosen) — the default: an
+    /// unconfigured request lets the engine choose.
+    #[default]
     /// Smart Protocol (ProTUN-chosen).
     Smart,
     /// WireGuard over UDP.
