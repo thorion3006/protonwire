@@ -89,6 +89,7 @@ impl EncryptedCache {
                         bytes.len()
                     )));
                 }
+                ensure_keyfile_private(key_path)?;
                 Zeroizing::new(bytes)
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -145,7 +146,9 @@ impl EncryptedCache {
     /// Reads and decrypts one entry. The SIZE CAP applies to reads
     /// too (the gate review's P1): a foreign/corrupted file of any
     /// size is absence — never an unbounded allocation on the
-    /// connection thread.
+    /// connection thread. The FILE NAME rides the AEAD as AAD (the
+    /// gate review's P2): a swapped ciphertext between cache files
+    /// fails the tag — reads as absence, never as the wrong value.
     fn read_entry(&self, key: CacheKey) -> Option<Vec<u8>> {
         let path = self.file_for(key);
         let metadata = fs::metadata(&path).ok()?;
@@ -154,27 +157,48 @@ impl EncryptedCache {
         }
         let bytes = fs::read(&path).ok()?;
         let (nonce, ciphertext) = split_entry(&bytes)?;
-        self.cipher.decrypt(nonce, Payload::from(ciphertext)).ok()
+        let aad = path.file_name()?.to_string_lossy().into_owned();
+        self.cipher
+            .decrypt(
+                nonce,
+                Payload {
+                    msg: ciphertext,
+                    aad: aad.as_bytes(),
+                },
+            )
+            .ok()
     }
 
     /// Encrypts and writes one entry (0600, atomic-replace). The
     /// plaintext is ZEROIZED after the write (the gate review's P2:
     /// the WG private key leaves no heap residue — the same class
-    /// as the at-rest discipline).
+    /// as the at-rest discipline). The file NAME binds as AAD.
     fn write_entry(&self, key: CacheKey, plaintext: Zeroizing<Vec<u8>>) -> Result<(), CacheError> {
         let mut nonce_bytes = [0u8; NONCE_LEN];
         getrandom::fill(&mut nonce_bytes)
             .map_err(|error| CacheError::Io(format!("OS randomness: {error}")))?;
         let nonce = XNonce::from_slice(&nonce_bytes);
+        let path = self.file_for(key);
+        let aad = path
+            .file_name()
+            .ok_or_else(|| CacheError::Io("no file name".to_owned()))?
+            .to_string_lossy()
+            .into_owned();
         let ciphertext = self
             .cipher
-            .encrypt(nonce, Payload::from(plaintext.as_slice()))
+            .encrypt(
+                nonce,
+                Payload {
+                    msg: plaintext.as_slice(),
+                    aad: aad.as_bytes(),
+                },
+            )
             .map_err(|_| CacheError::Crypto("encryption failed".to_owned()))?;
         let mut file = MAGIC.to_vec();
         file.push(VERSION);
         file.extend_from_slice(&nonce_bytes);
         file.extend_from_slice(&ciphertext);
-        write_private(&self.file_for(key), &file, &nonce_bytes)
+        write_private(&path, &file, &nonce_bytes)
     }
 }
 
@@ -295,6 +319,32 @@ fn open_new_private(path: &Path) -> Result<std::fs::File, CacheError> {
         .write(true)
         .open(path)
         .map_err(|error| CacheError::Io(error.to_string()))
+}
+
+/// The reuse-path mode check (the gate review's third P1): a
+/// PRE-EXISTING keyfile wider than 0600 refuses — a planted or
+/// restore-mangled keyfile never rides silently (the same
+/// fail-closed treatment as the wrong-size check). Unix-only (the
+/// daemon is Linux); non-unix builds skip (no mode to check).
+#[cfg(unix)]
+fn ensure_keyfile_private(key_path: &Path) -> Result<(), CacheError> {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = fs::metadata(key_path)
+        .map_err(|error| CacheError::KeyFile(error.to_string()))?
+        .permissions()
+        .mode();
+    if mode & 0o777 != 0o600 {
+        return Err(CacheError::KeyFile(format!(
+            "the keyfile mode is {mode:o}, expected 0600 — refusing (a wider keyfile \
+             never rides silently; tighten it and retry)"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn ensure_keyfile_private(_key_path: &Path) -> Result<(), CacheError> {
+    Ok(())
 }
 
 /// Cache failures. All variants carry NO key material (I/O paths
@@ -547,6 +597,49 @@ mod tests {
             None,
             "the cap refuses before the read allocates"
         );
+    }
+
+    /// The gate review's reuse-path mode P1: a PRE-EXISTING keyfile
+    /// wider than 0600 refuses — a planted/restore-mangled keyfile
+    /// never rides silently (pre-fix: the mode was never checked).
+    #[test]
+    fn a_too_wide_preexisting_keyfile_refuses() {
+        let dir = temp_dir("widemode");
+        let key_path = dir.join("cache.key");
+        fs::write(&key_path, key_bytes(14)).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&key_path, fs::Permissions::from_mode(0o644)).unwrap();
+            let error = EncryptedCache::open(&dir.join("cache"), &key_path).unwrap_err();
+            assert!(
+                error.to_string().contains("0600"),
+                "the refusal names the expected mode: {error}"
+            );
+            assert!(
+                error.to_string().contains("644"),
+                "the refusal names the observed mode: {error}"
+            );
+        }
+    }
+
+    /// The gate review's AAD P2: swapping two cache files' contents
+    /// fails both tags — each reads as ABSENCE, never as the wrong
+    /// value (pre-fix: the shared master key decrypted both fine).
+    #[test]
+    fn swapped_cache_files_read_as_absent() {
+        let dir = temp_dir("swap");
+        let cache = EncryptedCache::with_key_bytes(&dir, &key_bytes(15)).unwrap();
+        cache.put(CacheKey::Certificate, b"cert-material".to_vec());
+        cache.put(CacheKey::PrivateKey, b"key-material".to_vec());
+        let cert_path = cache.file_for(CacheKey::Certificate);
+        let key_path = cache.file_for(CacheKey::PrivateKey);
+        let cert_bytes = fs::read(&cert_path).unwrap();
+        let key_bytes_on_disk = fs::read(&key_path).unwrap();
+        fs::write(&cert_path, key_bytes_on_disk).unwrap();
+        fs::write(&key_path, cert_bytes).unwrap();
+        assert_eq!(cache.get(CacheKey::Certificate), None, "the tag fails");
+        assert_eq!(cache.get(CacheKey::PrivateKey), None, "both tags fail");
     }
 
     /// The gate review's temp-residue P1: a FAILED write leaves no
