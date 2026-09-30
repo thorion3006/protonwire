@@ -30,7 +30,7 @@ pub use engine::{
     EngineError, EngineEvent, EngineMode, EngineMuonEnv, EngineNetshield, EnginePeerRef,
     EngineSettingType, EngineStats, EngineVpnState,
 };
-pub use facade::{PersistenceFacade, PersistenceHealth};
+pub use facade::{PersistenceFacade, PersistenceHealth, SharedFacadeCache};
 pub use marks::{MarkApplier, MarkHealth, MarkingFdCallback, SoMarkApplier};
 pub use params::{PeerParams, TransportEndpoint, TunnelParams};
 pub use reconcile::{FeatureDivergence, FeatureReconciliation};
