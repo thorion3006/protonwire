@@ -14,6 +14,7 @@
 pub mod authz;
 pub mod bus;
 pub mod client;
+pub mod deadline;
 pub mod frame;
 pub mod peer;
 pub mod server;
