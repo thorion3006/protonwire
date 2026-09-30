@@ -19,7 +19,7 @@
 //!
 //! **Threat model** (the PR-2 gate's tracked item): the encryption
 //! defends the cache contents against a NON-ROOT local attacker who
-//! can reach the filesystem — mis-modeored backups, stolen disk
+//! can reach the filesystem — mis-modeled backups, stolen disk
 //! images, other-uid reads. It does NOT defend against root on the
 //! host: root reads the keyfile by construction (decision (a)), and
 //! everything the cache holds is equally present in the daemon's
@@ -527,12 +527,13 @@ fn hex_slice(bytes: &[u8]) -> String {
     out
 }
 
-/// Private-mode file creation (the PR-2 gate's tracked note): the
-/// 0600-from-first-byte guarantee rides `OpenOptionsExt::mode`, a
-/// Unix-only API — ProtonWire targets Linux exclusively (PRD §14), so
-/// there is no non-Unix permission story to maintain; on non-Unix
-/// builds this helper and its callers compile out with the rest of the
-/// filesystem cache, not silently degrade to default modes.
+/// Private-mode file creation (the PR-2 gate's tracked note): on Unix
+/// the 0600-from-first-byte guarantee rides `OpenOptionsExt::mode`.
+/// The non-Unix arm below DEGRADES — it creates without a mode call
+/// (umask applies) because std exposes no portable permission story;
+/// ProtonWire targets Linux exclusively (PRD §14), that arm exists
+/// only so the crate type-checks elsewhere, and it is untested by
+/// design.
 #[cfg(unix)]
 fn open_new_private(path: &Path) -> Result<std::fs::File, CacheError> {
     use std::os::unix::fs::OpenOptionsExt;
