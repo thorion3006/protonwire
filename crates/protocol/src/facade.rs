@@ -31,6 +31,7 @@ use crate::cache::EncryptedCache;
 /// write for a key wins within a drain). The put payload is
 /// Zeroizing (the bot round-4 P2): ops discarded by coalescing or a
 /// full queue scrub on drop.
+#[derive(Clone)]
 enum Op {
     Put(String, Zeroizing<Vec<u8>>),
     Remove(String),
@@ -188,7 +189,10 @@ impl PersistentCache for PersistenceFacade {
         // queue records the backpressure failure to health (the
         // callback returns — the memory answer stands, the disk
         // write is lost and REPORTED, never silently queued
-        // without bound).
+        // without bound). The owned input is Zeroizing FROM ENTRY
+        // (the bot round-6 P2): the cap-rejected credential
+        // scrubs on the early return too.
+        let bytes = Zeroizing::new(bytes);
         if bytes.len() > crate::cache::MAX_PLAINTEXT_LEN {
             record_failure(
                 &self.health,
@@ -201,11 +205,11 @@ impl PersistentCache for PersistenceFacade {
         self.memory
             .lock()
             .expect("facade memory lock")
-            .insert(name.clone(), Zeroizing::new(bytes.clone()));
+            .insert(name.clone(), Zeroizing::new(bytes.to_vec()));
         let send_result = self
             .sender
             .as_ref()
-            .map(|sender| sender.try_send(Op::Put(name, Zeroizing::new(bytes))));
+            .map(|sender| sender.try_send(Op::Put(name, Zeroizing::new(bytes.to_vec()))));
         if matches!(send_result, Some(Err(mpsc::TrySendError::Full(_)))) {
             record_failure(
                 &self.health,
@@ -271,16 +275,101 @@ fn record_failure(health: &HealthSlot, message: &str) {
     tracing::warn!(%message, "persistence failure recorded to health");
 }
 
+/// The BOUNDED RETRY (ER-18, the bot round-6 P1): a failed op's
+/// LATEST desired state is retained per key and retried with a
+/// bounded backoff — a transient filesystem failure never leaves the
+/// disk stale until ProTUN happens to update again. The retention
+/// is at most one op per key (three keys — naturally bounded), and
+/// the backoff doubles per consecutive failure up to the cap.
+struct RetryLane {
+    /// The latest failed op per key (by name; ClearAll keyed "").
+    pending: Vec<(String, Op, std::time::Instant)>,
+    /// The current backoff (doubles per consecutive failure).
+    backoff: Duration,
+}
+
+/// The retry backoff floor and cap (ER-18's "bounded").
+const RETRY_BACKOFF_START: Duration = Duration::from_millis(250);
+const RETRY_BACKOFF_MAX: Duration = Duration::from_secs(30);
+
+impl RetryLane {
+    fn new() -> Self {
+        Self {
+            pending: Vec::new(),
+            backoff: RETRY_BACKOFF_START,
+        }
+    }
+
+    /// Retains the op, replacing any prior op for the same key.
+    fn retain(&mut self, op: Op) {
+        let name = match &op {
+            Op::Put(name, _) | Op::Remove(name) => name.clone(),
+            Op::ClearAll => String::new(),
+        };
+        self.pending.retain(|(existing, _, _)| *existing != name);
+        let deadline = std::time::Instant::now() + self.backoff;
+        self.pending.push((name, op, deadline));
+        self.backoff = (self.backoff * 2).min(RETRY_BACKOFF_MAX);
+    }
+
+    /// The earliest deadline among the pending ops (the wake time),
+    /// or a long sleep when idle.
+    fn next_deadline(&self) -> Option<std::time::Instant> {
+        self.pending.iter().map(|(_, _, at)| *at).min()
+    }
+
+    /// Drains the ops whose backoff has elapsed (failure clears the
+    /// lane for the key — a fresh retain re-arms it).
+    fn take_ready(&mut self, now: std::time::Instant) -> Vec<Op> {
+        let mut ready = Vec::new();
+        let mut index = 0;
+        while index < self.pending.len() {
+            if self.pending[index].2 <= now {
+                let (_, op, _) = self.pending.remove(index);
+                ready.push(op);
+            } else {
+                index += 1;
+            }
+        }
+        ready
+    }
+
+    /// A success for this key clears any pending retry and resets
+    /// the backoff ladder.
+    fn note_success(&mut self, name: &str) {
+        self.pending.retain(|(existing, _, _)| existing != name);
+        if self.pending.is_empty() {
+            self.backoff = RETRY_BACKOFF_START;
+        }
+    }
+}
+
 /// The worker loop (serialized — FR-7JB): drains ops in BATCHES with
 /// per-key COALESCING (the bot round-2 P1's claim made real — only
 /// the LAST op per key in a batch applies), failures recorded to
 /// health through the cache's FALLIBLE path, the applied counter
-/// advancing only on success.
+/// advancing only on success — and the LATEST failed state retained
+/// for bounded-backoff retry (ER-18).
 fn worker_loop(cache: Arc<EncryptedCache>, receiver: mpsc::Receiver<Op>, health: &HealthSlot) {
     let mut batch: Vec<Op> = Vec::with_capacity(QUEUE_BOUND);
-    while let Ok(op) = receiver.recv() {
-        // Blocked for the first op; drain whatever else is ready.
-        batch.push(op);
+    let mut retry = RetryLane::new();
+    loop {
+        // Wake at the next retry deadline if one is pending;
+        // otherwise block for the first op.
+        match retry.next_deadline() {
+            Some(deadline) => match receiver.recv_timeout(deadline - std::time::Instant::now()) {
+                Ok(op) => batch.push(op),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            },
+            None => match receiver.recv() {
+                Ok(op) => batch.push(op),
+                Err(_) => break,
+            },
+        }
+        // Retry-ready ops first (the desired state precedes any new
+        // batch — the coalescer dedups them).
+        batch.extend(retry.take_ready(std::time::Instant::now()));
         while batch.len() < QUEUE_BOUND {
             match receiver.try_recv() {
                 Ok(op) => batch.push(op),
@@ -322,7 +411,16 @@ fn worker_loop(cache: Arc<EncryptedCache>, receiver: mpsc::Receiver<Op>, health:
         }
         coalesced.reverse();
         for op in coalesced {
-            let result: Result<(), crate::cache::CacheError> = match op {
+            let op_name = match &op {
+                Op::Put(name, _) | Op::Remove(name) => name.clone(),
+                Op::ClearAll => String::new(),
+            };
+            // The attempt consumes the op's payload; the RETRY lane
+            // keeps a clone (ER-18 — the failed state re-applies at
+            // the backoff; the payload is Zeroizing, the clone
+            // scrubs with its source).
+            let attempt = op.clone();
+            let result: Result<(), crate::cache::CacheError> = match attempt {
                 Op::Put(name, bytes) => match key_from_name(&name) {
                     Some(key) => cache.try_put(key, bytes.to_vec()),
                     None => Ok(()),
@@ -339,11 +437,17 @@ fn worker_loop(cache: Arc<EncryptedCache>, receiver: mpsc::Receiver<Op>, health:
             };
             match result {
                 Ok(()) => {
+                    retry.note_success(&op_name);
                     health
                         .applied
                         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 }
-                Err(error) => record_failure(health, &error.to_string()),
+                Err(error) => {
+                    record_failure(health, &error.to_string());
+                    // ER-18: the failed op's LATEST desired state is
+                    // retained for the bounded-backoff retry.
+                    retry.retain(op);
+                }
             }
         }
     }
@@ -607,5 +711,89 @@ mod round3_tests {
         second.put(CacheKey::Certificate, b"v".to_vec());
         let third = EncryptedCache::open(&shared, &key_path).unwrap();
         assert_eq!(third.get(CacheKey::Certificate), Some(b"v".to_vec()));
+    }
+}
+
+#[cfg(test)]
+mod round6_tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use protun::api::connection::{CacheKey, PersistentCache};
+
+    use super::*;
+    use crate::cache::EncryptedCache;
+
+    fn temp_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "protonwire-r6-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// ER-18's bounded retry (the bot round-6 P1): a FAILED put
+    /// whose target then becomes writable RETRIES at the backoff —
+    /// the disk converges to the desired state without a new op.
+    #[test]
+    fn a_failed_put_retries_when_the_target_recovers() {
+        let dir = temp_dir("retry");
+        let cache = Arc::new(EncryptedCache::with_key_bytes(&dir, &[13u8; 32]).unwrap());
+        // Block the write, then unblock it so the retry can land.
+        std::fs::create_dir_all(dir.join("certificate.bin")).unwrap();
+        let facade = PersistenceFacade::start(Arc::clone(&cache));
+        facade.put(CacheKey::Certificate, b"recovered".to_vec());
+        // Give the first attempt time to fail (records to health).
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while facade.health().last_failure.is_none() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            facade.health().last_failure.is_some(),
+            "the first attempt failed and recorded"
+        );
+        // Recover the target.
+        std::fs::remove_dir_all(dir.join("certificate.bin")).unwrap();
+        // The retry lane re-applies at the backoff (250ms start,
+        // doubling). Poll up to 30s for the disk convergence.
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            if cache.get(CacheKey::Certificate) == Some(b"recovered".to_vec()) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the retry never converged: {:?}",
+                facade.health()
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    /// The bot round-6 P1 (clear sweeps ALL): with TWO entries on
+    /// disk and the FIRST blocked, the clear still removes the
+    /// second — one failure, not a stopped sweep.
+    #[test]
+    fn clear_all_attempts_every_entry_despite_one_failure() {
+        let dir = temp_dir("sweep");
+        let cache = EncryptedCache::with_key_bytes(&dir, &[14u8; 32]).unwrap();
+        cache.put(CacheKey::Certificate, b"c".to_vec());
+        cache.put(CacheKey::PrivateKey, b"k".to_vec());
+        // Block the FIRST key's removal.
+        let cert = dir.join("certificate.bin");
+        std::fs::remove_file(&cert).unwrap();
+        std::fs::create_dir_all(&cert).unwrap();
+        let error = cache.try_clear_all().unwrap_err();
+        assert!(error.to_string().contains("io"), "{error}");
+        // The SECOND entry is gone anyway (the sweep did not stop).
+        assert!(
+            !dir.join("private-key.bin").exists(),
+            "the sweep attempted every entry"
+        );
     }
 }
