@@ -15,6 +15,7 @@ use protonwire_ipc::{EventBus, RequestHandler, SessionContext};
 
 use std::path::{Path, PathBuf};
 
+pub mod connect;
 pub mod services;
 
 pub use services::DaemonServices;
