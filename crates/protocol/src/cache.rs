@@ -250,8 +250,20 @@ impl PersistentCache for EncryptedCache {
 
     fn remove(&self, key: CacheKey) {
         let name = format!("{key:?}");
-        match fs::remove_file(self.file_for(key)) {
-            Ok(()) => {}
+        let path = self.file_for(key);
+        match fs::remove_file(&path) {
+            Ok(()) => {
+                // The DIRECTORY sync (the bot round-3 P2): a removal
+                // is durable only when its directory entry is — a
+                // crash before the sync resurrects the credential
+                // the worker counted applied.
+                #[cfg(unix)]
+                if let Some(parent) = path.parent()
+                    && let Ok(dir) = fs::File::open(parent)
+                {
+                    let _ = dir.sync_all();
+                }
+            }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => {
                 tracing::warn!(key = %name, %error, "persistent-cache remove failed");
@@ -421,9 +433,13 @@ fn read_keyfile(key_path: &Path) -> Result<Option<Vec<u8>>, CacheError> {
         // Zeroizing FROM THE READ (the bot round-2 P2): the plain
         // Vec is wrapped before ANY fallible check — a wrong-length
         // or otherwise-refusing path frees key material zeroized.
+        // The BOUNDED read (the bot round-3 P2): at most KEY_LEN + 1
+        // bytes — a malformed huge keyfile cannot grow the buffer
+        // before the length check refuses it.
         let mut bytes = Zeroizing::new(Vec::with_capacity(KEY_LEN));
         let mut file = file;
-        file.read_to_end(bytes.as_mut())
+        std::io::Read::take(&mut file, KEY_LEN as u64 + 1)
+            .read_to_end(bytes.as_mut())
             .map_err(|error| CacheError::KeyFile(error.to_string()))?;
         if bytes.len() != KEY_LEN {
             return Err(CacheError::KeyFile(format!(
@@ -474,40 +490,51 @@ enum CreateKeyfileError {
 fn create_keyfile_no_replace(
     key_path: &Path,
     key_bytes: &[u8],
-    _nonce: &[u8; NONCE_LEN],
+    nonce: &[u8; NONCE_LEN],
 ) -> Result<(), CreateKeyfileError> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        // The direct final-path creation: create_new + mode(0o600).
-        // The keyfile is the RAW 32 key bytes — plaintext under 0600
-        // (the decision-(a) record); no cache-file framing. fsync
-        // BEFORE publication (the bot's fsync P2: a power loss must
-        // not orphan the keyfile while ciphertext survives), then
-        // the parent-directory sync.
-        let mut file = match OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .mode(0o600)
-            .open(key_path)
-        {
-            Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                return Err(CreateKeyfileError::LostRace);
-            }
-            Err(error) => {
-                return Err(CreateKeyfileError::Io(CacheError::KeyFile(
-                    error.to_string(),
-                )));
-            }
+        // The ATOMIC PUBLISH (the bot round-3 P2): create_new made
+        // the final pathname visible BEFORE the key bytes were
+        // written — a racing loser could reload a still-empty file.
+        // The fix: write a UNIQUE TEMP (create_new + 0600 + sync),
+        // then publish with link() — an atomic no-replace rename; a
+        // loser's link fails EEXIST against the winner's COMPLETE
+        // file. The keyfile is the RAW 32 key bytes under 0600 (the
+        // decision-(a) record).
+        let [hi, lo] = hex_byte(nonce[0]);
+        let [hi2, lo2] = hex_byte(nonce[1]);
+        let temp = key_path.with_extension(format!("tmp{hi}{lo}{hi2}{lo2}"));
+        let write = || -> std::io::Result<()> {
+            let mut file = OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .mode(0o600)
+                .open(&temp)?;
+            file.write_all(key_bytes)?;
+            file.sync_all()?;
+            Ok(())
         };
-        if let Err(error) = file.write_all(key_bytes).and_then(|()| file.sync_all()) {
-            let _ = fs::remove_file(key_path);
+        if let Err(error) = write() {
+            let _ = fs::remove_file(&temp);
             return Err(CreateKeyfileError::Io(CacheError::KeyFile(
                 error.to_string(),
             )));
         }
-        drop(file);
+        // link(): no-replace publish (EEXIST = lost the race), the
+        // std-safe wrapper for a two-pathname syscall.
+        if let Err(error) = fs::hard_link(&temp, key_path) {
+            let _ = fs::remove_file(&temp);
+            return if error.kind() == std::io::ErrorKind::AlreadyExists {
+                Err(CreateKeyfileError::LostRace)
+            } else {
+                Err(CreateKeyfileError::Io(CacheError::KeyFile(
+                    error.to_string(),
+                )))
+            };
+        }
+        let _ = fs::remove_file(&temp);
         if let Some(parent) = key_path.parent()
             && let Ok(dir) = fs::File::open(parent)
         {
@@ -517,7 +544,7 @@ fn create_keyfile_no_replace(
     }
     #[cfg(not(unix))]
     {
-        let _ = (key_path, key_bytes);
+        let _ = (key_path, key_bytes, nonce);
         Ok(())
     }
 }

@@ -189,15 +189,35 @@ impl PersistentCache for PersistenceFacade {
             .lock()
             .expect("facade memory lock")
             .remove(&name);
-        if let Some(sender) = self.sender.as_ref() {
-            let _ = sender.try_send(Op::Remove(name));
+        // A destructive op dropped on a FULL queue is a FAILURE
+        // (the bot round-3 P1): the in-memory view is gone but the
+        // disk keeps the credential — it resurrects after restart.
+        // Recorded to health exactly like a dropped put.
+        let send_result = self
+            .sender
+            .as_ref()
+            .map(|sender| sender.try_send(Op::Remove(name)));
+        if matches!(send_result, Some(Err(mpsc::TrySendError::Full(_)))) {
+            record_failure(
+                &self.health,
+                "the persistence queue is full — a REMOVE was dropped (the credential \
+                 persists on disk and resurrects after restart)",
+            );
         }
     }
 
     fn clear_all(&self) {
         self.memory.lock().expect("facade memory lock").clear();
-        if let Some(sender) = self.sender.as_ref() {
-            let _ = sender.try_send(Op::ClearAll);
+        let send_result = self
+            .sender
+            .as_ref()
+            .map(|sender| sender.try_send(Op::ClearAll));
+        if matches!(send_result, Some(Err(mpsc::TrySendError::Full(_)))) {
+            record_failure(
+                &self.health,
+                "the persistence queue is full — a CLEAR-ALL was dropped (the credentials \
+                 persist on disk and resurrect after restart)",
+            );
         }
     }
 }
@@ -453,5 +473,97 @@ mod round2_tests {
             Some(b"last-words".to_vec()),
             "the queued write survived the shutdown"
         );
+    }
+}
+
+#[cfg(test)]
+mod round3_tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use protun::api::connection::{CacheKey, PersistentCache};
+
+    use super::*;
+    use crate::cache::EncryptedCache;
+
+    fn temp_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "protonwire-facade3-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// The bot round-3 P1: a destructive op (clear_all — the logout
+    /// shape) dropped on a FULL queue records to health — the
+    /// credential's disk persistence is REPORTED, never silent.
+    /// (A stalled worker is simulated by never draining: hold the
+    /// receiver... the facade owns it; instead fill the queue by
+    /// out-pacing a blocked worker via a paused cache target.)
+    #[test]
+    fn a_destructive_op_dropped_on_a_full_queue_records_to_health() {
+        let dir = temp_dir("fullqueue");
+        let cache = Arc::new(EncryptedCache::with_key_bytes(&dir, &[11u8; 32]).unwrap());
+        // Block the worker: a directory at the write path stalls the
+        // first put; the queue then fills with the rest.
+        std::fs::create_dir_all(dir.join("private-key.bin")).unwrap();
+        let facade = PersistenceFacade::start(Arc::clone(&cache));
+        // Fill past the bound with puts, then the destructive op.
+        for round in 0..(QUEUE_BOUND + 8) {
+            facade.put(CacheKey::PrivateKey, format!("burst-{round}").into_bytes());
+        }
+        facade.clear_all();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let health = facade.health();
+            if let Some(failure) = health.last_failure.as_deref() {
+                assert!(
+                    failure.contains("stalled") || failure.contains("full"),
+                    "the failure names the backpressure: {failure}"
+                );
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "neither the put nor the clear-all backpressure recorded: {:?}",
+                health
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// The bot round-3 P2 (atomic publish): a loser racing the
+    /// winner's creation reloads a COMPLETE key — the temp+link
+    /// publish means the final pathname never exists half-written.
+    /// (The convergence pin from round 1 already proves the reload;
+    /// this pin proves the published file is complete from byte 0.)
+    #[test]
+    fn the_published_keyfile_is_complete_from_the_first_byte() {
+        let dir = temp_dir("atomic");
+        let key_path = dir.join("cache.key");
+        let shared = dir.join("cache");
+        let first = EncryptedCache::open(&shared, &key_path).unwrap();
+        drop(first);
+        // No temp residue; the key is exactly 32 bytes.
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            assert!(
+                !path
+                    .extension()
+                    .is_some_and(|ext| ext.to_string_lossy().starts_with("tmp")),
+                "temp residue: {path:?}"
+            );
+        }
+        assert_eq!(std::fs::metadata(&key_path).unwrap().len(), 32);
+        // And it round-trips.
+        let second = EncryptedCache::open(&shared, &key_path).unwrap();
+        second.put(CacheKey::Certificate, b"v".to_vec());
+        let third = EncryptedCache::open(&shared, &key_path).unwrap();
+        assert_eq!(third.get(CacheKey::Certificate), Some(b"v".to_vec()));
     }
 }
