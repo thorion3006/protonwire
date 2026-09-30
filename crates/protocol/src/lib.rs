@@ -16,9 +16,11 @@
 //!   and disconnect cleanup
 
 pub mod cache;
+pub mod engine;
 pub mod facade;
 pub mod marks;
 pub mod params;
+pub mod reconcile;
 pub mod translate;
 pub mod tun;
 
