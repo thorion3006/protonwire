@@ -36,9 +36,16 @@ const UNSHARE_ARGS: &[&str] = &["--user", "--map-root-user", "--net"];
 /// The shim between `unshare` and cargo: reads the namespace identity
 /// inside the namespace, arms both gate variables, execs the test
 /// cargo. `sh -c` passes the first trailing argument as `$0` — the
-/// cargo binary — and the rest as `"$@"`.
-const GATE_SHIM: &str = "ns=$(readlink /proc/self/ns/net) && exec env \
-    PROTONWIRE_TEST_NETNS=1 PROTONWIRE_TEST_NETNS_ID=\"$ns\" \"$0\" \"$@\"";
+/// cargo binary — and the rest as `"$@"`. Built from the gate's own
+/// constants so a renamed variable cannot silently disarm the harness
+/// (both names are pinned on the net side).
+fn gate_shim() -> String {
+    use protonwire_net::netns::{MANAGED_NETNS_ENV, MANAGED_NETNS_ID_ENV};
+    format!(
+        "ns=$(readlink /proc/self/ns/net) && exec env \
+         {MANAGED_NETNS_ENV}=1 {MANAGED_NETNS_ID_ENV}=\"$ns\" \"$0\" \"$@\""
+    )
+}
 
 pub(crate) fn run(_root: &Path) -> Result<bool> {
     let mut reporter = Reporter::new("netns-it");
@@ -84,7 +91,7 @@ pub(crate) fn run(_root: &Path) -> Result<bool> {
             .arg("--")
             .arg("/bin/sh")
             .arg("-c")
-            .arg(GATE_SHIM)
+            .arg(gate_shim())
             .arg(&cargo)
             .arg("test")
             .args(&cargo_args)

@@ -31,8 +31,8 @@
 //! * `rtnetlink` link creation — the M5 dependency, heavyweight for
 //!   the M4 adapter's create-and-hand-off need;
 //! * **hand-rolled (chosen)** — ~30 lines: open `/dev/net/tun`, one
-//!   `ioctl(TUNSETIFF)` with `IFF_TUN | IFF_NO_PI`, read back the
-//!   assigned name. Scoped `#[allow(unsafe_code)]`, single buffer,
+//!   `ioctl(TUNSETIFF)` with `IFF_TUN | IFF_NO_PI | IFF_TUN_EXCL`, read
+//!   back the assigned name. Scoped `#[allow(unsafe_code)]`, single buffer,
 //!   no pointer arithmetic beyond the ioctl's own argument.
 
 use std::ffi::{CStr, CString};
@@ -129,7 +129,7 @@ impl TunAddressPlan {
 
 /// An owned TUN device descriptor (FR-24).
 ///
-/// Creating the handle attaches a fresh `IFF_TUN | IFF_NO_PI` device
+/// Creating the handle attaches a fresh `IFF_TUN | IFF_NO_PI | IFF_TUN_EXCL` device
 /// inside the caller's network namespace; the descriptor closes on
 /// drop or explicit [`close`](TunHandle::close) — idempotently (FR-31
 /// cleanup discipline). Transferring the descriptor to ProTUN
@@ -248,8 +248,11 @@ impl TunHandle {
         &self.name
     }
 
-    /// The ProTUN hand-off value for `Connection::unix_connect` /
-    /// `update_unix_tun` while this handle owns the descriptor.
+    /// The `update_unix_tun` update shape: what a LIVE connection
+    /// takes when the TUN descriptor must change without a session
+    /// teardown (FR-32C). The INITIAL hand-off is different —
+    /// `Connection::unix_connect` takes the raw fd
+    /// (`Some(handle.into_raw_fd())`), not this type.
     pub fn stream_info(&self) -> TunStreamInfo {
         TunStreamInfo::TunFd(self.raw_fd())
     }

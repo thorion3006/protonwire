@@ -101,8 +101,10 @@ mod tests {
 
     #[test]
     fn the_env_flag_is_the_runner_contract() {
-        // The runner (xtask netns-it) and the gate must agree on the
-        // exact flag; xtask imports this constant.
+        // The runner (xtask netns-it) and the gate must agree on BOTH
+        // flag names; xtask builds its shim from these constants, so a
+        // rename fails HERE rather than silently disarming the gate.
         assert_eq!(MANAGED_NETNS_ENV, "PROTONWIRE_TEST_NETNS");
+        assert_eq!(MANAGED_NETNS_ID_ENV, "PROTONWIRE_TEST_NETNS_ID");
     }
 }

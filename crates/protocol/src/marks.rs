@@ -151,11 +151,6 @@ impl MarkingFdCallback {
     pub fn new(applier: Arc<dyn MarkApplier>, health: Arc<MarkHealth>) -> Self {
         Self { applier, health }
     }
-
-    /// The health cell (the same `Arc` the route-commit lane holds).
-    pub fn health(&self) -> &MarkHealth {
-        &self.health
-    }
 }
 
 impl OnSocketFdAvailableCallback for MarkingFdCallback {
