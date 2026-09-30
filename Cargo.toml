@@ -96,7 +96,8 @@ getrandom = "0.3" # already in-graph (ring/muon paths); OS randomness
 
 # --- System ---------------------------------------------------------------
 # `poll` backs the ipc tests' deterministic readability checks (WO-R4).
-nix = { version = "0.31", features = ["socket", "user", "fs", "signal", "poll"] } # re-exports its libc (in-graph)
+# `net` backs if_nametoindex in the netns-gated integration tests (IT-1).
+nix = { version = "0.31", features = ["socket", "user", "fs", "signal", "poll", "net"] } # re-exports its libc (in-graph)
 zeroize = "1"
 
 # --- Credential secret storage (M2 S5c spike; docs/spike-2026-08.md §S5c) --
