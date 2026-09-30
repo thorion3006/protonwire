@@ -13,6 +13,15 @@
 //! `Connected` state's agent info) plus refusals, exposing
 //! [`FeatureReconciliation::divergences`] — the requested-vs-applied
 //! table the daemon surfaces to the frontend.
+//!
+//! Known limitation (tracked, the SEC gate's P3): a `Connected` state
+//! emitted BEFORE a live settings update but observed after it can
+//! stamp the superseded applied set over the fresh request — a
+//! narrow, self-healing race (the next genuine state corrects it; on
+//! the compared fields the stale answer can only produce spurious
+//! divergences, never a false-clean table). ProTUN states carry no
+//! provenance tag to close it engine-side; revisit if upstream ever
+//! timestamps state changes.
 
 use crate::engine::{EngineAgentSettings, EngineNetshield, EngineSettingType};
 
@@ -75,9 +84,12 @@ impl FeatureReconciliation {
         self.refused.clear();
     }
 
-    /// The server refused a setting outright.
+    /// The server refused a setting outright. ProTUN re-emits refusals
+    /// (reconnects re-negotiate); the table names each setting once.
     pub fn note_refused(&mut self, setting: EngineSettingType) {
-        self.refused.push(setting);
+        if !self.refused.contains(&setting) {
+            self.refused.push(setting);
+        }
     }
 
     /// The settings the server refused outright.
@@ -119,6 +131,22 @@ impl FeatureReconciliation {
                 self.requested.random_nat.map(RequestedValue::Flag),
                 applied.random_nat.map(RequestedValue::Flag),
             ),
+            (
+                EngineSettingType::SafeMode,
+                self.requested.soft_jail.map(RequestedValue::Flag),
+                applied.soft_jail.map(RequestedValue::Flag),
+            ),
+            (
+                // FR-32J: circumvention routing MUST be exposed as
+                // applied-or-not — protun's refusal enum has no
+                // variant for it, so the divergence table is its only
+                // honest-reporting surface.
+                EngineSettingType::CircumventionRouting,
+                self.requested
+                    .circumvention_routing
+                    .map(RequestedValue::Flag),
+                applied.circumvention_routing.map(RequestedValue::Flag),
+            ),
         ];
         pairs
             .into_iter()
@@ -153,6 +181,15 @@ impl FeatureReconciliation {
         if let Some(flag) = self.requested.random_nat {
             out.push(self.unconfirmed(EngineSettingType::RandomNat, RequestedValue::Flag(flag)));
         }
+        if let Some(flag) = self.requested.soft_jail {
+            out.push(self.unconfirmed(EngineSettingType::SafeMode, RequestedValue::Flag(flag)));
+        }
+        if let Some(flag) = self.requested.circumvention_routing {
+            out.push(self.unconfirmed(
+                EngineSettingType::CircumventionRouting,
+                RequestedValue::Flag(flag),
+            ));
+        }
         out
     }
 
@@ -179,8 +216,8 @@ mod tests {
             netshield_level: Some(EngineNetshield::AdsAndMalwareFilter),
             port_forwarding: Some(false),
             random_nat: Some(true),
-            soft_jail: None,
-            circumvention_routing: None,
+            soft_jail: Some(false),
+            circumvention_routing: Some(true),
         }
     }
 
@@ -239,12 +276,51 @@ mod tests {
         let divergences = ledger.divergences();
         assert_eq!(
             divergences.len(),
-            4,
-            "split_tcp + netshield + port_forwarding + random_nat"
+            6,
+            "split_tcp + netshield + port_forwarding + random_nat + safe-mode + circumvention"
         );
         assert!(
             divergences.iter().all(|d| d.applied.is_none()),
             "every request is unconfirmed while negotiating"
+        );
+    }
+
+    /// FR-32J (the SEC gate's P1): a circumvention-routing request the
+    /// server silently ignored is a NAMED divergence — the UI must
+    /// never report circumvention active while traffic is not
+    /// circumvented. protun's refusal enum has no variant for it, so
+    /// this table is its only honest-reporting surface.
+    #[test]
+    fn silently_ignored_circumvention_is_a_divergence() {
+        let mut ledger = FeatureReconciliation::new(requested());
+        let mut silent = requested();
+        silent.circumvention_routing = Some(false);
+        ledger.note_applied(silent);
+        let divergences = ledger.divergences();
+        assert!(
+            divergences
+                .iter()
+                .any(|d| d.setting == EngineSettingType::CircumventionRouting),
+            "the silently-ignored request must surface: {divergences:?}"
+        );
+    }
+
+    /// FR-7M (the same gate finding, the safe-mode arm): a requested
+    /// soft jail the server flipped is a named divergence — the
+    /// refusal vocabulary calls this setting SafeMode.
+    #[test]
+    fn server_flipped_safe_mode_is_a_named_divergence() {
+        let mut ledger = FeatureReconciliation::new(requested());
+        let mut flipped = requested();
+        flipped.soft_jail = Some(true);
+        ledger.note_applied(flipped);
+        assert_eq!(
+            ledger.divergences(),
+            vec![FeatureDivergence {
+                setting: EngineSettingType::SafeMode,
+                requested: RequestedValue::Flag(false),
+                applied: Some(RequestedValue::Flag(true)),
+            }]
         );
     }
 
