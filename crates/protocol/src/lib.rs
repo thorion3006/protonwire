@@ -25,8 +25,16 @@ pub mod translate;
 pub mod tun;
 
 pub use cache::{CacheError, EncryptedCache, NullCache};
+pub use engine::{
+    ActiveConnection, ConnectionEngine, EngineAgentInfo, EngineAgentSettings, EngineConfig,
+    EngineError, EngineEvent, EngineMode, EngineMuonEnv, EngineNetshield, EnginePeerRef,
+    EngineSettingType, EngineStats, EngineVpnState,
+};
 pub use facade::{PersistenceFacade, PersistenceHealth};
 pub use marks::{MarkApplier, MarkHealth, MarkingFdCallback, SoMarkApplier};
+pub use params::{PeerParams, TunnelParams};
+pub use reconcile::{FeatureDivergence, FeatureReconciliation};
+pub use translate::{KeyPolicy, translate, translate_with_policy};
 pub use params::{PeerParams, TransportEndpoint, TunnelParams};
 pub use translate::translate;
 pub use tun::{DEFAULT_IF_NAME, TunAddressPlan, TunError, TunHandle, TunIfAddress};

@@ -17,12 +17,13 @@
 //! `translate_event` and the map helpers.
 
 use std::net::IpAddr;
-use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use protun::api::connection::{
-    Connection, ConnectionMode, ConnectivityEvent, MuonEnv, PersistentCache, TunStreamInfo,
+    Connection, ConnectionMode, ConnectivityEvent, MuonEnv, PersistentCache,
 };
 use protun::api::events::{ErrorEvent, Event, LocalAgentSettingType};
 use protun::api::local_agent::{AgentConnectionInfo, LocalAgentSettings, NetshieldLevel};
@@ -30,7 +31,7 @@ use protun::api::state::{ConnectionState, InterfaceState, PeerConnectionInfo, Pr
 
 use crate::marks::{MarkHealth, MarkingFdCallback, SoMarkApplier};
 use crate::reconcile::FeatureReconciliation;
-use crate::translate::translate;
+use crate::translate::{KeyPolicy, translate, translate_with_policy};
 use crate::tun::{TunError, TunHandle};
 use crate::{ProtocolError, TunnelParams};
 
@@ -71,8 +72,10 @@ pub struct EngineAgentSettings {
     pub circumvention_routing: Option<bool>,
 }
 
-/// One LocalAgent setting identity (the refusal event's vocabulary,
-/// engine-mirrored).
+/// One LocalAgent setting identity. The six protun-refusable
+/// settings plus the engine-side circumvention identity (FR-32J:
+/// protun's refusal vocabulary has no circumvention variant, so the
+/// divergence table is that setting's only honest-reporting surface).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EngineSettingType {
     /// Netshield level.
@@ -87,6 +90,9 @@ pub enum EngineSettingType {
     SafeMode,
     /// Moderate NAT.
     RandomNat,
+    /// Censorship circumvention routing (never arrives as a protun
+    /// refusal — divergence-table only).
+    CircumventionRouting,
 }
 
 /// The Muon environment the LocalAgent session runs against,
@@ -139,17 +145,12 @@ pub struct EngineConfig {
     /// The FR-32B stable bypass mark applied to every outer socket.
     pub bypass_mark: u32,
     /// The connection mode (production vs deterministic tests).
+    ///
+    /// Deliberately NO `Default`: the mode is a trust-relevant
+    /// choice (production LocalAgent vs agent-less tests) - a
+    /// caller that forgets it should fail to compile, not
+    /// silently get the test engine.
     pub mode: EngineMode,
-}
-
-impl Default for EngineConfig {
-    fn default() -> Self {
-        Self {
-            if_name: crate::DEFAULT_IF_NAME.to_owned(),
-            bypass_mark: 0x51820,
-            mode: EngineMode::NoLocalAgent,
-        }
-    }
 }
 
 /// The transport actually in use for a peer (a live connection is
@@ -177,16 +178,97 @@ pub struct EnginePeerRef {
     pub port: u16,
 }
 
+/// A server-side restriction, engine-mirrored (FR-123).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EngineRestriction {
+    /// Streaming restricted; the server's reason string.
+    Streaming {
+        /// The server's reason.
+        reason: String,
+    },
+    /// Torrenting restricted; the server's reason string.
+    Torrent {
+        /// The server's reason.
+        reason: String,
+    },
+    /// Any other restriction.
+    Other {
+        /// The restriction's name.
+        name: String,
+        /// The server's reason.
+        reason: String,
+    },
+}
+
 /// What the LocalAgent reported about the connection, engine-mirrored
-/// (the applied-settings side of T-20).
+/// (the applied-settings side of T-20, plus the report fields the PRD
+/// makes normative: groups FR-32DA, MTU + restrictions + exit IPs at
+/// PRD line 468/FR-123. The ISP-identity fields are deliberately NOT
+/// mirrored — no clause needs them at the engine surface).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EngineAgentInfo {
     /// The server's exit IPv4.
     pub server_exit_v4: Option<IpAddr>,
     /// The server's exit IPv6.
     pub server_exit_v6: Option<IpAddr>,
+    /// The server-probed MTU, if any (FR-27: applied after
+    /// connection, never an address source).
+    pub server_mtu: Option<u16>,
+    /// LocalAgent-provided connection labels (FR-32DA: labels only —
+    /// never connection-group catalog definitions).
+    pub groups: Vec<String>,
+    /// The server's restrictions (FR-7M/FR-123 surfaces them).
+    pub restrictions: Vec<EngineRestriction>,
     /// The settings the server APPLIED (may differ from the request).
     pub applied: EngineAgentSettings,
+}
+
+/// Why the LocalAgent session is waiting (FR-7M: jail states — low
+/// plan, disabled user, pending invoice, session over limit, VPN
+/// 2FA… — must surface to the user).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EngineAgentWait {
+    /// Soft-jailed: features restricted until resolved.
+    SoftJailed,
+    /// Hard-jailed: one jail entry per reason the server gave.
+    HardJailed {
+        /// The server's jail entries.
+        jails: Vec<EngineAgentJail>,
+    },
+}
+
+/// One hard-jail entry, engine-mirrored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EngineAgentJail {
+    /// The jail category.
+    pub reason: EngineJailReason,
+    /// The server's numeric code.
+    pub code: u64,
+    /// The server's message (an untrusted display string).
+    pub message: String,
+}
+
+/// The jail category, engine-mirrored 1:1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EngineJailReason {
+    /// Bad user behavior.
+    BadUserBehavior,
+    /// The user is disabled.
+    DisabledUser,
+    /// The plan tier is too low.
+    LowPlan,
+    /// VPN 2FA is required.
+    Need2FA,
+    /// An invoice is pending.
+    PendingInvoice,
+    /// Too many simultaneous sessions.
+    SessionOverLimit,
+    /// The server waits for a client-challenge reply.
+    WaitingClientChallengeReply,
+    /// An internal server-side jail.
+    Internal,
+    /// Any other jail reason.
+    Other,
 }
 
 /// The connection state machine, engine-mirrored (FR-29's raw
@@ -205,10 +287,13 @@ pub enum EngineConnectionState {
         /// Whether ProTUN is waiting for the OS to report network.
         waiting_for_network: bool,
     },
-    /// WG up, LocalAgent session negotiating.
+    /// WG up, LocalAgent session negotiating (the wait/jail reason
+    /// surfaces — FR-7M).
     ConnectingToAgent {
         /// The peer whose tunnel carries the agent session.
         peer_id: String,
+        /// Why the session is waiting, if reported.
+        wait: Option<EngineAgentWait>,
     },
     /// Fully connected (in agent mode: WG + agent both up).
     Connected {
@@ -355,18 +440,10 @@ pub fn settings_from_protun(settings: LocalAgentSettings) -> EngineAgentSettings
 
 /// Translates one setting identity (refusal vocabulary) into
 /// ProTUN's.
-pub fn setting_type_to_protun(setting: EngineSettingType) -> LocalAgentSettingType {
-    match setting {
-        EngineSettingType::Netshield => LocalAgentSettingType::NetshieldLevel,
-        EngineSettingType::Bouncing => LocalAgentSettingType::Bouncing,
-        EngineSettingType::PortForwarding => LocalAgentSettingType::PortForwarding,
-        EngineSettingType::SplitTcp => LocalAgentSettingType::SplitTcp,
-        EngineSettingType::SafeMode => LocalAgentSettingType::SafeMode,
-        EngineSettingType::RandomNat => LocalAgentSettingType::RandomNat,
-    }
-}
-
-/// Translates one ProTUN setting identity back.
+/// Translates one ProTUN setting identity back. The engine-only
+/// [`EngineSettingType::CircumventionRouting`] has no protun
+/// counterpart (protun's refusal vocabulary stops at six) and never
+/// arrives from that direction.
 pub fn setting_type_from_protun(setting: &LocalAgentSettingType) -> EngineSettingType {
     match setting {
         LocalAgentSettingType::NetshieldLevel => EngineSettingType::Netshield,
@@ -416,6 +493,30 @@ pub fn agent_info_from_protun(info: &AgentConnectionInfo) -> EngineAgentInfo {
     EngineAgentInfo {
         server_exit_v4: info.server_exit_v4.map(ip_from_protun),
         server_exit_v6: info.server_exit_v6.map(ip_from_protun),
+        server_mtu: info.server_mtu,
+        groups: info.groups.clone(),
+        restrictions: info
+            .restrictions
+            .iter()
+            .map(|restriction| match restriction {
+                protun::api::local_agent::Restriction::Streaming { reason } => {
+                    EngineRestriction::Streaming {
+                        reason: reason.clone(),
+                    }
+                }
+                protun::api::local_agent::Restriction::Torrent { reason } => {
+                    EngineRestriction::Torrent {
+                        reason: reason.clone(),
+                    }
+                }
+                protun::api::local_agent::Restriction::Other { name, reason } => {
+                    EngineRestriction::Other {
+                        name: name.clone(),
+                        reason: reason.clone(),
+                    }
+                }
+            })
+            .collect(),
         applied: settings_from_protun(info.settings.clone()),
     }
 }
@@ -446,9 +547,36 @@ pub fn translate_state(state: &VpnState) -> EngineVpnState {
                     )
                 }),
             },
-            ConnectionState::ConnectingToLocalAgent { peer, .. } => {
+            ConnectionState::ConnectingToLocalAgent { peer, wait_reason } => {
                 EngineConnectionState::ConnectingToAgent {
                     peer_id: peer.peer_id.clone(),
+                    wait: wait_reason.as_ref().map(|reason| match reason {
+                        protun::api::state::AgentConnectionWaitReason::SoftJailed => {
+                            EngineAgentWait::SoftJailed
+                        }
+                        protun::api::state::AgentConnectionWaitReason::HardJailed { jails } => {
+                            EngineAgentWait::HardJailed {
+                                jails: jails
+                                    .iter()
+                                    .map(|jail| EngineAgentJail {
+                                        reason: match jail.reason {
+                                            protun::api::local_agent::WaitJailReason::BadUserBehavior => EngineJailReason::BadUserBehavior,
+                                            protun::api::local_agent::WaitJailReason::DisabledUser => EngineJailReason::DisabledUser,
+                                            protun::api::local_agent::WaitJailReason::LowPlan => EngineJailReason::LowPlan,
+                                            protun::api::local_agent::WaitJailReason::Need2FA => EngineJailReason::Need2FA,
+                                            protun::api::local_agent::WaitJailReason::PendingInvoice => EngineJailReason::PendingInvoice,
+                                            protun::api::local_agent::WaitJailReason::SessionOverLimit => EngineJailReason::SessionOverLimit,
+                                            protun::api::local_agent::WaitJailReason::WaitingClientChallengeReply => EngineJailReason::WaitingClientChallengeReply,
+                                            protun::api::local_agent::WaitJailReason::Internal => EngineJailReason::Internal,
+                                            protun::api::local_agent::WaitJailReason::Other => EngineJailReason::Other,
+                                        },
+                                        code: jail.code,
+                                        message: jail.message.clone(),
+                                    })
+                                    .collect(),
+                            }
+                        }
+                    }),
                 }
             }
             ConnectionState::Connected { peer, agent_info } => EngineConnectionState::Connected {
@@ -597,7 +725,14 @@ impl ConnectionEngine {
         params: &TunnelParams,
         cache: Box<dyn PersistentCache>,
     ) -> Result<ActiveConnection, EngineError> {
-        let mut initial = translate(params)?;
+        // The key policy follows the mode: production LocalAgent runs
+        // keyless params (the cache holds the key, FR-32A); agent-less
+        // tests must carry it (nothing else would provide one).
+        let key_policy = match &self.config.mode {
+            EngineMode::LocalAgent { .. } => KeyPolicy::FromCache,
+            EngineMode::NoLocalAgent => KeyPolicy::Required,
+        };
+        let mut initial = translate_with_policy(params, key_policy)?;
         // Compose the mode: production overrides translate's interim
         // agent-less mode with the LocalAgent session (FR-32A); the
         // agent-less test mode KEEPS translate's composition — the
@@ -615,7 +750,14 @@ impl ConnectionEngine {
             mark_health.clone(),
         );
 
-        let (event_tx, event_rx) = channel();
+        // Bounded with a drop policy (the SEC gate's P2): protun's
+        // thread NEVER blocks (FR-32D is absolute) and the queue can
+        // never grow without bound — stats-class events drop under
+        // pressure (their counters are pollable), a dropped STATE is
+        // counted and observable so a wedged consumer reads as an
+        // alarm, not a silent leak.
+        let (event_tx, event_rx) = std::sync::mpsc::sync_channel(EVENT_CHANNEL_BOUND);
+        let drops = Arc::new(EventDrops::default());
         let latest = Arc::new(Mutex::new(None));
         let reconciliation = Arc::new(Mutex::new(match &self.config.mode {
             EngineMode::LocalAgent { settings, .. } => FeatureReconciliation::new(*settings),
@@ -623,10 +765,19 @@ impl ConnectionEngine {
         }));
         let callbacks = EngineCallbacks {
             event_tx,
+            drops: drops.clone(),
             latest: latest.clone(),
             reconciliation: reconciliation.clone(),
         };
 
+        // protun-internal hazards noted for the record (PR-3's
+        // tracked item): unix_connect EXPECTS its mio poll/waker pair
+        // (a panic there stranding the already-transferred fd is
+        // protun's leak), and a factory error (corrupt cached
+        // certificate/key) exits its thread AFTER connect() already
+        // returned Ok — the observable is the event channel closing
+        // (events() erroring Disconnected): the daemon treats that as
+        // a fatal connection death.
         let connection = Connection::unix_connect(
             initial,
             Some(fd),
@@ -641,6 +792,7 @@ impl ConnectionEngine {
             if_name: self.config.if_name.clone(),
             mark_health,
             events: event_rx,
+            drops,
             latest,
             reconciliation,
             mode: self.config.mode.clone(),
@@ -648,13 +800,61 @@ impl ConnectionEngine {
     }
 }
 
-/// The forwarding callbacks (FR-32D): translate, record, send. No
-/// blocking work ever runs on ProTUN's connection thread.
+/// The forwarding lane's bound (events). States are change-gated
+/// (low rate); stats are pull-limited; agent stats are the one
+/// server-paced push — 1024 slots is minutes of adversarial spam,
+/// dropped-and-counted rather than grown.
+const EVENT_CHANNEL_BOUND: usize = 1024;
+
+/// Observable drop accounting for the bounded forwarding lane.
+#[derive(Debug, Default)]
+struct EventDrops {
+    stats: AtomicU64,
+    states: AtomicU64,
+}
+
+impl EventDrops {
+    fn note_stats_drop(&self) {
+        self.stats.fetch_add(1, Ordering::Relaxed);
+    }
+    fn note_state_drop(&self) {
+        self.states.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// The forwarding callbacks (FR-32D): translate, record, try-send.
+/// No blocking work ever runs on ProTUN's connection thread — under a
+/// full queue the event DROPS (counted), it never waits. Mutexes
+/// recover from poison (`into_inner`): no lock holder can panic, and
+/// the getters already recover, so the callbacks match them.
 #[derive(Clone)]
 struct EngineCallbacks {
-    event_tx: Sender<EngineEvent>,
+    event_tx: SyncSender<EngineEvent>,
+    drops: Arc<EventDrops>,
     latest: Arc<Mutex<Option<EngineVpnState>>>,
     reconciliation: Arc<Mutex<FeatureReconciliation>>,
+}
+
+impl EngineCallbacks {
+    /// The never-blocking send with the drop policy.
+    fn forward(&self, event: EngineEvent) {
+        match self.event_tx.try_send(event) {
+            Ok(()) => {}
+            Err(std::sync::mpsc::TrySendError::Full(event)) => match &event {
+                // Latest-wins semantics are fine: FR-30's counters
+                // are pollable and a stale stat is worthless.
+                EngineEvent::Stats(_) | EngineEvent::AgentStats(_) => self.drops.note_stats_drop(),
+                // A dropped STATE is a bug alarm: the poll surface
+                // (`latest_state`) stays current even when the push
+                // drops — the daemon reads `dropped_states() > 0` as
+                // a wedged consumer.
+                _ => self.drops.note_state_drop(),
+            },
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                // The handle is gone; nothing to forward to.
+            }
+        }
+    }
 }
 
 impl protun::api::connection::StateChangedCallback for EngineCallbacks {
@@ -666,14 +866,20 @@ impl protun::api::connection::StateChangedCallback for EngineCallbacks {
             agent_info: Some(info),
             ..
         } = &state.connection_state
-            && let Ok(mut ledger) = self.reconciliation.lock()
         {
+            let mut ledger = self
+                .reconciliation
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             ledger.note_applied(settings_from_protun(info.settings.clone()));
         }
-        if let Ok(mut slot) = self.latest.lock() {
-            *slot = Some(translated.clone());
-        }
-        let _ = self.event_tx.send(EngineEvent::State(translated));
+        let mut slot = self
+            .latest
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *slot = Some(translated.clone());
+        drop(slot);
+        self.forward(EngineEvent::State(translated));
     }
 }
 
@@ -681,12 +887,14 @@ impl protun::api::connection::EventCallback for EngineCallbacks {
     fn on_event(&self, event: Event) {
         for translated in translate_event(&event) {
             // T-20's refusal side.
-            if let EngineEvent::SettingRefused(setting) = &translated
-                && let Ok(mut ledger) = self.reconciliation.lock()
-            {
+            if let EngineEvent::SettingRefused(setting) = &translated {
+                let mut ledger = self
+                    .reconciliation
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 ledger.note_refused(*setting);
             }
-            let _ = self.event_tx.send(translated);
+            self.forward(translated);
         }
     }
 }
@@ -698,6 +906,7 @@ pub struct ActiveConnection {
     if_name: String,
     mark_health: Arc<MarkHealth>,
     events: Receiver<EngineEvent>,
+    drops: Arc<EventDrops>,
     latest: Arc<Mutex<Option<EngineVpnState>>>,
     reconciliation: Arc<Mutex<FeatureReconciliation>>,
     mode: EngineMode,
@@ -705,7 +914,11 @@ pub struct ActiveConnection {
 
 impl ActiveConnection {
     /// The engine event stream (states, stats, refusals, errors —
-    /// FR-29/30's raw material).
+    /// FR-29/30's raw material, bounded with a counted drop
+    /// policy). A `RecvError::Disconnected` means ProTUN's thread
+    /// exited — including the factory-error death AFTER connect()
+    /// returned Ok (corrupt cached certificate/key): the daemon
+    /// treats it as a fatal connection death.
     pub fn events(&mut self) -> &mut Receiver<EngineEvent> {
         &mut self.events
     }
@@ -778,9 +991,47 @@ impl ActiveConnection {
     /// Disconnects and waits for ProTUN's thread to stop. The TUN
     /// descriptor ProTUN owned closes with its stream — the interface
     /// dies with it (IT-1's ownership model). Consumes the handle:
-    /// a disconnected connection is never reused.
+    /// a disconnected connection is never reused (a moved value never
+    /// reaches `Drop`, so the fire-and-forget below never
+    /// double-sends).
     pub fn disconnect(self) {
         self.connection.disconnect_and_wait();
+    }
+
+    /// Swaps the TUN descriptor on the LIVE connection (FR-32C's
+    /// `update_unix_tun` replacement seam — M5's route lanes may
+    /// force a TUN swap without a session teardown). The handle
+    /// retains ownership of its new descriptor; ProTUN closes the
+    /// previous one.
+    pub fn update_tun(&self, handle: &TunHandle) {
+        self.connection.update_unix_tun(handle.stream_info());
+    }
+
+    /// How many stats-class events the bounded lane dropped under a
+    /// full queue (latest-wins — pollable counters make stale stats
+    /// worthless; a growing number still warrants a look).
+    pub fn dropped_stats(&self) -> u64 {
+        self.drops.stats.load(Ordering::Relaxed)
+    }
+
+    /// How many STATE events the bounded lane dropped. Zero, always,
+    /// in a healthy daemon: a nonzero count means the event consumer
+    /// wedged while holding this handle alive — the poll surface
+    /// (`latest_state`) stayed current, but the push lane did not.
+    pub fn dropped_states(&self) -> u64 {
+        self.drops.states.load(Ordering::Relaxed)
+    }
+}
+
+impl Drop for ActiveConnection {
+    fn drop(&mut self) {
+        // Never the waiting variant: Drop must not block a daemon
+        // unwinding. Fire-and-forget disconnect stops ProTUN's run
+        // loop, whose stream close tears the TUN down (the rust
+        // gate's P1: an orphaned handle must not leave a live
+        // tunnel). Only reached when `disconnect(self)` was NOT
+        // called — the moved value never drops.
+        self.connection.disconnect();
     }
 }
 
@@ -793,13 +1044,6 @@ pub enum ConnectivityChange {
     Down,
     /// The network switched (Wi-Fi to mobile, AP change, …).
     NetworkSwitch,
-}
-
-/// The TUN descriptor update shape (FR-32C's `update_unix_tun`
-/// replacement seam; M5's route lanes may force a TUN swap without a
-/// session teardown).
-pub fn tun_stream_update(handle: &TunHandle) -> TunStreamInfo {
-    handle.stream_info()
 }
 
 #[cfg(test)]
@@ -1007,5 +1251,81 @@ mod tests {
         }
         // The agent-less test engine keeps translate's composition.
         assert!(local_agent_mode(&EngineMode::NoLocalAgent).is_none());
+    }
+
+    /// FR-7M: the agent wait/jail reason surfaces through the mirror
+    /// — hard-jail codes and messages ride ConnectingToAgent.
+    #[test]
+    fn translate_state_connecting_to_agent_carries_the_jail() {
+        let state = VpnState {
+            interface_state: InterfaceState::Up { error: None },
+            connection_state: ConnectionState::ConnectingToLocalAgent {
+                peer: peer_connection("uk-42", Protocol::WireguardUdp, 51820),
+                wait_reason: Some(protun::api::state::AgentConnectionWaitReason::HardJailed {
+                    jails: vec![protun::api::local_agent::WaitJail {
+                        reason: protun::api::local_agent::WaitJailReason::PendingInvoice,
+                        code: 5001,
+                        message: "pay your invoice".to_owned(),
+                    }],
+                }),
+            },
+        };
+        let translated = translate_state(&state);
+        match translated.connection {
+            EngineConnectionState::ConnectingToAgent { peer_id, wait } => {
+                assert_eq!(peer_id, "uk-42");
+                match wait {
+                    Some(EngineAgentWait::HardJailed { jails }) => {
+                        assert_eq!(jails.len(), 1);
+                        assert_eq!(jails[0].reason, EngineJailReason::PendingInvoice);
+                        assert_eq!(jails[0].code, 5001);
+                        assert_eq!(jails[0].message, "pay your invoice");
+                    }
+                    other => panic!("expected a hard jail, got {other:?}"),
+                }
+            }
+            other => panic!("expected ConnectingToAgent, got {other:?}"),
+        }
+    }
+
+    /// The bounded lane's drop policy (the SEC gate's P2): a full
+    /// queue never blocks the callback — stats drop (counted) and
+    /// states drop (counted, the alarm counter).
+    #[test]
+    fn full_queue_drops_stats_and_states_without_blocking() {
+        let (event_tx, _event_rx) = std::sync::mpsc::sync_channel(1);
+        let callbacks = EngineCallbacks {
+            event_tx,
+            drops: Arc::new(EventDrops::default()),
+            latest: Arc::new(Mutex::new(None)),
+            reconciliation: Arc::new(Mutex::new(FeatureReconciliation::new(
+                EngineAgentSettings::default(),
+            ))),
+        };
+        let stats = || Event::ConnectionStats {
+            timestamp_ms: 0,
+            received_bytes: 1,
+            sent_bytes: 2,
+            time_since_last_handshake: Duration::ZERO,
+            estimated_loss: 0.0,
+            estimated_round_trip_time: Duration::ZERO,
+        };
+        // Fill the single slot, then push past it.
+        use protun::api::connection::EventCallback as _;
+        callbacks.on_event(stats());
+        callbacks.on_event(stats());
+        assert_eq!(callbacks.drops.stats.load(Ordering::Relaxed), 1);
+
+        let state = VpnState {
+            interface_state: InterfaceState::Up { error: None },
+            connection_state: ConnectionState::Disconnected { error: None },
+        };
+        use protun::api::connection::StateChangedCallback as _;
+        callbacks.on_state_changed(state);
+        assert_eq!(
+            callbacks.drops.states.load(Ordering::Relaxed),
+            1,
+            "a dropped state is the alarm counter, never silent"
+        );
     }
 }
