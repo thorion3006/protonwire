@@ -535,8 +535,9 @@ mod round3_tests {
             );
             std::thread::sleep(Duration::from_millis(5));
         }
-        // The applied counter reset on the recorded failure.
-        assert_eq!(facade.health().applied_since_failure, 0);
+        // (The counter's reset semantics are the round-2 health
+        // pin's; asserting them HERE is racy — a coalesced op can
+        // succeed after the failure records.)
     }
 
     /// The bot round-3 P2 (atomic publish): a loser racing the
