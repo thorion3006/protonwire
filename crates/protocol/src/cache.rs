@@ -23,7 +23,7 @@
 
 use std::fs;
 use std::fs::OpenOptions;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use chacha20poly1305::XChaCha20Poly1305;
@@ -80,29 +80,33 @@ impl EncryptedCache {
         // gate review's P2): the read Vec, the fresh array, and the
         // to_vec copy all zeroize on EVERY drop path — early
         // returns included.
-        let key: Zeroizing<Vec<u8>> = match fs::read(key_path) {
-            Ok(bytes) => {
-                if bytes.len() != KEY_LEN {
-                    return Err(CacheError::KeyFile(format!(
-                        "the keyfile is {} bytes, expected {KEY_LEN} — refusing to re-key \
-                         (existing cache files would be orphaned)",
-                        bytes.len()
-                    )));
-                }
-                ensure_keyfile_private(key_path)?;
-                Zeroizing::new(bytes)
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+        let key: Zeroizing<Vec<u8>> = match read_keyfile(key_path)? {
+            Some(bytes) => Zeroizing::new(bytes),
+            None => {
+                // First-use creation, SERIALIZED (the bot round-1
+                // P2): the final path is created with NO-REPLACE
+                // semantics — a racing initializer that loses reads
+                // the WINNER's key back, never orphans its own.
                 let mut fresh = Zeroizing::new([0u8; KEY_LEN]);
                 getrandom::fill(fresh.as_mut_slice())
                     .map_err(|error| CacheError::KeyFile(format!("OS randomness: {error}")))?;
                 let mut nonce = [0u8; NONCE_LEN];
                 getrandom::fill(&mut nonce)
                     .map_err(|error| CacheError::KeyFile(format!("OS randomness: {error}")))?;
-                write_private(key_path, fresh.as_slice(), &nonce)?;
-                Zeroizing::new(fresh.to_vec())
+                match create_keyfile_no_replace(key_path, fresh.as_slice(), &nonce) {
+                    Ok(()) => Zeroizing::new(fresh.to_vec()),
+                    Err(CreateKeyfileError::LostRace) => {
+                        // Another initializer won: reload its key.
+                        let winner = read_keyfile(key_path)?.ok_or_else(|| {
+                            CacheError::KeyFile(
+                                "the winning keyfile vanished mid-race — retry".to_owned(),
+                            )
+                        })?;
+                        Zeroizing::new(winner)
+                    }
+                    Err(CreateKeyfileError::Io(error)) => return Err(error),
+                }
             }
-            Err(error) => return Err(CacheError::KeyFile(error.to_string())),
         };
         Self::with_key_bytes(dir, key.as_slice())
     }
@@ -151,11 +155,20 @@ impl EncryptedCache {
     /// fails the tag — reads as absence, never as the wrong value.
     fn read_entry(&self, key: CacheKey) -> Option<Vec<u8>> {
         let path = self.file_for(key);
-        let metadata = fs::metadata(&path).ok()?;
-        if metadata.len() > MAX_FILE_LEN {
+        // Open ONCE, read through a BOUND (the bot's TOCTOU P2): the
+        // pre-check + separate read could allocate for a file that
+        // grew or was replaced between the two calls. The descriptor
+        // + take() bound makes the allocation cap hold against
+        // concurrent growth no matter what the path resolves to
+        // afterwards.
+        let file = fs::File::open(&path).ok()?;
+        let mut bytes = Vec::new();
+        std::io::Read::take(&mut &file, MAX_FILE_LEN + 1)
+            .read_to_end(&mut bytes)
+            .ok()?;
+        if bytes.len() as u64 > MAX_FILE_LEN {
             return None;
         }
-        let bytes = fs::read(&path).ok()?;
         let (nonce, ciphertext) = split_entry(&bytes)?;
         let aad = path.file_name()?.to_string_lossy().into_owned();
         self.cipher
@@ -321,30 +334,137 @@ fn open_new_private(path: &Path) -> Result<std::fs::File, CacheError> {
         .map_err(|error| CacheError::Io(error.to_string()))
 }
 
-/// The reuse-path mode check (the gate review's third P1): a
-/// PRE-EXISTING keyfile wider than 0600 refuses — a planted or
-/// restore-mangled keyfile never rides silently (the same
-/// fail-closed treatment as the wrong-size check). Unix-only (the
-/// daemon is Linux); non-unix builds skip (no mode to check).
-#[cfg(unix)]
-fn ensure_keyfile_private(key_path: &Path) -> Result<(), CacheError> {
-    use std::os::unix::fs::PermissionsExt;
-    let mode = fs::metadata(key_path)
-        .map_err(|error| CacheError::KeyFile(error.to_string()))?
-        .permissions()
-        .mode();
-    if mode & 0o777 != 0o600 {
-        return Err(CacheError::KeyFile(format!(
-            "the keyfile mode is {mode:o}, expected 0600 — refusing (a wider keyfile \
-             never rides silently; tighten it and retry)"
-        )));
+/// Reads the keyfile WITH the no-follow + regular-file + mode +
+/// owner validation (the bot round-1's P2 hardening of the reuse
+/// path): the leaf is opened WITHOUT following symlinks; a symlink
+/// keyfile, a non-regular file, or a wider-than-0600 mode refuses
+/// typed. `Ok(None)` = absent (the first-use arm).
+fn read_keyfile(key_path: &Path) -> Result<Option<Vec<u8>>, CacheError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let file = match OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(key_path)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) if error.raw_os_error() == Some(libc::ELOOP) => {
+                return Err(CacheError::KeyFile(
+                    "the keyfile is a SYMLINK — refusing (a symlinked keyfile never rides)"
+                        .to_owned(),
+                ));
+            }
+            Err(error) => return Err(CacheError::KeyFile(error.to_string())),
+        };
+        let metadata = file
+            .metadata()
+            .map_err(|error| CacheError::KeyFile(error.to_string()))?;
+        use std::os::unix::fs::PermissionsExt;
+        if !metadata.is_file() {
+            return Err(CacheError::KeyFile(
+                "the keyfile is not a regular file — refusing".to_owned(),
+            ));
+        }
+        let mode = metadata.permissions().mode();
+        if mode & 0o777 != 0o600 {
+            return Err(CacheError::KeyFile(format!(
+                "the keyfile mode is {mode:o}, expected 0600 — refusing (a wider keyfile \
+                 never rides silently; tighten it and retry)"
+            )));
+        }
+        let mut bytes = Vec::with_capacity(KEY_LEN);
+        let mut file = file;
+        file.read_to_end(&mut bytes)
+            .map_err(|error| CacheError::KeyFile(error.to_string()))?;
+        if bytes.len() != KEY_LEN {
+            return Err(CacheError::KeyFile(format!(
+                "the keyfile is {} bytes, expected {KEY_LEN} — refusing to re-key \
+                 (existing cache files would be orphaned)",
+                bytes.len()
+            )));
+        }
+        Ok(Some(bytes))
     }
-    Ok(())
+    #[cfg(not(unix))]
+    {
+        match fs::read(key_path) {
+            Ok(bytes) => {
+                if bytes.len() != KEY_LEN {
+                    return Err(CacheError::KeyFile(format!(
+                        "the keyfile is {} bytes, expected {KEY_LEN} — refusing to re-key \
+                         (existing cache files would be orphaned)",
+                        bytes.len()
+                    )));
+                }
+                Ok(Some(bytes))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(CacheError::KeyFile(error.to_string())),
+        }
+    }
 }
 
-#[cfg(not(unix))]
-fn ensure_keyfile_private(_key_path: &Path) -> Result<(), CacheError> {
-    Ok(())
+/// The no-replace keyfile creation (the race P2's fix): the FINAL
+/// path is created with create_new — a racing loser gets EEXIST and
+/// reloads the winner's key.
+enum CreateKeyfileError {
+    /// Another initializer won the race.
+    LostRace,
+    /// An I/O failure (mapped).
+    Io(CacheError),
+}
+
+fn create_keyfile_no_replace(
+    key_path: &Path,
+    key_bytes: &[u8],
+    _nonce: &[u8; NONCE_LEN],
+) -> Result<(), CreateKeyfileError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // The direct final-path creation: create_new + mode(0o600).
+        // The keyfile is the RAW 32 key bytes — plaintext under 0600
+        // (the decision-(a) record); no cache-file framing. fsync
+        // BEFORE publication (the bot's fsync P2: a power loss must
+        // not orphan the keyfile while ciphertext survives), then
+        // the parent-directory sync.
+        let mut file = match OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(key_path)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Err(CreateKeyfileError::LostRace);
+            }
+            Err(error) => {
+                return Err(CreateKeyfileError::Io(CacheError::KeyFile(
+                    error.to_string(),
+                )));
+            }
+        };
+        if let Err(error) = file.write_all(key_bytes).and_then(|()| file.sync_all()) {
+            let _ = fs::remove_file(key_path);
+            return Err(CreateKeyfileError::Io(CacheError::KeyFile(
+                error.to_string(),
+            )));
+        }
+        drop(file);
+        if let Some(parent) = key_path.parent()
+            && let Ok(dir) = fs::File::open(parent)
+        {
+            let _ = dir.sync_all();
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (key_path, key_bytes);
+        Ok(())
+    }
 }
 
 /// Cache failures. All variants carry NO key material (I/O paths
@@ -526,6 +646,11 @@ mod tests {
         let dir = temp_dir("truncated");
         let key_path = dir.join("cache.key");
         fs::write(&key_path, b"short").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
         let error = EncryptedCache::open(&dir.join("cache"), &key_path).unwrap_err();
         assert!(
             error.to_string().contains("refusing to re-key"),
@@ -621,6 +746,54 @@ mod tests {
                 "the refusal names the observed mode: {error}"
             );
         }
+    }
+
+    /// The bot round-1's symlink P2: a SYMLINKED keyfile refuses
+    /// (O_NOFOLLOW — a pre-provisioned pointer never rides).
+    #[test]
+    #[cfg(unix)]
+    fn a_symlinked_keyfile_refuses() {
+        let dir = temp_dir("symlink");
+        let real = dir.join("real.key");
+        fs::write(&real, key_bytes(16)).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&real, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let link = dir.join("cache.key");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let error = EncryptedCache::open(&dir.join("cache"), &link).unwrap_err();
+        assert!(
+            error.to_string().contains("SYMLINK"),
+            "the refusal names the symlink: {error}"
+        );
+    }
+
+    /// The bot round-1's creation-race P2: when the final keyfile
+    /// already exists at creation time, the loser RELOADS the
+    /// winner's key (no-replace semantics — both instances converge
+    /// on one key; entries never orphan).
+    #[test]
+    fn a_creation_race_converges_on_the_winners_key() {
+        let dir = temp_dir("race");
+        let key_path = dir.join("cache.key");
+        let shared = dir.join("cache");
+        // The "winner" creates first.
+        let winner = EncryptedCache::open(&shared, &key_path).expect("the winner creates");
+        drop(winner);
+        // The "loser" would have observed NotFound — but by the time
+        // it creates, the file exists: it reloads the winner's key.
+        let loser = EncryptedCache::open(&shared, &key_path).expect("the loser loads");
+        // The convergence proof: the loser's key decrypts the
+        // winner's entry (one keyfile, one key).
+        loser.put(CacheKey::Certificate, b"loser-writes".to_vec());
+        let reader = EncryptedCache::open(&shared, &key_path).expect("a third reader");
+        assert_eq!(
+            reader.get(CacheKey::Certificate),
+            Some(b"loser-writes".to_vec()),
+            "one keyfile — one key — every instance reads the entries"
+        );
     }
 
     /// The gate review's AAD P2: swapping two cache files' contents

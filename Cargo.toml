@@ -90,12 +90,13 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 # in-graph via protun -> pvpnclient -> proton-boringtun: zero new
 # code, the WG-ecosystem audit rides the pin. XChaCha's 24-byte
 # nonce makes RANDOM nonces safe without a counter.
+libc = "0.2" # in-graph via nix (its own dep); O_NOFOLLOW/ELOOP only
 chacha20poly1305 = "0.10"
 getrandom = "0.3" # already in-graph (ring/muon paths); OS randomness
 
 # --- System ---------------------------------------------------------------
 # `poll` backs the ipc tests' deterministic readability checks (WO-R4).
-nix = { version = "0.31", features = ["socket", "user", "fs", "signal", "poll"] }
+nix = { version = "0.31", features = ["socket", "user", "fs", "signal", "poll"] } # re-exports its libc (in-graph)
 zeroize = "1"
 
 # --- Credential secret storage (M2 S5c spike; docs/spike-2026-08.md §S5c) --
