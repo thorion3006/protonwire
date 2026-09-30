@@ -28,7 +28,10 @@ use crate::Reporter;
 
 /// The netns-gated integration test binaries, in execution order.
 /// M5's net-control suite appends its targets here.
-const GATED_TARGETS: &[(&str, &str)] = &[("protonwire-protocol", "it_tun_lifecycle")];
+const GATED_TARGETS: &[(&str, &str)] = &[
+    ("protonwire-protocol", "it_tun_lifecycle"),
+    ("protonwire-protocol", "it_engine_lifecycle"),
+];
 
 /// `unshare` flags creating the isolated user + network namespace.
 const UNSHARE_ARGS: &[&str] = &["--user", "--map-root-user", "--net"];
