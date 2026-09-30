@@ -2744,3 +2744,36 @@ the working tree mid-build and was withdrawn by its owner mid-read
 the only residue, removed here. The interrupted first push left an
 identical-tree duplicate on the remote (d9c1f87), superseded by the
 amended ff66372 via force-with-lease over the identical base.
+
+## 2026-09-18 — M4 PR-2 (#13): the seven-finding bot round (the facade + the hardenings)
+
+The bot's round 1 on PR #13 (opened by the parallel lane at ff66372
+after the shared-worktree incident — its write-shape/read-cap/zeroize
+remediations and my c462b69 completion landed as one reviewed
+surface): SEVEN findings, all genuine, fixed at b6c6513.
+
+- **P1 the facade (FR-7JB/FR-32A, cited verbatim)**: synchronous
+  file I/O in the PersistentCache callbacks is prohibited on
+  ProTUN's connection thread. PersistenceFacade: preload at start,
+  get from the memory layer, put/remove/clear through a serialized
+  worker — the two-layer shape the PRD draws.
+- **P1 the health surface (FR-7J)**: PersistenceHealth (alive,
+  last_failure, applied_since_failure) — the daemon's poll target;
+  the trait callbacks stay infallible.
+- **P2 the keyfile race**: create_new on the FINAL path; the loser
+  reloads the winner's key (convergence pinned). Plus O_NOFOLLOW +
+  regular-file + mode validation on the reuse path (a pre-provisioned
+  symlink refuses typed), fsync + parent-dir sync before publication
+  (and my accidental 8-byte keyfile header removed — the raw 32
+  bytes under 0600 is the record), and the take()-bounded read
+  (TOCTOU closed).
+- **P2 AAD**: already at c462b69 (the bot reviewed the pre-fix
+  commit); the swap pin carries it.
+
+Process note, honestly recorded: the round was built in the
+DEDICATED worktree ../protonwire-cache after the parallel lane
+checked the MAIN checkout out to m4/params-translation mid-round —
+the memory's shared-worktree protocol held (no branch switches
+under the lane, no amends, pathspec commits, full disclosure in
+the commit message). The bot's TOCTOU/fsync/symlink findings were
+genuinely beyond my c462b69 pass — the round earned its keep.
