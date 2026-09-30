@@ -2863,3 +2863,19 @@ failure records — the counter assertion moved to the round-2 pin
 that owns it). The ipc bind-socket test flaked ONCE under
 parallel workspace load (3/3 green isolated; the diff touches
 only crates/protocol) — watched, not dismissed.
+
+## 2026-09-30 — M4 PR-2 (#13) round 5: the off-by-overhead
+
+One P2, genuine, fixed at 5d226eb: the plaintext cap did not
+account for the 48-byte serialization overhead (magic + version +
+nonce + tag) — a 65,489..=65,536-byte plaintext passed both
+layers, encrypted, then the FILE check rejected the +48 result:
+the facade had accepted what persistence would drop, and the value
+vanished after restart. MAX_PLAINTEXT_LEN (file cap − 48) is now
+the ONE bound both layers refuse at. Pin: the at-the-bound
+round-trip.
+
+The M4 stack stands: #12 (the parallel lane's round 2 in flight)
+→ #13 (five bot rounds deep, 8/8 CI, MERGEABLE, 0 unresolved —
+19 findings: 17 fixed, AAD already-satisfied, mlock tracked to
+the PR-5 daemon lane).
