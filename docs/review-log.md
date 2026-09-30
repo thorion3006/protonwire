@@ -2879,3 +2879,26 @@ The M4 stack stands: #12 (the parallel lane's round 2 in flight)
 → #13 (five bot rounds deep, 8/8 CI, MERGEABLE, 0 unresolved —
 19 findings: 17 fixed, AAD already-satisfied, mlock tracked to
 the PR-5 daemon lane).
+
+## 2026-09-30 — M4 PR-2 (#13) round 6: the retry lane (ER-18) + the sweep
+
+Seven findings, all genuine, fixed at 8665a09:
+
+- **P1 — the BOUNDED RETRY LANE (ER-18 verbatim)**: the worker
+  retains a failed op's LATEST desired state per key and re-applies
+  with a doubling backoff (250ms → 30s cap); success clears the
+  entry and resets the ladder. Pin: the block-fail-UNBLOCK
+  convergence with no new op. This was the round the PRD itself
+  had been waiting for — ER-18's exact sentence.
+- **P1 — the clear sweeps ALL**: try_clear_all attempts every
+  entry, the first failure returned AFTER the sweep.
+- **P2s**: the NotFound arm resyncs the parent (the retry-after-
+  failed-sync window); read_keyfile's success path resyncs the
+  keyfile's parent (the publish-failed-sync window); the facade
+  cap's early return scrubs (Zeroizing from entry); both temp-name
+  sites carry the full 192-bit nonce (the 16-bit collision that
+  could delete the winner's temp).
+
+Pins: the retry convergence and the sweep. 44 protocol tests.
+The ipc bind flake recurred under full parallel load (5/5 isolated;
+tracked for the ipc lane).
