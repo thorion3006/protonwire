@@ -80,6 +80,7 @@ schemars = "1"
 
 # --- Errors / logging ------------------------------------------------------
 thiserror = "2"
+log = "0.4" # protun/pvpnclient logging facade (in-graph via protun); the netns ITs install a stderr logger
 anyhow = "1"
 base64 = "0.22.1" # already in-graph via muon->proton-srp->bcrypt (lock v0.22.1); zero new code
 tracing = "0.1"
