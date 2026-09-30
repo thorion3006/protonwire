@@ -42,6 +42,16 @@ const KEY_LEN: usize = 32;
 /// One cache file's hard cap (the values are certificates and keys —
 /// tens of KB at most; a larger file is corruption, refused).
 const MAX_FILE_LEN: u64 = 64 * 1024;
+/// The maximum PLAINTEXT the cache accepts: the FILE cap minus the
+/// complete serialization overhead — magic (7) + version (1) +
+/// nonce (24) + Poly1305 tag (16) = 48 bytes (the bot round-5 P2:
+/// a 65,489..=65,536-byte plaintext passed the old plaintext cap,
+/// encrypted, then the FILE check rejected the +48 result — the
+/// facade accepted what persistence would drop; the value
+/// disappeared after restart). Both layers use THIS bound so the
+/// facade's refusal and the write's are the same line.
+pub(crate) const MAX_PLAINTEXT_LEN: usize =
+    MAX_FILE_LEN as usize - MAGIC.len() - 1 - NONCE_LEN - 16;
 
 /// The encrypted cache: one directory, one master keyfile.
 ///
@@ -190,9 +200,10 @@ impl EncryptedCache {
     /// an oversized value never allocates the ciphertext + file
     /// buffers — the refusal is typed and cheap).
     fn write_entry(&self, key: CacheKey, plaintext: Zeroizing<Vec<u8>>) -> Result<(), CacheError> {
-        if plaintext.len() as u64 > MAX_FILE_LEN {
+        if plaintext.len() > MAX_PLAINTEXT_LEN {
             return Err(CacheError::Io(format!(
-                "cache entry {} bytes exceeds the {MAX_FILE_LEN} cap",
+                "cache entry {} bytes exceeds the plaintext cap (the file cap \
+                 {MAX_FILE_LEN} minus the 48-byte serialization overhead)",
                 plaintext.len()
             )));
         }
@@ -1013,5 +1024,44 @@ mod tests {
             })
             .count();
         assert_eq!(residue, 0, "concurrent-writer temp residue");
+    }
+}
+#[cfg(test)]
+mod round5_tests {
+    use super::*;
+    use protun::api::connection::{CacheKey, PersistentCache};
+
+    fn temp_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "protonwire-r5-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// The bot round-5 P2: the plaintext cap accounts for the FULL
+    /// serialization overhead — a plaintext at exactly the bound
+    /// round-trips (pre-fix: the +48 file bytes crossed the file
+    /// cap and the value vanished after restart).
+    #[test]
+    fn a_plaintext_at_the_bound_round_trips() {
+        let dir = temp_dir("bound");
+        let cache = EncryptedCache::with_key_bytes(&dir, &[12u8; 32]).unwrap();
+        let at_bound = vec![0xa5u8; MAX_PLAINTEXT_LEN];
+        cache.put(CacheKey::Certificate, at_bound.clone());
+        assert_eq!(
+            cache.get(CacheKey::Certificate),
+            Some(at_bound),
+            "at-the-bound plaintext persists (the overhead is accounted)"
+        );
+        // One byte past: the typed refusal at BOTH layers' line.
+        let over = Zeroizing::new(vec![0xa5u8; MAX_PLAINTEXT_LEN + 1]);
+        cache.put(CacheKey::PrivateKey, over.to_vec());
+        assert_eq!(cache.get(CacheKey::PrivateKey), None);
     }
 }
