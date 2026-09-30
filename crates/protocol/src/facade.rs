@@ -189,11 +189,11 @@ impl PersistentCache for PersistenceFacade {
         // callback returns — the memory answer stands, the disk
         // write is lost and REPORTED, never silently queued
         // without bound).
-        const MAX_ENTRY_LEN: usize = 64 * 1024;
-        if bytes.len() > MAX_ENTRY_LEN {
+        if bytes.len() > crate::cache::MAX_PLAINTEXT_LEN {
             record_failure(
                 &self.health,
-                "a put exceeded the 64 KiB cache-entry cap — refused before the clone",
+                "a put exceeded the plaintext cap (the file cap minus the serialization \
+                 overhead) — refused before the clone",
             );
             return;
         }
