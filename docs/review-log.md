@@ -2902,3 +2902,24 @@ Seven findings, all genuine, fixed at 8665a09:
 Pins: the retry convergence and the sweep. 44 protocol tests.
 The ipc bind flake recurred under full parallel load (5/5 isolated;
 tracked for the ipc lane).
+
+## 2026-09-30 — M4 PR-2 (#13) round 7: the retry lane's own review
+
+Three P1s, all refinements of round 6's ER-18 lane, fixed at
+e17f456: the clear EXPANDS per-key in the lane (the latest-desired-
+state model — a successful clear cancels a stale put, a newer put
+supersedes a pending clear; the synthetic "" name gone); ready
+retries build the batch's FRONT (the coalescer's keep-last gives
+the newest state the win); and the SHUTDOWN DRAIN (one final
+take_all pass regardless of deadline, the shared apply_pass, a
+still-failing lane recorded). Pins: both expansion directions and
+the drop-with-pending-retry convergence. 47 protocol tests.
+
+The cache PR's review arc (rounds 1-7, 33 findings: 30 fixed, AAD
+already-satisfied, mlock tracked to the daemon lane, one ipc flake
+tracked) mirrors the M3 PR #9 pattern exactly — each fix's exposed
+edge becoming the next round's finding, the severity bar holding
+(P1s now, mlock tracked), the pins earning their keep (round 7's
+drain pin caught nothing this time but the round-6 pin caught its
+own race at 10b9283). The lane discipline: fix, pin, reply with
+evidence, resolve, record.
