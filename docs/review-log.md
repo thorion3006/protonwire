@@ -2777,3 +2777,38 @@ the memory's shared-worktree protocol held (no branch switches
 under the lane, no amends, pathspec commits, full disclosure in
 the commit message). The bot's TOCTOU/fsync/symlink findings were
 genuinely beyond my c462b69 pass — the round earned its keep.
+
+## 2026-09-30 — M4 PR-2 (#13) round 2: the seven hardening findings (rebased onto the lane's PR-12 round)
+
+The base conflict (the parallel lane's PR-12 round-1 at 55af2f3 —
+the ClientPrivateKey/SNI/transport-constraint hardening that had
+appeared-and-withdrew earlier) resolved by rebase (one manifest
+conflict, the review-log taken ours-then-appended). The round-2
+findings, all genuine, fixed at af1455a:
+
+- **P1 health propagation**: the worker used the infallible put —
+  failures were warned, never surfaced. try_put (the new fallible
+  pub(crate) path) records into the health slot and resets the
+  applied counter.
+- **P1 the draining shutdown**: Drop dropped the sender only after
+  drop() returned while joining — a DEADLOCK (the worker waits for
+  senders, the join waits for the worker); the sender now drops
+  first, then the join drains the queue. Pin:
+  drop_drains_the_queued_writes.
+- **P1 the bounded coalescing queue**: sync_channel(64) — a full
+  queue records the failure to health (pressure at the bound);
+  the worker batches and coalesces per key (last op wins;
+  ClearAll dominates). The coalescing claim is now code.
+- **P2 fsync on entries**: write_private sync_all + parent-dir
+  sync (power loss never publishes over unflushed bytes).
+- **P2 zeroizing facade memory**: Zeroizing<Vec<u8>> in the map.
+- **P2 the keyfile owner check**: descriptor uid == euid (nix's
+  safe geteuid — unsafe-free).
+- **P2 pre-encryption cap + Zeroizing-before-validation**: the
+  size cap refuses before ciphertext allocation; the keyfile read
+  wraps before any fallible check.
+
+Pins: the failed-write health recording (an unwritable target) and
+the drop-drain. 39 protocol tests. The curator pass ran in the
+background through the round (one dispatch-scope fix in /dream's
+command file; the meta-layer otherwise clean).
