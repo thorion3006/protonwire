@@ -245,27 +245,40 @@ impl EncryptedCache {
     /// The FALLIBLE removal path (the bot round-4 P1): a removal
     /// the filesystem rejects (read-only, full) returns the error —
     /// the worker records it; a NotFound is SUCCESS (the desired
-    /// state already holds).
+    /// state already holds — but the DIRECTORY still syncs: a retry
+    /// after remove-succeeded-but-sync-failed takes this arm and
+    /// must not report durability the crash can contradict, the bot
+    /// round-6 P2).
     pub(crate) fn try_remove(&self, key: CacheKey) -> Result<(), CacheError> {
         let path = self.file_for(key);
         match fs::remove_file(&path) {
             Ok(()) => sync_parent_dir(&path).map_err(CacheError::Io),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                sync_parent_dir(&path).map_err(CacheError::Io)
+            }
             Err(error) => Err(CacheError::Io(error.to_string())),
         }
     }
 
-    /// The FALLIBLE clear path (round 4): all three removals, the
-    /// first failure returned.
+    /// The FALLIBLE clear path (round 4): EVERY removal is
+    /// attempted (the bot round-6 P1 — the `?` stopped at the
+    /// first failure, leaving the later credentials on disk while
+    /// the facade's memory view was already empty); the first
+    /// failure is returned AFTER the sweep.
     pub(crate) fn try_clear_all(&self) -> Result<(), CacheError> {
+        let mut first_failure = None;
         for key in [
             CacheKey::Certificate,
             CacheKey::PrivateKey,
             CacheKey::ApiSession,
         ] {
-            self.try_remove(key)?;
+            if let Err(error) = self.try_remove(key)
+                && first_failure.is_none()
+            {
+                first_failure = Some(error);
+            }
         }
-        Ok(())
+        first_failure.map_or(Ok(()), Err)
     }
 }
 
@@ -349,11 +362,11 @@ fn write_private(path: &Path, bytes: &[u8], nonce: &[u8; NONCE_LEN]) -> Result<(
             bytes.len()
         )));
     }
-    // The unique suffix: two bytes of the fresh nonce, hex — the
-    // same entropy that fronts the ciphertext.
-    let [hi, lo] = hex_byte(nonce[0]);
-    let [hi2, lo2] = hex_byte(nonce[1]);
-    let temp = path.with_extension(format!("tmp{hi}{lo}{hi2}{lo2}"));
+    // The unique suffix: the FULL nonce, hex (the bot round-6 P2 —
+    // 16 bits collided at 1/65,536 and the loser's cleanup removed
+    // the WINNER's temp; 192 bits makes that unreachable and the
+    // cleanup only ever unlinks this invocation's name).
+    let temp = path.with_extension(format!("tmp{}", hex_slice(nonce)));
     let write = || -> Result<(), CacheError> {
         let mut file = open_new_private(&temp)?;
         // sync_all, not flush (the bot round-2 P2): the ciphertext is
@@ -380,13 +393,18 @@ fn write_private(path: &Path, bytes: &[u8], nonce: &[u8; NONCE_LEN]) -> Result<(
     Ok(())
 }
 
-/// One byte as two hex characters (the temp suffix — no formatting
-/// machinery on the connection-thread path).
-fn hex_byte(byte: u8) -> [&'static str; 2] {
-    const HEX: [&str; 16] = [
-        "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "a", "b", "c", "d", "e", "f",
+/// A byte slice as hex (the temp suffix — the full nonce's 192
+/// bits; no formatting machinery on the connection-thread path).
+fn hex_slice(bytes: &[u8]) -> String {
+    const HEX: [char; 16] = [
+        '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f',
     ];
-    [HEX[(byte >> 4) as usize], HEX[(byte & 0xf) as usize]]
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize]);
+        out.push(HEX[(byte & 0xf) as usize]);
+    }
+    out
 }
 
 #[cfg(unix)]
@@ -482,6 +500,13 @@ fn read_keyfile(key_path: &Path) -> Result<Option<Vec<u8>>, CacheError> {
                 bytes.len()
             )));
         }
+        // The RESYNC (the bot round-6 P2): a prior publish's
+        // parent-dir sync may have FAILED after the hard_link —
+        // this open re-establishes the keyfile's directory
+        // durability before accepting it (ciphertext can otherwise
+        // become durable while the key's directory entry stays
+        // crash-volatile).
+        sync_parent_dir(key_path).map_err(CacheError::KeyFile)?;
         Ok(Some(bytes.to_vec()))
     }
     #[cfg(not(unix))]
@@ -537,9 +562,7 @@ fn create_keyfile_no_replace(
         // loser's link fails EEXIST against the winner's COMPLETE
         // file. The keyfile is the RAW 32 key bytes under 0600 (the
         // decision-(a) record).
-        let [hi, lo] = hex_byte(nonce[0]);
-        let [hi2, lo2] = hex_byte(nonce[1]);
-        let temp = key_path.with_extension(format!("tmp{hi}{lo}{hi2}{lo2}"));
+        let temp = key_path.with_extension(format!("tmp{}", hex_slice(nonce)));
         let write = || -> std::io::Result<()> {
             let mut file = OpenOptions::new()
                 .create_new(true)
