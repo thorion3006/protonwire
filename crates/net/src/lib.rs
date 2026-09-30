@@ -50,6 +50,12 @@ pub mod route_tables {
     pub const TERTIARY: u32 = 51822;
 }
 
+/// The network-namespace integration-test harness (NFR-31). Shared by
+/// every netns-gated integration test in the workspace (`protocol`'s
+/// IT-1 today, this crate's M5 suite next); the runner is
+/// `cargo xtask netns-it`.
+pub mod netns;
+
 #[cfg(test)]
 mod tests {
     use super::*;

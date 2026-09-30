@@ -21,3 +21,7 @@ libc = { workspace = true }
 nix = { workspace = true }
 getrandom = { workspace = true }
 
+
+[dev-dependencies]
+# The netns IT harness (IT-1 runs gated inside `cargo xtask netns-it`).
+protonwire-net = { workspace = true }
