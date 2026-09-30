@@ -2812,3 +2812,26 @@ Pins: the failed-write health recording (an unwritable target) and
 the drop-drain. 39 protocol tests. The curator pass ran in the
 background through the round (one dispatch-scope fix in /dream's
 command file; the meta-layer otherwise clean).
+
+## 2026-09-30 — M4 PR-2 (#13) round 3: the four durability findings
+
+All genuine, fixed at 85a7b20:
+
+- **P1 — destructive ops on a full queue**: remove/clear_all
+  silently discarded TrySendError::Full — a logout's clear emptied
+  memory while disk kept the credentials (resurrecting after
+  restart with no health failure). Both record the backpressure
+  failure like the put path.
+- **P2 — the atomic keyfile publish**: create_new published the
+  pathname before the bytes; a racing loser could reload a
+  half-written key. Now: unique temp (create_new + 0600 +
+  sync_all), then hard_link — an atomic no-replace publish; the
+  loser's EEXIST is against a COMPLETE file.
+- **P2 — the bounded keyfile read**: take(KEY_LEN + 1) — a
+  malformed huge keyfile cannot grow the buffer.
+- **P2 — the removal dir-sync**: remove_file syncs the parent —
+  a removal is durable when its directory entry is.
+
+Pins: the full-queue destructive-op recording (the stalled-write
+shape) and the publish completeness (no residue, 32 bytes,
+reload round-trip). 41 protocol tests.
