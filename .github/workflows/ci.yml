@@ -42,6 +42,20 @@ jobs:
       # enforcing the single committed root lockfile (PRD FR-127A).
       - run: cargo test --locked
 
+  netns-it:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.98.1
+      - uses: Swatinem/rust-cache@v2
+      # Netns-gated integration tests (NFR-31, IT-1 today, the M5 net
+      # suite next): `cargo xtask netns-it` runs each gated target via
+      # `unshare --user --map-root-user --net` — root of an empty
+      # network namespace, no host mutation, no real privilege. If the
+      # runner image refuses user namespaces the xtask probe discloses
+      # and exits 0 (honest skip, job stays green).
+      - run: cargo run -p xtask -- netns-it --locked
+
   msrv:
     runs-on: ubuntu-24.04
     steps:

@@ -16,6 +16,7 @@ mod groups_gen;
 mod license;
 mod m49;
 mod manifest;
+mod netns_it;
 mod schema_gen;
 
 use std::collections::BTreeSet;
@@ -38,6 +39,7 @@ subcommands:
   release-guard          distribution gate: re-runs the live license scan, then requires the clearance marker
   sbom                   SBOM generation (stub; lands in Milestone 8)
   capability-matrix      client capability matrix (stub; lands in Milestone 8, T-24)
+  netns-it               run the netns-gated integration tests inside an isolated namespace
   all                    run every check above except release-guard (schema-gen in --check mode)
 ";
 
@@ -86,6 +88,7 @@ fn run(args: &[String]) -> Result<bool> {
             capability_matrix_stub();
             Ok(true)
         }
+        Some("netns-it") => netns_it::run(&root),
         Some("license-scan") => license::run(&root),
         Some("release-guard") => license::release_guard(&root),
         Some("sbom") => {
