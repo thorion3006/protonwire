@@ -3009,3 +3009,58 @@ the CI netns-it job actually EXECUTES on ubuntu-24.04 (not the
 disclosed skip) on first push; the harness grows GATED_TARGETS with
 M5; protun's panic-before-factory fd leak is protun-internal (PR-4
 notes it); mlock stays PR-5's daemon lane.
+
+## 2026-09-30 — M4 PR-4 (m4/connection-engine): the engine + T-20, both gates' fix round
+
+The stack-forward lane's second element, three commits on
+m4/tun-fd-lifecycle (1291266 reconcile, 93f503a engine+IT, 9ece23a
+the fix round).
+
+What landed (FR-23E/24/28/29/30/32A/32C/32D, T-20, IT-14's engine
+slice):
+
+- **FeatureReconciliation (T-20)** — the requested-vs-applied ledger:
+  every REQUESTED setting the server did not confirm with the same
+  value is a divergence; unanswered = unconfirmed (never silent
+  agreement); refusals recorded; live updates reset the table. All
+  SIX requestable settings compared (soft_jail + circumvention
+  included — the SEC gate's P1; FR-32J's circumvention has no protun
+  refusal variant, the table is its only honest surface). Known
+  narrow stale-applied race documented (self-healing; no false-clean
+  path on compared fields).
+- **ConnectionEngine::connect** — the composition: translate (KeyPolicy-
+  aware: production runs KEYLESS params + the cache, FR-32A's shape
+  finally representable) → conditional LocalAgent mode override →
+  TunHandle::create → into_raw_fd transfer → MarkingFdCallback armed →
+  unix_connect. ActiveConnection: engine-mirrored events/state/stats,
+  update_peers (FR-28/32C live rotation), update_agent_settings,
+  update_tun, request_stats, Drop = fire-and-forget disconnect (the
+  rust gate's P1: no orphaned live tunnel — pinned live), disconnect
+  = the waiting path. The mirror: zero protun types leak (6.5 rule
+  8); jail reasons (FR-7M), groups/mtu/restrictions (FR-32DA/FR-123)
+  surface; agent Connecting states carry EMPTY peer lists (PINNED,
+  observed).
+- **FR-32D lane** — bounded (1024) + try_send: stats drop latest-wins
+  (counted), states drop as an ALARM counter (never silently), the
+  poll surface (latest_state) always current. protun's thread never
+  blocks; the queue never grows unbounded (the SEC gate's P2).
+- **IT-14's engine slice** (3 gated tests green in the namespace):
+  the full composition lifecycle on a deterministic dead UDP peer
+  (mark seam LIVE inside protun, peer rotation, disconnect cleanup);
+  the TCP arm + connectivity-change arm; the drop-safety pin. The
+  connected-through proof (mocked WG peer) rides PR-5's M4 exit test
+  per the plan. protun's log facade bridged to stderr in the IT
+  (in-graph dev-dep) — its diagnostics found the empty-peer-list
+  behavior.
+
+Gates: rust FAIL first (1×P1 + 5×P2 + 6×P3) and SEC FAIL (1×P1 +
+1×P2 + 3×P3) — EVERY finding landed in 9ece23a (the list is the
+commit message). Both gates independently verified the mode
+composition, key provenance, and channel arguments against the
+pinned protun source before flagging.
+
+Local: fmt/clippy clean, 76 protocol unit tests, full suite 31/31
+targets, xtask all PASS, netns-it 7/7. Carried: PR-5 wraps the
+facade as the cache box (Arc-forwarding adapter); the IT logger
+gains the redaction pre-filter when an agent-mode IT appears;
+mlock stays PR-5's daemon lane.
