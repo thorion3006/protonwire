@@ -17,6 +17,15 @@
 //! Every trace/log of this module carries only the cache KEY NAME,
 //! never bytes (FR-7P/T-32; the disk-scan canary pins it).
 //!
+//! **Threat model** (the PR-2 gate's tracked item): the encryption
+//! defends the cache contents against a NON-ROOT local attacker who
+//! can reach the filesystem — mis-modeored backups, stolen disk
+//! images, other-uid reads. It does NOT defend against root on the
+//! host: root reads the keyfile by construction (decision (a)), and
+//! everything the cache holds is equally present in the daemon's
+//! memory. A root-level compromise is the operating system's problem
+//! to solve, not this layer's.
+//!
 //! Blocking budget: protun calls these methods on its connection
 //! thread — each is one small file read/write, bounded by the size
 //! cap below, no network, no unbounded allocation.
@@ -505,6 +514,12 @@ fn hex_slice(bytes: &[u8]) -> String {
     out
 }
 
+/// Private-mode file creation (the PR-2 gate's tracked note): the
+/// 0600-from-first-byte guarantee rides `OpenOptionsExt::mode`, a
+/// Unix-only API — ProtonWire targets Linux exclusively (PRD §14), so
+/// there is no non-Unix permission story to maintain; on non-Unix
+/// builds this helper and its callers compile out with the rest of the
+/// filesystem cache, not silently degrade to default modes.
 #[cfg(unix)]
 fn open_new_private(path: &Path) -> Result<std::fs::File, CacheError> {
     use std::os::unix::fs::OpenOptionsExt;
