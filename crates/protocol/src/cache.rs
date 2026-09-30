@@ -185,8 +185,17 @@ impl EncryptedCache {
     /// Encrypts and writes one entry (0600, atomic-replace). The
     /// plaintext is ZEROIZED after the write (the gate review's P2:
     /// the WG private key leaves no heap residue — the same class
-    /// as the at-rest discipline). The file NAME binds as AAD.
+    /// as the at-rest discipline). The file NAME binds as AAD. The
+    /// size cap is checked BEFORE encryption (the bot round-2 P2:
+    /// an oversized value never allocates the ciphertext + file
+    /// buffers — the refusal is typed and cheap).
     fn write_entry(&self, key: CacheKey, plaintext: Zeroizing<Vec<u8>>) -> Result<(), CacheError> {
+        if plaintext.len() as u64 > MAX_FILE_LEN {
+            return Err(CacheError::Io(format!(
+                "cache entry {} bytes exceeds the {MAX_FILE_LEN} cap",
+                plaintext.len()
+            )));
+        }
         let mut nonce_bytes = [0u8; NONCE_LEN];
         getrandom::fill(&mut nonce_bytes)
             .map_err(|error| CacheError::Io(format!("OS randomness: {error}")))?;
@@ -212,6 +221,14 @@ impl EncryptedCache {
         file.extend_from_slice(&nonce_bytes);
         file.extend_from_slice(&ciphertext);
         write_private(&path, &file, &nonce_bytes)
+    }
+
+    /// The FALLIBLE write path (the bot round-2 P1): returns the
+    /// error instead of warning-and-discarding, so the facade's
+    /// worker can record it into the health surface. The plaintext
+    /// zeroizes on every path.
+    pub(crate) fn try_put(&self, key: CacheKey, bytes: Vec<u8>) -> Result<(), CacheError> {
+        self.write_entry(key, Zeroizing::new(bytes))
     }
 }
 
@@ -289,8 +306,12 @@ fn write_private(path: &Path, bytes: &[u8], nonce: &[u8; NONCE_LEN]) -> Result<(
     let temp = path.with_extension(format!("tmp{hi}{lo}{hi2}{lo2}"));
     let write = || -> Result<(), CacheError> {
         let mut file = open_new_private(&temp)?;
+        // sync_all, not flush (the bot round-2 P2): the ciphertext is
+        // DURABLE before the rename publishes it — a power loss
+        // never publishes a name over unflushed bytes; the
+        // parent-dir sync below completes the directory-entry side.
         file.write_all(bytes)
-            .and_then(|()| file.flush())
+            .and_then(|()| file.sync_all())
             .map_err(|error| CacheError::Io(error.to_string()))?;
         Ok(())
     };
@@ -301,6 +322,14 @@ fn write_private(path: &Path, bytes: &[u8], nonce: &[u8; NONCE_LEN]) -> Result<(
     if let Err(error) = fs::rename(&temp, path) {
         let _ = fs::remove_file(&temp);
         return Err(CacheError::Io(error.to_string()));
+    }
+    // The parent-directory sync: the rename itself survives power
+    // loss (the session-kit discipline).
+    #[cfg(unix)]
+    if let Some(parent) = path.parent()
+        && let Ok(dir) = fs::File::open(parent)
+    {
+        let _ = dir.sync_all();
     }
     Ok(())
 }
@@ -374,9 +403,27 @@ fn read_keyfile(key_path: &Path) -> Result<Option<Vec<u8>>, CacheError> {
                  never rides silently; tighten it and retry)"
             )));
         }
-        let mut bytes = Vec::with_capacity(KEY_LEN);
+        // The OWNER check (the bot round-2 P2): the keyfile must
+        // belong to the READING user — a foreign-owned keyfile
+        // (even mode-0600) never rides.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let expected = nix_uid();
+            if metadata.uid() != expected {
+                return Err(CacheError::KeyFile(format!(
+                    "the keyfile owner is uid {}, expected {expected} (the reading user) — \
+                     refusing",
+                    metadata.uid()
+                )));
+            }
+        }
+        // Zeroizing FROM THE READ (the bot round-2 P2): the plain
+        // Vec is wrapped before ANY fallible check — a wrong-length
+        // or otherwise-refusing path frees key material zeroized.
+        let mut bytes = Zeroizing::new(Vec::with_capacity(KEY_LEN));
         let mut file = file;
-        file.read_to_end(&mut bytes)
+        file.read_to_end(bytes.as_mut())
             .map_err(|error| CacheError::KeyFile(error.to_string()))?;
         if bytes.len() != KEY_LEN {
             return Err(CacheError::KeyFile(format!(
@@ -385,12 +432,13 @@ fn read_keyfile(key_path: &Path) -> Result<Option<Vec<u8>>, CacheError> {
                 bytes.len()
             )));
         }
-        Ok(Some(bytes))
+        Ok(Some(bytes.to_vec()))
     }
     #[cfg(not(unix))]
     {
         match fs::read(key_path) {
             Ok(bytes) => {
+                let bytes = Zeroizing::new(bytes);
                 if bytes.len() != KEY_LEN {
                     return Err(CacheError::KeyFile(format!(
                         "the keyfile is {} bytes, expected {KEY_LEN} — refusing to re-key \
@@ -398,12 +446,19 @@ fn read_keyfile(key_path: &Path) -> Result<Option<Vec<u8>>, CacheError> {
                         bytes.len()
                     )));
                 }
-                Ok(Some(bytes))
+                Ok(Some(bytes.to_vec()))
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(CacheError::KeyFile(error.to_string())),
         }
     }
+}
+
+/// The reading user's uid (the keyfile owner check) — nix's safe
+/// wrapper (no unsafe block in this crate).
+#[cfg(unix)]
+fn nix_uid() -> u32 {
+    nix::unistd::geteuid().as_raw()
 }
 
 /// The no-replace keyfile creation (the race P2's fix): the FINAL
