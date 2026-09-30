@@ -135,11 +135,11 @@ impl TunAddressPlan {
 /// cleanup discipline). Transferring the descriptor to ProTUN
 /// relinquishes this side's ownership entirely.
 ///
-/// The attach is EXCLUSIVE: the kernel refuses a second `TUNSETIFF`
-/// on an existing name with `EBUSY` (IT-1 pins this), so the device
-/// has exactly one owner at any moment — its creating descriptor until
-/// the transfer, ProTUN's stream after. The device is destroyed when
-/// that descriptor closes.
+/// The attach is EXCLUSIVE by kernel contract: `IFF_TUN_EXCL` makes a
+/// second `TUNSETIFF` on an existing name fail `EBUSY` on every kernel
+/// (IT-1 pins the refusal), so the device has exactly one owner at any
+/// moment — its creating descriptor until the transfer, ProTUN's
+/// stream after. The device is destroyed when that descriptor closes.
 #[derive(Debug)]
 pub struct TunHandle {
     file: Option<File>,
@@ -155,6 +155,11 @@ const IFF_TUN: i16 = 0x0001;
 /// `IFF_NO_PI` from `linux/if_tun.h`: no packet-information prefix —
 /// ProTUN's `TunStreamUnix` expects raw IP frames.
 const IFF_NO_PI: i16 = 0x1000;
+/// `IFF_TUN_EXCL` from `linux/if_tun.h`: the attach is refused
+/// (`EBUSY`) if the device already exists — exclusivity by kernel
+/// CONTRACT, not by incidental same-flags behavior (the rust gate's
+/// P2: the refusal must hold on every kernel, CI's 6.x included).
+const IFF_TUN_EXCL: i16 = 0x8000u16 as i16; // bit 15: negative as i16, the intended bit pattern
 /// `IFNAMSIZ` from `linux/if.h`; `libc` re-exports it.
 const IFNAMSIZ: usize = libc::IFNAMSIZ;
 /// `sizeof(struct ifreq)` on Linux: `IFNAMSIZ` + the 24-byte
@@ -162,8 +167,9 @@ const IFNAMSIZ: usize = libc::IFNAMSIZ;
 /// its ioctl number declares `sizeof(int)`.
 const IFREQ_LEN: usize = IFNAMSIZ + 24;
 
-/// Attaches `name` to a fresh `IFF_TUN | IFF_NO_PI` device on an open
-/// `/dev/net/tun` descriptor and returns the kernel-assigned name.
+/// Attaches `name` to a fresh `IFF_TUN | IFF_NO_PI | IFF_TUN_EXCL`
+/// device on an open `/dev/net/tun` descriptor and returns the
+/// kernel-assigned name.
 ///
 /// # Safety
 ///
@@ -178,8 +184,8 @@ fn tunsetiff(fd: RawFd, name: &CStr) -> io::Result<String> {
     let name_bytes = name.to_bytes_with_nul();
     // The caller validated the name; the copy stays in bounds.
     ifreq[..name_bytes.len()].copy_from_slice(name_bytes);
-    let flags: i16 = IFF_TUN | IFF_NO_PI;
-    ifreq[IFNAMSIZ..IFNAMSIZ + 2].copy_from_slice(&flags.to_le_bytes());
+    let flags: i16 = IFF_TUN | IFF_NO_PI | IFF_TUN_EXCL;
+    ifreq[IFNAMSIZ..IFNAMSIZ + 2].copy_from_slice(&flags.to_ne_bytes());
     // SAFETY: fd is an open descriptor; the ioctl writes only within
     // ifreq (kernel `copy_from_user`/`copy_to_user` of sizeof(ifreq)).
     let rc = unsafe { libc::ioctl(fd, TUNSETIFF, ifreq.as_mut_ptr().cast::<libc::c_void>()) };
@@ -187,7 +193,10 @@ fn tunsetiff(fd: RawFd, name: &CStr) -> io::Result<String> {
         return Err(io::Error::last_os_error());
     }
     // The kernel returns the assigned name in ifr_name (it fills a %d
-    // wildcard; a fixed name comes back unchanged).
+    // wildcard; a fixed name comes back unchanged). The lossy decode
+    // cannot mangle in practice: validate_name admits only ASCII and
+    // no '%', so the echoed name is byte-identical to the request —
+    // the lossy arm exists only to keep the decode total.
     let raw = &ifreq[..IFNAMSIZ];
     let end = raw.iter().position(|b| *b == 0).unwrap_or(IFNAMSIZ);
     Ok(String::from_utf8_lossy(&raw[..end]).into_owned())
@@ -327,6 +336,22 @@ mod tests {
     #[test]
     fn default_name_is_fr25_protonwire0() {
         assert_eq!(DEFAULT_IF_NAME, "protonwire0");
+    }
+
+    /// The documented discipline, pinned: transferring a handle that
+    /// was closed first is an invalid state and panics (rather than
+    /// handing ProTUN a closed descriptor). The engine sequences
+    /// create → transfer immediately; PR-4's error paths must not
+    /// close-then-transfer.
+    #[test]
+    #[should_panic(expected = "handle owns its fd until close or transfer")]
+    fn into_raw_fd_after_close_panics_rather_than_handing_a_dead_fd() {
+        let mut handle = TunHandle {
+            file: None,
+            name: "unspent".to_owned(),
+        };
+        handle.close();
+        let _ = handle.into_raw_fd();
     }
 
     #[test]
