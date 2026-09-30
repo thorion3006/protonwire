@@ -2923,3 +2923,16 @@ edge becoming the next round's finding, the severity bar holding
 drain pin caught nothing this time but the round-6 pin caught its
 own race at 10b9283). The lane discipline: fix, pin, reply with
 evidence, resolve, record.
+
+## 2026-09-30 — M4 PR-2 (#13) round 8: the lane's success paths
+
+Three P1s — the retry lane's SUCCESS paths were the blind spot —
+fixed at 56b5488: a successful ClearAll now wipes the whole lane
+(the empty-name marker matched nothing; a stale put survived a
+successful logout-clear); the disconnect break applies the ready
+batch before exiting (take_ready's pulled ops were lost in the
+window); and the OVERFLOW lane carries ops the full queue refused
+— the newest desired state reaches the worker when the disk drains
+(the stale-restart shape), through a shared bounded lane drained
+into every batch's tail and the shutdown drain. Pins: the
+clear-wipe and the overflow convergence. 49 protocol tests.
