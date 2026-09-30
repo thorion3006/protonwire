@@ -57,6 +57,13 @@ pub struct PersistenceHealth {
 pub struct PersistenceFacade {
     memory: Mutex<HashMap<String, Zeroizing<Vec<u8>>>>,
     sender: Option<mpsc::SyncSender<Op>>,
+    /// The OVERFLOW lane (the bot round-8 P1): ops the bounded
+    /// queue refused (Full) land here — the newest desired state
+    /// must reach the worker even when the disk side is backed up;
+    /// the worker drains the overflow into every batch's TAIL (the
+    /// coalescer's keep-last gives the newest state the win).
+    /// Bounded at one op per key (the retry lane's own bound).
+    overflow: Arc<Mutex<Vec<Op>>>,
     health: Arc<HealthSlot>,
     /// Joined on drop (the bot round-2 P1): shutdown DRAINS the
     /// queue before the thread ends — no queued write is lost.
@@ -104,16 +111,19 @@ impl PersistenceFacade {
             failure: Mutex::new(None),
             applied: std::sync::atomic::AtomicU64::new(0),
         });
+        let overflow = Arc::new(Mutex::new(Vec::new()));
         let worker_health = Arc::clone(&health);
+        let worker_overflow = Arc::clone(&overflow);
         let worker = std::thread::Builder::new()
             .name("protonwire-cache-worker".to_owned())
             .spawn(move || {
-                worker_loop(cache, receiver, &worker_health);
+                worker_loop(cache, receiver, &worker_health, &worker_overflow);
             })
             .expect("the persistence worker thread spawns");
         Self {
             memory: Mutex::new(memory),
             sender: Some(sender),
+            overflow,
             health,
             worker: Some(worker),
         }
@@ -177,6 +187,45 @@ impl Drop for PersistenceFacade {
     }
 }
 
+impl PersistenceFacade {
+    /// The OVERFLOW feed (the bot round-8 P1): an op the bounded
+    /// queue refused lands in the shared overflow — the NEWEST
+    /// desired state reaches the worker when the disk side drains
+    /// (bounded at one op per key; ClearAll expands per-key inside).
+    fn overflow(&self, op: Op) {
+        let mut overflow = self.overflow.lock().expect("overflow lock");
+        let name = match &op {
+            Op::Put(name, _) | Op::Remove(name) => name.clone(),
+            Op::ClearAll => String::new(),
+        };
+        // A ClearAll in the overflow supersedes every per-key entry
+        // (expand it now, the retry lane's model).
+        let entries: Vec<(String, Op)> = if name.is_empty() {
+            [
+                CacheKey::Certificate,
+                CacheKey::PrivateKey,
+                CacheKey::ApiSession,
+            ]
+            .iter()
+            .map(|key| {
+                let key_name = format!("{key:?}");
+                let remove = Op::Remove(key_name.clone());
+                (key_name, remove)
+            })
+            .collect()
+        } else {
+            vec![(name, op)]
+        };
+        for (key_name, op) in entries {
+            overflow.retain(|existing| match existing {
+                Op::Put(existing_name, _) | Op::Remove(existing_name) => *existing_name != key_name,
+                Op::ClearAll => true,
+            });
+            overflow.push(op);
+        }
+    }
+}
+
 impl PersistentCache for PersistenceFacade {
     fn put(&self, key: CacheKey, bytes: Vec<u8>) {
         // Memory first (the read side is served from here
@@ -186,12 +235,11 @@ impl PersistentCache for PersistenceFacade {
         // enforced BEFORE the clone (the bot round-4 P2): an
         // oversized value never occupies a second allocation or a
         // queue slot — the typed refusal, the cheap path. A FULL
-        // queue records the backpressure failure to health (the
-        // callback returns — the memory answer stands, the disk
-        // write is lost and REPORTED, never silently queued
-        // without bound). The owned input is Zeroizing FROM ENTRY
-        // (the bot round-6 P2): the cap-rejected credential
-        // scrubs on the early return too.
+        // queue feeds the OVERFLOW (the bot round-8 P1 — the newest
+        // state must reach the worker when the disk drains) and
+        // records the backpressure failure to health. The owned
+        // input is Zeroizing FROM ENTRY (the bot round-6 P2): the
+        // cap-rejected credential scrubs on the early return too.
         let bytes = Zeroizing::new(bytes);
         if bytes.len() > crate::cache::MAX_PLAINTEXT_LEN {
             record_failure(
@@ -206,15 +254,17 @@ impl PersistentCache for PersistenceFacade {
             .lock()
             .expect("facade memory lock")
             .insert(name.clone(), Zeroizing::new(bytes.to_vec()));
+        let op = Op::Put(name, Zeroizing::new(bytes.to_vec()));
         let send_result = self
             .sender
             .as_ref()
-            .map(|sender| sender.try_send(Op::Put(name, Zeroizing::new(bytes.to_vec()))));
+            .map(|sender| sender.try_send(op.clone()));
         if matches!(send_result, Some(Err(mpsc::TrySendError::Full(_)))) {
+            self.overflow(op);
             record_failure(
                 &self.health,
-                "the persistence queue is full — a put was dropped (the stalled cache \
-                 filesystem backs pressure onto the caller at the bound)",
+                "the persistence queue is full — a put was moved to the overflow lane \
+                 (it applies when the disk side drains)",
             );
         }
     }
@@ -234,19 +284,20 @@ impl PersistentCache for PersistenceFacade {
             .lock()
             .expect("facade memory lock")
             .remove(&name);
-        // A destructive op dropped on a FULL queue is a FAILURE
-        // (the bot round-3 P1): the in-memory view is gone but the
-        // disk keeps the credential — it resurrects after restart.
-        // Recorded to health exactly like a dropped put.
+        // A destructive op refused by a FULL queue goes to the
+        // OVERFLOW (the bot round-8 P1 — the newest state must
+        // reach the worker) and records the backpressure to health.
+        let op = Op::Remove(name);
         let send_result = self
             .sender
             .as_ref()
-            .map(|sender| sender.try_send(Op::Remove(name)));
+            .map(|sender| sender.try_send(op.clone()));
         if matches!(send_result, Some(Err(mpsc::TrySendError::Full(_)))) {
+            self.overflow(op);
             record_failure(
                 &self.health,
-                "the persistence queue is full — a REMOVE was dropped (the credential \
-                 persists on disk and resurrects after restart)",
+                "the persistence queue is full — a REMOVE was moved to the overflow lane \
+                 (it applies when the disk side drains)",
             );
         }
     }
@@ -258,10 +309,11 @@ impl PersistentCache for PersistenceFacade {
             .as_ref()
             .map(|sender| sender.try_send(Op::ClearAll));
         if matches!(send_result, Some(Err(mpsc::TrySendError::Full(_)))) {
+            self.overflow(Op::ClearAll);
             record_failure(
                 &self.health,
-                "the persistence queue is full — a CLEAR-ALL was dropped (the credentials \
-                 persist on disk and resurrect after restart)",
+                "the persistence queue is full — a CLEAR-ALL was moved to the overflow \
+                 lane (it applies when the disk side drains)",
             );
         }
     }
@@ -370,6 +422,14 @@ impl RetryLane {
             self.backoff = RETRY_BACKOFF_START;
         }
     }
+
+    /// A successful ClearAll invalidates every pending per-key
+    /// retry (the bot round-8 P1 — the desired state for EVERY key
+    /// is now "removed"; nothing older survives).
+    fn clear_all_entries(&mut self) {
+        self.pending.clear();
+        self.backoff = RETRY_BACKOFF_START;
+    }
 }
 
 /// The worker loop (serialized — FR-7JB): drains ops in BATCHES with
@@ -378,7 +438,12 @@ impl RetryLane {
 /// health through the cache's FALLIBLE path, the applied counter
 /// advancing only on success — and the LATEST failed state retained
 /// for bounded-backoff retry (ER-18).
-fn worker_loop(cache: Arc<EncryptedCache>, receiver: mpsc::Receiver<Op>, health: &HealthSlot) {
+fn worker_loop(
+    cache: Arc<EncryptedCache>,
+    receiver: mpsc::Receiver<Op>,
+    health: &HealthSlot,
+    overflow: &Mutex<Vec<Op>>,
+) {
     // The apply pass, shared by the live loop and the shutdown
     // drain: coalesce, attempt, record, retain.
     fn apply_pass(
@@ -449,7 +514,17 @@ fn worker_loop(cache: Arc<EncryptedCache>, receiver: mpsc::Receiver<Op>, health:
             };
             match result {
                 Ok(()) => {
-                    retry.note_success(&op_name);
+                    // A SUCCESSFUL ClearAll invalidates EVERY pending
+                    // per-key retry (the bot round-8 P1 — note_success
+                    // keyed on the empty string matched nothing; a
+                    // stale put survived a successful logout-clear and
+                    // could re-create the credential). The empty name
+                    // IS the clear's marker: clear the whole lane.
+                    if op_name.is_empty() {
+                        retry.clear_all_entries();
+                    } else {
+                        retry.note_success(&op_name);
+                    }
                     health
                         .applied
                         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -470,21 +545,38 @@ fn worker_loop(cache: Arc<EncryptedCache>, receiver: mpsc::Receiver<Op>, health:
         // them after the new op let the OLDER state sort later and
         // the reverse coalescer's keep-last made the STALE retry
         // win; the newest desired state must be the LAST in the
-        // batch).
+        // batch). The OVERFLOW drains into the batch's TAIL (the
+        // bot round-8 P1 — ops the full queue refused carry the
+        // NEWEST desired state; keep-last gives them the win).
         let mut batch: Vec<Op> = retry.take_ready(std::time::Instant::now());
+        batch.extend(overflow.lock().expect("overflow lock").drain(..));
         // Wake at the next retry deadline if one is pending;
-        // otherwise block for the first op.
+        // otherwise block for the first op. The disconnect break
+        // APPLIES the ready batch first (the bot round-8 P1 — the
+        // break discarded ops take_ready had already pulled; they
+        // were no longer pending for take_all to recover).
+        let mut disconnected = false;
+        if !batch.is_empty() {
+            apply_pass(batch, &cache, health, &mut retry);
+            batch = Vec::new();
+        }
         match retry.next_deadline() {
             Some(deadline) => match receiver.recv_timeout(deadline - std::time::Instant::now()) {
                 Ok(op) => batch.push(op),
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(mpsc::RecvTimeoutError::Disconnected) => disconnected = true,
             },
             None if batch.is_empty() => match receiver.recv() {
                 Ok(op) => batch.push(op),
-                Err(_) => break,
+                Err(_) => disconnected = true,
             },
             None => {}
+        }
+        if disconnected {
+            if !batch.is_empty() {
+                apply_pass(batch, &cache, health, &mut retry);
+            }
+            break;
         }
         while batch.len() < QUEUE_BOUND {
             match receiver.try_recv() {
@@ -496,11 +588,18 @@ fn worker_loop(cache: Arc<EncryptedCache>, receiver: mpsc::Receiver<Op>, health:
     }
     // The SHUTDOWN DRAIN (the bot round-7 P1): a disconnect with
     // pending retries exited "clean" while the desired state was
-    // never applied. The final pass attempts EVERYTHING once,
-    // deadline or not — the join in join_worker then reports an
-    // honest completion (a still-failing lane records to health;
-    // the daemon reads it on the way down).
-    let final_pass = retry.take_all();
+    // never applied. The final pass attempts EVERYTHING once —
+    // the overflow too (its newest states may have landed between
+    // the loop's last drain and the disconnect), deadline or not;
+    // the join in join_worker then reports an honest completion (a
+    // still-failing lane records to health; the daemon reads it on
+    // the way down).
+    let mut final_pass = overflow
+        .lock()
+        .expect("overflow lock")
+        .drain(..)
+        .collect::<Vec<_>>();
+    final_pass.extend(retry.take_all());
     if !final_pass.is_empty() {
         apply_pass(final_pass, &cache, health, &mut retry);
         // A failure re-retained: the process is exiting — record
@@ -964,6 +1063,73 @@ mod round7_tests {
             Some(b"last-state".to_vec()),
             "the shutdown drain applied the pending retry"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod round8_tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use protun::api::connection::{CacheKey, PersistentCache};
+
+    use super::*;
+
+    /// The bot round-8 P1: a SUCCESSFUL ClearAll clears every
+    /// pending per-key retry (the "" marker matched nothing before).
+    #[test]
+    fn a_successful_clear_empties_the_whole_lane() {
+        let mut retry = RetryLane::new();
+        retry.retain(Op::Put(
+            "Certificate".to_owned(),
+            Zeroizing::new(b"stale".to_vec()),
+        ));
+        retry.retain(Op::Put(
+            "PrivateKey".to_owned(),
+            Zeroizing::new(b"stale".to_vec()),
+        ));
+        // Simulate the ClearAll SUCCESS path (the empty-name marker).
+        retry.clear_all_entries();
+        assert!(
+            retry.pending.is_empty(),
+            "the successful clear invalidated every pending retry"
+        );
+        assert_eq!(retry.backoff, RETRY_BACKOFF_START, "the ladder reset");
+    }
+
+    /// The bot round-8 P1 (overflow): an op the full queue refused
+    /// reaches the worker's batch — the newest state applies when
+    /// the disk side drains. (The full-queue shape is the facade's
+    /// overflow() + the worker's tail-drain; this pins the WIRING:
+    /// an overflow op converges to disk without any queue slot.)
+    #[test]
+    fn an_overflow_op_reaches_disk() {
+        let dir = std::path::PathBuf::from(format!(
+            "/tmp/protonwire-r8-overflow-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cache = Arc::new(EncryptedCache::with_key_bytes(&dir, &[16u8; 32]).unwrap());
+        let facade = PersistenceFacade::start(Arc::clone(&cache));
+        // Feed an op DIRECTLY through the overflow lane (the full-
+        // queue shape): the worker's tail-drain must apply it.
+        facade.overflow(Op::Put(
+            "Certificate".to_owned(),
+            Zeroizing::new(b"overflow-state".to_vec()),
+        ));
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while cache.get(CacheKey::Certificate) != Some(b"overflow-state".to_vec()) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the overflow op never reached disk"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 }
