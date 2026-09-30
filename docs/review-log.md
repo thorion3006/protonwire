@@ -2835,3 +2835,31 @@ All genuine, fixed at 85a7b20:
 Pins: the full-queue destructive-op recording (the stalled-write
 shape) and the publish completeness (no residue, 32 bytes,
 reload round-trip). 41 protocol tests.
+
+## 2026-09-30 — M4 PR-2 (#13) rounds 3+4: the durability ladder
+
+Round 3 (four findings at 85a7b20, amended into 475cfdd): the
+destructive-op backpressure (a full-queue remove/clear records —
+the logout-resurrection shape), the ATOMIC keyfile publish
+(temp-write + sync + hard_link; the loser's EEXIST is against a
+COMPLETE file), the bounded keyfile read (take KEY_LEN+1), and
+the removal dir-sync.
+
+Round 4 (seven findings at cd2cca1 — six fixed, one tracked):
+try_remove/try_clear_all (removal failures into health — the P1
+the round-2 put fix foreshadowed); the BOUNDED shutdown join (a
+joiner thread races recv_timeout(5s) — a stuck worker detaches
+with the loss reported, the daemon never blocks on shutdown);
+Zeroizing queue payloads; the PROPAGATED dir syncs (entry-rename,
+entry-removal, keyfile-publish — a discarded sync published a
+durability a crash can contradict); the cap before the facade
+clone. TRACKED: mlock — FR-7JB's locked-memory facade is a
+process-wide property (mlockall/RLIMIT_MEMLOCK) owned at daemon
+startup; the PR-5 lane wires it and brings the pin.
+
+A pin-discipline note: the round-3 destructive-op pin was
+de-raced at 10b9283 (a coalesced op can succeed after the
+failure records — the counter assertion moved to the round-2 pin
+that owns it). The ipc bind-socket test flaked ONCE under
+parallel workspace load (3/3 green isolated; the diff touches
+only crates/protocol) — watched, not dismissed.
