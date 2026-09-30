@@ -24,7 +24,7 @@
 use std::io;
 use std::os::fd::RawFd;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use protun::api::connection_unix::OnSocketFdAvailableCallback;
 
@@ -64,33 +64,75 @@ impl MarkApplier for SoMarkApplier {
         // mark happens before the factory could close or reuse it).
         #[allow(unsafe_code)] // workspace deny; the one raw-fd borrow in the seam
         let fd = unsafe { std::os::fd::BorrowedFd::borrow_raw(socket_fd) };
+        // SO_TYPE succeeds only on sockets: if a future protun ever
+        // reports a stale fd the process has reused for something
+        // else, refuse BEFORE marking an unrelated descriptor (the
+        // contract drift becomes a recorded failure, not a silent
+        // policy hole).
+        nix::sys::socket::getsockopt(&fd, nix::sys::socket::sockopt::SockType)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
         nix::sys::socket::setsockopt(&fd, nix::sys::socket::sockopt::Mark, &self.mark)
             .map_err(io::Error::from)
     }
 }
 
 /// The fail-closed health surface M5's route-commit lane gates on:
-/// `true` until a reported socket fails to mark.
-#[derive(Debug, Default)]
+/// healthy only when every socket reported so far was marked
+/// successfully AND at least one socket was reported at all (a cell
+/// that saw zero sockets proves nothing — see [`MarkHealth::healthy`]).
+#[derive(Debug)]
 pub struct MarkHealth {
     all_marked: AtomicBool,
+    reported: AtomicUsize,
 }
 
 impl MarkHealth {
-    /// A healthy cell (nothing failed yet).
+    /// A healthy cell (nothing failed yet, nothing reported yet).
     pub fn new() -> Self {
         Self {
             all_marked: AtomicBool::new(true),
+            reported: AtomicUsize::new(0),
         }
     }
 
     /// Whether every socket reported so far was marked successfully.
+    /// Alone this is NOT the route-commit gate: a mis-wired callback
+    /// that reports nothing leaves it `true` vacuously.
     pub fn all_marked(&self) -> bool {
         self.all_marked.load(Ordering::SeqCst)
     }
 
+    /// How many sockets ProTUN reported through the callback. The M5
+    /// FR-32B route-commit gate is **`all_marked() && reported() > 0`**
+    /// — no full-tunnel route commits before at least one outer socket
+    /// carried the bypass mark.
+    pub fn reported(&self) -> usize {
+        self.reported.load(Ordering::SeqCst)
+    }
+
+    /// The M5 route-commit gate, one call: every reported socket
+    /// marked, and at least one reported (fail-closed against both the
+    /// mark failure and the vacuous no-socket case).
+    pub fn healthy(&self) -> bool {
+        self.all_marked() && self.reported() > 0
+    }
+
     fn note_failure(&self) {
         self.all_marked.store(false, Ordering::SeqCst);
+    }
+
+    fn note_reported(&self) {
+        self.reported.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+impl Default for MarkHealth {
+    /// Delegates to [`MarkHealth::new`] (healthy): `Default` must agree
+    /// with `new()` — a derived `Default` would start `all_marked`
+    /// false and permanently fail-close the route-commit lane with no
+    /// failure anywhere to explain it.
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -121,6 +163,7 @@ impl OnSocketFdAvailableCallback for MarkingFdCallback {
         // Synchronous: by the time this returns, the descriptor carries
         // the bypass mark (or the failure is recorded for the
         // fail-closed gate — the callback cannot refuse the socket).
+        self.health.note_reported();
         if let Err(error) = self.applier.apply_mark(socket_fd) {
             self.health.note_failure();
             tracing::warn!(
@@ -167,9 +210,10 @@ mod tests {
         callback.on_socket_fd_available(9);
 
         assert_eq!(*applier.marked.lock().unwrap(), vec![7, 9]);
+        assert_eq!(health.reported(), 2, "every report is counted");
         assert!(
-            health.all_marked(),
-            "successful marks keep the cell healthy"
+            health.healthy(),
+            "marks succeeded and sockets were reported"
         );
     }
 
@@ -190,12 +234,40 @@ mod tests {
             !health.all_marked(),
             "the route-commit gate must refuse now"
         );
+        assert_eq!(
+            health.reported(),
+            1,
+            "the failed socket still counts as reported"
+        );
+        assert!(!health.healthy());
         assert!(applier.marked.lock().unwrap().is_empty());
     }
 
+    /// The vacuous case the M5 route-commit gate must refuse: a cell
+    /// that saw ZERO sockets proves nothing — `all_marked()` alone
+    /// stays `true`, `healthy()` does not. A mis-wired callback (or a
+    /// future protun path creating outer sockets outside the factory)
+    /// must fail closed, not pass open.
     #[test]
-    fn so_mark_applier_carries_the_stable_mark() {
-        let applier = SoMarkApplier::new(0x51820);
-        assert_eq!(applier.mark(), 0x51820);
+    fn zero_reported_sockets_is_not_healthy() {
+        let health = MarkHealth::new();
+        assert!(health.all_marked());
+        assert_eq!(health.reported(), 0);
+        assert!(
+            !health.healthy(),
+            "the gate is all_marked() && reported() > 0 — never all_marked() alone"
+        );
+    }
+
+    /// `Default` must agree with `new()` (the derived `Default` would
+    /// start the latch false and fail-close the lane with no failure
+    /// to point at).
+    #[test]
+    fn default_agrees_with_new() {
+        let by_default = MarkHealth::default();
+        let by_new = MarkHealth::new();
+        assert_eq!(by_default.all_marked(), by_new.all_marked());
+        assert_eq!(by_default.reported(), by_new.reported());
+        assert_eq!(by_default.healthy(), by_new.healthy());
     }
 }

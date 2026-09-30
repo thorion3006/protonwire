@@ -74,11 +74,12 @@ fn it1_second_attach_is_refused_not_shared() {
     if !netns::gate("IT-1 TUNSETIFF attach semantics on an existing name") {
         return;
     }
-    // Pin the kernel's semantics (observed on Linux 7.x): a second
-    // TUNSETIFF on an existing TUN name is REFUSED with EBUSY — the
-    // device is exclusive to its creating descriptor. The failed
-    // attach leaves the first owner untouched, and its cleanup still
-    // removes the device. FR-31's cleanup never races a shadow owner.
+    // Pin the kernel contract: IFF_TUN_EXCL in the attach flags makes
+    // a second TUNSETIFF on an existing TUN name fail EBUSY on every
+    // kernel — the device is exclusive to its creating descriptor. The
+    // failed attach leaves the first owner untouched, and its cleanup
+    // still removes the device. FR-31's cleanup never races a shadow
+    // owner.
     let first = TunHandle::create("pwshare0").expect("first create");
     assert!(interface_exists("pwshare0"));
 
