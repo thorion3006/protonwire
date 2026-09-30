@@ -20,6 +20,7 @@
 use std::collections::HashMap;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use protun::api::connection::{CacheKey, PersistentCache};
 use zeroize::Zeroizing;
@@ -27,9 +28,11 @@ use zeroize::Zeroizing;
 use crate::cache::EncryptedCache;
 
 /// One worker operation (coalesced per key at send time — the LAST
-/// write for a key wins within a drain).
+/// write for a key wins within a drain). The put payload is
+/// Zeroizing (the bot round-4 P2): ops discarded by coalescing or a
+/// full queue scrub on drop.
 enum Op {
-    Put(String, Vec<u8>),
+    Put(String, Zeroizing<Vec<u8>>),
     Remove(String),
     ClearAll,
 }
@@ -72,6 +75,11 @@ struct HealthSlot {
 /// accumulate unbounded work. 64 covers every sane burst (three keys
 /// × rapid updates) with the worker draining at disk speed.
 const QUEUE_BOUND: usize = 64;
+
+/// The shutdown drain deadline (the bot round-4 P1): long enough
+/// for a full queue's bounded writes on a healthy filesystem;
+/// past it the join detaches with the failure recorded.
+const SHUTDOWN_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 impl PersistenceFacade {
     /// Preloads the three values from the cache and starts the
@@ -130,8 +138,30 @@ impl PersistenceFacade {
         // recv loop ends only when every sender drops; a facade
         // holding its own sender while joining would wait forever).
         self.sender = None;
+        // The BOUNDED join (the bot round-4 P1): a worker stuck in
+        // a filesystem operation must not block daemon shutdown
+        // indefinitely. std's join has no deadline, so a JOINER
+        // thread races a recv_timeout: within the timeout the join
+        // completed; past it the joiner DETACHES (leaked, joining
+        // eventually when the syscall returns), the failure is
+        // recorded — the queued writes may be lost, REPORTED, never
+        // silent, and the daemon shuts down.
         if let Some(handle) = self.worker.take() {
-            let _ = handle.join();
+            let (done, signal) = mpsc::channel::<()>();
+            std::thread::spawn(move || {
+                let _ = handle.join();
+                let _ = done.send(());
+            });
+            match signal.recv_timeout(SHUTDOWN_JOIN_TIMEOUT) {
+                Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => {}
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    record_failure(
+                        &self.health,
+                        "the persistence worker did not drain within the shutdown timeout — \
+                         detaching (queued writes may be lost)",
+                    );
+                }
+            }
         }
     }
 }
@@ -151,11 +181,22 @@ impl PersistentCache for PersistenceFacade {
         // Memory first (the read side is served from here
         // immediately, in Zeroizing storage — the bot round-2 P2:
         // replaced/removed/cleared entries zeroize), then the
-        // worker (the disk side is the worker's alone). A FULL
+        // worker (the disk side is the worker's alone). The CAP is
+        // enforced BEFORE the clone (the bot round-4 P2): an
+        // oversized value never occupies a second allocation or a
+        // queue slot — the typed refusal, the cheap path. A FULL
         // queue records the backpressure failure to health (the
         // callback returns — the memory answer stands, the disk
         // write is lost and REPORTED, never silently queued
         // without bound).
+        const MAX_ENTRY_LEN: usize = 64 * 1024;
+        if bytes.len() > MAX_ENTRY_LEN {
+            record_failure(
+                &self.health,
+                "a put exceeded the 64 KiB cache-entry cap — refused before the clone",
+            );
+            return;
+        }
         let name = format!("{key:?}");
         self.memory
             .lock()
@@ -164,7 +205,7 @@ impl PersistentCache for PersistenceFacade {
         let send_result = self
             .sender
             .as_ref()
-            .map(|sender| sender.try_send(Op::Put(name, bytes)));
+            .map(|sender| sender.try_send(Op::Put(name, Zeroizing::new(bytes))));
         if matches!(send_result, Some(Err(mpsc::TrySendError::Full(_)))) {
             record_failure(
                 &self.health,
@@ -283,20 +324,18 @@ fn worker_loop(cache: Arc<EncryptedCache>, receiver: mpsc::Receiver<Op>, health:
         for op in coalesced {
             let result: Result<(), crate::cache::CacheError> = match op {
                 Op::Put(name, bytes) => match key_from_name(&name) {
-                    Some(key) => cache.try_put(key, bytes),
+                    Some(key) => cache.try_put(key, bytes.to_vec()),
                     None => Ok(()),
                 },
+                // The FALLIBLE paths (the bot round-4 P1): a removal
+                // the filesystem rejects records to health — the
+                // logout shape never reads durable while the
+                // credential persists on disk.
                 Op::Remove(name) => match key_from_name(&name) {
-                    Some(key) => {
-                        cache.remove(key);
-                        Ok(())
-                    }
+                    Some(key) => cache.try_remove(key),
                     None => Ok(()),
                 },
-                Op::ClearAll => {
-                    cache.clear_all();
-                    Ok(())
-                }
+                Op::ClearAll => cache.try_clear_all(),
             };
             match result {
                 Ok(()) => {

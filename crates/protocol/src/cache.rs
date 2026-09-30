@@ -230,6 +230,49 @@ impl EncryptedCache {
     pub(crate) fn try_put(&self, key: CacheKey, bytes: Vec<u8>) -> Result<(), CacheError> {
         self.write_entry(key, Zeroizing::new(bytes))
     }
+
+    /// The FALLIBLE removal path (the bot round-4 P1): a removal
+    /// the filesystem rejects (read-only, full) returns the error —
+    /// the worker records it; a NotFound is SUCCESS (the desired
+    /// state already holds).
+    pub(crate) fn try_remove(&self, key: CacheKey) -> Result<(), CacheError> {
+        let path = self.file_for(key);
+        match fs::remove_file(&path) {
+            Ok(()) => sync_parent_dir(&path).map_err(CacheError::Io),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(CacheError::Io(error.to_string())),
+        }
+    }
+
+    /// The FALLIBLE clear path (round 4): all three removals, the
+    /// first failure returned.
+    pub(crate) fn try_clear_all(&self) -> Result<(), CacheError> {
+        for key in [
+            CacheKey::Certificate,
+            CacheKey::PrivateKey,
+            CacheKey::ApiSession,
+        ] {
+            self.try_remove(key)?;
+        }
+        Ok(())
+    }
+}
+
+/// Syncs a path's parent directory, PROPAGATING the failure (the
+/// bot round-4 P2s: a discarded sync publishes a durability the
+/// crash can contradict).
+#[cfg(unix)]
+fn sync_parent_dir(path: &Path) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        let dir = fs::File::open(parent).map_err(|error| error.to_string())?;
+        dir.sync_all().map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_parent_dir(_path: &Path) -> Result<(), String> {
+    Ok(())
 }
 
 impl PersistentCache for EncryptedCache {
@@ -250,24 +293,8 @@ impl PersistentCache for EncryptedCache {
 
     fn remove(&self, key: CacheKey) {
         let name = format!("{key:?}");
-        let path = self.file_for(key);
-        match fs::remove_file(&path) {
-            Ok(()) => {
-                // The DIRECTORY sync (the bot round-3 P2): a removal
-                // is durable only when its directory entry is — a
-                // crash before the sync resurrects the credential
-                // the worker counted applied.
-                #[cfg(unix)]
-                if let Some(parent) = path.parent()
-                    && let Ok(dir) = fs::File::open(parent)
-                {
-                    let _ = dir.sync_all();
-                }
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                tracing::warn!(key = %name, %error, "persistent-cache remove failed");
-            }
+        if let Err(error) = self.try_remove(key) {
+            tracing::warn!(key = %name, %error, "persistent-cache remove failed");
         }
     }
 
@@ -335,14 +362,10 @@ fn write_private(path: &Path, bytes: &[u8], nonce: &[u8; NONCE_LEN]) -> Result<(
         let _ = fs::remove_file(&temp);
         return Err(CacheError::Io(error.to_string()));
     }
-    // The parent-directory sync: the rename itself survives power
-    // loss (the session-kit discipline).
-    #[cfg(unix)]
-    if let Some(parent) = path.parent()
-        && let Ok(dir) = fs::File::open(parent)
-    {
-        let _ = dir.sync_all();
-    }
+    // The parent-directory sync, PROPAGATED (the bot round-4 P2): a
+    // discarded failure would report durability a crash can
+    // contradict.
+    sync_parent_dir(path).map_err(CacheError::Io)?;
     Ok(())
 }
 
@@ -535,12 +558,13 @@ fn create_keyfile_no_replace(
             };
         }
         let _ = fs::remove_file(&temp);
-        if let Some(parent) = key_path.parent()
-            && let Ok(dir) = fs::File::open(parent)
-        {
-            let _ = dir.sync_all();
-        }
-        Ok(())
+        // The dir sync PROPAGATED (the bot round-4 P2): a failed
+        // sync after the hard_link means the key can vanish on
+        // crash while ciphertext survives — the next startup
+        // re-keys and orphans every entry. Reported, never assumed.
+        sync_parent_dir(key_path)
+            .map_err(CacheError::KeyFile)
+            .map_err(CreateKeyfileError::Io)
     }
     #[cfg(not(unix))]
     {
