@@ -300,15 +300,35 @@ impl RetryLane {
         }
     }
 
-    /// Retains the op, replacing any prior op for the same key.
+    /// Retains the op, replacing any prior op for the same key. A
+    /// ClearAll EXPANDS into per-key Removes (the bot round-7 P1 —
+    /// the "" synthetic name let a pending put survive a successful
+    /// clear and recreate the credential after logout, and a pending
+    /// clear later delete a newer successful put; modeling the
+    /// LATEST DESIRED STATE per key makes both directions
+    /// impossible: the clear replaces every key's entry, a newer
+    /// per-key op replaces the clear's entry for that key).
     fn retain(&mut self, op: Op) {
-        let name = match &op {
-            Op::Put(name, _) | Op::Remove(name) => name.clone(),
-            Op::ClearAll => String::new(),
-        };
-        self.pending.retain(|(existing, _, _)| *existing != name);
         let deadline = std::time::Instant::now() + self.backoff;
-        self.pending.push((name, op, deadline));
+        let expanded: Vec<(String, Op)> = match op {
+            Op::ClearAll => [
+                CacheKey::Certificate,
+                CacheKey::PrivateKey,
+                CacheKey::ApiSession,
+            ]
+            .iter()
+            .map(|key| {
+                let name = format!("{key:?}");
+                let remove = Op::Remove(name.clone());
+                (name, remove)
+            })
+            .collect(),
+            Op::Put(ref name, _) | Op::Remove(ref name) => vec![(name.clone(), op)],
+        };
+        for (name, op) in expanded {
+            self.pending.retain(|(existing, _, _)| *existing != name);
+            self.pending.push((name, op, deadline));
+        }
         self.backoff = (self.backoff * 2).min(RETRY_BACKOFF_MAX);
     }
 
@@ -334,6 +354,14 @@ impl RetryLane {
         ready
     }
 
+    /// Takes ALL pending ops regardless of deadline (the shutdown
+    /// drain — the bot round-7 P1: a disconnect with a pending
+    /// retry exited clean while the desired state was never
+    /// applied; the final pass attempts everything once).
+    fn take_all(&mut self) -> Vec<Op> {
+        self.pending.drain(..).map(|(_, op, _)| op).collect()
+    }
+
     /// A success for this key clears any pending retry and resets
     /// the backoff ladder.
     fn note_success(&mut self, name: &str) {
@@ -351,31 +379,15 @@ impl RetryLane {
 /// advancing only on success — and the LATEST failed state retained
 /// for bounded-backoff retry (ER-18).
 fn worker_loop(cache: Arc<EncryptedCache>, receiver: mpsc::Receiver<Op>, health: &HealthSlot) {
-    let mut batch: Vec<Op> = Vec::with_capacity(QUEUE_BOUND);
-    let mut retry = RetryLane::new();
-    loop {
-        // Wake at the next retry deadline if one is pending;
-        // otherwise block for the first op.
-        match retry.next_deadline() {
-            Some(deadline) => match receiver.recv_timeout(deadline - std::time::Instant::now()) {
-                Ok(op) => batch.push(op),
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
-            },
-            None => match receiver.recv() {
-                Ok(op) => batch.push(op),
-                Err(_) => break,
-            },
-        }
-        // Retry-ready ops first (the desired state precedes any new
-        // batch — the coalescer dedups them).
-        batch.extend(retry.take_ready(std::time::Instant::now()));
-        while batch.len() < QUEUE_BOUND {
-            match receiver.try_recv() {
-                Ok(op) => batch.push(op),
-                Err(_) => break,
-            }
-        }
+    // The apply pass, shared by the live loop and the shutdown
+    // drain: coalesce, attempt, record, retain.
+    fn apply_pass(
+        batch: Vec<Op>,
+        cache: &EncryptedCache,
+        health: &HealthSlot,
+        retry: &mut RetryLane,
+    ) {
+        let mut batch = batch;
         // Coalesce: keep the LAST op per key (and the last ClearAll,
         // which dominates everything before it).
         let mut coalesced: Vec<Op> = Vec::with_capacity(batch.len());
@@ -449,6 +461,57 @@ fn worker_loop(cache: Arc<EncryptedCache>, receiver: mpsc::Receiver<Op>, health:
                     retry.retain(op);
                 }
             }
+        }
+    }
+
+    let mut retry = RetryLane::new();
+    loop {
+        // The ready retries go FIRST (the bot round-7 P1 — appending
+        // them after the new op let the OLDER state sort later and
+        // the reverse coalescer's keep-last made the STALE retry
+        // win; the newest desired state must be the LAST in the
+        // batch).
+        let mut batch: Vec<Op> = retry.take_ready(std::time::Instant::now());
+        // Wake at the next retry deadline if one is pending;
+        // otherwise block for the first op.
+        match retry.next_deadline() {
+            Some(deadline) => match receiver.recv_timeout(deadline - std::time::Instant::now()) {
+                Ok(op) => batch.push(op),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            },
+            None if batch.is_empty() => match receiver.recv() {
+                Ok(op) => batch.push(op),
+                Err(_) => break,
+            },
+            None => {}
+        }
+        while batch.len() < QUEUE_BOUND {
+            match receiver.try_recv() {
+                Ok(op) => batch.push(op),
+                Err(_) => break,
+            }
+        }
+        apply_pass(batch, &cache, health, &mut retry);
+    }
+    // The SHUTDOWN DRAIN (the bot round-7 P1): a disconnect with
+    // pending retries exited "clean" while the desired state was
+    // never applied. The final pass attempts EVERYTHING once,
+    // deadline or not — the join in join_worker then reports an
+    // honest completion (a still-failing lane records to health;
+    // the daemon reads it on the way down).
+    let final_pass = retry.take_all();
+    if !final_pass.is_empty() {
+        apply_pass(final_pass, &cache, health, &mut retry);
+        // A failure re-retained: the process is exiting — record
+        // the un-drained state so the health surface tells the
+        // truth on the way down.
+        if !retry.pending.is_empty() {
+            record_failure(
+                health,
+                "pending persistence retries could not drain at shutdown — the desired \
+                 state may not be durable",
+            );
         }
     }
     health
@@ -795,5 +858,112 @@ mod round6_tests {
             !dir.join("private-key.bin").exists(),
             "the sweep attempted every entry"
         );
+    }
+}
+
+#[cfg(test)]
+mod round7_tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use protun::api::connection::{CacheKey, PersistentCache};
+
+    use super::*;
+
+    /// The bot round-7 P1 (clear cancels per-key retries): a failed
+    /// put retained under Certificate, then a SUCCESSFUL clear-all —
+    /// the pending put must NOT re-create the credential after
+    /// logout (the clear superseded it per-key).
+    #[test]
+    fn a_successful_clear_cancels_pending_per_key_retries() {
+        let mut retry = RetryLane::new();
+        // A failed put for Certificate retained.
+        retry.retain(Op::Put(
+            "Certificate".to_owned(),
+            Zeroizing::new(b"stale".to_vec()),
+        ));
+        // A successful ClearAll arrives — note_success("") under the
+        // old synthetic-name scheme cleared only "", leaving the
+        // Certificate put. The EXPANSION model: the clear's success
+        // is per-key — simulate by the retain of a ClearAll (which
+        // now REPLACES the Certificate entry with a Remove).
+        retry.retain(Op::ClearAll);
+        // The Certificate entry is now a REMOVE (the clear
+        // superseded the stale put).
+        assert!(
+            retry
+                .pending
+                .iter()
+                .any(|(name, op, _)| name == "Certificate" && matches!(op, Op::Remove(_))),
+            "the clear replaced the stale put per-key: {:?}",
+            retry.pending.iter().map(|(n, _, _)| n).collect::<Vec<_>>()
+        );
+        // And no synthetic "" entry exists.
+        assert!(
+            !retry.pending.iter().any(|(name, _, _)| name.is_empty()),
+            "no synthetic clear-all name remains"
+        );
+    }
+
+    /// The bot round-7 P1 (a newer per-key op supersedes the
+    /// clear's entry for that key): a pending clear-all then a
+    /// newer put for PrivateKey — the key's entry is the PUT.
+    #[test]
+    fn a_newer_put_supersedes_the_clear_for_that_key() {
+        let mut retry = RetryLane::new();
+        retry.retain(Op::ClearAll);
+        retry.retain(Op::Put(
+            "PrivateKey".to_owned(),
+            Zeroizing::new(b"newer".to_vec()),
+        ));
+        let private = retry
+            .pending
+            .iter()
+            .find(|(name, _, _)| name == "PrivateKey")
+            .expect("the entry exists");
+        assert!(
+            matches!(private.1, Op::Put(_, _)),
+            "the newer put is the desired state for the key"
+        );
+    }
+
+    /// The bot round-7 P1 (shutdown drains pending retries): a
+    /// facade drop with a pending (ready) retry applies it in the
+    /// final pass — the disk reflects the desired state.
+    #[test]
+    fn shutdown_drains_pending_retries() {
+        let dir = std::path::PathBuf::from(format!(
+            "/tmp/protonwire-r7-drain-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cache = Arc::new(EncryptedCache::with_key_bytes(&dir, &[15u8; 32]).unwrap());
+        // Make the FIRST attempt fail (the target blocked), then
+        // unblock BEFORE drop so the shutdown drain can land it.
+        std::fs::create_dir_all(dir.join("api-session.bin")).unwrap();
+        let facade = PersistenceFacade::start(Arc::clone(&cache));
+        facade.put(CacheKey::ApiSession, b"last-state".to_vec());
+        // Wait for the first failure to record (the op is now
+        // pending for retry at the 250ms backoff).
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while facade.health().last_failure.is_none() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(facade.health().last_failure.is_some());
+        // Unblock the target, then drop IMMEDIATELY (before the
+        // backoff elapses): the shutdown drain attempts the pending
+        // op regardless of the deadline.
+        std::fs::remove_dir_all(dir.join("api-session.bin")).unwrap();
+        drop(facade);
+        assert_eq!(
+            cache.get(CacheKey::ApiSession),
+            Some(b"last-state".to_vec()),
+            "the shutdown drain applied the pending retry"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
