@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 use base64::Engine as _;
 use protonwire_net::netns;
 use protonwire_protocol::Protocol;
+use protonwire_protocol::engine::ConnectivityChange as EngineConnectivityChange;
 use protonwire_protocol::engine::{
     ActiveConnection, ConnectionEngine, EngineConfig, EngineConnectionState, EngineEvent,
     EngineMode, EngineVpnState,
@@ -79,7 +80,10 @@ fn await_event(
 
 /// ProTUN logs through the `log` facade; without a logger those lines
 /// vanish. A stderr logger makes the engine's own diagnostics visible
-/// under `--nocapture`.
+/// under `--nocapture`. HARNESS RULE (the SEC gate): never raise the
+/// filter above Debug — Trace-level dependency dumps (selectors,
+/// cookies) must not bake into CI artifacts — and agent-mode ITs
+/// must add the redaction pre-filter before extending this.
 struct StderrLogger;
 impl log::Log for StderrLogger {
     fn enabled(&self, metadata: &log::Metadata) -> bool {
@@ -152,10 +156,16 @@ fn it14_engine_composition_lifecycle() {
         },
         "a Connecting state",
     );
-    assert!(
-        matches!(connecting, EngineEvent::State(_)),
-        "the awaited event is a state"
-    );
+    match connecting {
+        EngineEvent::State(EngineVpnState {
+            connection: EngineConnectionState::Connecting { peer_ids, .. },
+            ..
+        }) => assert!(
+            peer_ids.is_empty(),
+            "protun v2.2.1 pins an EMPTY Connecting peer list (an upgrade changed the surface)"
+        ),
+        other => panic!("expected a Connecting state, got {other:?}"),
+    }
 
     // FR-32B lane: protun created its outer socket and OUR callback
     // saw it — the mark seam is live inside the real engine, not just
@@ -185,4 +195,97 @@ fn it14_engine_composition_lifecycle() {
         nix::net::if_::if_nametoindex(IF_NAME).is_err(),
         "the device dies with the disconnected connection"
     );
+}
+
+/// IT-14's transport arms against dead deterministic peers: the
+/// engine composes every manual protocol, and each transport's outer
+/// socket reaches the FR-32B mark seam (the observable for a peer
+/// that never answers). The connected-through proof is PR-5's M4
+/// exit test.
+#[test]
+fn it14_tcp_and_connectivity_arms() {
+    install_logger();
+    if !netns::gate("IT-14 transport arms: TCP composition + connectivity change") {
+        return;
+    }
+    let engine = ConnectionEngine::new(EngineConfig {
+        if_name: "pwenginetcp0".to_owned(),
+        bypass_mark: 0x51820,
+        mode: EngineMode::NoLocalAgent,
+    });
+
+    // TCP-constrained params (FR-32G: the manual request constrains
+    // the candidates to that transport).
+    let mut params = tunnel_params();
+    params.protocol = protonwire_protocol::Protocol::WireGuardTcp;
+    params.peers[0].udp_ports.clear();
+
+    let mut connection = engine
+        .connect(&params, Box::new(protonwire_protocol::NullCache::default()))
+        .expect("the TCP-composed connection starts");
+    let _ = await_event(
+        &mut connection,
+        &|event| {
+            matches!(
+                event,
+                EngineEvent::State(EngineVpnState {
+                    connection: EngineConnectionState::Connecting { .. },
+                    ..
+                })
+            )
+        },
+        "a Connecting state on the TCP arm",
+    );
+    assert!(
+        mark_health_reported(&connection),
+        "the TCP outer socket reached the mark seam"
+    );
+
+    // The connectivity-change lane (IT-14's arm): a network switch on
+    // the live connection resets the sockets — the engine stays
+    // responsive and the socket factory runs again.
+    connection.on_connectivity_change(EngineConnectivityChange::NetworkSwitch);
+    connection.request_stats();
+    assert!(connection.latest_state().is_some());
+
+    connection.disconnect();
+    assert!(nix::net::if_::if_nametoindex("pwenginetcp0").is_err());
+}
+
+/// IT-1's drop-safety pin at engine scope (the rust gate's P1): a
+/// DROPPED handle — no explicit disconnect — must not orphan the
+/// tunnel. Drop fires the fire-and-forget disconnect; ProTUN's stream
+/// close tears the device down.
+#[test]
+fn it14_dropped_handle_does_not_orphan_the_tunnel() {
+    install_logger();
+    if !netns::gate("IT-14 drop safety: an orphaned handle cannot leave a live tunnel") {
+        return;
+    }
+    let engine = ConnectionEngine::new(EngineConfig {
+        if_name: "pwengdrop0".to_owned(),
+        bypass_mark: 0x51820,
+        mode: EngineMode::NoLocalAgent,
+    });
+    let mut connection = engine
+        .connect(
+            &tunnel_params(),
+            Box::new(protonwire_protocol::NullCache::default()),
+        )
+        .expect("the composed connection starts");
+    let _ = await_event(
+        &mut connection,
+        &|event| matches!(event, EngineEvent::State(_)),
+        "any state (the connection is live)",
+    );
+    drop(connection);
+
+    let start = Instant::now();
+    while start.elapsed() < DEADLINE {
+        if nix::net::if_::if_nametoindex("pwengdrop0").is_err() {
+            return; // the device died with the dropped handle
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    panic!("the TUN device outlived its dropped handle within {DEADLINE:?}");
 }
