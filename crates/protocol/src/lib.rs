@@ -17,13 +17,17 @@
 
 pub mod cache;
 pub mod facade;
+pub mod marks;
 pub mod params;
 pub mod translate;
+pub mod tun;
 
 pub use cache::{CacheError, EncryptedCache, NullCache};
 pub use facade::{PersistenceFacade, PersistenceHealth};
+pub use marks::{MarkApplier, MarkHealth, MarkingFdCallback, SoMarkApplier};
 pub use params::{PeerParams, TransportEndpoint, TunnelParams};
 pub use translate::translate;
+pub use tun::{DEFAULT_IF_NAME, TunAddressPlan, TunError, TunHandle, TunIfAddress};
 
 pub use protun;
 
