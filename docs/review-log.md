@@ -2936,3 +2936,15 @@ window); and the OVERFLOW lane carries ops the full queue refused
 (the stale-restart shape), through a shared bounded lane drained
 into every batch's tail and the shutdown drain. Pins: the
 clear-wipe and the overflow convergence. 49 protocol tests.
+
+## 2026-09-30 — M4 PR-2 (#13) round 9: the cross-lane ordering guard
+
+One P1, genuine, fixed at 8d58901: the queue and the overflow are
+two lanes with no shared order — the newest overflow op could
+apply, then the stale queued batch overwrite it (memory and disk
+diverging with NO failure recorded). Every op now carries the
+facade's send-time sequence; the worker keeps a per-key
+last-applied watermark (advancing only on durable success) and
+skips any op not newer. ClearAll checks/advances all three
+watermarks; the retry lane retains sequences. Pin: the
+stale-queued-op skip. 50 protocol tests.
