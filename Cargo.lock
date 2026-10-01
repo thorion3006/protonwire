@@ -3729,6 +3729,18 @@ checksum = "650eef8c711430f1a879fdd01d4745a7deea475becfb90269c06775983bbf086"
 
 [[package]]
 name = "nix"
+version = "0.25.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f346ff70e7dbfd675fe90590b92d59ef2de15a8779ae305ebcbfd3f0caf59be4"
+dependencies = [
+ "autocfg",
+ "bitflags 1.3.2",
+ "cfg-if",
+ "libc",
+]
+
+[[package]]
+name = "nix"
 version = "0.29.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "71e2746dc3a24dd78b3cfcb7be93368c6de9963d30f43a6a73998a9cf4b17b46"
@@ -4838,6 +4850,8 @@ dependencies = [
  "chacha20poly1305",
  "hex",
  "hmac 0.12.1",
+ "nix 0.25.1",
+ "parking_lot",
  "proton-os-interface",
  "rand_core 0.6.4",
  "ring",
@@ -5124,6 +5138,7 @@ dependencies = [
  "protonwire-core",
  "protonwire-frontend-api",
  "protonwire-ipc",
+ "protonwire-protocol",
  "protonwire-store",
  "serde_json",
  "thiserror 2.0.20",
@@ -5197,6 +5212,7 @@ dependencies = [
  "libc",
  "log",
  "nix 0.31.3",
+ "proton-boringtun",
  "protonwire-net",
  "protun",
  "thiserror 2.0.20",
