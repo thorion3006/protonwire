@@ -15,32 +15,68 @@ use zeroize::Zeroizing;
 
 use crate::Protocol;
 
+/// One transport's endpoint: the entry address and its port
+/// candidates — the catalog's own `ProtocolEndpoint` shape (an
+/// address-and-ports PAIR per transport: the addresses may DIFFER
+/// across transports on one physical, which a single flattened
+/// address cannot express — the bot round-2 P1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransportEndpoint {
+    /// The entry address for THIS transport.
+    pub entry_ip: IpAddr,
+    /// Port candidates, priority order.
+    pub ports: Vec<u16>,
+}
+
 /// One connection candidate physical: the network identity ProTUN
 /// cycles through, composed by the caller from the catalog's
 /// `PhysicalServer` (the daemon join: selection's logical winner →
 /// its online physicals, priority order preserved).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct PeerParams {
-    /// The caller's stable id for this peer (rides ProTUN's state
+    /// The caller's stable id for the peer (rides ProTUN's state
     /// events back — `peer_id`).
     pub id: String,
-    /// The entry address to reach (per-protocol IPv4 preferred; the
-    /// legacy `EntryIP` shape maps per the catalog contract).
-    pub entry_ip: IpAddr,
     /// The server's WireGuard X25519 public key (base64).
     pub public_key_base64: String,
-    /// UDP port candidates, priority order (empty: UDP not served).
-    pub udp_ports: Vec<u16>,
-    /// TCP port candidates, priority order (empty: TCP not served).
-    pub tcp_ports: Vec<u16>,
-    /// TLS port candidates, priority order (empty: Stealth not served).
-    pub tls_ports: Vec<u16>,
+    /// The UDP endpoint; `None` when the transport is not served.
+    pub udp: Option<TransportEndpoint>,
+    /// The TCP endpoint; `None` when not served.
+    pub tcp: Option<TransportEndpoint>,
+    /// The TLS (Stealth) endpoint; `None` when not served.
+    pub tls: Option<TransportEndpoint>,
     /// Lower connects first (the caller's ranking; selection's
     /// official order is the precedent).
     pub priority: i32,
     /// The exit location label (status rendering; the catalog's
     /// `Domain` or the logical's country, per the caller).
     pub exit_label: Option<String>,
+}
+
+/// SEC-5/FR-121: full entry addresses never render. A derived Debug
+/// would print every transport's `entry_ip` verbatim into the exact
+/// downstream `debug!("{params:?}")` scenario TunnelParams' manual
+/// Debug exists to make safe — the manual impl redacts them (the
+/// core redact.rs precedent; ports, keys, and labels are catalog
+/// data, not addresses).
+impl std::fmt::Debug for PeerParams {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let endpoint = |transport: &str, endpoint: &Option<TransportEndpoint>| {
+            endpoint.as_ref().map(|endpoint| {
+                format!("{transport}={{ip=[redacted], ports={:?}}}", endpoint.ports)
+            })
+        };
+        formatter
+            .debug_struct("PeerParams")
+            .field("id", &self.id)
+            .field("public_key_base64", &self.public_key_base64)
+            .field("udp", &endpoint("udp", &self.udp))
+            .field("tcp", &endpoint("tcp", &self.tcp))
+            .field("tls", &endpoint("tls", &self.tls))
+            .field("priority", &self.priority)
+            .field("exit_label", &self.exit_label)
+            .finish()
+    }
 }
 
 /// The client's private WireGuard key (base64) in ZEROIZING storage
@@ -146,18 +182,19 @@ impl std::fmt::Debug for TunnelParams {
 impl TunnelParams {
     /// Whether any peer can serve the requested protocol at all —
     /// the honest pre-flight for a typed refusal before the engine
-    /// spins up (an empty port set for the requested transport is a
-    /// dead connection cycle).
+    /// spins up (an endpoint without ports is a dead connection
+    /// cycle).
     pub fn serves_requested_protocol(&self) -> bool {
-        match self.protocol {
-            Protocol::Smart => self.peers.iter().any(|peer| {
-                !peer.udp_ports.is_empty()
-                    || !peer.tcp_ports.is_empty()
-                    || !peer.tls_ports.is_empty()
-            }),
-            Protocol::WireGuardUdp => self.peers.iter().any(|p| !p.udp_ports.is_empty()),
-            Protocol::WireGuardTcp => self.peers.iter().any(|p| !p.tcp_ports.is_empty()),
-            Protocol::Stealth => self.peers.iter().any(|p| !p.tls_ports.is_empty()),
-        }
+        let serves = |peer: &PeerParams| match self.protocol {
+            Protocol::Smart => {
+                peer.udp.as_ref().is_some_and(|e| !e.ports.is_empty())
+                    || peer.tcp.as_ref().is_some_and(|e| !e.ports.is_empty())
+                    || peer.tls.as_ref().is_some_and(|e| !e.ports.is_empty())
+            }
+            Protocol::WireGuardUdp => peer.udp.as_ref().is_some_and(|e| !e.ports.is_empty()),
+            Protocol::WireGuardTcp => peer.tcp.as_ref().is_some_and(|e| !e.ports.is_empty()),
+            Protocol::Stealth => peer.tls.as_ref().is_some_and(|e| !e.ports.is_empty()),
+        };
+        self.peers.iter().any(serves)
     }
 }

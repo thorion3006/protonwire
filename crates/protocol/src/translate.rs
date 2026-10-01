@@ -163,8 +163,26 @@ fn decode_client_key(key: &str) -> Result<WgClientPrivateKey, ProtocolError> {
     Ok(WgClientPrivateKey(array))
 }
 
-/// Decodes one peer's key and address into ProTUN's types.
-fn decode_peer(peer: &crate::params::PeerParams) -> Result<PeerInfo, ProtocolError> {
+/// The three transports ProTUN candidates carry port lists for.
+#[derive(Clone, Copy)]
+enum Transport {
+    Udp,
+    Tcp,
+    Tls,
+}
+
+/// Decodes one peer into ProTUN's types, EXPANDING per-address (the
+/// bot round-2 P1): the catalog's `ProtocolEndpoint` pairs each
+/// transport with its own entry address, and a physical MAY advertise
+/// different addresses per transport — a single flattened address
+/// cannot express that (ProTUN would attempt TCP or TLS against the
+/// UDP address and fail). Transports SHARING an address merge into
+/// one candidate (the common case stays byte-identical to the
+/// pre-expansion shape, one `PeerInfo` with three port lists); a peer
+/// whose addresses genuinely differ expands into several candidates,
+/// disambiguated with a `/{n}` suffix on the caller's id (the daemon
+/// maps state events back with the prefix).
+fn decode_peer(peer: &crate::params::PeerParams) -> Result<Vec<PeerInfo>, ProtocolError> {
     use base64::Engine;
     let key_bytes = base64::engine::general_purpose::STANDARD
         .decode(&peer.public_key_base64)
@@ -174,16 +192,58 @@ fn decode_peer(peer: &crate::params::PeerParams) -> Result<PeerInfo, ProtocolErr
     let server_public_key = WgPeerPublicKey::try_from(key_bytes).map_err(|_| {
         ProtocolError::InvalidPeer(peer.id.clone(), "key is not 32 bytes".to_owned())
     })?;
-    Ok(PeerInfo {
-        peer_id: peer.id.clone(),
-        server_ip: IpAddress(peer.entry_ip),
-        server_public_key,
-        udp_ports: peer.udp_ports.clone(),
-        tcp_ports: peer.tcp_ports.clone(),
-        tls_ports: peer.tls_ports.clone(),
-        priority: peer.priority,
-        exit_label: peer.exit_label.clone(),
-    })
+    // The raw bytes are Copy — each expanded candidate gets its own.
+    let server_public_key = server_public_key.0;
+
+    let mut candidates: Vec<PeerInfo> = Vec::new();
+    for (transport, endpoint) in [
+        (Transport::Udp, &peer.udp),
+        (Transport::Tcp, &peer.tcp),
+        (Transport::Tls, &peer.tls),
+    ] {
+        // An endpoint without ports is a transport this peer does not
+        // serve (the pre-flight's own convention).
+        let Some(endpoint) = endpoint.as_ref().filter(|e| !e.ports.is_empty()) else {
+            continue;
+        };
+        let install = |info: &mut PeerInfo| match transport {
+            Transport::Udp => info.udp_ports = endpoint.ports.clone(),
+            Transport::Tcp => info.tcp_ports = endpoint.ports.clone(),
+            Transport::Tls => info.tls_ports = endpoint.ports.clone(),
+        };
+        match candidates
+            .iter_mut()
+            .find(|candidate| candidate.server_ip == IpAddress(endpoint.entry_ip))
+        {
+            Some(candidate) => install(candidate),
+            None => {
+                let mut info = PeerInfo {
+                    peer_id: peer.id.clone(),
+                    server_ip: IpAddress(endpoint.entry_ip),
+                    server_public_key: WgPeerPublicKey(server_public_key),
+                    udp_ports: Vec::new(),
+                    tcp_ports: Vec::new(),
+                    tls_ports: Vec::new(),
+                    priority: peer.priority,
+                    exit_label: peer.exit_label.clone(),
+                };
+                install(&mut info);
+                candidates.push(info);
+            }
+        }
+    }
+    if candidates.len() > 1 {
+        for (index, candidate) in candidates.iter_mut().enumerate() {
+            candidate.peer_id = format!("{}/{index}", candidate.peer_id);
+        }
+    }
+    if candidates.is_empty() {
+        return Err(ProtocolError::InvalidPeer(
+            peer.id.clone(),
+            "the peer serves no transport".to_owned(),
+        ));
+    }
+    Ok(candidates)
 }
 
 /// Translates the peer list, refusing when NO well-formed peer
@@ -194,7 +254,7 @@ fn translate_peers(peers: &[crate::params::PeerParams]) -> Result<Vec<PeerInfo>,
     let mut last_error = None;
     for peer in peers {
         match decode_peer(peer) {
-            Ok(info) => translated.push(info),
+            Ok(infos) => translated.extend(infos),
             Err(error) => {
                 // Warn-and-proceed among healthy ones; the specific
                 // error is kept for the none-remain refusal so it
@@ -233,18 +293,30 @@ mod tests {
     }
 
     fn peer(id: &str, priority: i32) -> crate::params::PeerParams {
+        use crate::params::TransportEndpoint;
         use base64::Engine;
         // The PEER key is PUBLIC catalog data (no redaction needed)
         // but must DIFFER from the client-key fixture so the Debug
         // pin cannot pass on a collision.
         let peer_key = base64::engine::general_purpose::STANDARD.encode([1u8; 32]);
+        // One address shared by all transports (the common catalog
+        // shape — the expansion MERGES these into one candidate).
+        let address = IpAddr::from_str("192.0.2.10").unwrap();
         crate::params::PeerParams {
             id: id.to_owned(),
-            entry_ip: IpAddr::from_str("192.0.2.10").unwrap(),
             public_key_base64: peer_key,
-            udp_ports: vec![443, 1194],
-            tcp_ports: vec![443],
-            tls_ports: vec![8443],
+            udp: Some(TransportEndpoint {
+                entry_ip: address,
+                ports: vec![443, 1194],
+            }),
+            tcp: Some(TransportEndpoint {
+                entry_ip: address,
+                ports: vec![443],
+            }),
+            tls: Some(TransportEndpoint {
+                entry_ip: address,
+                ports: vec![8443],
+            }),
             priority,
             exit_label: Some("CH#10".to_owned()),
         }
@@ -328,8 +400,8 @@ mod tests {
     #[test]
     fn serves_requested_protocol_matches_the_port_sets() {
         let mut udp_only = peer("a", 0);
-        udp_only.tcp_ports.clear();
-        udp_only.tls_ports.clear();
+        udp_only.tcp = None;
+        udp_only.tls = None;
         let mut request = params(vec![udp_only]);
         assert!(request.serves_requested_protocol(), "UDP requested");
         request.protocol = crate::Protocol::WireGuardTcp;
@@ -344,8 +416,8 @@ mod tests {
         // OpenVPN-only physical: protun has no OpenVPN transport, so
         // it can serve nothing — false under every protocol).
         let mut tls_only = peer("b", 1);
-        tls_only.udp_ports.clear();
-        tls_only.tcp_ports.clear();
+        tls_only.udp = None;
+        tls_only.tcp = None;
         let mut request = params(vec![tls_only]);
         request.protocol = crate::Protocol::Stealth;
         assert!(request.serves_requested_protocol(), "TLS requested");
@@ -353,9 +425,9 @@ mod tests {
         assert!(!request.serves_requested_protocol());
 
         let mut dead = peer("c", 2);
-        dead.udp_ports.clear();
-        dead.tcp_ports.clear();
-        dead.tls_ports.clear();
+        dead.udp = None;
+        dead.tcp = None;
+        dead.tls = None;
         let mut request = params(vec![dead]);
         request.protocol = crate::Protocol::Smart;
         assert!(
@@ -403,8 +475,8 @@ mod tests {
     #[test]
     fn translate_refuses_a_dead_transport_typed() {
         let mut udp_only = peer("a", 0);
-        udp_only.tcp_ports.clear();
-        udp_only.tls_ports.clear();
+        udp_only.tcp = None;
+        udp_only.tls = None;
         let mut request = params(vec![udp_only]);
         request.protocol = crate::Protocol::Stealth;
         let error = translate(&request).unwrap_err();
@@ -449,7 +521,7 @@ mod tests {
         // A peer that cannot serve the requested transport is
         // OMITTED; one that can survives.
         let mut tcp_only = peer("tcp-only", 1);
-        tcp_only.udp_ports.clear();
+        tcp_only.udp = None;
         let config = translate(&params(vec![peer("udp-ok", 0), tcp_only])).unwrap();
         assert_eq!(config.peers.len(), 1);
         assert_eq!(config.peers[0].peer_id, "udp-ok");
@@ -475,7 +547,7 @@ mod tests {
         // transport): the pre-flight passes on the carrier's ports,
         // the skip drops the carrier, and the survivors cannot serve.
         let mut tcp_only = peer("tcp-only", 1);
-        tcp_only.udp_ports.clear();
+        tcp_only.udp = None;
         let error = translate(&params(vec![malformed_carrier, tcp_only])).unwrap_err();
         assert!(
             matches!(
@@ -504,5 +576,81 @@ mod tests {
             config.sni_strategy,
             protun::api::connection::SniStrategy::Random
         ));
+    }
+
+    /// The bot round-2 P1: per-transport entry addresses are
+    /// PRESERVED — a physical advertising different addresses per
+    /// transport expands into per-address candidates (a single
+    /// flattened `server_ip` would aim TCP at the UDP address), each
+    /// carrying only its own transport's ports, ids disambiguated
+    /// with the `/{n}` suffix.
+    #[test]
+    fn per_transport_addresses_expand_into_per_address_candidates() {
+        use crate::params::TransportEndpoint;
+        let mut split = peer("split", 0);
+        split.udp = Some(TransportEndpoint {
+            entry_ip: IpAddr::from_str("192.0.2.10").unwrap(),
+            ports: vec![443],
+        });
+        split.tcp = Some(TransportEndpoint {
+            entry_ip: IpAddr::from_str("198.51.100.20").unwrap(),
+            ports: vec![443],
+        });
+        split.tls = Some(TransportEndpoint {
+            entry_ip: IpAddr::from_str("203.0.113.30").unwrap(),
+            ports: vec![8443],
+        });
+        let mut request = params(vec![split]);
+        request.protocol = crate::Protocol::Smart;
+        let config = translate(&request).unwrap();
+        assert_eq!(config.peers.len(), 3, "one candidate per address");
+        for (index, candidate) in config.peers.iter().enumerate() {
+            assert_eq!(candidate.peer_id, format!("split/{index}"));
+            let transport_ports =
+                candidate.udp_ports.len() + candidate.tcp_ports.len() + candidate.tls_ports.len();
+            assert_eq!(
+                transport_ports, 1,
+                "each per-address candidate carries exactly one transport"
+            );
+        }
+        // The addresses themselves differ and land on their
+        // transports: the TCP-only candidate owns the TCP address.
+        let tcp_candidate = config
+            .peers
+            .iter()
+            .find(|candidate| !candidate.tcp_ports.is_empty())
+            .unwrap();
+        assert_eq!(
+            tcp_candidate.server_ip.0,
+            IpAddr::from_str("198.51.100.20").unwrap()
+        );
+    }
+
+    /// The common catalog shape — one address, three transports —
+    /// MERGES into a single candidate (the pre-expansion output is
+    /// preserved for the same-address case; nothing multiplies).
+    #[test]
+    fn same_address_transports_merge_into_one_candidate() {
+        let mut request = params(vec![peer("merged", 0)]);
+        request.protocol = crate::Protocol::Smart;
+        let config = translate(&request).unwrap();
+        assert_eq!(config.peers.len(), 1);
+        assert_eq!(config.peers[0].peer_id, "merged");
+        assert!(!config.peers[0].udp_ports.is_empty());
+        assert!(!config.peers[0].tcp_ports.is_empty());
+        assert!(!config.peers[0].tls_ports.is_empty());
+    }
+
+    /// SEC-5/FR-121 (the bot round-2 P2): peer entry addresses never
+    /// render — the exact downstream `debug!("{params:?}")` scenario
+    /// emits `[redacted]` placeholders, not the addresses.
+    #[test]
+    fn peer_entry_addresses_never_render_in_debug() {
+        let rendered = format!("{:?}", params(vec![peer("a", 0)]));
+        assert!(rendered.contains("ip=[redacted]"), "{rendered}");
+        assert!(
+            !rendered.contains("192.0.2"),
+            "the entry address must not appear: {rendered}"
+        );
     }
 }
