@@ -57,22 +57,60 @@ impl SoMarkApplier {
 
 impl MarkApplier for SoMarkApplier {
     fn apply_mark(&self, socket_fd: RawFd) -> io::Result<()> {
-        // nix's setsockopt takes an AsFd; protun hands over a borrowed
-        // raw descriptor it owns for the duration of the callback.
-        // SAFETY: socket_fd is an open descriptor (its owner, ProTUN's
-        // socket factory, keeps it open for the whole callback — the
-        // mark happens before the factory could close or reuse it).
-        #[allow(unsafe_code)] // workspace deny; the one raw-fd borrow in the seam
-        let fd = unsafe { std::os::fd::BorrowedFd::borrow_raw(socket_fd) };
-        // SO_TYPE succeeds only on sockets: if a future protun ever
-        // reports a stale fd the process has reused for something
-        // else, refuse BEFORE marking an unrelated descriptor (the
-        // contract drift becomes a recorded failure, not a silent
+        // The bot round's P2: raw fd values cross this SAFE api, so
+        // no `BorrowedFd` may be constructed from them — its
+        // "descriptor is open and stays open" precondition is
+        // unverifiable for an arbitrary i32, and a closed/reused fd
+        // would be UB through safe Rust. Direct libc syscalls have
+        // no such invariant: the KERNEL rejects invalid descriptors
+        // with EBADF, a benign typed error.
+        //
+        // SO_TYPE succeeds only on sockets: if a caller ever hands a
+        // stale fd the process has reused for something else, the
+        // check fails BEFORE an unrelated descriptor gets marked
+        // (contract drift becomes a recorded failure, not a silent
         // policy hole).
-        nix::sys::socket::getsockopt(&fd, nix::sys::socket::sockopt::SockType)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
-        nix::sys::socket::setsockopt(&fd, nix::sys::socket::sockopt::Mark, &self.mark)
-            .map_err(io::Error::from)
+        #[allow(unsafe_code)] // workspace deny; leaf syscalls, no pointers beyond the value args
+        fn socket_type(socket_fd: RawFd) -> io::Result<libc::c_int> {
+            let mut socket_type: libc::c_int = 0;
+            let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+            // SAFETY: socket_fd is passed by value; the out-pointer
+            // and length name a properly initialized c_int. An
+            // invalid fd yields EBADF from the kernel.
+            let rc = unsafe {
+                libc::getsockopt(
+                    socket_fd,
+                    libc::SOL_SOCKET,
+                    libc::SO_TYPE,
+                    std::ptr::addr_of_mut!(socket_type).cast(),
+                    std::ptr::addr_of_mut!(len),
+                )
+            };
+            if rc != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(socket_type)
+        }
+        socket_type(socket_fd)?;
+        #[allow(unsafe_code)] // workspace deny; leaf syscall, no pointers beyond the value args
+        fn set_mark(socket_fd: RawFd, mark: u32) -> io::Result<()> {
+            // SAFETY: socket_fd and mark pass by value; the value
+            // pointer names the u32 argument SO_MARK reads.
+            let rc = unsafe {
+                libc::setsockopt(
+                    socket_fd,
+                    libc::SOL_SOCKET,
+                    libc::SO_MARK,
+                    std::ptr::addr_of!(mark).cast(),
+                    std::mem::size_of::<u32>() as libc::socklen_t,
+                )
+            };
+            if rc != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        }
+        set_mark(socket_fd, self.mark)
     }
 }
 
@@ -158,18 +196,27 @@ impl OnSocketFdAvailableCallback for MarkingFdCallback {
         // Synchronous: by the time this returns, the descriptor carries
         // the bypass mark (or the failure is recorded for the
         // fail-closed gate — the callback cannot refuse the socket).
-        self.health.note_reported();
-        if let Err(error) = self.applier.apply_mark(socket_fd) {
-            self.health.note_failure();
-            tracing::warn!(
-                socket_fd,
-                error = %error,
-                "outer-socket bypass mark failed (FR-32B) — route commit must refuse until resolved"
-            );
+        // PUBLISH-AFTER-OUTCOME (the bot round's P1): `reported` is
+        // counted only once the marking RESULT is in — a concurrent
+        // `healthy()` between report and outcome could otherwise see
+        // reported>0 with all_marked still true and commit routes
+        // over an unmarked socket. Both orderings below are
+        // fail-closed: the failure latch lands BEFORE the report; a
+        // success records the report last.
+        match self.applier.apply_mark(socket_fd) {
+            Ok(()) => self.health.note_reported(),
+            Err(error) => {
+                self.health.note_failure();
+                self.health.note_reported();
+                tracing::warn!(
+                    socket_fd,
+                    error = %error,
+                    "outer-socket bypass mark failed (FR-32B) — route commit must refuse until resolved"
+                );
+            }
         }
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
