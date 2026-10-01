@@ -401,14 +401,18 @@ impl RetryLane {
         }
     }
 
-    /// Retains the op, replacing any prior op for the same key. A
+    /// Retains the op, keeping the NEWEST desired state per key. A
     /// ClearAll EXPANDS into per-key Removes (the bot round-7 P1 —
     /// the "" synthetic name let a pending put survive a successful
     /// clear and recreate the credential after logout, and a pending
     /// clear later delete a newer successful put; modeling the
     /// LATEST DESIRED STATE per key makes both directions
     /// impossible: the clear replaces every key's entry, a newer
-    /// per-key op replaces the clear's entry for that key).
+    /// per-key op replaces the clear's entry for that key). An
+    /// OLDER failed op never evicts a NEWER pending one (the bot
+    /// round-10 P1: the overflow's newest op fails and is retained;
+    /// a stale queued op for the same key then fails too — the
+    /// unconditional replace would lose the newest state's retry).
     fn retain(&mut self, op: Op) {
         let deadline = std::time::Instant::now() + self.backoff;
         let op_seq = op.seq();
@@ -428,6 +432,14 @@ impl RetryLane {
             Op::Put(ref name, _, _) | Op::Remove(ref name, _) => vec![(name.clone(), op)],
         };
         for (name, op) in expanded {
+            // Newest-wins: an existing pending op with a sequence at
+            // least as new keeps its place.
+            let superseded = self.pending.iter().any(|(existing, existing_op, _)| {
+                *existing == name && existing_op.seq() >= op.seq()
+            });
+            if superseded {
+                continue;
+            }
             self.pending.retain(|(existing, _, _)| *existing != name);
             self.pending.push((name, op, deadline));
         }
@@ -464,21 +476,17 @@ impl RetryLane {
         self.pending.drain(..).map(|(_, op, _)| op).collect()
     }
 
-    /// A success for this key clears any pending retry and resets
-    /// the backoff ladder.
-    fn note_success(&mut self, name: &str) {
-        self.pending.retain(|(existing, _, _)| existing != name);
+    /// A success for this key clears pending retries up to the
+    /// APPLIED sequence (the bot round-10 P1: an older op's success
+    /// must not drop a NEWER pending op — the failed newest state
+    /// stays armed) and resets the backoff ladder.
+    fn note_success(&mut self, name: &str, applied_seq: u64) {
+        self.pending.retain(|(existing, existing_op, _)| {
+            !(*existing == name && existing_op.seq() <= applied_seq)
+        });
         if self.pending.is_empty() {
             self.backoff = RETRY_BACKOFF_START;
         }
-    }
-
-    /// A successful ClearAll invalidates every pending per-key
-    /// retry (the bot round-8 P1 — the desired state for EVERY key
-    /// is now "removed"; nothing older survives).
-    fn clear_all_entries(&mut self) {
-        self.pending.clear();
-        self.backoff = RETRY_BACKOFF_START;
     }
 }
 
@@ -495,7 +503,7 @@ fn worker_loop(
     overflow: &Mutex<Vec<Op>>,
 ) {
     // The apply pass, shared by the live loop and the shutdown
-    // drain: coalesce, attempt, record, retain.
+    // drain: coalesce, expand, attempt, record, retain.
     fn apply_pass(
         batch: Vec<Op>,
         cache: &EncryptedCache,
@@ -538,35 +546,44 @@ fn worker_loop(
             }
         }
         coalesced.reverse();
-        for op in coalesced {
+        // EXPAND every ClearAll into per-key Removes at the clear's
+        // own sequence (the bot round-10 P1): a whole-bucket
+        // try_clear_all cannot respect per-key watermarks — a key
+        // whose NEWER op already applied (overflow lane racing an
+        // older queued clear) would be wiped, and the success path
+        // would even lower its watermark. As per-key Removes the
+        // existing sequence guard skips exactly those keys and
+        // clears the rest; nothing below needs a ClearAll arm.
+        let expanded: Vec<Op> = coalesced
+            .into_iter()
+            .flat_map(|op| match op {
+                Op::ClearAll(seq) => [
+                    CacheKey::Certificate,
+                    CacheKey::PrivateKey,
+                    CacheKey::ApiSession,
+                ]
+                .into_iter()
+                .map(|key| Op::Remove(format!("{key:?}"), seq))
+                .collect::<Vec<_>>(),
+                per_key => vec![per_key],
+            })
+            .collect();
+        for op in expanded {
             // The SEQUENCE GUARD (the bot round-9 P1): the queue and
             // the overflow are two lanes with no shared order — an
             // overflow op (newest) can apply before the stale queued
             // batch reaches this loop. An op whose sequence is not
             // NEWER than the last this worker applied for its key is
             // STALE (a newer desired state already persisted) and is
-            // skipped, never applied over the newer state. ClearAll
-            // expands per-key (the overflow's model) so each key
-            // checks its own watermark; the guard consumes nothing.
+            // skipped, never applied over the newer state. Everything
+            // here is per-key (ClearAll expanded above — the bot
+            // round-10 P1), so each key checks its own watermark;
+            // the guard consumes nothing.
             let seq = op.seq();
-            match &op {
-                Op::Put(name, _, _) | Op::Remove(name, _) => {
-                    if last_applied.get(name).is_some_and(|last| *last >= seq) {
-                        continue;
-                    }
-                }
-                Op::ClearAll(_) => {
-                    let stale = [
-                        "Certificate".to_owned(),
-                        "PrivateKey".to_owned(),
-                        "ApiSession".to_owned(),
-                    ]
-                    .iter()
-                    .all(|name| last_applied.get(name).is_some_and(|last| *last >= seq));
-                    if stale {
-                        continue;
-                    }
-                }
+            if let Op::Put(name, _, _) | Op::Remove(name, _) = &op
+                && last_applied.get(name).is_some_and(|last| *last >= seq)
+            {
+                continue;
             }
             let op_name = op.key_name();
             // The attempt consumes the op's payload; the RETRY lane
@@ -587,26 +604,21 @@ fn worker_loop(
                     Some(key) => cache.try_remove(key),
                     None => Ok(()),
                 },
+                // Unreachable since the expansion above (kept
+                // exhaustively typed): a ClearAll never reaches the
+                // attempt loop.
                 Op::ClearAll(_) => cache.try_clear_all(),
             };
             match result {
                 Ok(()) => {
-                    // A SUCCESSFUL ClearAll invalidates EVERY pending
-                    // per-key retry (the bot round-8 P1 — note_success
-                    // keyed on the empty string matched nothing; a
-                    // stale put survived a successful logout-clear and
-                    // could re-create the credential). The empty name
-                    // IS the clear's marker: clear the whole lane.
-                    // The watermark advances ONLY on durable success (a failed op0027s seq is re-armed by the retry lane).
-                    if op_name.is_empty() {
-                        for name in ["Certificate", "PrivateKey", "ApiSession"] {
-                            last_applied.insert(name.to_owned(), seq);
-                        }
-                        retry.clear_all_entries();
-                    } else {
-                        last_applied.insert(op_name.clone(), seq);
-                        retry.note_success(&op_name);
-                    }
+                    // The watermark advances ONLY on durable success
+                    // (a failed op's seq is re-armed by the retry
+                    // lane). The seq-aware note_success (the bot
+                    // round-10 P1) drops pending retries for this key
+                    // only up to the applied sequence — a NEWER
+                    // pending op (the failed newest state) survives.
+                    last_applied.insert(op_name.clone(), seq);
+                    retry.note_success(&op_name, seq);
                     health
                         .applied
                         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -1165,10 +1177,13 @@ mod round8_tests {
 
     use super::*;
 
-    /// The bot round-8 P1: a SUCCESSFUL ClearAll clears every
-    /// pending per-key retry (the "" marker matched nothing before).
+    /// The bot round-8 P1's INVARIANT, via the round-10 mechanism: a
+    /// successful clear invalidates every pending retry it covers —
+    /// as per-key Removes the clear advances each key's watermark
+    /// past the pending ops (seq ≤ clear seq), while a NEWER pending
+    /// op (the failed newest state, the round-10 P1) stays armed.
     #[test]
-    fn a_successful_clear_empties_the_whole_lane() {
+    fn a_successful_clear_covers_pending_retries_but_not_newer_ones() {
         let mut retry = RetryLane::new();
         retry.retain(Op::Put(
             "Certificate".to_owned(),
@@ -1177,16 +1192,24 @@ mod round8_tests {
         ));
         retry.retain(Op::Put(
             "PrivateKey".to_owned(),
-            Zeroizing::new(b"stale".to_vec()),
-            2,
+            Zeroizing::new(b"newest".to_vec()),
+            9,
         ));
-        // Simulate the ClearAll SUCCESS path (the empty-name marker).
-        retry.clear_all_entries();
-        assert!(
-            retry.pending.is_empty(),
-            "the successful clear invalidated every pending retry"
+        // The clear at seq 5 succeeds per key: the seq-1 pending
+        // retry is covered (its watermark moves past it); the seq-9
+        // pending op is NEWER and must survive.
+        retry.note_success("Certificate", 5);
+        retry.note_success("PrivateKey", 5);
+        let names: Vec<&str> = retry
+            .pending
+            .iter()
+            .map(|(name, _, _)| name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["PrivateKey"],
+            "older retries are covered by the clear; the newest state stays armed"
         );
-        assert_eq!(retry.backoff, RETRY_BACKOFF_START, "the ladder reset");
     }
 
     /// The bot round-8 P1 (overflow): an op the full queue refused
@@ -1328,6 +1351,85 @@ mod round9_tests {
             );
             std::thread::sleep(Duration::from_millis(10));
         }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The bot round-10 P1 (retain): an OLDER failed op must not
+    /// evict a NEWER pending one — the overflow's newest state fails
+    /// first (retained), the stale queued op for the same key fails
+    /// after; the unconditional replace would have lost the newest
+    /// state's retry entirely.
+    #[test]
+    fn an_older_failed_op_does_not_replace_a_newer_pending_one() {
+        let mut retry = RetryLane::new();
+        retry.retain(Op::Put(
+            "Certificate".to_owned(),
+            Zeroizing::new(b"newest".to_vec()),
+            65,
+        ));
+        // The stale seq-64 op fails later — the lane keeps 65.
+        retry.retain(Op::Put(
+            "Certificate".to_owned(),
+            Zeroizing::new(b"stale".to_vec()),
+            64,
+        ));
+        assert_eq!(retry.pending.len(), 1);
+        assert_eq!(retry.pending[0].1.seq(), 65);
+
+        // And the symmetric arm: a NEWER failed op DOES replace the
+        // older pending one (the latest desired state wins).
+        retry.retain(Op::Put(
+            "Certificate".to_owned(),
+            Zeroizing::new(b"newest-2".to_vec()),
+            66,
+        ));
+        assert_eq!(retry.pending.len(), 1);
+        assert_eq!(retry.pending[0].1.seq(), 66);
+    }
+
+    /// The bot round-10 P1 (apply path): a ClearAll OLDER than an
+    /// already-applied per-key op must not wipe that key — the
+    /// per-key expansion makes the sequence guard skip exactly the
+    /// newer-applied key (driven through the facade surface, the
+    /// overflow lane both times — the newest state applies on the
+    /// idle-drain cadence, then the STALE clear arrives).
+    #[test]
+    fn an_older_clear_does_not_wipe_a_newer_applied_key() {
+        let dir = std::path::PathBuf::from(format!(
+            "/tmp/protonwire-r10-clear-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cache = Arc::new(EncryptedCache::with_key_bytes(&dir, &[23u8; 32]).unwrap());
+        let facade = PersistenceFacade::start(Arc::clone(&cache));
+        // The NEWEST certificate state lands and applies.
+        let newest = facade.next_seq();
+        facade.overflow(Op::Put(
+            "Certificate".to_owned(),
+            Zeroizing::new(b"newest".to_vec()),
+            newest,
+        ));
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while cache.get(CacheKey::Certificate) != Some(b"newest".to_vec()) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the newest op never applied"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // The STALE ClearAll (older than the applied put): the
+        // certificate is NOT wiped; the other keys clear if set.
+        facade.overflow(Op::ClearAll(newest - 1));
+        std::thread::sleep(OVERFLOW_POLL + Duration::from_millis(200));
+        assert_eq!(
+            cache.get(CacheKey::Certificate),
+            Some(b"newest".to_vec()),
+            "the newer applied state survives the older clear"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 }
