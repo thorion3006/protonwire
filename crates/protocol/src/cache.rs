@@ -1161,10 +1161,17 @@ mod round5_tests {
         // block. Run it on a thread so a regression fails the
         // deadline instead of hanging the test runner.
         let key_fifo = dir.join("cache.key");
+        // mkfifo needs a NUL-TERMINATED path (the CI flake's root
+        // cause: OsStr::as_bytes() carries no NUL, so the syscall
+        // read past the buffer — "worked" locally by luck, created a
+        // garbage-named file on CI and the real open got NotFound).
+        // CString is the one safe way to hand a path to a C ABI.
+        let key_fifo_c = std::ffi::CString::new(key_fifo.as_os_str().as_bytes())
+            .expect("the temp path has no NUL");
         let mk = || {
-            #[allow(unsafe_code)] // workspace deny; mkfifo is a leaf syscall, no pointers
+            #[allow(unsafe_code)] // workspace deny; leaf syscall, NUL-terminated
             unsafe {
-                libc::mkfifo(key_fifo.as_os_str().as_bytes().as_ptr().cast(), 0o600)
+                libc::mkfifo(key_fifo_c.as_ptr(), 0o600)
             }
         };
         assert_eq!(mk(), 0, "mkfifo keyfile");
@@ -1193,10 +1200,11 @@ mod round5_tests {
         // A FIFO at an ENTRY path: the preload read treats it as
         // absent (EOF under the bound) instead of blocking startup.
         let entry_fifo = dir.join("certificate.bin");
-        #[allow(unsafe_code)] // workspace deny; mkfifo is a leaf syscall, no pointers
-        unsafe {
-            libc::mkfifo(entry_fifo.as_os_str().as_bytes().as_ptr().cast(), 0o600)
-        };
+        let entry_fifo_c = std::ffi::CString::new(entry_fifo.as_os_str().as_bytes())
+            .expect("the temp path has no NUL");
+        #[allow(unsafe_code)] // workspace deny; leaf syscall, NUL-terminated
+        let entry_mk = unsafe { libc::mkfifo(entry_fifo_c.as_ptr(), 0o600) };
+        assert_eq!(entry_mk, 0, "mkfifo entry");
         let cache = super::EncryptedCache::with_key_bytes(&dir, &[31u8; 32]).unwrap();
         let read = cache.get(protun::api::connection::CacheKey::Certificate);
         assert_eq!(read, None, "the FIFO entry reads as absent, promptly");
