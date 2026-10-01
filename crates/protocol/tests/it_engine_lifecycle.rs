@@ -147,35 +147,25 @@ fn it14_engine_composition_lifecycle() {
         .expect("the composed connection starts");
     assert_eq!(connection.interface_name(), IF_NAME.to_owned());
 
-    // FR-29 lane: the state events flow, translated. PINNED BEHAVIOR
-    // of protun v2.2.1 (observed): the `Connecting` state carries an
-    // EMPTY peer list — the deterministic peer's id only ever rides
-    // the per-peer states (`Connected`). If an upgrade populates it,
-    // this pin fails and the daemon lane learns its state surface
-    // changed.
+    // FR-29 lane: the state events flow, translated, carrying OUR
+    // deterministic peer's id. (The first draft pinned an EMPTY
+    // Connecting peer list — that was an artifact of the harness
+    // before it brought `lo` up: an unreachable network yields empty
+    // peer lists. With loopback up, protun v2.2.1 populates the ids.)
     let connecting = await_event(
         &mut connection,
         &|event| {
             matches!(
                 event,
                 EngineEvent::State(EngineVpnState {
-                    connection: EngineConnectionState::Connecting { .. },
+                    connection: EngineConnectionState::Connecting { peer_ids, .. },
                     ..
-                })
+                }) if peer_ids.iter().any(|id| id == "it14-peer")
             )
         },
-        "a Connecting state",
+        "a Connecting state naming the deterministic peer",
     );
-    match connecting {
-        EngineEvent::State(EngineVpnState {
-            connection: EngineConnectionState::Connecting { peer_ids, .. },
-            ..
-        }) => assert!(
-            peer_ids.is_empty(),
-            "protun v2.2.1 pins an EMPTY Connecting peer list (an upgrade changed the surface)"
-        ),
-        other => panic!("expected a Connecting state, got {other:?}"),
-    }
+    let _ = connecting;
 
     // FR-32B lane: protun created its outer socket and OUR callback
     // saw it — the mark seam is live inside the real engine, not just
