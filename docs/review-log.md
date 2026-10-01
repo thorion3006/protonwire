@@ -3064,3 +3064,55 @@ targets, xtask all PASS, netns-it 7/7. Carried: PR-5 wraps the
 facade as the cache box (Arc-forwarding adapter); the IT logger
 gains the redaction pre-filter when an agent-mode IT appears;
 mlock stays PR-5's daemon lane.
+
+## 2026-09-30 — M4 PR-5 (m4/connect-surface): the daemon lane + THE M4 EXIT TEST
+
+The stack's final element, six commits on m4/connection-engine:
+SharedFacadeCache, the ConnectionLane, ipc deadline+§9.5 flags, the
+M4 exit test, the fix round.
+
+**THE M4 EXIT TEST IS GREEN** (the milestone's §18 criterion):
+connect/disconnect lifecycle in the netns against a MOCKED WireGuard
+peer — a real boringtun StdTunn (in-graph via pvpnclient) answering
+handshakes on loopback. Engine compose → handshake → Connected{the
+deterministic peer, transport, port} → stats pull answered → mark
+health held → disconnect → the TUN dies. The test FORCED the harness
+fix that unblocked it: a fresh netns starts with lo DOWN (the client's
+handshakes vanished; a plain-UDP probe returned NetworkUnreachable) —
+the gate shim now brings lo up. That fix CORRECTED a wrong recorded
+pin: IT-14's 'EMPTY Connecting peer list' was an unreachable-network
+artifact, not a protun surface property; with lo up protun v2.2.1
+POPULATES the ids and the pin now asserts our peer's id (the
+supersession of the PR-4-recorded pin, per the gate's R8).
+
+What else landed: SharedFacadeCache (the process-wide facade rides
+ProTUN's per-connection Box without dying with it — pinned); the
+ConnectionLane (owner-gated connect/disconnect, active_owner_uid,
+the bounded-cadence event pump into core's sequenced set_vpn_state,
+drain); ipc's deadline module + the pub timeout; the CLI §9.5
+entry/exit flags (scoped to secure-core, pinned); proton-boringtun
+as a dev-dep (in-graph crate, but its std feature admits nix 0.25.1
+into the committed lock — dev-only, disclosed).
+
+Gates: combined rust+SEC — RUST FAIL (P1: the pump's blocking recv
+under the slot mutex — MY earlier fix had silently failed to apply
+and the gate caught the live code; plus the phantom-owner P2 and the
+stranded-terminal-state P2 — ALL landed in the fix round), SEC PASS
+(2×P2 latent-on-wiring, both closed by the same fix round; the owner
+gate has no bypass; the test key cannot leak; the shim has no
+injection surface).
+
+DESCOPED FROM THE PLAN ENTRY, recorded per the standing rule (the
+gate's R4): (1) the ipc Connect/Disconnect WIRING onto the lane —
+the daemon's Connect arm still refuses NotImplemented until the
+M6 composition lane lands (the lane is constructed, tested, and
+waiting for its consumer; wiring it through core's request
+dispatch + TunnelParams assembly from the selection winner is the
+M6 connect-composition item's first slice); (2) the r21 THREE
+provider-cell installs — the production install needs the api
+lane's session-mint helper (MuonAuth::mint_session over the shared
+client/store/key; MuonCatalog/MuonEntitlements per the S8/S10
+builder pattern) and that is M2-lane architecture, not a daemon
+one-liner — carried with this precise pointer; (3) mlock (PR-2's
+track) — process-wide, belongs with the daemon's privilege setup in
+the M6 lane. Netns suite: 8/8 gated green.
