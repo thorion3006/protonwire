@@ -82,7 +82,23 @@ pub(crate) fn run(root: &Path) -> Result<bool> {
         }
     }
 
+    // BUILD OUTSIDE THE NAMESPACE (the bot round-11 P2): a fresh
+    // checkout or a CI cache miss needs the registry network — a
+    // namespace has none (loopback only, `lo` up), so cargo's fetch
+    // would die inside it before any gated test ran. Every target
+    // compiles here first (--no-run); the in-namespace invocation
+    // below is then a no-network compile check away from running.
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_owned());
+    let mut build = Command::new(&cargo);
+    build.arg("test").arg("--no-run");
+    for (package, target) in GATED_TARGETS {
+        build.args(["-p", package, "--test", target]);
+    }
+    build
+        .args(&cargo_args)
+        .status()
+        .with_context(|| "compiling the gated targets outside the namespace (registry access)")?;
+
     let mut failures = Vec::new();
     for (package, target) in GATED_TARGETS {
         let label = format!("{package}::{target}");
