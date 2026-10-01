@@ -778,6 +778,11 @@ impl ConnectionEngine {
             EngineMode::LocalAgent { settings, .. } => FeatureReconciliation::new(*settings),
             EngineMode::NoLocalAgent => FeatureReconciliation::new(EngineAgentSettings::default()),
         }));
+        // The callbacks share the ledger's epoch handle (round-13).
+        let epoch = reconciliation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .epoch_handle();
         let recovery = Arc::new(RecoverySlots::default());
         let callbacks = EngineCallbacks {
             event_tx,
@@ -785,6 +790,7 @@ impl ConnectionEngine {
             recovery: recovery.clone(),
             latest: latest.clone(),
             reconciliation: reconciliation.clone(),
+            epoch,
         };
 
         // protun-internal hazards noted for the record (PR-3's
@@ -806,7 +812,7 @@ impl ConnectionEngine {
 
         Ok(ActiveConnection {
             connection,
-            if_name: self.config.if_name.clone(),
+            if_name: std::cell::RefCell::new(self.config.if_name.clone()),
             mark_health,
             events: event_rx,
             drops,
@@ -852,6 +858,10 @@ struct EngineCallbacks {
     recovery: Arc<RecoverySlots>,
     latest: Arc<Mutex<Option<Arc<EngineVpnState>>>>,
     reconciliation: Arc<Mutex<FeatureReconciliation>>,
+    /// The ledger's epoch handle (the bot round-13 P2): snapshot at
+    /// callback ENTRY — answers queued before a settings change are
+    /// discarded.
+    epoch: Arc<AtomicU64>,
 }
 
 impl EngineCallbacks {
@@ -924,6 +934,10 @@ impl EngineCallbacks {
 
 impl protun::api::connection::StateChangedCallback for EngineCallbacks {
     fn on_state_changed(&self, state: VpnState) {
+        // The ENTRY snapshot (the bot round-13 P2): taken before any
+        // ledger work — if a settings update lands between this line
+        // and note_applied, the answer is discarded as stale.
+        let epoch = self.epoch.load(std::sync::atomic::Ordering::SeqCst);
         let translated = translate_state(&state);
         // T-20's applied side: a Connected state's agent report is
         // the server's answer to the feature request.
@@ -936,7 +950,7 @@ impl protun::api::connection::StateChangedCallback for EngineCallbacks {
                 .reconciliation
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            ledger.note_applied(settings_from_protun(info.settings.clone()));
+            ledger.note_applied(settings_from_protun(info.settings.clone()), epoch);
         } else {
             // The bot round's P2 (the round-11 sharpening): EVERY
             // state that is not a confirmed Connected report —
@@ -973,6 +987,8 @@ impl protun::api::connection::StateChangedCallback for EngineCallbacks {
 
 impl protun::api::connection::EventCallback for EngineCallbacks {
     fn on_event(&self, event: Event) {
+        // The ENTRY snapshot (the bot round-13 P2).
+        let epoch = self.epoch.load(std::sync::atomic::Ordering::SeqCst);
         for translated in translate_event(&event) {
             // T-20's refusal side.
             if let EngineEvent::SettingRefused(setting) = &translated {
@@ -980,7 +996,7 @@ impl protun::api::connection::EventCallback for EngineCallbacks {
                     .reconciliation
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                ledger.note_refused(*setting);
+                ledger.note_refused(*setting, epoch);
             }
             self.forward(translated);
         }
@@ -1034,7 +1050,7 @@ pub enum LatestStats {
 /// down the frontend session).
 pub struct ActiveConnection {
     connection: Connection,
-    if_name: String,
+    if_name: std::cell::RefCell<String>,
     mark_health: Arc<MarkHealth>,
     events: Receiver<EngineEvent>,
     drops: Arc<EventDrops>,
@@ -1086,8 +1102,8 @@ impl ActiveConnection {
     /// `translate` would refuse every rotation with MissingKey.
     /// The TUN interface name this connection owns (cleanup claims,
     /// FR-31).
-    pub fn interface_name(&self) -> &str {
-        &self.if_name
+    pub fn interface_name(&self) -> String {
+        self.if_name.borrow().clone()
     }
 
     pub fn update_peers(&self, params: &TunnelParams) -> Result<(), ProtocolError> {
@@ -1154,7 +1170,14 @@ impl ActiveConnection {
     /// handle (the bot round's P1): ProTUN's stream owns the new
     /// descriptor — a borrowed shape left two owners of one fd.
     pub fn update_tun(&self, handle: TunHandle) {
+        // The interface NAME follows the replacement (the bot round-13
+        // P2): the new device is necessarily DIFFERENTLY NAMED
+        // (IFF_TUN_EXCL refuses the live name) — interface_name() must
+        // identify the LIVE device for status, cleanup, and M5's route
+        // lanes, not the destroyed one.
+        let name = handle.name().to_owned();
         self.connection.update_unix_tun(handle.into_stream_info());
+        *self.if_name.borrow_mut() = name;
     }
     pub fn dropped_stats(&self) -> u64 {
         self.drops.stats.load(Ordering::Relaxed)
@@ -1484,14 +1507,19 @@ mod tests {
     #[test]
     fn full_queue_drops_stats_and_states_without_blocking() {
         let (event_tx, _event_rx) = std::sync::mpsc::sync_channel(1);
+        let reconciliation = Arc::new(Mutex::new(FeatureReconciliation::new(
+            EngineAgentSettings::default(),
+        )));
         let callbacks = EngineCallbacks {
             event_tx,
             drops: Arc::new(EventDrops::default()),
             recovery: Arc::new(RecoverySlots::default()),
             latest: Arc::new(Mutex::new(None)),
-            reconciliation: Arc::new(Mutex::new(FeatureReconciliation::new(
-                EngineAgentSettings::default(),
-            ))),
+            epoch: reconciliation
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .epoch_handle(),
+            reconciliation: Arc::clone(&reconciliation),
         };
         let stats = || Event::ConnectionStats {
             timestamp_ms: 0,
@@ -1527,15 +1555,21 @@ mod tests {
     #[test]
     fn full_queue_retains_the_newest_stats_and_the_critical_event() {
         let (event_tx, _event_rx) = std::sync::mpsc::sync_channel(1);
+        let reconciliation = Arc::new(Mutex::new(FeatureReconciliation::new(
+            EngineAgentSettings::default(),
+        )));
         let callbacks = EngineCallbacks {
             event_tx,
             drops: Arc::new(EventDrops::default()),
             recovery: Arc::new(RecoverySlots::default()),
             latest: Arc::new(Mutex::new(None)),
-            reconciliation: Arc::new(Mutex::new(FeatureReconciliation::new(
-                EngineAgentSettings::default(),
-            ))),
+            epoch: reconciliation
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .epoch_handle(),
+            reconciliation: Arc::clone(&reconciliation),
         };
+
         use protun::api::connection::EventCallback as _;
         // Fill the single slot with a stale stat, then overflow with
         // a FRESH one: the slot must hold the fresh counters.

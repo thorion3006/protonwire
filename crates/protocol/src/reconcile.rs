@@ -23,6 +23,8 @@
 //! provenance tag to close it engine-side; revisit if upstream ever
 //! timestamps state changes.
 
+use std::sync::Arc;
+
 use crate::engine::{EngineAgentSettings, EngineNetshield, EngineSettingType};
 
 /// One requested-vs-applied mismatch.
@@ -55,6 +57,14 @@ pub struct FeatureReconciliation {
     requested: EngineAgentSettings,
     applied: Option<EngineAgentSettings>,
     refused: Vec<EngineSettingType>,
+    /// The request EPOCH (the bot round-13 P2), shared with the
+    /// engine callbacks: every callback snapshots it at ENTRY and
+    /// stamps its answers — an answer whose snapshot predates the
+    /// current epoch was queued BEFORE the request changed and cannot
+    /// serve it (a stale SettingRefused must not report the new
+    /// request refused; a stale applied set must not read
+    /// false-clean).
+    epoch: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl FeatureReconciliation {
@@ -65,15 +75,25 @@ impl FeatureReconciliation {
             requested,
             applied: None,
             refused: Vec::new(),
+            epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 
+    /// The shared epoch handle the engine callbacks snapshot at entry
+    /// (the bot round-13 P2's ordering boundary).
+    pub fn epoch_handle(&self) -> Arc<std::sync::atomic::AtomicU64> {
+        Arc::clone(&self.epoch)
+    }
+
     /// The request changed (connect or a live settings update): the
-    /// previous applied snapshot no longer answers the new request.
+    /// previous applied snapshot no longer answers the new request,
+    /// and the EPOCH advances — pre-update callbacks are
+    /// quarantined by their stale snapshots.
     pub fn note_requested(&mut self, requested: EngineAgentSettings) {
         self.requested = requested;
         self.applied = None;
         self.refused.clear();
+        self.epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// The live request (the refactor pass's single-source change):
@@ -85,9 +105,14 @@ impl FeatureReconciliation {
     }
 
     /// The server reported the applied set (a `Connected` state's
-    /// agent info). Refusals recorded against the superseded request
-    /// are stale — the new applied set is the answer.
-    pub fn note_applied(&mut self, applied: EngineAgentSettings) {
+    /// agent info). `observed_epoch` is the epoch the CALLBACK
+    /// snapshotted at entry: an answer that predates the current
+    /// request epoch is discarded (the bot round-13 P2).
+    pub fn note_applied(&mut self, applied: EngineAgentSettings, observed_epoch: u64) {
+        let current = self.epoch.load(std::sync::atomic::Ordering::SeqCst);
+        if observed_epoch != current {
+            return; // queued before the request changed
+        }
         self.applied = Some(applied);
         // Refusals are RETAINED (the bot round's P2): the applied set
         // and the refusal are complementary answers to the CURRENT
@@ -113,7 +138,14 @@ impl FeatureReconciliation {
 
     /// The server refused a setting outright. ProTUN re-emits refusals
     /// (reconnects re-negotiate); the table names each setting once.
-    pub fn note_refused(&mut self, setting: EngineSettingType) {
+    /// `observed_epoch` is the callback's entry snapshot: a refusal
+    /// queued before the request changed is discarded (the bot
+    /// round-13 P2).
+    pub fn note_refused(&mut self, setting: EngineSettingType, observed_epoch: u64) {
+        let current = self.epoch.load(std::sync::atomic::Ordering::SeqCst);
+        if observed_epoch != current {
+            return; // queued before the request changed
+        }
         if !self.refused.contains(&setting) {
             self.refused.push(setting);
         }
@@ -253,7 +285,10 @@ mod tests {
     #[test]
     fn applied_matching_request_is_clean() {
         let mut ledger = FeatureReconciliation::new(requested());
-        ledger.note_applied(requested());
+        let epoch = ledger
+            .epoch_handle()
+            .load(std::sync::atomic::Ordering::SeqCst);
+        ledger.note_applied(requested(), epoch);
         assert!(
             ledger.divergences().is_empty(),
             "identical applied set must reconcile clean, got {:?}",
@@ -268,7 +303,10 @@ mod tests {
         let mut ledger = FeatureReconciliation::new(requested());
         let mut downgraded = requested();
         downgraded.netshield_level = Some(EngineNetshield::MalwareFilter);
-        ledger.note_applied(downgraded);
+        let epoch = ledger
+            .epoch_handle()
+            .load(std::sync::atomic::Ordering::SeqCst);
+        ledger.note_applied(downgraded, epoch);
         let divergences = ledger.divergences();
         assert_eq!(divergences.len(), 1, "only netshield moved");
         assert_eq!(
@@ -288,7 +326,10 @@ mod tests {
         let mut ledger = FeatureReconciliation::new(requested());
         let mut silent = requested();
         silent.netshield_level = None; // the server did not answer
-        ledger.note_applied(silent);
+        let epoch = ledger
+            .epoch_handle()
+            .load(std::sync::atomic::Ordering::SeqCst);
+        ledger.note_applied(silent, epoch);
         let divergences = ledger.divergences();
         assert_eq!(divergences.len(), 1, "unanswered ≠ agreed");
         assert_eq!(divergences[0].setting, EngineSettingType::Netshield);
@@ -322,7 +363,10 @@ mod tests {
         let mut ledger = FeatureReconciliation::new(requested());
         let mut silent = requested();
         silent.circumvention_routing = Some(false);
-        ledger.note_applied(silent);
+        let epoch = ledger
+            .epoch_handle()
+            .load(std::sync::atomic::Ordering::SeqCst);
+        ledger.note_applied(silent, epoch);
         let divergences = ledger.divergences();
         assert!(
             divergences
@@ -340,7 +384,10 @@ mod tests {
         let mut ledger = FeatureReconciliation::new(requested());
         let mut flipped = requested();
         flipped.soft_jail = Some(true);
-        ledger.note_applied(flipped);
+        let epoch = ledger
+            .epoch_handle()
+            .load(std::sync::atomic::Ordering::SeqCst);
+        ledger.note_applied(flipped, epoch);
         assert_eq!(
             ledger.divergences(),
             vec![FeatureDivergence {
@@ -357,14 +404,20 @@ mod tests {
         let mut ledger = FeatureReconciliation::new(EngineAgentSettings::default());
         // The server applies values the client never requested —
         // still no divergence: an unset request makes no claim.
-        ledger.note_applied(EngineAgentSettings {
-            split_tcp: Some(true),
-            netshield_level: Some(EngineNetshield::MalwareFilter),
-            port_forwarding: Some(true),
-            random_nat: Some(false),
-            soft_jail: None,
-            circumvention_routing: None,
-        });
+        let epoch = ledger
+            .epoch_handle()
+            .load(std::sync::atomic::Ordering::SeqCst);
+        ledger.note_applied(
+            EngineAgentSettings {
+                split_tcp: Some(true),
+                netshield_level: Some(EngineNetshield::MalwareFilter),
+                port_forwarding: Some(true),
+                random_nat: Some(false),
+                soft_jail: None,
+                circumvention_routing: None,
+            },
+            epoch,
+        );
         assert!(
             ledger.divergences().is_empty(),
             "no preference means no divergence"
@@ -377,13 +430,19 @@ mod tests {
     #[test]
     fn refusals_are_recorded_and_survive_the_applied_answer() {
         let mut ledger = FeatureReconciliation::new(requested());
-        ledger.note_refused(EngineSettingType::Netshield);
+        let epoch = ledger
+            .epoch_handle()
+            .load(std::sync::atomic::Ordering::SeqCst);
+        ledger.note_refused(EngineSettingType::Netshield, epoch);
         assert_eq!(ledger.refused(), &[EngineSettingType::Netshield]);
         // The applied set and the refusal are COMPLEMENTARY answers to
         // the SAME request (the bot round's P2): the refusal stays
         // visible — callers can still report that LocalAgent
         // explicitly refused the setting.
-        ledger.note_applied(requested());
+        let epoch = ledger
+            .epoch_handle()
+            .load(std::sync::atomic::Ordering::SeqCst);
+        ledger.note_applied(requested(), epoch);
         assert_eq!(
             ledger.refused(),
             &[EngineSettingType::Netshield],
@@ -404,7 +463,10 @@ mod tests {
     #[test]
     fn leaving_connected_invalidates_the_applied_snapshot() {
         let mut ledger = FeatureReconciliation::new(requested());
-        ledger.note_applied(requested());
+        let epoch = ledger
+            .epoch_handle()
+            .load(std::sync::atomic::Ordering::SeqCst);
+        ledger.note_applied(requested(), epoch);
         assert!(ledger.divergences().is_empty());
         ledger.note_unconfirmed();
         assert!(
@@ -418,9 +480,15 @@ mod tests {
     #[test]
     fn requested_update_resets_applied_and_refusals() {
         let mut ledger = FeatureReconciliation::new(requested());
-        ledger.note_applied(requested());
+        let epoch = ledger
+            .epoch_handle()
+            .load(std::sync::atomic::Ordering::SeqCst);
+        ledger.note_applied(requested(), epoch);
         assert!(ledger.divergences().is_empty());
-        ledger.note_refused(EngineSettingType::SplitTcp);
+        let epoch = ledger
+            .epoch_handle()
+            .load(std::sync::atomic::Ordering::SeqCst);
+        ledger.note_refused(EngineSettingType::SplitTcp, epoch);
         let mut updated = requested();
         updated.split_tcp = Some(false);
         ledger.note_requested(updated);
@@ -433,5 +501,38 @@ mod tests {
             divergences.iter().all(|d| d.applied.is_none()),
             "nothing is confirmed against the NEW request yet"
         );
+    }
+
+    /// The bot round-13 P2: an answer QUEUED before a settings change
+    /// cannot serve the new request — the callback's entry-snapshot
+    /// epoch predates the change, so the ledger discards it (a stale
+    /// refusal would otherwise report the new request refused
+    /// forever; a stale applied set would read false-clean).
+    #[test]
+    fn answers_queued_before_a_request_change_are_discarded() {
+        let mut ledger = FeatureReconciliation::new(requested());
+        let stale_epoch = ledger
+            .epoch_handle()
+            .load(std::sync::atomic::Ordering::SeqCst);
+        // The settings change lands (the epoch advances).
+        ledger.note_requested(requested());
+        // The STALE callback runs now: its refusal and applied set
+        // carry the pre-change epoch and are both discarded.
+        ledger.note_refused(EngineSettingType::Netshield, stale_epoch);
+        assert!(
+            ledger.refused().is_empty(),
+            "a queued refusal cannot serve the new request"
+        );
+        ledger.note_applied(requested(), stale_epoch);
+        assert!(
+            !ledger.divergences().is_empty(),
+            "a queued applied set cannot answer the new request (still unconfirmed)"
+        );
+        // A CURRENT-epoch answer serves it normally.
+        let current = ledger
+            .epoch_handle()
+            .load(std::sync::atomic::Ordering::SeqCst);
+        ledger.note_applied(requested(), current);
+        assert!(ledger.divergences().is_empty());
     }
 }
