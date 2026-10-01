@@ -137,3 +137,4 @@ protonwire-net = { path = "crates/net", version = "0.1.0" }
 protonwire-policy = { path = "crates/policy", version = "0.1.0" }
 protonwire-pf = { path = "crates/port-forwarding", version = "0.1.0" }
 protonwire-store = { path = "crates/store", version = "0.1.0" }
+proton-boringtun = { version = "3.0.0", registry = "proton", features = ["std"] } # in-graph via protun->pvpnclient (lock v3.0.0); the M4 exit IT's mocked peer

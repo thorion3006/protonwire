@@ -26,3 +26,5 @@ getrandom = { workspace = true }
 # The netns IT harness (IT-1 runs gated inside `cargo xtask netns-it`).
 protonwire-net = { workspace = true }
 log = { workspace = true } # protun's own logging; the ITs install a stderr logger to see it
+# The M4 exit test's mocked WG peer (in-graph via protun->pvpnclient).
+proton-boringtun = { workspace = true }
