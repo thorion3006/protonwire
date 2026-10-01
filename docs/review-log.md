@@ -3116,3 +3116,35 @@ builder pattern) and that is M2-lane architecture, not a daemon
 one-liner — carried with this precise pointer; (3) mlock (PR-2's
 track) — process-wide, belongs with the daemon's privilege setup in
 the M6 lane. Netns suite: 8/8 gated green.
+
+## 2026-10-01 — The CI fix round across the stack (doc/fmt/test)
+
+The owner's "first fix the ci failures" pass, three root causes:
+
+- **doc FAIL on #15/#16/#17** — the netns module doc's `[`gate`]`
+  link does not resolve from `//!` docs (rustdoc resolves those
+  against the parent scope); fixed at the origin (#15) with the
+  crate-qualified path. Lesson re-learned the hard way: the M3
+  record itself says "cargo doc is a local gate" (r11) — it was not
+  run on the M4 PR branches before pushing. It is now in the local
+  gate set for every push (the exact CI command:
+  RUSTDOCFLAGS="--document-private-items -D warnings" cargo doc
+  --no-deps).
+- **fmt FAIL on #17** — the gate fix round was committed without
+  the fmt pass. fmt is in the pre-push set again (it had been).
+- **test FAIL on #15/#16 — a REAL BUG, not a flake**: the overflow
+  lane could not wake an IDLE worker (the idle wait was a blocking
+  recv; overflow fills exactly when the queue is full, so nothing
+  could wake it) — the newest desired state could sit undrained
+  until the next queue op or shutdown, breaking the round-8
+  guarantee in the idle case. The round-9 pin had passed only by
+  losing a startup race to the worker; CI's scheduling flipped it.
+  Fixed at the origin (#13): the idle wait polls on OVERFLOW_POLL
+  (250 ms), plus a deterministic pin that parks the worker FIRST
+  and asserts the drain (8/8 stable). Cascaded rebases through
+  #15→#16→#17, force-with-lease, full local gates re-verified at
+  every level.
+
+End state: #12 8/8, #13 8/8, #15/#16/#17 9/9 — every job green,
+netns-it EXECUTING on all three new PRs (25-38 s runs, not the
+disclosed skip; the M4-era track item closes).
