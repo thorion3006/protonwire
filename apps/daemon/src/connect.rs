@@ -439,7 +439,7 @@ fn reconcile_drops(
     // selector — the M6 Muon-refresh lane routes it); the terminal
     // fatal tears down HERE, the others WARN and ride the log until
     // that lane exists (silently discarding them is the bug).
-    if let Some(critical) = connection.take_critical_event() {
+    for critical in connection.take_critical_events() {
         match critical {
             EngineEvent::CertificateFatal => {
                 tracing::warn!(
