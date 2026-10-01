@@ -3230,3 +3230,32 @@ Gates at every level: fmt/clippy/test/doc clean, netns-it green.
 Process note: the pipe-gate (`cargo clippy | tail -1`) masked a
 -D-warnings error twice this session — clippy now runs unpiped or
 with explicit error grep before any push.
+
+## 2026-10-01 — Round 12: the re-review of the fixes (8 threads, all genuine, all landed)
+
+- **#13 (5b88160 + a3bed59)**: the two P1s — next_seq now runs
+  INSIDE the memory-lock critical section in all three mutators
+  (put/remove/clear_all: the value and its sequence are one atomic
+  transition; the worker can never persist an older value than
+  memory serves — pinned with a two-writer hammer converging
+  durable==served), and the coalescer retains the MAX-sequence
+  ClearAll itself (a stale clear entering later could otherwise be
+  the retained one and its removals watermark-skipped — pinned).
+- **#15 (b08c054)**: the in-flight P1 — MarkHealth tracks callbacks
+  currently inside the applier; healthy() requires in-flight == 0
+  (after one success the latch stays green while a later mark is
+  still in flight). Pinned with a barrier-synchronized blocking
+  applier. Plus the prebuild cwd P2 (root + fail-loud).
+- **#16 (97df6da)**: forward() mirrors the stat into its recovery
+  slot BEFORE the queue send (publication order = the contract);
+  update_agent_settings drops the reconciliation guard before the
+  ProTUN call (FR-32D covers our own locks).
+- **#17 (3a6f5af)**: the reconnect window is serialized (a
+  reconnecting flag refuses interlopers while the lock is down for
+  teardown+join); the recovered CertificateFatal now runs the same
+  terminate_on_fatal teardown as a delivered one.
+
+Gates at every level green (fmt/clippy/test/netns-it/doc). The
+bots' quality held through three rounds — each one caught real
+fresh evidence against the PREVIOUS fix, exactly the adversarial
+depth the process wants.
