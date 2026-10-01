@@ -281,6 +281,12 @@ impl EncryptedCache {
     /// first failure, leaving the later credentials on disk while
     /// the facade's memory view was already empty); the first
     /// failure is returned AFTER the sweep.
+    ///
+    /// Caller-less in the FACADE since the round-10 per-key
+    /// expansion (the whole-bucket path is exactly what that fix
+    /// removed) — the method stays: its sweep pin owns this
+    /// cache-layer invariant directly.
+    #[allow(dead_code)]
     pub(crate) fn try_clear_all(&self) -> Result<(), CacheError> {
         let mut first_failure = None;
         for key in [
