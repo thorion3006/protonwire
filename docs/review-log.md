@@ -3383,3 +3383,22 @@ Gates green at every level after each fix.
   Muon-refresh lane (silently discarding it was the bug).
 
 Gates green at every level.
+
+## 2026-10-01 — Round 19 (3 threads, all genuine, all landed)
+
+- **#16 (9244b19)**: per-class control retention — the single
+  critical slot let a retained ForkSelectorNeeded be overwritten by
+  a later ApiError/SettingRefused; the store is a per-CLASS Vec
+  (fatal never displaced, take_critical_events drains with the
+  fatal last), and retained controls count on their OWN counter
+  (controls_retained()) — dropped_states() stays the pure
+  wedged-consumer alarm.
+- **#17 (fc24de6)**: the pump EXITS when the weak lane can no
+  longer upgrade — the lane's drop IS the teardown, so the pump
+  takes its slot with it: ActiveConnection::drop runs and the
+  ProTUN session/TUN die with the lane (the Weak alone left the
+  strong pump→slot→connection chain leaking).
+
+Gates green at every level. Branch-hygiene note: the engine-side
+change briefly landed on #17's branch; moved to #16 (9244b19) and
+the stack rebased — each PR's diff is its own again.
