@@ -3259,3 +3259,28 @@ Gates at every level green (fmt/clippy/test/netns-it/doc). The
 bots' quality held through three rounds — each one caught real
 fresh evidence against the PREVIOUS fix, exactly the adversarial
 depth the process wants.
+
+## 2026-10-01 — Round 13 (5 threads, all genuine, all landed)
+
+- **#13 (66145a0)**: a relative key path's EMPTY parent (not None)
+  syncs as the current directory — File::open("") no longer ENOENTs
+  the resync after a successful publish. Pinned with a chdir'd
+  open + round-trip.
+- **#15 (0474fab)**: MarkHealth is ONE atomic word
+  (reported<<2 | in_flight<<1 | failed): admission, completion,
+  and the latch are each ONE RMW and healthy()'s single load has no
+  interleave window at all (the round-12 separate-atomics shape
+  could go green between loads while a mark was in flight).
+- **#16 (b12c24c)**: the ledger carries a shared request EPOCH —
+  callbacks snapshot at entry, answers predating a settings change
+  are discarded (the stale-refusal/false-clean race); pinned.
+  update_tun tracks the replacement's interface name (necessarily
+  differently named under IFF_TUN_EXCL).
+- **#17 (3f93979)**: the reconnect window rechecks the draining
+  flag after re-acquiring — a racing shutdown can no longer let a
+  reconnect install a tunnel outside the controlled teardown.
+
+Gates green at every level. Three consecutive fix→re-review rounds
+(11, 12, 13) with real fresh evidence each time — the loop is
+converging (13 threads → 8 → 5, each round shallower than the
+last).
