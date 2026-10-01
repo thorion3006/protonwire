@@ -930,7 +930,20 @@ fn critical_class(event: &EngineEvent) -> ControlClass {
         EngineEvent::CertificateFatal => ControlClass::CertificateFatal,
         EngineEvent::ForkSelectorNeeded => ControlClass::ForkSelector,
         EngineEvent::SettingRefused(_) => ControlClass::SettingRefused,
-        EngineEvent::ApiError { .. } => ControlClass::ApiError,
+        EngineEvent::ApiError {
+            refresh_token_invalid,
+            ..
+        } => {
+            // The credential signal is its OWN class (the bot round-20
+            // P2): an auth-invalid error must never be displaced by a
+            // later ordinary refresh error — the recovering consumer
+            // would not learn reauthentication is required.
+            if *refresh_token_invalid {
+                ControlClass::ApiErrorCredentialInvalid
+            } else {
+                ControlClass::ApiError
+            }
+        }
         _ => ControlClass::Other,
     }
 }
@@ -942,6 +955,7 @@ enum ControlClass {
     ForkSelector,
     SettingRefused,
     ApiError,
+    ApiErrorCredentialInvalid,
     Other,
 }
 impl EngineCallbacks {
