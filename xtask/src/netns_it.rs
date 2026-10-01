@@ -90,6 +90,12 @@ pub(crate) fn run(root: &Path) -> Result<bool> {
     // below is then a no-network compile check away from running.
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_owned());
     let mut build = Command::new(&cargo);
+    // From the workspace root (the bot round-12 P2): the built xtask
+    // binary is invocable from outside the repository — the prebuild
+    // must inherit the same discipline as the inner run — and its
+    // failure is FAIL-LOUD (a failed prebuild would otherwise push
+    // the missing build into the networkless namespace).
+    build.current_dir(root);
     build.arg("test").arg("--no-run");
     for (package, target) in GATED_TARGETS {
         build.args(["-p", package, "--test", target]);
