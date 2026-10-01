@@ -204,7 +204,15 @@ impl ConnectionLane {
         // Re-acquiring may observe a pump-retired lane — the same
         // empty, unowned state we want. The window closes BEFORE the
         // engine attempt (a failure below leaves the lane open, not
-        // wedged).
+        // wedged). The DRAINING flag is RE-CHECKED here (the bot
+        // round-13 P2): drain may have set it and observed the
+        // temporarily empty slot while the lock was down — starting
+        // an engine connection now would install a tunnel outside
+        // the administrator's controlled teardown.
+        if self.draining.load(Ordering::SeqCst) {
+            lane.reconnecting = false;
+            return Err(LaneRefusal::Draining.into());
+        }
         lane.reconnecting = false;
         lane.owner = None;
         let connection = self.engine.connect(
