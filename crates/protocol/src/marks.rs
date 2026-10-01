@@ -55,63 +55,66 @@ impl SoMarkApplier {
     }
 }
 
+/// The bot round's P2: raw fd values cross the SAFE `apply_mark`
+/// api, so no `BorrowedFd` may be constructed from them — its
+/// "descriptor is open and stays open" precondition is unverifiable
+/// for an arbitrary i32, and a closed/reused fd would be UB through
+/// safe Rust. Direct libc syscalls have no such invariant: the
+/// KERNEL rejects invalid descriptors with EBADF, a benign typed
+/// error.
 impl MarkApplier for SoMarkApplier {
     fn apply_mark(&self, socket_fd: RawFd) -> io::Result<()> {
-        // The bot round's P2: raw fd values cross this SAFE api, so
-        // no `BorrowedFd` may be constructed from them — its
-        // "descriptor is open and stays open" precondition is
-        // unverifiable for an arbitrary i32, and a closed/reused fd
-        // would be UB through safe Rust. Direct libc syscalls have
-        // no such invariant: the KERNEL rejects invalid descriptors
-        // with EBADF, a benign typed error.
-        //
-        // SO_TYPE succeeds only on sockets: if a caller ever hands a
-        // stale fd the process has reused for something else, the
-        // check fails BEFORE an unrelated descriptor gets marked
-        // (contract drift becomes a recorded failure, not a silent
-        // policy hole).
-        #[allow(unsafe_code)] // workspace deny; leaf syscalls, no pointers beyond the value args
-        fn socket_type(socket_fd: RawFd) -> io::Result<libc::c_int> {
-            let mut socket_type: libc::c_int = 0;
-            let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
-            // SAFETY: socket_fd is passed by value; the out-pointer
-            // and length name a properly initialized c_int. An
-            // invalid fd yields EBADF from the kernel.
-            let rc = unsafe {
-                libc::getsockopt(
-                    socket_fd,
-                    libc::SOL_SOCKET,
-                    libc::SO_TYPE,
-                    std::ptr::addr_of_mut!(socket_type).cast(),
-                    std::ptr::addr_of_mut!(len),
-                )
-            };
-            if rc != 0 {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(socket_type)
-        }
-        socket_type(socket_fd)?;
-        #[allow(unsafe_code)] // workspace deny; leaf syscall, no pointers beyond the value args
-        fn set_mark(socket_fd: RawFd, mark: u32) -> io::Result<()> {
-            // SAFETY: socket_fd and mark pass by value; the value
-            // pointer names the u32 argument SO_MARK reads.
-            let rc = unsafe {
-                libc::setsockopt(
-                    socket_fd,
-                    libc::SOL_SOCKET,
-                    libc::SO_MARK,
-                    std::ptr::addr_of!(mark).cast(),
-                    std::mem::size_of::<u32>() as libc::socklen_t,
-                )
-            };
-            if rc != 0 {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(())
-        }
+        // SO_TYPE succeeds only on sockets: a stale/reused fd fails
+        // BEFORE an unrelated descriptor gets marked (contract drift
+        // becomes a recorded failure, not a silent policy hole).
+        ensure_socket(socket_fd)?;
         set_mark(socket_fd, self.mark)
     }
+}
+
+/// The socket check the caller's contract exercises: the descriptor
+/// must BE a socket before it gets marked (the returned c_int is
+/// the type — the check is the point, not the value).
+#[allow(unsafe_code)] // workspace deny; leaf syscall, no pointers beyond the value args
+fn ensure_socket(socket_fd: RawFd) -> io::Result<libc::c_int> {
+    let mut socket_type: libc::c_int = 0;
+    let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    // SAFETY: socket_fd is passed by value; the out-pointer and
+    // length name a properly initialized c_int. An invalid fd
+    // yields EBADF from the kernel.
+    let rc = unsafe {
+        libc::getsockopt(
+            socket_fd,
+            libc::SOL_SOCKET,
+            libc::SO_TYPE,
+            std::ptr::addr_of_mut!(socket_type).cast(),
+            std::ptr::addr_of_mut!(len),
+        )
+    };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(socket_type)
+}
+
+/// The FR-32B stable bypass mark, one descriptor at a time.
+#[allow(unsafe_code)] // workspace deny; leaf syscall, no pointers beyond the value args
+fn set_mark(socket_fd: RawFd, mark: u32) -> io::Result<()> {
+    // SAFETY: socket_fd and mark pass by value; the value pointer
+    // names the u32 argument SO_MARK reads.
+    let rc = unsafe {
+        libc::setsockopt(
+            socket_fd,
+            libc::SOL_SOCKET,
+            libc::SO_MARK,
+            std::ptr::addr_of!(mark).cast(),
+            std::mem::size_of::<u32>() as libc::socklen_t,
+        )
+    };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// The fail-closed health surface M5's route-commit lane gates on:
