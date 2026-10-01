@@ -3309,3 +3309,23 @@ Gates green at every level. The convergence continues: 13 → 8 → 5 →
 5 (round 14's count held — but three of the five were fresh
 evidence against my own round-13 fixes, which is the loop working,
 not stalling).
+
+## 2026-10-01 — Round 15 (3 threads on #16 + the CI flake root-caused)
+
+- **#13 (41ec3b6, the CI flake + the artifact)**: the relative-key
+  pin's first draft chdir'd the PROCESS — the only new global state,
+  racing every parallel test (the FIFO pin's CI NotFound), and its
+  try_put ran after the CWD restore, writing a randomized
+  certificate.bin into the crate dir (the bot's tracked-file dirt).
+  The pin is hermetic now (the empty-parent sync tested directly, no
+  chdir, no cache at a relative path); the artifact is removed.
+- **#16 (65f51a4)**: the snapshot Clone is manual — a snapshot owns
+  an INDEPENDENT epoch (mutating a returned snapshot can no longer
+  advance the live ledger's generation and discard a legitimate
+  in-flight callback); pinned. The response-provenance residual is
+  DISCLOSED (a response generated for the old request that enters
+  after the update is misattributed; closing it needs request/
+  response correlation ProTUN does not expose — documented on the
+  epoch field, tracked to M6).
+
+Gates green at every level.
