@@ -323,6 +323,15 @@ impl EncryptedCache {
 #[cfg(unix)]
 fn sync_parent_dir(path: &Path) -> Result<(), String> {
     if let Some(parent) = path.parent() {
+        // A RELATIVE path with no directory component yields an EMPTY
+        // parent (the bot round-13 P2): File::open("") would ENOENT
+        // and fail the resync after a successful publish. The empty
+        /// parent IS the current directory.
+        let parent = if parent.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            parent
+        };
         let dir = fs::File::open(parent).map_err(|error| error.to_string())?;
         dir.sync_all().map_err(|error| error.to_string())?;
     }
@@ -1191,6 +1200,35 @@ mod round5_tests {
         let cache = super::EncryptedCache::with_key_bytes(&dir, &[31u8; 32]).unwrap();
         let read = cache.get(protun::api::connection::CacheKey::Certificate);
         assert_eq!(read, None, "the FIFO entry reads as absent, promptly");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The bot round-13 P2: a RELATIVE key path with no directory
+    /// component — `Path::new("cache.key")` — has an EMPTY parent,
+    /// not None: the sync must treat that as the current directory
+    /// (File::open("") would ENOENT and fail the resync after a
+    /// successful publish).
+    #[test]
+    fn a_relative_key_path_syncs_the_current_directory() {
+        let dir = std::env::temp_dir().join(format!(
+            "pw-relkey-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Run from inside the temp dir: the key path is a BARE
+        // filename (empty parent).
+        let previous = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&dir).unwrap();
+        let result = EncryptedCache::open(Path::new("."), Path::new("cache.key"));
+        std::env::set_current_dir(previous).unwrap();
+        let cache = result.expect("a bare-filename key path opens (the empty parent syncs as .)");
+        cache
+            .try_put(CacheKey::Certificate, b"cert".to_vec())
+            .expect("the round-trip works");
         std::fs::remove_dir_all(&dir).ok();
     }
 }
