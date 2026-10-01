@@ -24,7 +24,7 @@
 use std::io;
 use std::os::fd::RawFd;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use protun::api::connection_unix::OnSocketFdAvailableCallback;
 
