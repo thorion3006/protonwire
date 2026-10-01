@@ -326,7 +326,7 @@ fn sync_parent_dir(path: &Path) -> Result<(), String> {
         // A RELATIVE path with no directory component yields an EMPTY
         // parent (the bot round-13 P2): File::open("") would ENOENT
         // and fail the resync after a successful publish. The empty
-        /// parent IS the current directory.
+        // parent IS the current directory.
         let parent = if parent.as_os_str().is_empty() {
             Path::new(".")
         } else {
