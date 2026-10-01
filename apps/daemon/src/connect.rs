@@ -253,6 +253,15 @@ impl ConnectionLane {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // The RECONNECTING window is honored here too (the bot
+        // round-20 P2): an owner reconnect temporarily sets
+        // owner=None with no active lane — a disconnect here would
+        // pass the gate, "succeed" on the empty lane, and the
+        // in-flight reconnect would then install a tunnel AFTER the
+        // completed disconnect. Refuse for the window's duration.
+        if lane.reconnecting {
+            return Err(LaneRefusal::Reconnecting);
+        }
         gate_owner(lane.owner, uid)?;
         // NO JOIN UNDER THE LANE LOCK (the refactor pass's P1): take
         // the entry, clear the owner, DROP the guard, then join — the
