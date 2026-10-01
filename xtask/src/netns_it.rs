@@ -47,7 +47,7 @@ fn gate_shim() -> String {
     )
 }
 
-pub(crate) fn run(_root: &Path) -> Result<bool> {
+pub(crate) fn run(root: &Path) -> Result<bool> {
     let mut reporter = Reporter::new("netns-it");
 
     let userns_supported = probe_userns();
@@ -91,6 +91,7 @@ pub(crate) fn run(_root: &Path) -> Result<bool> {
             .arg("--")
             .arg("/bin/sh")
             .arg("-c")
+            .current_dir(root)
             .arg(gate_shim())
             .arg(&cargo)
             .arg("test")

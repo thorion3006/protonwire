@@ -36,23 +36,23 @@ fn it1_create_transfer_cleanup() {
     let ifindex = if_nametoindex(DEFAULT_IF_NAME).expect("the device exists");
     assert!(ifindex > 0);
 
-    // The hand-off shape `Connection::unix_connect` accepts, and the
-    // ownership transfer: ProTUN's TunStreamUnix wraps the fd in
-    // File::from_raw_fd and CLOSES it on disconnect. Emulating exactly
-    // that move proves the fd survives our handle's drop (no
-    // double-close on the transfer path).
-    let stream_info = handle.stream_info();
-    let fd = handle.into_raw_fd(); // consumes the handle — nothing left to double-close
+    // The update hand-off shape (update_unix_tun) CONSUMES the
+    // handle — the same single-ownership transfer as into_raw_fd
+    // (the bot round's P1: a borrowing shape left two owners of one
+    // descriptor). Emulating exactly ProTUN's owning move proves the
+    // fd survives with no second owner to double-close.
+    let stream_info = handle.into_stream_info();
     match stream_info {
-        protun::api::connection::TunStreamInfo::TunFd(reported) => assert_eq!(reported, fd),
+        protun::api::connection::TunStreamInfo::TunFd(fd) => {
+            #[allow(unsafe_code)] // test: the exact ownership move ProTUN performs
+            let protun_owner = unsafe { File::from_raw_fd(fd) };
+            drop(protun_owner); // ProTUN's disconnect close
+        }
         protun::api::connection::TunStreamInfo::NoTun => panic!("stream_info must carry the fd"),
     }
-    #[allow(unsafe_code)] // test: the exact ownership move ProTUN performs
-    let protun_owner = unsafe { File::from_raw_fd(fd) };
-    drop(protun_owner); // ProTUN's disconnect close
     assert!(
         !interface_exists(DEFAULT_IF_NAME),
-        "the device dies with its last fd — the transfer was single-ownership"
+        "the device dies with its single owner — the transfer was single-ownership"
     );
 }
 
