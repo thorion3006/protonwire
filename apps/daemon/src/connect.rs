@@ -287,7 +287,7 @@ impl ConnectionLane {
         // blocking-shutdown contract. The reconnecting flag names
         // that window; spin until it closes, then take what is there.
         loop {
-            let mut lane = self
+            let lane = self
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -371,10 +371,10 @@ fn pump_events(slot: &ConnectionSlot, lane: &std::sync::Weak<Mutex<LaneState>>, 
                 // LANE-DROPPED CHECK (the bot round-21 P2): the only
                 // upgrade site was retire_lane AFTER a terminal — the
                 // healthy-lane case looped forever holding the slot
-                /// (the session and TUN leaked). The quiet cadence
-                /// checks: a lane that can no longer upgrade has been
-                /// dropped — exit, taking the slot (and the
-                /// ActiveConnection) with us.
+                // (the session and TUN leaked). The quiet cadence
+                // checks: a lane that can no longer upgrade has been
+                // dropped — exit, taking the slot (and the
+                // ActiveConnection) with us.
                 if lane.upgrade().is_none() {
                     if let Some(connection) = slot.lock().ok().and_then(|mut guard| guard.take()) {
                         connection.disconnect();
