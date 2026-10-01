@@ -3402,3 +3402,19 @@ Gates green at every level.
 Gates green at every level. Branch-hygiene note: the engine-side
 change briefly landed on #17's branch; moved to #16 (9244b19) and
 the stack rebased — each PR's diff is its own again.
+
+## 2026-10-01 — Round 20 (2 threads, both genuine, both landed)
+
+- **#16 (836bc72)**: the credential-invalid signal is its own
+  retention class — an auth error with refresh_token_invalid=true
+  can no longer be displaced by a later ordinary refresh error
+  (the recovering consumer must learn reauthentication is
+  required).
+- **#17 (f5e49a4)**: disconnect honors the reconnect window — the
+  temporarily-cleared owner could admit a disconnect that
+  "succeeded" on the empty lane while the in-flight reconnect went
+  on to install a tunnel after it. Typed refusal (Reconnecting)
+  for the window's duration.
+
+Gates green at every level. The rounds keep shallowing (13 → 8 →
+5 → 5 → 5 → 3 → 3 → 2) — the loop is converging.
