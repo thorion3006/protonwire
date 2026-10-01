@@ -3193,3 +3193,40 @@ owner's call).
 Gates at every level: fmt/clippy/test/doc clean, netns-it green
 (the M4 exit test survives every rebase). Replies+resolves posted
 per-thread with the commit references.
+
+## 2026-10-01 — Round 11: the bots re-review the fixes (13 threads, 2 stale, 11 landed)
+
+The bots re-reviewed the pushed fix commits. Two STALE (already
+satisfied at tip, challenged with the commit refs): #12's
+TransportEndpoint Debug (the refactor pass landed the redacting
+manual impl before that review) and #17's lock-cycle P1 (eb2feb8).
+Eleven GENUINE, all landed bottom-up:
+
+- **#13 (8c29826 + 8cbe2e7)**: the P1's two halves — the coalescer
+  keeps the MAX-sequence op per key (ClearAll dominates only
+  smaller sequences) AND the overflow lane's replace is
+  seq-guarded newest-wins. Honest note: my first patch fixed only
+  the coalescer half; the pin REPRODUCED the miss through the
+  overflow half (the replace had already evicted seq 2 before the
+  worker ran) and forced the second arm — the pin did its job.
+  Plus the keyfile-parent P2 (first-run creates the parent).
+- **#15 (281b1ff)**: healthy() reads reported FIRST — the callback's
+  program order (failure latch THEN report) makes the load order
+  the snapshot; the old order could return true with a known
+  failure. Plus the runner builds every gated target OUTSIDE the
+  namespace first (a fresh checkout has no registry inside lo-only
+  netns).
+- **#16 (ae559d6)**: five freshness fixes — the Connecting arm
+  invalidates the ledger (the refactor pass's finding-8 owner's
+  call, settled by the bot's evidence); note_unconfirmed
+  supersedes refusals (one negotiation's answers, not forever); a
+  retained CertificateFatal is never displaced by a later
+  non-terminal critical; independent WireGuard/Agent stat slots
+  (LatestStatsSnapshot) that update on SUCCESS too; the
+  latest_state snapshot is an Arc (reader deep-clones OUTSIDE the
+  mutex — FR-32D holds against readers now).
+
+Gates at every level: fmt/clippy/test/doc clean, netns-it green.
+Process note: the pipe-gate (`cargo clippy | tail -1`) masked a
+-D-warnings error twice this session — clippy now runs unpiped or
+with explicit error grep before any push.
