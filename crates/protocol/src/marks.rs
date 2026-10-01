@@ -121,13 +121,18 @@ fn set_mark(socket_fd: RawFd, mark: u32) -> io::Result<()> {
 /// successfully AND at least one socket was reported at all (a cell
 /// that saw zero sockets proves nothing — see [`MarkHealth::healthy`]).
 ///
-/// The state is ONE atomic word (the bot round-13 P1): separate
-/// atomics cannot be read as a snapshot — a later callback admitted
-/// between healthy()'s loads could render a green answer stale while
-/// its mark is still in flight. The word packs
-/// `reported << 2 | in_flight << 1 | failed`, so admission
-/// (in_flight 0→1), completion, and the failure latch are each ONE
-/// RMW the reader's single load observes entirely or not at all.
+/// The fail-closed health surface M5's route-commit lane gates on:
+/// healthy only when every socket reported so far was marked
+/// successfully AND at least one socket was reported at all (a cell
+/// that saw zero sockets proves nothing — see [`MarkHealth::healthy`]).
+///
+/// The state is ONE atomic word: `reported << 2 | in_flight << 1 |
+/// failed`, where **in-flight is a COUNT** (the bot round-14 P1:
+/// overlapping callbacks each add 1; a single bit let the first
+/// completion clear the second's admission, and its later
+/// completion subtracted into the neighboring fields). Admission,
+/// completion, and the failure latch are each ONE RMW the reader's
+/// single load observes entirely.
 #[derive(Debug)]
 pub struct MarkHealth {
     state: AtomicUsize,
@@ -156,17 +161,30 @@ impl MarkHealth {
         self.state.load(Ordering::SeqCst) >> REPORTED_SHIFT
     }
 
+    /// How many callbacks are currently inside the applier.
+    pub fn in_flight(&self) -> usize {
+        (self.state.load(Ordering::SeqCst) & IN_FLIGHT_MASK) >> IN_FLIGHT_SHIFT
+    }
+
     /// The M5 route-commit gate, one call: every reported socket
     /// marked, at least one reported, and NOTHING IN FLIGHT — the
-    /// single-word state makes the whole conjunction one snapshot
-    /// (the round-13 fix: no load interleaves with an admission).
+    /// single-word state makes the whole conjunction one snapshot.
+    ///
+    /// NOTE THE RESIDUAL WINDOW (the bot round-14 second P1,
+    /// disclosed): this is a CHECK, not a reservation — a callback
+    /// admitted after this load can still be in flight when the
+    /// caller commits. Closing check-to-act requires the commit side
+    /// to hold the same lock the callbacks take (or a generation
+    /// handshake); that belongs to M5's route-commit lane, which owns
+    /// the act. The honest contract here: healthy() is a correct
+    /// snapshot AT CALL TIME.
     pub fn healthy(&self) -> bool {
         let state = self.state.load(Ordering::SeqCst);
-        state >> REPORTED_SHIFT > 0 && state & (IN_FLIGHT | FAILED) == 0
+        state >> REPORTED_SHIFT > 0 && state & (IN_FLIGHT_MASK | FAILED) == 0
     }
 
     fn note_in_flight(&self) {
-        self.state.fetch_or(IN_FLIGHT, Ordering::SeqCst);
+        self.state.fetch_add(IN_FLIGHT_UNIT, Ordering::SeqCst);
     }
 
     fn note_failure(&self) {
@@ -178,18 +196,20 @@ impl MarkHealth {
     }
 
     fn note_done(&self) {
-        self.state.fetch_sub(IN_FLIGHT, Ordering::SeqCst);
+        self.state.fetch_sub(IN_FLIGHT_UNIT, Ordering::SeqCst);
     }
 }
 
-/// The in-flight bit: a callback admitted but not yet completed.
-const IN_FLIGHT: usize = 1 << 0;
+/// The in-flight COUNT's field (multi-bit: overlapping callbacks).
+const IN_FLIGHT_SHIFT: usize = 1;
+const IN_FLIGHT_MASK: usize = 0x3FFF << IN_FLIGHT_SHIFT;
+const IN_FLIGHT_UNIT: usize = 1 << IN_FLIGHT_SHIFT;
 /// The failure latch: any mark failure, permanent.
-const FAILED: usize = 1 << 1;
-/// The reported counter's unit (one bit-pair per report).
-const REPORTED_UNIT: usize = 1 << 2;
+const FAILED: usize = 1 << 0;
+/// The reported counter's unit.
+const REPORTED_UNIT: usize = 1 << 15;
 /// The reported counter's shift.
-const REPORTED_SHIFT: usize = 2;
+const REPORTED_SHIFT: usize = 15;
 
 impl Default for MarkHealth {
     /// Delegates to [`MarkHealth::new`] (healthy): `Default` must agree
@@ -387,5 +407,53 @@ mod tests {
         release.wait();
         handle.join().unwrap();
         assert!(health.healthy(), "the gate reopens once the marking lands");
+    }
+
+    /// The bot round-14 P1: OVERLAPPING callbacks — the in-flight
+    /// field is a COUNT, so the first completion does not clear the
+    /// second's admission and no completion ever borrows into the
+    /// neighboring fields.
+    #[test]
+    fn overlapping_admissions_are_counted_not_cleared() {
+        struct ParkingApplier {
+            entered: Arc<std::sync::Barrier>,
+            release: Arc<std::sync::Barrier>,
+        }
+        impl MarkApplier for ParkingApplier {
+            fn apply_mark(&self, _socket_fd: RawFd) -> io::Result<()> {
+                self.entered.wait();
+                self.release.wait();
+                Ok(())
+            }
+        }
+        let health = Arc::new(MarkHealth::new());
+        let entered = Arc::new(std::sync::Barrier::new(3));
+        let release = Arc::new(std::sync::Barrier::new(3));
+        // TWO callbacks overlap inside apply_mark.
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                let callback = MarkingFdCallback::new(
+                    Arc::new(ParkingApplier {
+                        entered: Arc::clone(&entered),
+                        release: Arc::clone(&release),
+                    }),
+                    Arc::clone(&health),
+                );
+                std::thread::spawn(move || callback.on_socket_fd_available(1))
+            })
+            .collect();
+        entered.wait();
+        assert_eq!(health.in_flight(), 2, "both admissions are counted");
+        assert!(!health.healthy());
+        release.wait();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        assert_eq!(
+            health.in_flight(),
+            0,
+            "every completion decrements its own admission"
+        );
+        assert!(health.healthy(), "no field was corrupted by the overlap");
     }
 }
