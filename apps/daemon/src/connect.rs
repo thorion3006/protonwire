@@ -420,9 +420,9 @@ fn reconcile_drops(
     // STALE-BACKLOG MODE (the bot round-14 P2): once a drop is
     // observed, the queue holds PRE-DROP state events that can each
     // overwrite the reconciled core after this pass — keep
-    /// re-reconciling on every quiet cadence until a FRESH push
-    /// (a non-timeout event) supersedes the backlog. The dirty flag
-    /// carries the mode; the watermark only ARMS it.
+    // re-reconciling on every quiet cadence until a FRESH push
+    // (a non-timeout event) supersedes the backlog. The dirty flag
+    // carries the mode; the watermark only ARMS it.
     let dropped = connection.dropped_states();
     if dropped > *watermark {
         *watermark = dropped;
