@@ -3365,3 +3365,21 @@ Gates green at every level.
   suffix; real ids with slashes pass through); pinned.
 
 Gates green at every level after each fix.
+
+## 2026-10-01 — Round 18 (4 threads, all genuine, all landed)
+
+- **#16 (8bfe71d)**: the stable-id normalization covers EVERY
+  state variant (Connecting's peer_ids, ConnectingToAgent's
+  peer_id — the round-17 fix only covered Connected); and
+  EnginePeerRef/EngineAgentInfo get manual redacting Debug impls
+  (SEC-5/FR-121 — diagnostics can no longer write entry/exit
+  addresses; pinned).
+- **#17 (8b2f852)**: the pump holds a WEAK lane reference — the
+  strong Arc formed an ownership cycle (a ConnectionLane dropped
+  without drain() leaked the ProTUN session/TUN forever: nothing
+  could take the connection, ActiveConnection::drop never ran).
+  And ForkSelectorNeeded — delivered OR retained — is surfaced with
+  the engine-contract obligation named, routed to the M6
+  Muon-refresh lane (silently discarding it was the bug).
+
+Gates green at every level.
