@@ -647,10 +647,60 @@ mod tests {
     #[test]
     fn peer_entry_addresses_never_render_in_debug() {
         let rendered = format!("{:?}", params(vec![peer("a", 0)]));
-        assert!(rendered.contains("ip=[redacted]"), "{rendered}");
+        assert!(rendered.contains("\"[redacted]\""), "{rendered}");
         assert!(
             !rendered.contains("192.0.2"),
             "the entry address must not appear: {rendered}"
+        );
+    }
+
+    /// The refactor pass's P3: the PARTIAL merge — two transports
+    /// share one address, the third differs (the second-most-likely
+    /// real catalog shape: WG-over-UDP and WG-over-TCP on one entry,
+    /// Stealth elsewhere) — merges into exactly two candidates, ids
+    /// prefix-recoverable (the daemon's mapping contract).
+    #[test]
+    fn a_partial_address_merge_yields_two_prefix_recoverable_candidates() {
+        use crate::params::TransportEndpoint;
+        let mut split = peer("partial", 0);
+        let shared = IpAddr::from_str("192.0.2.10").unwrap();
+        split.udp = Some(TransportEndpoint {
+            entry_ip: shared,
+            ports: vec![443],
+        });
+        split.tcp = Some(TransportEndpoint {
+            entry_ip: shared,
+            ports: vec![443],
+        });
+        split.tls = Some(TransportEndpoint {
+            entry_ip: IpAddr::from_str("203.0.113.30").unwrap(),
+            ports: vec![8443],
+        });
+        let mut request = params(vec![split]);
+        request.protocol = crate::Protocol::Smart;
+        let config = translate(&request).unwrap();
+        assert_eq!(
+            config.peers.len(),
+            2,
+            "shared-address UDP+TCP merge; TLS apart"
+        );
+        for candidate in &config.peers {
+            assert!(
+                candidate.peer_id.starts_with("partial/"),
+                "every expanded id is prefix-recoverable: {}",
+                candidate.peer_id
+            );
+        }
+        let merged = config
+            .peers
+            .iter()
+            .find(|c| c.server_ip.0 == shared)
+            .unwrap();
+        assert!(
+            !merged.udp_ports.is_empty()
+                && !merged.tcp_ports.is_empty()
+                && merged.tls_ports.is_empty(),
+            "the shared candidate carries exactly UDP+TCP"
         );
     }
 }
