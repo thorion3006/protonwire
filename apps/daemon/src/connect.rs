@@ -435,7 +435,7 @@ fn reconcile_drops(
     // tunnel still live).
     // EVERY retained critical is surfaced (the bot round-18 P2): a
     // ForkSelectorNeeded consumed here and dropped would lose the
-    /// engine-contract obligation (the consumer must provide a new
+    // engine-contract obligation (the consumer must provide a new
     // selector — the M6 Muon-refresh lane routes it); the terminal
     // fatal tears down HERE, the others WARN and ride the log until
     // that lane exists (silently discarding them is the bug).
