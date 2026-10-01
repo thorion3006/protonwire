@@ -886,6 +886,10 @@ const EVENT_CHANNEL_BOUND: usize = 1024;
 struct EventDrops {
     stats: AtomicU64,
     states: AtomicU64,
+    /// Retained controls (the bot round-19 P2): NOT dropped states —
+    /// a separate surface, so dropped_states() stays the pure
+    /// wedged-consumer alarm its doc promises.
+    controls_retained: AtomicU64,
 }
 
 impl EventDrops {
@@ -894,6 +898,10 @@ impl EventDrops {
     }
     fn note_state_drop(&self) {
         self.states.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn note_control_retained(&self) {
+        self.controls_retained.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -915,6 +923,27 @@ struct EngineCallbacks {
     epoch: Arc<AtomicU64>,
 }
 
+/// actionable controls are retained INDEPENDENTLY — one slot per
+/// class, so no obligation overwrites another.
+fn critical_class(event: &EngineEvent) -> ControlClass {
+    match event {
+        EngineEvent::CertificateFatal => ControlClass::CertificateFatal,
+        EngineEvent::ForkSelectorNeeded => ControlClass::ForkSelector,
+        EngineEvent::SettingRefused(_) => ControlClass::SettingRefused,
+        EngineEvent::ApiError { .. } => ControlClass::ApiError,
+        _ => ControlClass::Other,
+    }
+}
+
+/// The independent recovery classes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ControlClass {
+    CertificateFatal,
+    ForkSelector,
+    SettingRefused,
+    ApiError,
+    Other,
+}
 impl EngineCallbacks {
     /// The never-blocking send with the drop policy.
     fn forward(&self, event: EngineEvent) {
@@ -963,17 +992,37 @@ impl EngineCallbacks {
                 // is never displaced by a later one.
                 critical => {
                     let terminal = matches!(critical, EngineEvent::CertificateFatal);
+                    // The recovery slot is a per-CLASS map (the bot
+                    // round-19 P2): every actionable control class is
+                    // retained independently — a retained
+                    // ForkSelectorNeeded can no longer be overwritten
+                    // by a later ApiError/SettingRefused (the
+                    // single-slot shape lost the obligation), and the
+                    // terminal CertificateFatal still cannot be
+                    // displaced at all.
                     let mut slot = self
                         .recovery
                         .critical
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    let displaced_terminal =
-                        matches!(slot.as_ref(), Some(EngineEvent::CertificateFatal));
-                    if terminal || !displaced_terminal {
-                        *slot = Some(critical.clone());
+                    let class = critical_class(critical);
+                    let retained = slot
+                        .iter()
+                        .position(|existing| critical_class(existing) == class);
+                    match retained {
+                        // A terminal is never displaced by its class's
+                        // later non-terminal (and vice versa is
+                        // irrelevant — the terminal wins on read).
+                        Some(index) if matches!(slot[index], EngineEvent::CertificateFatal) => {}
+                        Some(index) if !terminal => slot[index] = critical.clone(),
+                        Some(_) => {}
+                        None => slot.push(critical.clone()),
                     }
-                    self.drops.note_state_drop();
+                    // A SEPARATE counter (the bot round-19's second
+                    // P2): retained controls are NOT dropped states —
+                    // dropped_states() is the wedged-consumer alarm;
+                    // control pressure is its own surface.
+                    self.drops.note_control_retained();
                 }
             },
             Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
@@ -1074,11 +1123,10 @@ pub struct LatestStatsSnapshot {
 
 #[derive(Debug, Default)]
 pub struct RecoverySlots {
-    /// The newest retained control event. TERMINAL events
-    /// (CertificateFatal) are never displaced by later ones (the bot
-    /// round-11 P2): a fatal must reach the consumer even if a
-    /// ForkSelectorNeeded arrives after it.
-    critical: Mutex<Option<EngineEvent>>,
+    /// The retained control events, ONE PER CLASS (the bot round-19
+    /// P2): each actionable class survives independently of the
+    /// others; a TERMINAL CertificateFatal is never displaced.
+    critical: Mutex<Vec<EngineEvent>>,
     /// The newest WireGuard counters — an INDEPENDENT slot (the bot
     /// round-11 P2): the two counter streams must not overwrite each
     /// other.
@@ -1246,16 +1294,32 @@ impl ActiveConnection {
     /// one must act on it (a `CertificateFatal` closes the
     /// connection; a fork selector must be provided) before
     /// draining further.
-    pub fn take_critical_event(&self) -> Option<EngineEvent> {
-        self.recovery
-            .critical
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take()
+    /// The RETAINED control events (the bot round's P2, the
+    /// round-19 per-class shape): DRAINS them — a consumer that
+    /// finds any must act (a `CertificateFatal` closes the
+    /// connection; a fork selector must be provided) before
+    /// draining further. The terminal fatal, if present, comes
+    /// LAST so a consumer folding over the Vec acts on the
+    /// strongest signal endmost.
+    pub fn take_critical_events(&self) -> Vec<EngineEvent> {
+        let mut retained = std::mem::take(
+            &mut *self
+                .recovery
+                .critical
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        retained.sort_by_key(|event| matches!(event, EngineEvent::CertificateFatal));
+        retained
     }
 
-    /// The NEWEST statistics (the bot round's P2): the drop policy
-    /// is latest-wins — a consumer recovering from a full queue
+    /// How many control events were RETAINED through queue
+    /// pressure (NOT dropped — the separate surface the round-19
+    /// finding asked for; dropped_states() stays the pure
+    /// wedged-consumer alarm).
+    pub fn controls_retained(&self) -> u64 {
+        self.drops.controls_retained.load(Ordering::Relaxed)
+    }
     /// The NEWEST statistics, per INDEPENDENT stream (the bot
     /// round-11 P2): the WireGuard and LocalAgent counter streams
     /// never overwrite each other — a consumer recovering from a
@@ -1663,18 +1727,15 @@ mod tests {
             error: ErrorEvent::CertificateRefreshFatalError,
         };
         callbacks.on_event(fatal);
-        let mut critical = callbacks
+        let critical = callbacks
             .recovery
             .critical
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(critical.len(), 1, "one retained control");
         assert!(
-            matches!(critical.take(), Some(EngineEvent::CertificateFatal)),
-            "the retained control event is delivered once"
-        );
-        assert!(
-            critical.take().is_none(),
-            "a second take is empty — take, not peek"
+            matches!(critical[0], EngineEvent::CertificateFatal),
+            "the retained control event is the fatal"
         );
     }
 
