@@ -149,6 +149,25 @@ pub struct TunHandle {
 /// `TUNSETIFF` — `_IOW('T', 202, int)` from `linux/if_tun.h` (not
 /// exposed by glibc or the `libc` crate; the value is
 /// `(1 << 30) | (4 << 16) | (0x54 << 8) | 202`).
+/// TUNSETIFF is only correct on asm-generic-ioctl architectures
+/// (the bot round's P2): mips/powerpc/sparc encode _IOW differently,
+/// and the hardcoded request would fail ENOTTY there. Fail the BUILD
+/// on those targets rather than shipping a silently-broken create —
+/// derive the per-arch value if such a port ever becomes real.
+#[cfg(not(any(
+    target_arch = "x86_64",
+    target_arch = "x86",
+    target_arch = "aarch64",
+    target_arch = "arm",
+    target_arch = "riscv64",
+    target_arch = "riscv32",
+    target_arch = "loongarch64",
+    target_arch = "csky",
+)))]
+compile_error!(
+    "TUNSETIFF's asm-generic encoding is not valid on this architecture — \
+     derive the request per-arch before building here (see tun.rs)"
+);
 const TUNSETIFF: libc::c_ulong = 0x4004_54ca;
 /// `IFF_TUN` from `linux/if_tun.h` (same glibc/libc gap).
 const IFF_TUN: i16 = 0x0001;
@@ -250,11 +269,23 @@ impl TunHandle {
 
     /// The `update_unix_tun` update shape: what a LIVE connection
     /// takes when the TUN descriptor must change without a session
-    /// teardown (FR-32C). The INITIAL hand-off is different —
+    /// teardown (FR-32C). CONSUMES the handle (the bot round's P1):
+    /// ProTUN wraps the carried fd in its own owning `File`, so a
+    /// borrowing shape left a SECOND owner of the same descriptor —
+    /// dropping either could close it under the other or target a
+    /// reused fd later. The initial hand-off is different —
     /// `Connection::unix_connect` takes the raw fd
     /// (`Some(handle.into_raw_fd())`), not this type.
-    pub fn stream_info(&self) -> TunStreamInfo {
-        TunStreamInfo::TunFd(self.raw_fd())
+    pub fn into_stream_info(mut self) -> TunStreamInfo {
+        let file = self
+            .file
+            .take()
+            .expect("handle owns its fd until close or transfer");
+        let fd = file.as_raw_fd();
+        // ProTUN's stream owns the descriptor now (same transfer
+        // semantics as into_raw_fd).
+        std::mem::forget(file);
+        TunStreamInfo::TunFd(fd)
     }
 
     /// The owned descriptor (valid until `close`/transfer).
