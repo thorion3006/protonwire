@@ -227,7 +227,16 @@ impl ConnectionLane {
         let slot: ConnectionSlot = Arc::new(Mutex::new(Some(connection)));
         let core = Arc::clone(&self.core);
         let pump_slot = Arc::clone(&slot);
-        let pump_lane = Arc::clone(&self.state);
+        // A WEAK lane reference (the bot round-18 P2): a strong Arc
+        // from the pump back into LaneState (which holds the
+        // ActiveLane and the slot) formed an ownership CYCLE — a
+        // ConnectionLane dropped without drain() (an early return or
+        // unwind in the daemon composition) left nothing able to take
+        // the connection, so ActiveConnection::drop never ran and the
+        // ProTUN session/TUN outlived the lane. Weak breaks the cycle;
+        // the pump's retirement upgrades only while the lane lives
+        // (a dropped lane needs no retirement — its drop IS one).
+        let pump_lane = Arc::downgrade(&self.state);
         let pump = std::thread::spawn(move || pump_events(&pump_slot, &pump_lane, &core));
         lane.active = Some(ActiveLane {
             connection: slot,
@@ -295,7 +304,11 @@ const PUMP_POLL: Duration = Duration::from_millis(200);
 /// The terminal teardown (the engine contract: the caller must close
 /// the connection on a fatal certificate-refresh failure — delivered
 /// OR recovered from the drop lane; the bot round-12 P2).
-fn terminate_on_fatal(slot: &ConnectionSlot, lane: &SharedLane, core: &CoreState) {
+fn terminate_on_fatal(
+    slot: &ConnectionSlot,
+    lane: &std::sync::Weak<Mutex<LaneState>>,
+    core: &CoreState,
+) {
     tracing::warn!("certificate refresh failed terminally — tearing the session down");
     if let Some(connection) = slot.lock().ok().and_then(|mut guard| guard.take()) {
         connection.disconnect();
@@ -304,7 +317,7 @@ fn terminate_on_fatal(slot: &ConnectionSlot, lane: &SharedLane, core: &CoreState
     retire_lane(slot, lane);
 }
 
-fn pump_events(slot: &ConnectionSlot, lane: &SharedLane, core: &CoreState) {
+fn pump_events(slot: &ConnectionSlot, lane: &std::sync::Weak<Mutex<LaneState>>, core: &CoreState) {
     let mut last: Option<VpnState> = None;
     let mut dropped_watermark: u64 = 0;
     let mut backlog: bool = false;
@@ -420,11 +433,27 @@ fn reconcile_drops(
     // teardown path as a directly delivered fatal (taking the event
     // and only logging it destroyed its sole recovery copy with the
     // tunnel still live).
-    if let Some(EngineEvent::CertificateFatal) = connection.take_critical_event() {
-        tracing::warn!(
-            "a retained certificate-fatal surfaced from the drop lane — tearing the session down"
-        );
-        return true;
+    // EVERY retained critical is surfaced (the bot round-18 P2): a
+    // ForkSelectorNeeded consumed here and dropped would lose the
+    /// engine-contract obligation (the consumer must provide a new
+    // selector — the M6 Muon-refresh lane routes it); the terminal
+    // fatal tears down HERE, the others WARN and ride the log until
+    // that lane exists (silently discarding them is the bug).
+    if let Some(critical) = connection.take_critical_event() {
+        match critical {
+            EngineEvent::CertificateFatal => {
+                tracing::warn!(
+                    "a retained certificate-fatal surfaced from the drop lane — tearing the session down"
+                );
+                return true;
+            }
+            other => {
+                tracing::warn!(
+                    ?other,
+                    "a retained critical event surfaced from the drop lane — routed to the M6 lane"
+                );
+            }
+        }
     }
     // WATERMARK-GATED (the refactor pass's P3): read the counter
     // first; the latest_state clone (a lock + a String/Vec-carrying
@@ -460,12 +489,15 @@ fn reconcile_drops(
 /// Retires THIS pump's lane entry when the engine died on its own
 /// (the bot round's P2): a reconnect may already have replaced the
 /// lane — only the entry whose connection slot is OURS is retired.
-fn retire_lane(slot: &ConnectionSlot, lane: &SharedLane) {
+fn retire_lane(slot: &ConnectionSlot, lane: &std::sync::Weak<Mutex<LaneState>>) {
     // Poison recovery matches the lane methods (the refactor
     // pass's P3): silently skipping retirement on a poisoned mutex
     // re-creates the stranded-owner state this function exists to
     // prevent.
-    let mut lane = lane
+    let Some(shared) = lane.upgrade() else {
+        return; // a dropped lane needs no retirement (its drop IS one)
+    };
+    let mut lane = shared
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     // Ours only: a reconnect may already have replaced the entry —
