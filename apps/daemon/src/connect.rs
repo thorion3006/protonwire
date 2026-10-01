@@ -280,6 +280,23 @@ impl ConnectionLane {
     /// exits so no event races the IPC socket's close.
     pub fn drain(&self) {
         self.draining.store(true, Ordering::SeqCst);
+        // The in-progress RECONNECT teardown is waited out (the bot
+        // round-21 P2): a reconnect whose teardown the drain's take()
+        // missed (the entry was already taken, the join not yet run)
+        // left the old pump publishing after drain returned — the
+        // blocking-shutdown contract. The reconnecting flag names
+        // that window; spin until it closes, then take what is there.
+        loop {
+            let mut lane = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !lane.reconnecting {
+                break;
+            }
+            drop(lane);
+            std::thread::sleep(Duration::from_millis(5));
+        }
         // Same no-join-under-lock discipline as disconnect (the
         // refactor pass's P1).
         let active = self
@@ -351,6 +368,19 @@ fn pump_events(slot: &ConnectionSlot, lane: &std::sync::Weak<Mutex<LaneState>>, 
                 event
             }
             Some(Err(std::sync::mpsc::RecvTimeoutError::Timeout)) => {
+                // LANE-DROPPED CHECK (the bot round-21 P2): the only
+                // upgrade site was retire_lane AFTER a terminal — the
+                // healthy-lane case looped forever holding the slot
+                /// (the session and TUN leaked). The quiet cadence
+                /// checks: a lane that can no longer upgrade has been
+                /// dropped — exit, taking the slot (and the
+                /// ActiveConnection) with us.
+                if lane.upgrade().is_none() {
+                    if let Some(connection) = slot.lock().ok().and_then(|mut guard| guard.take()) {
+                        connection.disconnect();
+                    }
+                    break;
+                }
                 // The quiet path still converges (the bot round's
                 // P2): a consumer that stalled while the bounded
                 // engine queue dropped states is caught up NOW —
