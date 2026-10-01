@@ -316,9 +316,16 @@ fn pump_events(slot: &ConnectionSlot, lane: &SharedLane, core: &CoreState) {
         });
         let event = match received {
             Some(Ok(event)) => {
-                // A FRESH push supersedes any stale backlog (the bot
-                // round-14 P2): the queue has drained past the drop.
-                backlog = false;
+                // A received event does NOT disarm the backlog (the
+                // bot round-16 P2): the queue may still hold PRE-DROP
+                // states behind this one — the first of them cleared
+                // the flag while the rest went on overwriting the
+                // reconciled core. The backlog stays armed until the
+                // queue is QUIET (the timeout arm's reconcile runs
+                // with an empty queue behind it); every quiet
+                // cadence re-reconciles in the meantime, so a stale
+                // queued state can be authoritative for at most one
+                // cadence — and never once the drain completes.
                 event
             }
             Some(Err(std::sync::mpsc::RecvTimeoutError::Timeout)) => {
@@ -332,6 +339,12 @@ fn pump_events(slot: &ConnectionSlot, lane: &SharedLane, core: &CoreState) {
                     terminate_on_fatal(slot, lane, core);
                     break;
                 }
+                // The queue is QUIET here (the timeout proves the
+                // cursor sat at an empty channel): the stale backlog
+                // has fully drained — disarm (the bot rounds 14+16:
+                // receiving an event must NOT disarm, because older
+                // states may sit behind it; only emptiness does).
+                backlog = false;
                 continue;
             }
             // SPLIT ARMS (the refactor pass's P1): engine death
@@ -417,12 +430,15 @@ fn reconcile_drops(
     // first; the latest_state clone (a lock + a String/Vec-carrying
     // struct) happens only when drops actually moved — the common
     // quiet tick pays one load.
-    // STALE-BACKLOG MODE (the bot round-14 P2): once a drop is
+    // STALE-BACKLOG MODE (the bot rounds 14+16): once a drop is
     // observed, the queue holds PRE-DROP state events that can each
-    // overwrite the reconciled core after this pass — keep
-    // re-reconciling on every quiet cadence until a FRESH push
-    // (a non-timeout event) supersedes the backlog. The dirty flag
-    // carries the mode; the watermark only ARMS it.
+    // overwrite the reconciled core after this pass. The mode stays
+    /// armed until the queue is QUIET — this arm only runs on the
+    /// timeout path (an empty queue behind the cursor) or after a
+    /// received event (whose drain leaves the rest) — and every
+    /// invocation re-reconciles the core onto latest_state, so a
+    /// stale queued state is authoritative for at most one cadence
+    /// and never after the drain. The watermark only ARMS the mode.
     let dropped = connection.dropped_states();
     if dropped > *watermark {
         *watermark = dropped;
