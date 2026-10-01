@@ -368,8 +368,8 @@ impl PersistentCache for PersistenceFacade {
     fn clear_all(&self) {
         self.memory.lock().expect("facade memory lock").clear();
         // The sibling shape (the refactor pass's consistency note): the
-        /// op is built ONCE — the queue gets a clone, the overflow
-        /// gets the original (one sequence, not two).
+        // op is built ONCE — the queue gets a clone, the overflow
+        // gets the original (one sequence, not two).
         let op = Op::ClearAll(self.next_seq());
         let send_result = self
             .sender
