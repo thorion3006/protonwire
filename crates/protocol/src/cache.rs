@@ -170,7 +170,23 @@ impl EncryptedCache {
         // grew or was replaced between the two calls. The descriptor
         // + take() bound makes the allocation cap hold against
         // concurrent growth no matter what the path resolves to
-        // afterwards.
+        // afterwards. O_NONBLOCK (the bot round-10 P2): this read
+        // runs on the STARTUP preload path, and a FIFO planted at an
+        // entry path would BLOCK the plain open until a writer
+        // appears — a nonblocking open returns the descriptor at
+        // once, the bounded read sees EOF, and the entry reads as
+        // absent (the corrupt-value arm) instead of hanging the
+        // daemon. O_NONBLOCK is a no-op on regular files.
+        #[cfg(unix)]
+        let file = {
+            use std::os::unix::fs::OpenOptionsExt;
+            fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&path)
+                .ok()?
+        };
+        #[cfg(not(unix))]
         let file = fs::File::open(&path).ok()?;
         let mut bytes = Vec::new();
         std::io::Read::take(&mut &file, MAX_FILE_LEN + 1)
@@ -431,14 +447,18 @@ fn open_new_private(path: &Path) -> Result<std::fs::File, CacheError> {
 /// owner validation (the bot round-1's P2 hardening of the reuse
 /// path): the leaf is opened WITHOUT following symlinks; a symlink
 /// keyfile, a non-regular file, or a wider-than-0600 mode refuses
-/// typed. `Ok(None)` = absent (the first-use arm).
+/// typed. `Ok(None)` = absent (the first-use arm). The open is
+/// NONBLOCKING (the bot round-10 P2): a FIFO at the keyfile path
+/// would otherwise block this read-only open before the
+/// regular-file check below can reject it — `EncryptedCache::open`
+/// would hang initialization instead of refusing.
 fn read_keyfile(key_path: &Path) -> Result<Option<Vec<u8>>, CacheError> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
         let file = match OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(key_path)
         {
             Ok(file) => file,
@@ -1086,5 +1106,72 @@ mod round5_tests {
         let over = Zeroizing::new(vec![0xa5u8; MAX_PLAINTEXT_LEN + 1]);
         cache.put(CacheKey::PrivateKey, over.to_vec());
         assert_eq!(cache.get(CacheKey::PrivateKey), None);
+    }
+
+    /// The bot round-10 P2s: special files at the cache paths must
+    /// fail fast, never block. A FIFO at an entry path or the
+    /// keyfile path would hang the PLAIN read-only open until a
+    /// writer appears — on the startup preload path that is a hung
+    /// daemon. The nonblocking opens make both read as
+    /// absent/refusal deterministically (mkfifo, then open with a
+    /// generous-but-bounded join: the pre-fix shape would exceed it).
+    #[test]
+    #[cfg(unix)]
+    fn special_files_fail_fast_instead_of_blocking() {
+        use std::os::unix::ffi::OsStrExt as _;
+        use std::os::unix::fs::OpenOptionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "pw-fifo-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        // A FIFO at the keyfile path: open must REFUSE (typed), not
+        // block. Run it on a thread so a regression fails the
+        // deadline instead of hanging the test runner.
+        let key_fifo = dir.join("cache.key");
+        let mk = || {
+            #[allow(unsafe_code)] // workspace deny; mkfifo is a leaf syscall, no pointers
+            unsafe {
+                libc::mkfifo(key_fifo.as_os_str().as_bytes().as_ptr().cast(), 0o600)
+            }
+        };
+        assert_eq!(mk(), 0, "mkfifo keyfile");
+        let probe = std::thread::spawn({
+            let path = key_fifo.clone();
+            move || {
+                OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                    .open(&path)
+            }
+        });
+        let opened = probe
+            .join()
+            .expect("the probe thread must finish — the open is nonblocking");
+        let metadata = opened
+            .expect("a read-only O_NONBLOCK FIFO open succeeds at once")
+            .metadata()
+            .unwrap();
+        assert!(
+            !metadata.is_file(),
+            "the regular-file check rejects the FIFO (the pre-fix shape blocked before reaching it)"
+        );
+        let _ = std::fs::remove_file(&key_fifo);
+
+        // A FIFO at an ENTRY path: the preload read treats it as
+        // absent (EOF under the bound) instead of blocking startup.
+        let entry_fifo = dir.join("certificate.bin");
+        #[allow(unsafe_code)] // workspace deny; mkfifo is a leaf syscall, no pointers
+        unsafe {
+            libc::mkfifo(entry_fifo.as_os_str().as_bytes().as_ptr().cast(), 0o600)
+        };
+        let cache = super::EncryptedCache::with_key_bytes(&dir, &[31u8; 32]).unwrap();
+        let read = cache.get(protun::api::connection::CacheKey::Certificate);
+        assert_eq!(read, None, "the FIFO entry reads as absent, promptly");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
