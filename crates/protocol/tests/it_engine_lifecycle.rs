@@ -145,7 +145,7 @@ fn it14_engine_composition_lifecycle() {
             Box::new(protonwire_protocol::NullCache::default()),
         )
         .expect("the composed connection starts");
-    assert_eq!(connection.interface_name(), IF_NAME);
+    assert_eq!(connection.interface_name(), IF_NAME.to_owned());
 
     // FR-29 lane: the state events flow, translated. PINNED BEHAVIOR
     // of protun v2.2.1 (observed): the `Connecting` state carries an
