@@ -328,11 +328,17 @@ impl PersistentCache for PersistenceFacade {
             return;
         }
         let name = format!("{key:?}");
-        self.memory
-            .lock()
-            .expect("facade memory lock")
-            .insert(name.clone(), Zeroizing::new(bytes.to_vec()));
-        let op = Op::Put(name, Zeroizing::new(bytes.to_vec()), self.next_seq());
+        // SEQ-UNDER-THE-MEMORY-LOCK (the bot round-12 P1): the
+        // sequence is assigned in the SAME critical section that
+        // mutates the facade state — otherwise concurrent callbacks
+        // can interleave store/seq so the worker persists an OLDER
+        // value than memory serves (restart restores the wrong
+        // credential). The lock orders both against get().
+        let op = {
+            let mut memory = self.memory.lock().expect("facade memory lock");
+            memory.insert(name.clone(), Zeroizing::new(bytes.to_vec()));
+            Op::Put(name, Zeroizing::new(bytes.to_vec()), self.next_seq())
+        };
         let send_result = self
             .sender
             .as_ref()
@@ -358,14 +364,15 @@ impl PersistentCache for PersistenceFacade {
 
     fn remove(&self, key: CacheKey) {
         let name = format!("{key:?}");
-        self.memory
-            .lock()
-            .expect("facade memory lock")
-            .remove(&name);
+        // Seq under the memory lock (the bot round-12 P1 — see put).
+        let op = {
+            let mut memory = self.memory.lock().expect("facade memory lock");
+            memory.remove(&name);
+            Op::Remove(name, self.next_seq())
+        };
         // A destructive op refused by a FULL queue goes to the
         // OVERFLOW (the bot round-8 P1 — the newest state must
         // reach the worker) and records the backpressure to health.
-        let op = Op::Remove(name, self.next_seq());
         let send_result = self
             .sender
             .as_ref()
@@ -381,11 +388,14 @@ impl PersistentCache for PersistenceFacade {
     }
 
     fn clear_all(&self) {
-        self.memory.lock().expect("facade memory lock").clear();
-        // The sibling shape (the refactor pass's consistency note): the
-        // op is built ONCE — the queue gets a clone, the overflow
-        // gets the original (one sequence, not two).
-        let op = Op::ClearAll(self.next_seq());
+        // Seq under the memory lock (the bot round-12 P1 — see put);
+        // the sibling shape: the op is built ONCE — the queue gets a
+        // clone, the overflow gets the original.
+        let op = {
+            let mut memory = self.memory.lock().expect("facade memory lock");
+            memory.clear();
+            Op::ClearAll(self.next_seq())
+        };
         let send_result = self
             .sender
             .as_ref()
@@ -565,7 +575,19 @@ fn worker_loop(
             };
             match name {
                 None => {
-                    if !saw_clear {
+                    // Retain the MAX-sequence clear itself (the bot
+                    // round-12 P1): the first clear ENCOUNTERED in
+                    // reverse order may be the STALE one (a seq-10
+                    // clear can enter the queue before a delayed
+                    // seq-5 clear) — retaining the stale one lets the
+                    // watermark guard skip its removals entirely and
+                    // the credential survives the clear-all. Only the
+                    // max-sequence clear is authoritative.
+                    let superseded = coalesced
+                        .iter()
+                        .any(|existing| matches!(existing, Op::ClearAll(seq) if *seq >= op.seq()));
+                    if !superseded {
+                        coalesced.retain(|existing| !matches!(existing, Op::ClearAll(_)));
                         saw_clear = true;
                         coalesced.push(op);
                     }
@@ -1516,6 +1538,113 @@ mod round9_tests {
             Some(b"newer".to_vec()),
             "the stale sequence never overwrites the newer state"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The bot round-12 P1 (the coalescing half): the MAX-sequence
+    /// clear is the authoritative one — a seq-10 clear entering the
+    /// queue before a delayed seq-5 clear must not be coalesced away
+    /// (the stale clear's removals are then watermark-skipped and
+    /// the credential survives the clear-all). Driven through the
+    /// facade surface: the NEWER clear lands in the overflow lane
+    /// first, the stale one second.
+    #[test]
+    fn the_max_sequence_clear_survives_the_coalesce() {
+        let dir = std::path::PathBuf::from(format!(
+            "/tmp/protonwire-r12-clear-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cache = Arc::new(EncryptedCache::with_key_bytes(&dir, &[31u8; 32]).unwrap());
+        let facade = PersistenceFacade::start(Arc::clone(&cache));
+        // A certificate is durable, then the NEWER clear (seq n+1)
+        // enters first, the STALE clear (seq n) second.
+        assert!(
+            cache
+                .try_put(CacheKey::Certificate, b"cert".to_vec())
+                .is_ok()
+        );
+        let newer = facade.next_seq();
+        facade.overflow(Op::ClearAll(newer));
+        facade.overflow(Op::ClearAll(newer - 1));
+        // The stale clear never lands: the newer one's removals
+        // clear the certificate.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while cache.get(CacheKey::Certificate).is_some() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the max-sequence clear must survive the coalesce and clear the key"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The bot round-12 P1 (the seq-assignment half): the sequence is
+    /// assigned UNDER the memory lock — the put's value and its
+    /// sequence are one atomic transition, so the worker can never
+    /// persist an OLDER value than memory serves.
+    #[test]
+    fn the_sequence_is_assigned_under_the_memory_lock() {
+        let dir = std::path::PathBuf::from(format!(
+            "/tmp/protonwire-r12-seq-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cache = Arc::new(EncryptedCache::with_key_bytes(&dir, &[37u8; 32]).unwrap());
+        let facade = Arc::new(PersistenceFacade::start(Arc::clone(&cache)));
+        // Two concurrent puts of the SAME key: whichever gets the
+        // LARGER sequence must be the one memory serves. Before the
+        // fix, callback A could store value A, pause; B stores B,
+        // enqueues seq 1; A resumes, enqueues seq 2 (value A) — the
+        // worker persists A while get returns B. The invariant: the
+        // value with the max sequence IS the value memory holds.
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let handles: Vec<_> = (0..2)
+            .map(|index| {
+                let facade = Arc::clone(&facade);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    for _ in 0..50 {
+                        facade.put(
+                            CacheKey::Certificate,
+                            format!("writer-{index}").into_bytes(),
+                        );
+                    }
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        let served = facade.get(CacheKey::Certificate);
+        // Deterministic check: the worker's LAST durable write (the
+        // max sequence) must equal the served value. Drain: wait for
+        // the disk to settle, then compare against a fresh get (the
+        // memory value could still advance only by ANOTHER put —
+        // there are none left).
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let served_now = facade.get(CacheKey::Certificate);
+            let durable = cache.get(CacheKey::Certificate);
+            if served_now.is_some() && served_now == durable {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the durable value converged to the served value — no seq/store interleave"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 }
