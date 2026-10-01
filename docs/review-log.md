@@ -2686,3 +2686,55 @@ and 5cfe840 dropped both entries (tombstone comment; audit exit 0;
 the `audit` CI job green). Replied in-thread with the evidence via
 pr-champion and resolved — zero open threads. The severity bar held:
 nothing new above P2, no code change required.
+
+## 2026-09-17 — M4 PR-1 (m4/params-translation): FR-27 translation layer
+
+Master updated to fbc9959 (PR #11's upstream refresh absorbed: muon
+=2.6.2 under the protun ceiling, toolchain 1.98.1; suite 29/29 +
+xtask all green on the update). The key-source decision LANDED:
+(a) the root-owned 0600 keyfile + audited AEAD (PR-2's shape).
+
+The first M4 unit at 6b3d6e5: params.rs (the engine-agnostic
+vocabulary — PeerParams/TunnelParams, std-only per PRD 6.5's
+boundary rule; the serves_requested_protocol pre-flight) and
+translate.rs (the ONE mapping onto protun's
+InitialConnectionConfig: base64+32-byte-validated keys typed, the
+skip-among-healthy peer rule, MissingKey until PR-2's cache).
+base64 = 0.22.1 joined the workspace deps ALREADY IN GRAPH via
+muon->proton-srp->bcrypt (lock-verified 811→811: zero new code —
+the stdlib-first audit note; the gate's correction on the chain
+naming landed).
+
+RUST gate PASS, no P1; its catches landed in-commit: the
+malformed-FIRST mutation pin (the original condition would have
+dropped the healthy peer), TunnelParams' manual Debug (the private
+key renders [redacted] — FR-7P/T-32, the SecretString precedent),
+the dead-transport refusal AT translate (defense-in-depth at the
+choke point, with the empty-set bug class kept distinct), the
+all-malformed refusal naming the LAST peer's error, the
+Stealth/all-empty pre-flight matrix arms, and the peer-key fixture
+distinctness (the Debug pin can no longer pass on a client/peer
+key collision). The gate's PR-3 note recorded: the tun-contract
+prefixes are the PRD's /32//128, never pvpnclient's internal
+24/112 netstack values.
+
+## 2026-09-17 — PR#12 bot round 1 (M4 PR-1): the four findings
+
+All verified GENUINE, fixed red-first at 7d799a7: (P1) FR-32G/ER-11
+transport constraint — constrain_transports clears the non-selected
+lists and omits non-serving peers (Smart keeps all); (P1) NFR-16A
+zeroizing key storage — ClientPrivateKey(Arc<Zeroizing<String>>),
+shared clones, two-layer Debug redaction, Zeroizing decode
+intermediate; (P2) the post-skip recheck — serves_translated over
+the DECODED survivors refuses Unavailable when the malformed peer
+was the only transport carrier; (P2) SNI strategy propagation —
+the engine-agnostic SniStrategy rides TunnelParams onto ProTUN's
+enum (pre-fix hard-coded Random). Protocol gains Default (Smart).
+
+Parallel-lane coordination, recorded: the identical hardening pass
+appeared UNCOMMITTED in the shared worktree mid-PR-2, was
+withdrawn, then re-derived independently against the bot threads
+here. The cache branch (PR #13) is the other lane's active surface
+(its c462b69 addresses the gate round there); the branches divide
+cleanly — PR-1 fixes on m4/params-translation, PR-2 fixes on
+m4/encrypted-persistent-cache, no shared files at this round.

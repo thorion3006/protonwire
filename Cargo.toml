@@ -81,6 +81,7 @@ schemars = "1"
 # --- Errors / logging ------------------------------------------------------
 thiserror = "2"
 anyhow = "1"
+base64 = "0.22.1" # already in-graph via muon->proton-srp->bcrypt (lock v0.22.1); zero new code
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
