@@ -3148,3 +3148,48 @@ The owner's "first fix the ci failures" pass, three root causes:
 End state: #12 8/8, #13 8/8, #15/#16/#17 9/9 — every job green,
 netns-it EXECUTING on all three new PRs (25-38 s runs, not the
 disclosed skip; the M4-era track item closes).
+
+## 2026-10-01 — The bot round across the M4 stack (21 threads) + the five refactor passes
+
+The owner's "address the comments, and don't forget to run the
+refactor agents on each pr" round. 21 unresolved findings
+(#12×2, #13×4, #15×5, #16×7, #17×3) — EVERY one verified genuine
+and landed; then a refactor pass PER PR (the standing rule), all
+five findings-sets landed too.
+
+The P1s: per-transport entry addresses (#12 — the parallel lane's
+round-2 WIP taken over disclosed and completed: TransportEndpoint,
+per-address candidate expansion with the /{n} contract, redacting
+Debug); the retry lane's newest-pending + the per-key clear (#13 —
+retain is newest-wins, note_success takes the applied seq, apply_pass
+expands every ClearAll into per-key Removes; the whole-bucket
+try_clear_all arm is inert); mark health publish-after-outcome +
+the CONSUMING into_stream_info (#15); update_peers' key policy +
+update_tun consuming the handle (#16); and #17's round introduced
+its own P1 caught by its refactor pass — the retire_lane lock
+cycle (join under the lane mutex vs the pump's retirement) — fixed
+with guard-free joins, the split terminal arm, and the ptr_eq read.
+
+The refactor passes (one per PR, read-only, findings landed in
+sequenced commits): #12 (redaction moved onto the endpoint type;
+the /{n} contract documented at PeerParams::id; the partial-merge
+pin), #13 (Op::expand_per_key — THE expansion; ALL_KEYS/name_for;
+the inert arm; clear_all's single-op shape), #15 (relinquish()
+holds the forget ONCE behind twin panic pins; the marks leaf fns
+hoisted with ensure_socket renamed; the arch guard flipped to the
+denylist matching its comment), #16 (the recovery-slot pins FIRST;
+requested() single-sourced on the ledger; EngineMode::key_policy();
+the poison unification), #17 (the P1 above; the retained-critical
+drain on the quiet path; the watermark-gated reconcile).
+
+Deferred with triggers: the FIFO pin's nix::unistd::mkfifo helper;
+the OverflowRecord merge; the reconcile double-enumeration
+unification; the generation token + trait seam + the gated
+daemon-lane IT (required-before-M6-wiring — no test executes
+ConnectionLane::disconnect, which is why no gate caught the
+deadlock); finding 8's Connecting-arm invalidation (behavior,
+owner's call).
+
+Gates at every level: fmt/clippy/test/doc clean, netns-it green
+(the M4 exit test survives every rebase). Replies+resolves posted
+per-thread with the commit references.
