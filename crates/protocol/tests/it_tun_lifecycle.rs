@@ -19,6 +19,7 @@ use protonwire_net::netns;
 use protonwire_protocol::DEFAULT_IF_NAME;
 use protonwire_protocol::marks::{MarkHealth, MarkingFdCallback, SoMarkApplier};
 use protonwire_protocol::tun::TunHandle;
+use protun::api::connection::TunStreamInfo;
 use protun::api::connection_unix::OnSocketFdAvailableCallback;
 
 fn interface_exists(name: &str) -> bool {
@@ -43,12 +44,12 @@ fn it1_create_transfer_cleanup() {
     // fd survives with no second owner to double-close.
     let stream_info = handle.into_stream_info();
     match stream_info {
-        protun::api::connection::TunStreamInfo::TunFd(fd) => {
+        TunStreamInfo::TunFd(fd) => {
             #[allow(unsafe_code)] // test: the exact ownership move ProTUN performs
             let protun_owner = unsafe { File::from_raw_fd(fd) };
             drop(protun_owner); // ProTUN's disconnect close
         }
-        protun::api::connection::TunStreamInfo::NoTun => panic!("stream_info must carry the fd"),
+        TunStreamInfo::NoTun => panic!("stream_info must carry the fd"),
     }
     assert!(
         !interface_exists(DEFAULT_IF_NAME),
@@ -123,5 +124,8 @@ fn it1_outer_socket_mark_seam_roundtrip() {
 
     let mark = getsockopt(&socket_fd, sockopt::Mark).expect("SO_MARK is readable back");
     assert_eq!(mark, 0x51820, "the callback applied the stable mark");
-    assert!(health.all_marked(), "no failure was recorded");
+    assert!(
+        health.healthy(),
+        "the success path pins the publish-after-outcome cell"
+    );
 }

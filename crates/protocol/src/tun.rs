@@ -146,28 +146,33 @@ pub struct TunHandle {
     name: String,
 }
 
+// TUNSETIFF is only correct on architectures using the
+// asm-generic ioctl encodings (the bot round's P2): mips, powerpc,
+// and sparc encode _IOW differently, and the hardcoded request
+// would fail ENOTTY there. The DENYLIST is the frozen set of
+// custom-encoding architectures in Linux history (no new arch will
+// define one — alpha/parisc are not Rust targets); every
+// asm-generic arch (s390x, m68k-class included) builds fine. Fail
+// the BUILD on the bad set rather than shipping a silently-broken
+// create — derive the per-arch value if such a port ever becomes
+// real.
+#[cfg(any(
+    target_arch = "mips",
+    target_arch = "mips64",
+    target_arch = "powerpc",
+    target_arch = "powerpc64",
+    target_arch = "sparc",
+    target_arch = "sparc64",
+))]
+compile_error!(
+    "this architecture encodes ioctl _IOW differently — derive the \
+     TUNSETIFF request per-arch before building here (see tun.rs)"
+);
+
 /// `TUNSETIFF` — `_IOW('T', 202, int)` from `linux/if_tun.h` (not
 /// exposed by glibc or the `libc` crate; the value is
-/// `(1 << 30) | (4 << 16) | (0x54 << 8) | 202`).
-/// TUNSETIFF is only correct on asm-generic-ioctl architectures
-/// (the bot round's P2): mips/powerpc/sparc encode _IOW differently,
-/// and the hardcoded request would fail ENOTTY there. Fail the BUILD
-/// on those targets rather than shipping a silently-broken create —
-/// derive the per-arch value if such a port ever becomes real.
-#[cfg(not(any(
-    target_arch = "x86_64",
-    target_arch = "x86",
-    target_arch = "aarch64",
-    target_arch = "arm",
-    target_arch = "riscv64",
-    target_arch = "riscv32",
-    target_arch = "loongarch64",
-    target_arch = "csky",
-)))]
-compile_error!(
-    "TUNSETIFF's asm-generic encoding is not valid on this architecture — \
-     derive the request per-arch before building here (see tun.rs)"
-);
+/// `(1 << 30) | (4 << 16) | (0x54 << 8) | 202`, the asm-generic
+/// encoding the guard above keeps authoritative).
 const TUNSETIFF: libc::c_ulong = 0x4004_54ca;
 /// `IFF_TUN` from `linux/if_tun.h` (same glibc/libc gap).
 const IFF_TUN: i16 = 0x0001;
@@ -267,6 +272,20 @@ impl TunHandle {
         &self.name
     }
 
+    /// Relinquishes the descriptor (the shared take/forget of both
+    /// consuming transfers — the refactor pass's P2): forget is the
+    /// double-close hazard; it lives HERE once, not one copy per
+    /// transfer method.
+    fn relinquish(&mut self) -> RawFd {
+        let file = self
+            .file
+            .take()
+            .expect("handle owns its fd until close or transfer");
+        let fd = file.as_raw_fd();
+        std::mem::forget(file);
+        fd
+    }
+
     /// The `update_unix_tun` update shape: what a LIVE connection
     /// takes when the TUN descriptor must change without a session
     /// teardown (FR-32C). CONSUMES the handle (the bot round's P1):
@@ -276,16 +295,12 @@ impl TunHandle {
     /// reused fd later. The initial hand-off is different —
     /// `Connection::unix_connect` takes the raw fd
     /// (`Some(handle.into_raw_fd())`), not this type.
+    ///
+    /// # Panics
+    ///
+    /// If the handle was [`close`](TunHandle::close)d first.
     pub fn into_stream_info(mut self) -> TunStreamInfo {
-        let file = self
-            .file
-            .take()
-            .expect("handle owns its fd until close or transfer");
-        let fd = file.as_raw_fd();
-        // ProTUN's stream owns the descriptor now (same transfer
-        // semantics as into_raw_fd).
-        std::mem::forget(file);
-        TunStreamInfo::TunFd(fd)
+        TunStreamInfo::TunFd(self.relinquish())
     }
 
     /// The owned descriptor (valid until `close`/transfer).
@@ -305,15 +320,7 @@ impl TunHandle {
     /// If the handle was already [`close`](TunHandle::close)d — the
     /// engine sequences create → transfer immediately.
     pub fn into_raw_fd(mut self) -> RawFd {
-        let file = self
-            .file
-            .take()
-            .expect("handle owns its fd until close or transfer");
-        let fd = file.as_raw_fd();
-        // The descriptor now belongs to ProTUN's stream; dropping our
-        // File would close it under the new owner.
-        std::mem::forget(file);
-        fd
+        self.relinquish()
     }
 
     /// Closes the owned descriptor, idempotently (FR-31): a second
@@ -386,6 +393,20 @@ mod tests {
         };
         handle.close();
         let _ = handle.into_raw_fd();
+    }
+
+    /// The twin pin (the refactor pass's P2): the CONSUMING update
+    /// shape panics on the closed handle exactly like into_raw_fd —
+    /// both transfers share relinquish(), one hazard, one behavior.
+    #[test]
+    #[should_panic(expected = "handle owns its fd until close or transfer")]
+    fn into_stream_info_after_close_panics_the_same_way() {
+        let mut handle = TunHandle {
+            file: None,
+            name: "unspent".to_owned(),
+        };
+        handle.close();
+        let _ = handle.into_stream_info();
     }
 
     #[test]
