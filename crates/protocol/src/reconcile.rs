@@ -52,7 +52,7 @@ pub enum RequestedValue {
 }
 
 /// The requested-versus-applied ledger (T-20).
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct FeatureReconciliation {
     requested: EngineAgentSettings,
     applied: Option<EngineAgentSettings>,
@@ -64,7 +64,34 @@ pub struct FeatureReconciliation {
     /// serve it (a stale SettingRefused must not report the new
     /// request refused; a stale applied set must not read
     /// false-clean).
+    ///
+    /// RESIDUAL (the bot round-15 P2, disclosed): a response
+    /// GENERATED for the old request that ENTERS after the update
+    /// snapshots the new epoch and is misattributed — closing it
+    /// needs response provenance ProTUN does not expose (no
+    /// request/response correlation on the LocalAgent lane). The
+    /// misattribution is transient (the next genuine status
+    /// corrects it) and tracked to the M6 LocalAgent lane, where
+    /// the upstream surface is actually exercised.
     epoch: Arc<std::sync::atomic::AtomicU64>,
+}
+
+/// The SNAPSHOT clone (the bot round-15 P2): a clone owns an
+/// INDEPENDENT epoch — mutating a snapshot (or its epoch handle)
+/// cannot advance the live ledger's generation and discard a
+/// legitimate in-flight callback. The live callbacks share the
+/// ORIGINAL's handle via [`Self::epoch_handle`].
+impl Clone for FeatureReconciliation {
+    fn clone(&self) -> Self {
+        Self {
+            requested: self.requested,
+            applied: self.applied,
+            refused: self.refused.clone(),
+            epoch: Arc::new(std::sync::atomic::AtomicU64::new(
+                self.epoch.load(std::sync::atomic::Ordering::SeqCst),
+            )),
+        }
+    }
 }
 
 impl FeatureReconciliation {
@@ -534,5 +561,36 @@ mod tests {
             .load(std::sync::atomic::Ordering::SeqCst);
         ledger.note_applied(requested(), current);
         assert!(ledger.divergences().is_empty());
+    }
+
+    /// The bot round-15 P2: a SNAPSHOT's epoch is independent —
+    /// mutating the snapshot cannot advance the live ledger's
+    /// generation (which would discard a legitimate in-flight
+    /// callback).
+    #[test]
+    fn snapshot_clones_own_an_independent_epoch() {
+        let ledger = FeatureReconciliation::new(requested());
+        let snapshot = ledger.clone();
+        // Mutating the SNAPSHOT's request must not touch the live
+        // generation...
+        let mut mutated = snapshot;
+        mutated.note_requested(requested());
+        let live_epoch = ledger
+            .epoch_handle()
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let snapshot_epoch = mutated
+            .epoch_handle()
+            .load(std::sync::atomic::Ordering::SeqCst);
+        assert_ne!(
+            live_epoch, snapshot_epoch,
+            "the snapshot's epoch is independent of the live ledger's"
+        );
+        // ...so a live callback answering the live epoch still serves.
+        let mut live = ledger;
+        live.note_applied(requested(), live_epoch);
+        assert!(
+            live.divergences().is_empty(),
+            "the live ledger answered normally despite the snapshot's mutation"
+        );
     }
 }
