@@ -97,6 +97,20 @@ impl EncryptedCache {
                 // P2): the final path is created with NO-REPLACE
                 // semantics — a racing initializer that loses reads
                 // the WINNER's key back, never orphans its own.
+                // The keyfile's PARENT is created first (the bot
+                // round-11 P2): a natural first-run call
+                // (`open(&state_dir, &state_dir.join("cache.key"))`)
+                // has a missing state dir — read_keyfile read that
+                // NotFound as "absent", and publishing into the
+                // still-missing parent would fail ENOENT before the
+                // with_key_bytes step that creates `dir` is reached.
+                if let Some(parent) = key_path.parent() {
+                    if !parent.as_os_str().is_empty() {
+                        fs::create_dir_all(parent).map_err(|error| {
+                            CacheError::KeyFile(format!("keyfile parent: {error}"))
+                        })?;
+                    }
+                }
                 let mut fresh = Zeroizing::new([0u8; KEY_LEN]);
                 getrandom::fill(fresh.as_mut_slice())
                     .map_err(|error| CacheError::KeyFile(format!("OS randomness: {error}")))?;
