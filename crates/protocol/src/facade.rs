@@ -115,6 +115,19 @@ const QUEUE_BOUND: usize = 64;
 /// past it the join detaches with the failure recorded.
 const SHUTDOWN_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// The idle worker's poll cadence. The overflow lane CANNOT wake the
+/// worker: it fills only when the queue refused an op (the queue is
+/// FULL — the very condition that routed the op to overflow), so an
+/// idle worker sitting in a blocking `recv` would leave the newest
+/// desired state undrained until the next queue op or shutdown —
+/// exactly the staleness the bot round-8 P1 closed. An idle worker
+/// therefore re-checks the lane every cadence (the CI round-9 flake
+/// exposed this: the worker won the startup race to the blocking
+/// recv and the test's overflow op sat undrained for the whole
+/// deadline; the production shape of the same race is a missed
+/// newest state).
+const OVERFLOW_POLL: Duration = Duration::from_millis(250);
+
 impl PersistenceFacade {
     /// Preloads the three values from the cache and starts the
     /// worker. The disk reads happen HERE (startup), never on a
@@ -636,9 +649,13 @@ fn worker_loop(
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => disconnected = true,
             },
-            None if batch.is_empty() => match receiver.recv() {
+            // Bounded, never a blocking recv: a timeout loops back to
+            // the overflow drain at the top (the only wake source the
+            // lane has — see OVERFLOW_POLL).
+            None if batch.is_empty() => match receiver.recv_timeout(OVERFLOW_POLL) {
                 Ok(op) => batch.push(op),
-                Err(_) => disconnected = true,
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => disconnected = true,
             },
             None => {}
         }
@@ -1266,6 +1283,51 @@ mod round9_tests {
             Some(b"newest".to_vec()),
             "the sequence guard skipped the stale write"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The overflow lane's idle-drain contract (the CI flake that
+    /// broke the round-9 pin above): an op landing in the OVERFLOW
+    /// while the worker is PARKED in its idle wait — no queue
+    /// traffic, no pending retry, which is precisely when overflow
+    /// fills — still reaches the disk within one poll cadence. The
+    /// newest-state guarantee cannot depend on future queue traffic
+    /// (before OVERFLOW_POLL the idle wait was a blocking recv the
+    /// lane could never wake; this test parks the worker FIRST, the
+    /// exact scheduling the CI runner exposed).
+    #[test]
+    fn overflow_drains_while_the_worker_is_parked_idle() {
+        let dir = std::path::PathBuf::from(format!(
+            "/tmp/protonwire-r9-idle-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cache = Arc::new(EncryptedCache::with_key_bytes(&dir, &[19u8; 32]).unwrap());
+        let facade = PersistenceFacade::start(Arc::clone(&cache));
+        // Park the worker in the idle wait: it started with nothing
+        // to apply, so after one cadence it is definitively waiting.
+        std::thread::sleep(OVERFLOW_POLL + Duration::from_millis(100));
+        // The newest state lands in the overflow lane while the
+        // worker idles.
+        let newest = facade.next_seq();
+        facade.overflow(Op::Put(
+            "Certificate".to_owned(),
+            Zeroizing::new(b"idle-newest".to_vec()),
+            newest,
+        ));
+        // It must reach the disk on the poll cadence alone.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while cache.get(CacheKey::Certificate) != Some(b"idle-newest".to_vec()) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the overflow op never drained off an idle worker"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 }
