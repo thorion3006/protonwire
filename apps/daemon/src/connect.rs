@@ -107,7 +107,7 @@ struct LaneState {
     owner: Option<u32>,
 }
 
-/// The lane's shared state: the PUMP must retire the lane when the
+/// The lane's shared state: the pump must retire the lane when the
 // engine dies on its own (the bot round's P2) — an Arc'd lane the
 // pump and the daemon-side methods share.
 type SharedLane = Arc<Mutex<LaneState>>;
@@ -172,14 +172,26 @@ impl ConnectionLane {
         // Reconnect by the owner: tear the previous session down first
         // (FR-28's reconnect IS a fresh connection — peer rotation on
         // a LIVE session is update_peers, the engine's own surface).
-        if let Some(active) = lane.active.take() {
-            active.teardown();
-        }
+        // NO JOIN UNDER THE LANE LOCK (the refactor pass's P1): the
+        // pump's retire_lane needs this same mutex on engine death —
+        // dropping the guard before joining breaks the circular wait.
+        let superseded = lane.active.take();
         // The old owner is cleared BEFORE the engine attempt: a FAILED
         // reconnect must not leave a phantom owner locking every other
         // UID out with no tunnel existing (the gate's P2 — no state
         // commits on failing paths; the owner is recorded only after a
         // confirmed start).
+        lane.owner = None;
+        drop(lane);
+        if let Some(active) = superseded {
+            active.teardown();
+        }
+        let mut lane = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Re-acquiring may observe a pump-retired lane — the same
+        // empty, unowned state we want.
         lane.owner = None;
         let connection = self.engine.connect(
             params,
@@ -206,10 +218,15 @@ impl ConnectionLane {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         gate_owner(lane.owner, uid)?;
-        if let Some(active) = lane.active.take() {
+        // NO JOIN UNDER THE LANE LOCK (the refactor pass's P1): take
+        // the entry, clear the owner, DROP the guard, then join — the
+        // pump's retire_lane parks on this mutex at engine death.
+        let active = lane.active.take();
+        lane.owner = None;
+        drop(lane);
+        if let Some(active) = active {
             active.teardown();
         }
-        lane.owner = None;
         Ok(())
     }
 
@@ -218,14 +235,21 @@ impl ConnectionLane {
     /// exits so no event races the IPC socket's close.
     pub fn drain(&self) {
         self.draining.store(true, Ordering::SeqCst);
-        let mut lane = self
+        // Same no-join-under-lock discipline as disconnect (the
+        // refactor pass's P1).
+        let active = self
             .state
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(active) = lane.active.take() {
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .active
+            .take();
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .owner = None;
+        if let Some(active) = active {
             active.teardown();
         }
-        lane.owner = None;
     }
 }
 /// The pump's wait cadence: every slot-guard hold is bounded by this
@@ -262,13 +286,19 @@ fn pump_events(slot: &ConnectionSlot, lane: &SharedLane, core: &CoreState) {
                 reconcile_drops(slot, core, &mut last, &mut dropped_watermark);
                 continue;
             }
-            Some(Err(std::sync::mpsc::RecvTimeoutError::Disconnected)) | None => {
-                // The engine died on its own (or teardown took the
-                // connection): publish the terminal state and RETIRE
-                // the lane (the bot round's P2) — a dead session's
-                // owner must not keep refusing every other UID.
+            // SPLIT ARMS (the refactor pass's P1): engine death
+            // (Disconnected, the slot still holding OUR connection)
+            // retires the lane; a teardown-observed None belongs to
+            // the CALLER's cleanup (disconnect/drain already own the
+            // join — the retire here would park on the lane mutex
+            // they hold, the circular wait).
+            Some(Err(std::sync::mpsc::RecvTimeoutError::Disconnected)) => {
                 core.set_vpn_state(VpnState::Disconnected);
                 retire_lane(slot, lane);
+                break;
+            }
+            None => {
+                core.set_vpn_state(VpnState::Disconnected);
                 break;
             }
         };
@@ -317,22 +347,38 @@ fn reconcile_drops(
     last: &mut Option<VpnState>,
     watermark: &mut u64,
 ) {
-    let (dropped, latest) = match slot.lock().ok().and_then(|guard| {
-        guard
-            .as_ref()
-            .map(|connection| (connection.dropped_states(), connection.latest_state()))
-    }) {
-        Some(pair) => pair,
-        None => return, // teardown took the connection
+    let guard = match slot.lock() {
+        Ok(guard) => guard,
+        Err(_) => return, // teardown took the connection
     };
-    if dropped > *watermark {
-        *watermark = dropped;
-        if let Some(state) = latest {
-            let mapped = map_vpn_state(&state);
-            if last.as_ref() != Some(&mapped) {
-                core.set_vpn_state(mapped);
-                *last = Some(mapped);
-            }
+    let Some(connection) = guard.as_ref() else {
+        return; // teardown took the connection
+    };
+    // The retained CRITICAL event drains here (the refactor pass's
+    // P2): a CertificateFatal dropped by the full queue has no other
+    // delivery — leaving it retained strands a dead tunnel reporting
+    // live (the exact terminal-state P2 through the drop path). The
+    // other criticals log and ride the engine's surface (the M6
+    // observability lane owns their routing).
+    if let Some(EngineEvent::CertificateFatal) = connection.take_critical_event() {
+        tracing::warn!(
+            "a retained certificate-fatal surfaced from the drop lane — the engine will die"
+        );
+    }
+    // WATERMARK-GATED (the refactor pass's P3): read the counter
+    // first; the latest_state clone (a lock + a String/Vec-carrying
+    // struct) happens only when drops actually moved — the common
+    // quiet tick pays one load.
+    let dropped = connection.dropped_states();
+    if dropped <= *watermark {
+        return;
+    }
+    *watermark = dropped;
+    if let Some(state) = connection.latest_state() {
+        let mapped = map_vpn_state(&state);
+        if last.as_ref() != Some(&mapped) {
+            core.set_vpn_state(mapped);
+            *last = Some(mapped);
         }
     }
 }
@@ -341,16 +387,22 @@ fn reconcile_drops(
 /// (the bot round's P2): a reconnect may already have replaced the
 /// lane — only the entry whose connection slot is OURS is retired.
 fn retire_lane(slot: &ConnectionSlot, lane: &SharedLane) {
-    let Ok(mut lane) = lane.lock() else {
-        return;
-    };
-    if let Some(active) = lane.active.take() {
-        if Arc::ptr_eq(&active.connection, slot) {
-            lane.owner = None;
-        } else {
-            // A newer session owns the lane now; put its entry back.
-            lane.active = Some(active);
-        }
+    // Poison recovery matches the lane methods (the refactor
+    // pass's P3): silently skipping retirement on a poisoned mutex
+    // re-creates the stranded-owner state this function exists to
+    // prevent.
+    let mut lane = lane
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // Ours only: a reconnect may already have replaced the entry —
+    // the ptr_eq read decides WITHOUT a take-and-put-back dance.
+    let ours = lane
+        .active
+        .as_ref()
+        .is_some_and(|active| Arc::ptr_eq(&active.connection, slot));
+    if ours {
+        lane.active = None;
+        lane.owner = None;
     }
 }
 
