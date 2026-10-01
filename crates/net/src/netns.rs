@@ -8,9 +8,10 @@
 //! network namespace* — `CAP_NET_ADMIN` over `lo` and nothing else, no
 //! real privilege, no host mutation.
 //!
-//! Test binaries consult [`gate`] first. Outside the runner every gated
-//! test *skips with a disclosure line* naming the command to run — a
-//! plain `cargo test` (CI unit lane, developer shells) stays green
+//! Test binaries consult [`gate`](crate::netns::gate) first. Outside
+//! the runner every gated test *skips with a disclosure line* naming
+//! the command to run — a plain `cargo test` (CI unit lane,
+//! developer shells) stays green
 //! while the integration lane stays opt-in and observable.
 //!
 //! Inside the namespace, `/proc/net` (a symlink to `/proc/self/net`)
