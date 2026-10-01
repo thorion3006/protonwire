@@ -149,11 +149,13 @@ fn m4_exit_connect_disconnect_lifecycle() {
     let params = TunnelParams {
         peers: vec![PeerParams {
             id: "m4-exit-peer".to_owned(),
-            entry_ip: peer_addr.ip(),
             public_key_base64: peer_public,
-            udp_ports: vec![peer_addr.port()],
-            tcp_ports: Vec::new(),
-            tls_ports: Vec::new(),
+            udp: Some(protonwire_protocol::params::TransportEndpoint {
+                entry_ip: peer_addr.ip(),
+                ports: vec![peer_addr.port()],
+            }),
+            tcp: None,
+            tls: None,
             priority: 1,
             exit_label: Some("m4-exit".to_owned()),
         }],
