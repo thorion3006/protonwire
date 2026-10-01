@@ -32,11 +32,9 @@ pub use engine::{
 };
 pub use facade::{PersistenceFacade, PersistenceHealth};
 pub use marks::{MarkApplier, MarkHealth, MarkingFdCallback, SoMarkApplier};
-pub use params::{PeerParams, TunnelParams};
+pub use params::{PeerParams, TransportEndpoint, TunnelParams};
 pub use reconcile::{FeatureDivergence, FeatureReconciliation};
 pub use translate::{KeyPolicy, translate, translate_with_policy};
-pub use params::{PeerParams, TransportEndpoint, TunnelParams};
-pub use translate::translate;
 pub use tun::{DEFAULT_IF_NAME, TunAddressPlan, TunError, TunHandle, TunIfAddress};
 
 pub use protun;

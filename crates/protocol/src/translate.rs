@@ -602,30 +602,6 @@ mod tests {
         ));
     }
 
-    /// The key policy (the rust gate's P2): production LocalAgent
-    /// connections run KEYLESS params — the cache holds the key
-    /// (FR-32A). `FromCache` accepts the keyless shape; `Required`
-    /// (the default translate form) keeps its typed refusal.
-    #[test]
-    fn key_policy_governs_the_keyless_shape() {
-        let mut keyless = params(vec![peer("uk-42", 1)]);
-        keyless.client_private_key = None;
-
-        let cache_mode = translate_with_policy(&keyless, KeyPolicy::FromCache)
-            .expect("the cache-sourced policy accepts keyless params");
-        assert!(
-            matches!(
-                cache_mode.connection_mode,
-                ConnectionMode::NoLocalAgent {
-                    wg_private_key: None
-                }
-            ),
-            "the engine's LocalAgent override replaces this interim mode"
-        );
-
-        assert!(
-            matches!(translate(&keyless), Err(ProtocolError::MissingKey(_))),
-            "the Required default still refuses the keyless shape"
     /// The bot round-2 P1: per-transport entry addresses are
     /// PRESERVED — a physical advertising different addresses per
     /// transport expands into per-address candidates (a single
@@ -749,6 +725,33 @@ mod tests {
                 && !merged.tcp_ports.is_empty()
                 && merged.tls_ports.is_empty(),
             "the shared candidate carries exactly UDP+TCP"
+        );
+    }
+
+    /// The key policy (the rust gate's P2): production LocalAgent
+    /// connections run KEYLESS params — the cache holds the key
+    /// (FR-32A). `FromCache` accepts the keyless shape; `Required`
+    /// (the default translate form) keeps its typed refusal.
+    #[test]
+    fn key_policy_governs_the_keyless_shape() {
+        let mut keyless = params(vec![peer("uk-42", 1)]);
+        keyless.client_private_key = None;
+
+        let cache_mode = translate_with_policy(&keyless, KeyPolicy::FromCache)
+            .expect("the cache-sourced policy accepts keyless params");
+        assert!(
+            matches!(
+                cache_mode.connection_mode,
+                ConnectionMode::NoLocalAgent {
+                    wg_private_key: None
+                }
+            ),
+            "the engine's LocalAgent override replaces this interim mode"
+        );
+
+        assert!(
+            matches!(translate(&keyless), Err(ProtocolError::MissingKey(_))),
+            "the Required default still refuses the keyless shape"
         );
     }
 }

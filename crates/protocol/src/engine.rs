@@ -31,7 +31,7 @@ use protun::api::state::{ConnectionState, InterfaceState, PeerConnectionInfo, Pr
 
 use crate::marks::{MarkHealth, MarkingFdCallback, SoMarkApplier};
 use crate::reconcile::FeatureReconciliation;
-use crate::translate::{KeyPolicy, translate, translate_with_policy};
+use crate::translate::{KeyPolicy, translate_with_policy};
 use crate::tun::{TunError, TunHandle};
 use crate::{ProtocolError, TunnelParams};
 
@@ -763,9 +763,11 @@ impl ConnectionEngine {
             EngineMode::LocalAgent { settings, .. } => FeatureReconciliation::new(*settings),
             EngineMode::NoLocalAgent => FeatureReconciliation::new(EngineAgentSettings::default()),
         }));
+        let recovery = Arc::new(RecoverySlots::default());
         let callbacks = EngineCallbacks {
             event_tx,
             drops: drops.clone(),
+            recovery: recovery.clone(),
             latest: latest.clone(),
             reconciliation: reconciliation.clone(),
         };
@@ -793,8 +795,14 @@ impl ConnectionEngine {
             mark_health,
             events: event_rx,
             drops,
+            recovery: recovery.clone(),
             latest,
             reconciliation,
+            requested: Mutex::new(match &self.config.mode {
+                EngineMode::LocalAgent { settings, .. } => *settings,
+                EngineMode::NoLocalAgent => EngineAgentSettings::default(),
+            }),
+            key_policy,
             mode: self.config.mode.clone(),
         })
     }
@@ -831,6 +839,7 @@ impl EventDrops {
 struct EngineCallbacks {
     event_tx: SyncSender<EngineEvent>,
     drops: Arc<EventDrops>,
+    recovery: Arc<RecoverySlots>,
     latest: Arc<Mutex<Option<EngineVpnState>>>,
     reconciliation: Arc<Mutex<FeatureReconciliation>>,
 }
@@ -841,14 +850,40 @@ impl EngineCallbacks {
         match self.event_tx.try_send(event) {
             Ok(()) => {}
             Err(std::sync::mpsc::TrySendError::Full(event)) => match &event {
-                // Latest-wins semantics are fine: FR-30's counters
-                // are pollable and a stale stat is worthless.
-                EngineEvent::Stats(_) | EngineEvent::AgentStats(_) => self.drops.note_stats_drop(),
+                // Latest-wins with a RECOVERY SLOT (the bot round's
+                // P2): FR-30's counters are pollable and a stale stat
+                // is worthless — the NEWEST lands in the slot, so a
+                // recovering consumer reads fresh numbers instead of
+                // replaying stale queued samples (the drop policy was
+                // oldest-wins in effect before).
+                EngineEvent::Stats(stats) => {
+                    if let Ok(mut slot) = self.recovery.latest_stats.lock() {
+                        *slot = Some(LatestStats::WireGuard(*stats));
+                    }
+                    self.drops.note_stats_drop();
+                }
+                EngineEvent::AgentStats(stats) => {
+                    if let Ok(mut slot) = self.recovery.latest_stats.lock() {
+                        *slot = Some(LatestStats::Agent(*stats));
+                    }
+                    self.drops.note_stats_drop();
+                }
                 // A dropped STATE is a bug alarm: the poll surface
                 // (`latest_state`) stays current even when the push
                 // drops — the daemon reads `dropped_states() > 0` as
                 // a wedged consumer.
-                _ => self.drops.note_state_drop(),
+                EngineEvent::State(_) => self.drops.note_state_drop(),
+                // CONTROL events have no poll surface at all (the
+                // bot round's P2): a CertificateFatal the consumer
+                // never sees leaves a dead tunnel reporting live —
+                // the NEWEST is retained in the recovery slot for
+                // the consumer that drains after the full queue.
+                critical => {
+                    if let Ok(mut slot) = self.recovery.critical.lock() {
+                        *slot = Some(critical.clone());
+                    }
+                    self.drops.note_state_drop();
+                }
             },
             Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
                 // The handle is gone; nothing to forward to.
@@ -872,6 +907,18 @@ impl protun::api::connection::StateChangedCallback for EngineCallbacks {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             ledger.note_applied(settings_from_protun(info.settings.clone()));
+        } else if let ConnectionState::ConnectingToLocalAgent { .. }
+        | ConnectionState::Disconnected { .. } = &state.connection_state
+        {
+            // The bot round's P2: leaving Connected INVALIDATES the
+            // applied snapshot — until the new agent session answers,
+            // every requested setting reads UNCONFIRMED, never
+            // confirmed-by-the-previous-server.
+            let mut ledger = self
+                .reconciliation
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            ledger.note_unconfirmed();
         }
         let mut slot = self
             .latest
@@ -899,6 +946,29 @@ impl protun::api::connection::EventCallback for EngineCallbacks {
     }
 }
 
+/// The recovery slots for events the bounded queue could not
+/// deliver (the bot round's P2s): a control event
+/// (`CertificateFatal`/`ForkSelectorNeeded`/`SettingRefused`/`ApiError`)
+/// has no `latest_state`-style poll surface, so the newest one is
+/// RETAINED here for the consumer that drains after a full queue;
+/// the newest STATISTICS land here too (the drop policy is
+/// latest-wins, not oldest-wins).
+#[derive(Debug, Default)]
+pub struct RecoverySlots {
+    critical: Mutex<Option<EngineEvent>>,
+    latest_stats: Mutex<Option<LatestStats>>,
+}
+
+/// The newest statistics of either class (the recovery slot's
+/// payload).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum LatestStats {
+    /// The newest WireGuard counters.
+    WireGuard(EngineStats),
+    /// The newest LocalAgent counters.
+    Agent(EngineAgentStats),
+}
+
 /// A live connection (FR-28/32C: atomically updatable without tearing
 /// down the frontend session).
 pub struct ActiveConnection {
@@ -907,8 +977,11 @@ pub struct ActiveConnection {
     mark_health: Arc<MarkHealth>,
     events: Receiver<EngineEvent>,
     drops: Arc<EventDrops>,
+    recovery: Arc<RecoverySlots>,
     latest: Arc<Mutex<Option<EngineVpnState>>>,
     reconciliation: Arc<Mutex<FeatureReconciliation>>,
+    requested: Mutex<EngineAgentSettings>,
+    key_policy: KeyPolicy,
     mode: EngineMode,
 }
 
@@ -943,26 +1016,34 @@ impl ActiveConnection {
             .unwrap_or_else(|poisoned| poisoned.into_inner().clone())
     }
 
+    /// Rotates the candidate peers on the live connection (FR-28's
+    /// new endpoint, FR-32C's atomic update — the session survives).
+    /// Rotates with the CONNECTION's key policy (the bot round's
+    /// P1): a production LocalAgent connection runs keyless params
+    /// (the cache holds the key), so the `Required` default
+    /// `translate` would refuse every rotation with MissingKey.
     /// The TUN interface name this connection owns (cleanup claims,
     /// FR-31).
     pub fn interface_name(&self) -> &str {
         &self.if_name
     }
 
-    /// Rotates the candidate peers on the live connection (FR-28's
-    /// new endpoint, FR-32C's atomic update — the session survives).
     pub fn update_peers(&self, params: &TunnelParams) -> Result<(), ProtocolError> {
-        let translated = translate(params)?;
+        let translated = translate_with_policy(params, self.key_policy)?;
         self.connection.update_peers(translated.peers);
         Ok(())
     }
-
     /// Updates the LocalAgent feature request on the live connection
     /// (FR-32C). The T-20 ledger resets: the new request has no
     /// answer yet.
     pub fn update_agent_settings(&self, settings: EngineAgentSettings) {
         if let Ok(mut ledger) = self.reconciliation.lock() {
             ledger.note_requested(settings);
+        }
+        // The live request slot follows the update (the bot round's
+        // P2): requested_settings() stays the honest view.
+        if let Ok(mut requested) = self.requested.lock() {
+            *requested = settings;
         }
         self.connection
             .update_local_agent_settings(settings_to_protun(settings));
@@ -1000,16 +1081,12 @@ impl ActiveConnection {
 
     /// Swaps the TUN descriptor on the LIVE connection (FR-32C's
     /// `update_unix_tun` replacement seam — M5's route lanes may
-    /// force a TUN swap without a session teardown). The handle
-    /// retains ownership of its new descriptor; ProTUN closes the
-    /// previous one.
-    pub fn update_tun(&self, handle: &TunHandle) {
-        self.connection.update_unix_tun(handle.stream_info());
+    /// force a TUN swap without a session teardown). CONSUMES the
+    /// handle (the bot round's P1): ProTUN's stream owns the new
+    /// descriptor — a borrowed shape left two owners of one fd.
+    pub fn update_tun(&self, handle: TunHandle) {
+        self.connection.update_unix_tun(handle.into_stream_info());
     }
-
-    /// How many stats-class events the bounded lane dropped under a
-    /// full queue (latest-wins — pollable counters make stale stats
-    /// worthless; a growing number still warrants a look).
     pub fn dropped_stats(&self) -> u64 {
         self.drops.stats.load(Ordering::Relaxed)
     }
@@ -1020,6 +1097,41 @@ impl ActiveConnection {
     /// (`latest_state`) stayed current, but the push lane did not.
     pub fn dropped_states(&self) -> u64 {
         self.drops.states.load(Ordering::Relaxed)
+    }
+
+    /// The RETAINED control event, if one was dropped by a full
+    /// queue (the bot round's P2): takes it — a consumer that finds
+    /// one must act on it (a `CertificateFatal` closes the
+    /// connection; a fork selector must be provided) before
+    /// draining further.
+    pub fn take_critical_event(&self) -> Option<EngineEvent> {
+        self.recovery
+            .critical
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
+
+    /// The NEWEST statistics (the bot round's P2): the drop policy
+    /// is latest-wins — a consumer recovering from a full queue
+    /// reads the freshest counters here instead of replaying
+    /// stale queued samples.
+    pub fn latest_stats(&self) -> Option<LatestStats> {
+        *self
+            .recovery
+            .latest_stats
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The LIVE requested feature set (the bot round's P2):
+    /// `mode()` keeps the connect-time snapshot; this reflects
+    /// `update_agent_settings` — the honest view for status.
+    pub fn requested_settings(&self) -> EngineAgentSettings {
+        *self
+            .requested
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
 
@@ -1297,6 +1409,7 @@ mod tests {
         let callbacks = EngineCallbacks {
             event_tx,
             drops: Arc::new(EventDrops::default()),
+            recovery: Arc::new(RecoverySlots::default()),
             latest: Arc::new(Mutex::new(None)),
             reconciliation: Arc::new(Mutex::new(FeatureReconciliation::new(
                 EngineAgentSettings::default(),

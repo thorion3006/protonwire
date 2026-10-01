@@ -81,7 +81,19 @@ impl FeatureReconciliation {
     /// are stale — the new applied set is the answer.
     pub fn note_applied(&mut self, applied: EngineAgentSettings) {
         self.applied = Some(applied);
-        self.refused.clear();
+        // Refusals are RETAINED (the bot round's P2): the applied set
+        // and the refusal are complementary answers to the CURRENT
+        // request — erasing the refusal here hid that LocalAgent
+        // explicitly refused a setting. Only a NEW request supersedes
+        // refusals (note_requested).
+    }
+
+    /// The connection left Connected (the bot round's P2): the
+    /// previous server's applied snapshot no longer answers the
+    /// request — every requested setting reads UNCONFIRMED until
+    /// the new agent session reports.
+    pub fn note_unconfirmed(&mut self) {
+        self.applied = None;
     }
 
     /// The server refused a setting outright. ProTUN re-emits refusals
@@ -348,14 +360,41 @@ mod tests {
     /// answers the request (refusals against a superseded request
     /// would be stale).
     #[test]
-    fn refusals_are_recorded_and_cleared_by_new_answers() {
+    fn refusals_are_recorded_and_survive_the_applied_answer() {
         let mut ledger = FeatureReconciliation::new(requested());
         ledger.note_refused(EngineSettingType::Netshield);
         assert_eq!(ledger.refused(), &[EngineSettingType::Netshield]);
+        // The applied set and the refusal are COMPLEMENTARY answers to
+        // the SAME request (the bot round's P2): the refusal stays
+        // visible — callers can still report that LocalAgent
+        // explicitly refused the setting.
         ledger.note_applied(requested());
+        assert_eq!(
+            ledger.refused(),
+            &[EngineSettingType::Netshield],
+            "the refusal survives the applied answer"
+        );
+        // Only a NEW request supersedes refusals.
+        ledger.note_requested(requested());
         assert!(
             ledger.refused().is_empty(),
-            "the applied set answers; the stale refusal clears"
+            "the new request clears the superseded refusals"
+        );
+    }
+
+    /// Leaving Connected invalidates the applied snapshot (the bot
+    /// round's P2): after a disconnect or agent re-negotiation every
+    /// requested setting reads UNCONFIRMED — never
+    /// confirmed-by-the-previous-server.
+    #[test]
+    fn leaving_connected_invalidates_the_applied_snapshot() {
+        let mut ledger = FeatureReconciliation::new(requested());
+        ledger.note_applied(requested());
+        assert!(ledger.divergences().is_empty());
+        ledger.note_unconfirmed();
+        assert!(
+            !ledger.divergences().is_empty(),
+            "every requested setting is unconfirmed again"
         );
     }
 
