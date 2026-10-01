@@ -47,6 +47,10 @@ pub enum LaneRefusal {
     /// The daemon is shutting down; no new connections start.
     #[error("the daemon is draining")]
     Draining,
+    /// A reconnect is in its serialized teardown window (the bot
+    /// round-12 P2); retry.
+    #[error("a reconnect is in progress; retry")]
+    Reconnecting,
 }
 
 /// A failed connect: the typed refusal or the engine's own error.
@@ -105,6 +109,10 @@ impl ActiveLane {
 struct LaneState {
     active: Option<ActiveLane>,
     owner: Option<u32>,
+    // A reconnect's guard-drop window (the bot round-12 P2): while
+    // set, connect() refuses — an interloper cannot install a lane
+    // the reconnecting owner would then clobber or leak.
+    reconnecting: bool,
 }
 
 /// The lane's shared state: the pump must retire the lane when the
@@ -169,6 +177,9 @@ impl ConnectionLane {
         if self.draining.load(Ordering::SeqCst) {
             return Err(LaneRefusal::Draining.into());
         }
+        if lane.reconnecting {
+            return Err(LaneRefusal::Reconnecting.into());
+        }
         // Reconnect by the owner: tear the previous session down first
         // (FR-28's reconnect IS a fresh connection — peer rotation on
         // a LIVE session is update_peers, the engine's own surface).
@@ -191,7 +202,10 @@ impl ConnectionLane {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         // Re-acquiring may observe a pump-retired lane — the same
-        // empty, unowned state we want.
+        // empty, unowned state we want. The window closes BEFORE the
+        // engine attempt (a failure below leaves the lane open, not
+        // wedged).
+        lane.reconnecting = false;
         lane.owner = None;
         let connection = self.engine.connect(
             params,
@@ -265,6 +279,18 @@ const PUMP_POLL: Duration = Duration::from_millis(200);
 /// published and the lane RETIRED, never left stranded at
 /// Connecting/Connected with a dead owner). Runs on its own thread;
 /// every step is non-blocking on the engine side.
+/// The terminal teardown (the engine contract: the caller must close
+/// the connection on a fatal certificate-refresh failure — delivered
+/// OR recovered from the drop lane; the bot round-12 P2).
+fn terminate_on_fatal(slot: &ConnectionSlot, lane: &SharedLane, core: &CoreState) {
+    tracing::warn!("certificate refresh failed terminally — tearing the session down");
+    if let Some(connection) = slot.lock().ok().and_then(|mut guard| guard.take()) {
+        connection.disconnect();
+    }
+    core.set_vpn_state(VpnState::Disconnected);
+    retire_lane(slot, lane);
+}
+
 fn pump_events(slot: &ConnectionSlot, lane: &SharedLane, core: &CoreState) {
     let mut last: Option<VpnState> = None;
     let mut dropped_watermark: u64 = 0;
@@ -283,7 +309,10 @@ fn pump_events(slot: &ConnectionSlot, lane: &SharedLane, core: &CoreState) {
                 // reconcile the core with the engine's authoritative
                 // poll surface instead of leaving the frontend state
                 // stale until the next (possibly never) push.
-                reconcile_drops(slot, core, &mut last, &mut dropped_watermark);
+                if reconcile_drops(slot, core, &mut last, &mut dropped_watermark) {
+                    terminate_on_fatal(slot, lane, core);
+                    break;
+                }
                 continue;
             }
             // SPLIT ARMS (the refactor pass's P1): engine death
@@ -321,12 +350,7 @@ fn pump_events(slot: &ConnectionSlot, lane: &SharedLane, core: &CoreState) {
             // critical event recovered from a full queue — drain the
             // recovery slot on the quiet path too.
             EngineEvent::CertificateFatal => {
-                tracing::warn!("certificate refresh failed terminally — tearing the session down");
-                if let Some(connection) = slot.lock().ok().and_then(|mut guard| guard.take()) {
-                    connection.disconnect();
-                }
-                core.set_vpn_state(VpnState::Disconnected);
-                retire_lane(slot, lane);
+                terminate_on_fatal(slot, lane, core);
                 break;
             }
             // Stats/refusals ride the engine's own recovery surfaces;
@@ -334,7 +358,10 @@ fn pump_events(slot: &ConnectionSlot, lane: &SharedLane, core: &CoreState) {
             // lane.
             _ => {}
         }
-        reconcile_drops(slot, core, &mut last, &mut dropped_watermark);
+        if reconcile_drops(slot, core, &mut last, &mut dropped_watermark) {
+            terminate_on_fatal(slot, lane, core);
+            break;
+        }
     }
 }
 
@@ -346,24 +373,25 @@ fn reconcile_drops(
     core: &CoreState,
     last: &mut Option<VpnState>,
     watermark: &mut u64,
-) {
+) -> bool {
     let guard = match slot.lock() {
         Ok(guard) => guard,
-        Err(_) => return, // teardown took the connection
+        Err(_) => return false, // teardown took the connection
     };
     let Some(connection) = guard.as_ref() else {
-        return; // teardown took the connection
+        return false; // teardown took the connection
     };
-    // The retained CRITICAL event drains here (the refactor pass's
-    // P2): a CertificateFatal dropped by the full queue has no other
-    // delivery — leaving it retained strands a dead tunnel reporting
-    // live (the exact terminal-state P2 through the drop path). The
-    // other criticals log and ride the engine's surface (the M6
-    // observability lane owns their routing).
+    // The retained CRITICAL event drains here: a CertificateFatal
+    // dropped by the full queue has no other delivery — and it is
+    // PROPAGATED (the bot round-12 P2): the pump runs the same
+    // teardown path as a directly delivered fatal (taking the event
+    // and only logging it destroyed its sole recovery copy with the
+    // tunnel still live).
     if let Some(EngineEvent::CertificateFatal) = connection.take_critical_event() {
         tracing::warn!(
-            "a retained certificate-fatal surfaced from the drop lane — the engine will die"
+            "a retained certificate-fatal surfaced from the drop lane — tearing the session down"
         );
+        return true;
     }
     // WATERMARK-GATED (the refactor pass's P3): read the counter
     // first; the latest_state clone (a lock + a String/Vec-carrying
@@ -371,7 +399,7 @@ fn reconcile_drops(
     // quiet tick pays one load.
     let dropped = connection.dropped_states();
     if dropped <= *watermark {
-        return;
+        return false;
     }
     *watermark = dropped;
     if let Some(state) = connection.latest_state() {
@@ -381,6 +409,7 @@ fn reconcile_drops(
             *last = Some(mapped);
         }
     }
+    false
 }
 
 /// Retires THIS pump's lane entry when the engine died on its own
