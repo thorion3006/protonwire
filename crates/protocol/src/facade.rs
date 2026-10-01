@@ -1626,7 +1626,6 @@ mod round9_tests {
         for handle in handles {
             handle.join().unwrap();
         }
-        let served = facade.get(CacheKey::Certificate);
         // Deterministic check: the worker's LAST durable write (the
         // max sequence) must equal the served value. Drain: wait for
         // the disk to settle, then compare against a fresh get (the
