@@ -107,13 +107,18 @@ struct LaneState {
     owner: Option<u32>,
 }
 
+/// The lane's shared state: the PUMP must retire the lane when the
+// engine dies on its own (the bot round's P2) — an Arc'd lane the
+// pump and the daemon-side methods share.
+type SharedLane = Arc<Mutex<LaneState>>;
+
 /// The lane. Construct once at daemon startup with the production
 /// mode; the engine inside is stateless configuration.
 pub struct ConnectionLane {
     engine: ConnectionEngine,
     facade: Arc<PersistenceFacade>,
     core: Arc<CoreState>,
-    state: Mutex<LaneState>,
+    state: SharedLane,
     draining: AtomicBool,
 }
 
@@ -140,7 +145,7 @@ impl ConnectionLane {
             }),
             facade,
             core,
-            state: Mutex::new(LaneState::default()),
+            state: Arc::new(Mutex::new(LaneState::default())),
             draining: AtomicBool::new(false),
         }
     }
@@ -183,7 +188,8 @@ impl ConnectionLane {
         let slot: ConnectionSlot = Arc::new(Mutex::new(Some(connection)));
         let core = Arc::clone(&self.core);
         let pump_slot = Arc::clone(&slot);
-        let pump = std::thread::spawn(move || pump_events(&pump_slot, &core));
+        let pump_lane = Arc::clone(&self.state);
+        let pump = std::thread::spawn(move || pump_events(&pump_slot, &pump_lane, &core));
         lane.active = Some(ActiveLane {
             connection: slot,
             pump,
@@ -222,7 +228,6 @@ impl ConnectionLane {
         lane.owner = None;
     }
 }
-
 /// The pump's wait cadence: every slot-guard hold is bounded by this
 /// timeout, so teardown's `take()` never waits longer than one cadence
 /// on a pump that is itself waiting on a silent peer (the rust gate's
@@ -232,12 +237,13 @@ const PUMP_POLL: Duration = Duration::from_millis(200);
 
 /// Pumps engine events into the core state machine until the channel
 /// dies (teardown takes the connection — its Drop closes the engine —
-/// or the engine died on its own; either way the TERMINAL state is
-/// published, never left stranded at Connecting/Connected — the
-/// gate's P2). Runs on its own thread; every step is non-blocking on
-/// the engine side.
-fn pump_events(slot: &ConnectionSlot, core: &CoreState) {
+/// or the engine died on its own; either way the terminal state is
+/// published and the lane RETIRED, never left stranded at
+/// Connecting/Connected with a dead owner). Runs on its own thread;
+/// every step is non-blocking on the engine side.
+fn pump_events(slot: &ConnectionSlot, lane: &SharedLane, core: &CoreState) {
     let mut last: Option<VpnState> = None;
+    let mut dropped_watermark: u64 = 0;
     loop {
         let received = slot.lock().ok().and_then(|mut guard| {
             guard
@@ -246,30 +252,104 @@ fn pump_events(slot: &ConnectionSlot, core: &CoreState) {
         });
         let event = match received {
             Some(Ok(event)) => event,
-            Some(Err(std::sync::mpsc::RecvTimeoutError::Timeout)) => continue,
+            Some(Err(std::sync::mpsc::RecvTimeoutError::Timeout)) => {
+                // The quiet path still converges (the bot round's
+                // P2): a consumer that stalled while the bounded
+                // engine queue dropped states is caught up NOW —
+                // reconcile the core with the engine's authoritative
+                // poll surface instead of leaving the frontend state
+                // stale until the next (possibly never) push.
+                reconcile_drops(slot, core, &mut last, &mut dropped_watermark);
+                continue;
+            }
             Some(Err(std::sync::mpsc::RecvTimeoutError::Disconnected)) | None => {
                 // The engine died on its own (or teardown took the
-                // connection): the process-wide state machine must
-                // not strand at the last live state.
+                // connection): publish the terminal state and RETIRE
+                // the lane (the bot round's P2) — a dead session's
+                // owner must not keep refusing every other UID.
                 core.set_vpn_state(VpnState::Disconnected);
+                retire_lane(slot, lane);
                 break;
             }
         };
-        let EngineEvent::State(state) = event else {
-            continue; // stats/refusals ride the engine's own surface;
-            // the daemon's stat broadcast is the M6
-            // observability lane
-        };
-        if let EngineConnectionState::Disconnected {
-            error: Some(ref detail),
-        } = state.connection
-        {
-            tracing::warn!(error = %detail, "the engine disconnected with an error");
+        match event {
+            EngineEvent::State(state) => {
+                if let EngineConnectionState::Disconnected {
+                    error: Some(ref detail),
+                } = state.connection
+                {
+                    tracing::warn!(error = %detail, "the engine disconnected with an error");
+                }
+                let mapped = map_vpn_state(&state);
+                if last.as_ref() != Some(&mapped) {
+                    core.set_vpn_state(mapped);
+                    last = Some(mapped);
+                }
+            }
+            // The engine contract: the caller must close the
+            // connection (the bot round's P2). Same for a retained
+            // critical event recovered from a full queue — drain the
+            // recovery slot on the quiet path too.
+            EngineEvent::CertificateFatal => {
+                tracing::warn!("certificate refresh failed terminally — tearing the session down");
+                if let Some(connection) = slot.lock().ok().and_then(|mut guard| guard.take()) {
+                    connection.disconnect();
+                }
+                core.set_vpn_state(VpnState::Disconnected);
+                retire_lane(slot, lane);
+                break;
+            }
+            // Stats/refusals ride the engine's own recovery surfaces;
+            // the daemon's stat broadcast is the M6 observability
+            // lane.
+            _ => {}
         }
-        let mapped = map_vpn_state(&state);
-        if last.as_ref() != Some(&mapped) {
-            core.set_vpn_state(mapped);
-            last = Some(mapped);
+        reconcile_drops(slot, core, &mut last, &mut dropped_watermark);
+    }
+}
+
+/// Publishes the engine's authoritative state when the bounded queue
+/// dropped pushes (the bot round's P2): `latest_state` stays current
+/// even when the push lane did not.
+fn reconcile_drops(
+    slot: &ConnectionSlot,
+    core: &CoreState,
+    last: &mut Option<VpnState>,
+    watermark: &mut u64,
+) {
+    let (dropped, latest) = match slot.lock().ok().and_then(|guard| {
+        guard
+            .as_ref()
+            .map(|connection| (connection.dropped_states(), connection.latest_state()))
+    }) {
+        Some(pair) => pair,
+        None => return, // teardown took the connection
+    };
+    if dropped > *watermark {
+        *watermark = dropped;
+        if let Some(state) = latest {
+            let mapped = map_vpn_state(&state);
+            if last.as_ref() != Some(&mapped) {
+                core.set_vpn_state(mapped);
+                *last = Some(mapped);
+            }
+        }
+    }
+}
+
+/// Retires THIS pump's lane entry when the engine died on its own
+/// (the bot round's P2): a reconnect may already have replaced the
+/// lane — only the entry whose connection slot is OURS is retired.
+fn retire_lane(slot: &ConnectionSlot, lane: &SharedLane) {
+    let Ok(mut lane) = lane.lock() else {
+        return;
+    };
+    if let Some(active) = lane.active.take() {
+        if Arc::ptr_eq(&active.connection, slot) {
+            lane.owner = None;
+        } else {
+            // A newer session owns the lane now; put its entry back.
+            lane.active = Some(active);
         }
     }
 }
