@@ -14,10 +14,10 @@
 //! machine's sequenced `set_vpn_state` (the process-wide event
 //! sequence and the resync protocol stay intact).
 
-use std::time::Duration;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 use protonwire_core::state::DaemonCore as CoreState;
 use protonwire_frontend_api::VpnState;
@@ -260,7 +260,10 @@ fn pump_events(slot: &ConnectionSlot, core: &CoreState) {
             // the daemon's stat broadcast is the M6
             // observability lane
         };
-        if let EngineConnectionState::Disconnected { error: Some(ref detail) } = state.connection {
+        if let EngineConnectionState::Disconnected {
+            error: Some(ref detail),
+        } = state.connection
+        {
             tracing::warn!(error = %detail, "the engine disconnected with an error");
         }
         let mapped = map_vpn_state(&state);

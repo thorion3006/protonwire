@@ -1355,8 +1355,7 @@ mod shared_cache_tests {
         let facade = Arc::new(PersistenceFacade::start(Arc::new(cache)));
 
         {
-            let boxed: Box<dyn PersistentCache> =
-                Box::new(SharedFacadeCache(Arc::clone(&facade)));
+            let boxed: Box<dyn PersistentCache> = Box::new(SharedFacadeCache(Arc::clone(&facade)));
             boxed.put(CacheKey::Certificate, b"cert-bytes".to_vec());
             drop(boxed); // ProTUN's disconnect drop
         }
