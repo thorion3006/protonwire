@@ -96,12 +96,19 @@ impl FeatureReconciliation {
         // refusals (note_requested).
     }
 
-    /// The connection left Connected (the bot round's P2): the
-    /// previous server's applied snapshot no longer answers the
-    /// request — every requested setting reads UNCONFIRMED until
+    /// The connection left the confirmed state (the bot round's P2,
+    /// the round-11 sharpening): the previous server's applied
+    /// snapshot no longer answers the request AND its refusals are
+    /// superseded — every requested setting reads UNCONFIRMED until
     /// the new agent session reports.
     pub fn note_unconfirmed(&mut self) {
         self.applied = None;
+        // The round-11 boundary: refusals are answers to ONE
+        // negotiation — a new negotiation (any non-confirmed state)
+        // supersedes them, exactly as note_requested does. Within one
+        // negotiation the applied set and the refusal coexist (the
+        // round-10 retention).
+        self.refused.clear();
     }
 
     /// The server refused a setting outright. ProTUN re-emits refusals
