@@ -116,30 +116,28 @@ fn set_mark(socket_fd: RawFd, mark: u32) -> io::Result<()> {
     }
     Ok(())
 }
-
 /// The fail-closed health surface M5's route-commit lane gates on:
 /// healthy only when every socket reported so far was marked
 /// successfully AND at least one socket was reported at all (a cell
 /// that saw zero sockets proves nothing — see [`MarkHealth::healthy`]).
+///
+/// The state is ONE atomic word (the bot round-13 P1): separate
+/// atomics cannot be read as a snapshot — a later callback admitted
+/// between healthy()'s loads could render a green answer stale while
+/// its mark is still in flight. The word packs
+/// `reported << 2 | in_flight << 1 | failed`, so admission
+/// (in_flight 0→1), completion, and the failure latch are each ONE
+/// RMW the reader's single load observes entirely or not at all.
 #[derive(Debug)]
 pub struct MarkHealth {
-    all_marked: AtomicBool,
-    reported: AtomicUsize,
-    /// Callbacks currently inside the applier (the bot round-12 P1):
-    /// after one success, `reported`/`all_marked` stay green while a
-    /// LATER callback is still inside apply_mark — healthy() would
-    /// approve route commit over an unmarked in-flight socket. The
-    /// gate requires in-flight == 0.
-    in_flight: AtomicUsize,
+    state: AtomicUsize,
 }
 
 impl MarkHealth {
     /// A healthy cell (nothing failed yet, nothing reported yet).
     pub fn new() -> Self {
         Self {
-            all_marked: AtomicBool::new(true),
-            reported: AtomicUsize::new(0),
-            in_flight: AtomicUsize::new(0),
+            state: AtomicUsize::new(0),
         }
     }
 
@@ -147,7 +145,7 @@ impl MarkHealth {
     /// Alone this is NOT the route-commit gate: a mis-wired callback
     /// that reports nothing leaves it `true` vacuously.
     pub fn all_marked(&self) -> bool {
-        self.all_marked.load(Ordering::SeqCst)
+        self.state.load(Ordering::SeqCst) & FAILED == 0
     }
 
     /// How many sockets ProTUN reported through the callback. The M5
@@ -155,48 +153,43 @@ impl MarkHealth {
     /// — no full-tunnel route commits before at least one outer socket
     /// carried the bypass mark.
     pub fn reported(&self) -> usize {
-        self.reported.load(Ordering::SeqCst)
+        self.state.load(Ordering::SeqCst) >> REPORTED_SHIFT
     }
 
     /// The M5 route-commit gate, one call: every reported socket
-    /// marked, and at least one reported (fail-closed against both the
-    /// mark failure and the vacuous no-socket case).
+    /// marked, at least one reported, and NOTHING IN FLIGHT — the
+    /// single-word state makes the whole conjunction one snapshot
+    /// (the round-13 fix: no load interleaves with an admission).
     pub fn healthy(&self) -> bool {
-        // LOAD ORDER IS THE SNAPSHOT (the bot round-11 P1): the
-        // callback's program order is note_failure() THEN
-        // note_reported(), so reading `reported` FIRST puts this
-        // reader after that pair in the SeqCst total order — a
-        // non-zero report observed here implies the paired outcome
-        // (success or the latched failure) is already visible to the
-        // all_marked load that follows. The other order (latch read
-        // first) could observe all_marked==true, then the failing
-        // pair lands, then reported>0 — healthy() true with a known
-        // failure. Two SeqCst loads are not one snapshot; the order
-        // is what makes them one.
-        // IN-FLIGHT == 0 (the bot round-12 P1): a nonzero report with
-        // a callback still inside apply_mark proves nothing about the
-        // socket it is marking. reported>0 FIRST (the round-11 order
-        // argument), then in-flight, then the latch.
-        let reported = self.reported();
-        reported > 0 && self.in_flight.load(Ordering::SeqCst) == 0 && self.all_marked()
-    }
-
-    fn note_failure(&self) {
-        self.all_marked.store(false, Ordering::SeqCst);
-    }
-
-    fn note_reported(&self) {
-        self.reported.fetch_add(1, Ordering::SeqCst);
+        let state = self.state.load(Ordering::SeqCst);
+        state >> REPORTED_SHIFT > 0 && state & (IN_FLIGHT | FAILED) == 0
     }
 
     fn note_in_flight(&self) {
-        self.in_flight.fetch_add(1, Ordering::SeqCst);
+        self.state.fetch_or(IN_FLIGHT, Ordering::SeqCst);
+    }
+
+    fn note_failure(&self) {
+        self.state.fetch_or(FAILED, Ordering::SeqCst);
+    }
+
+    fn note_reported(&self) {
+        self.state.fetch_add(REPORTED_UNIT, Ordering::SeqCst);
     }
 
     fn note_done(&self) {
-        self.in_flight.fetch_sub(1, Ordering::SeqCst);
+        self.state.fetch_sub(IN_FLIGHT, Ordering::SeqCst);
     }
 }
+
+/// The in-flight bit: a callback admitted but not yet completed.
+const IN_FLIGHT: usize = 1 << 0;
+/// The failure latch: any mark failure, permanent.
+const FAILED: usize = 1 << 1;
+/// The reported counter's unit (one bit-pair per report).
+const REPORTED_UNIT: usize = 1 << 2;
+/// The reported counter's shift.
+const REPORTED_SHIFT: usize = 2;
 
 impl Default for MarkHealth {
     /// Delegates to [`MarkHealth::new`] (healthy): `Default` must agree
