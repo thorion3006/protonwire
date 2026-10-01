@@ -1208,27 +1208,27 @@ mod round5_tests {
     /// not None: the sync must treat that as the current directory
     /// (File::open("") would ENOENT and fail the resync after a
     /// successful publish).
+    ///
+    /// HERMETIC (the bot round-15 P2): the first draft chdir'd the
+    /// PROCESS — a global mutation racing every parallel test, and
+    /// its try_put (after the CWD restore) wrote a randomized
+    /// `certificate.bin` into the crate dir. This version tests the
+    /// invariant directly: sync_parent_dir on a bare filename (the
+    /// crate CWD stands in for "the current directory") must be Ok —
+    /// the empty-parent fix — and no cache object is ever built at a
+    /// relative path.
     #[test]
     fn a_relative_key_path_syncs_the_current_directory() {
-        let dir = std::env::temp_dir().join(format!(
-            "pw-relkey-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        // Run from inside the temp dir: the key path is a BARE
-        // filename (empty parent).
-        let previous = std::env::current_dir().unwrap();
-        std::env::set_current_dir(&dir).unwrap();
-        let result = EncryptedCache::open(Path::new("."), Path::new("cache.key"));
-        std::env::set_current_dir(previous).unwrap();
-        let cache = result.expect("a bare-filename key path opens (the empty parent syncs as .)");
-        cache
-            .try_put(CacheKey::Certificate, b"cert".to_vec())
-            .expect("the round-trip works");
-        std::fs::remove_dir_all(&dir).ok();
+        // The bare filename: the parent is EMPTY, not None.
+        assert!(
+            Path::new("cache.key")
+                .parent()
+                .is_some_and(|p| p.as_os_str().is_empty()),
+            "the fixture premise: a bare filename has an empty parent"
+        );
+        // The empty parent resolves to the current directory and
+        // syncs without ENOENT (the fix; pre-fix this failed).
+        super::sync_parent_dir(Path::new("cache.key"))
+            .expect("the empty parent syncs as the current directory");
     }
 }
