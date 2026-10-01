@@ -1111,27 +1111,26 @@ impl ActiveConnection {
         self.connection.update_peers(translated.peers);
         Ok(())
     }
-    /// Updates the LocalAgent feature request on the live connection
-    /// (FR-32C). The T-20 ledger resets: the new request has no
-    /// answer yet. The ledger OWNS the live request (the refactor
-    /// pass's single-source change) — `requested_settings()` reads
-    /// through it, so there is no second snapshot to desync.
     pub fn update_agent_settings(&self, settings: EngineAgentSettings) {
-        // The guard DROPS before ProTUN (the bot round-12 P2): a
-        // state or refusal callback firing on ProTUN's connection
-        // thread takes this same reconciliation mutex — holding it
-        // across update_local_agent_settings could block (or deadlock
-        // against) that callback, violating the FR-32D non-blocking
-        // contract.
-        {
-            let mut ledger = self
-                .reconciliation
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            ledger.note_requested(settings);
-        }
+        // SEND FIRST, ADVANCE SECOND (the bot round-16 P2): the
+        // round-12 shape advanced the epoch and dropped the guard
+        // BEFORE the ProTUN send — an old-request callback entering
+        // that gap snapshotted the NEW epoch and was accepted as the
+        // new request's answer. With the send first, a callback
+        // entering the new gap (send → advance) snapshots the OLD
+        // epoch and its answer is DISCARDED (fail-closed transient;
+        // the next genuine status corrects). The guard is still never
+        // held across the ProTUN call (the round-12 non-blocking
+        // contract). The residual — an old-request response entering
+        // before the send entirely — is the disclosed provenance
+        // limit on the epoch field.
         self.connection
             .update_local_agent_settings(settings_to_protun(settings));
+        let mut ledger = self
+            .reconciliation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        ledger.note_requested(settings);
     }
 
     /// Reports OS connectivity to ProTUN (network up/down/switch).
