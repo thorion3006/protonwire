@@ -155,7 +155,19 @@ impl MarkHealth {
     /// marked, and at least one reported (fail-closed against both the
     /// mark failure and the vacuous no-socket case).
     pub fn healthy(&self) -> bool {
-        self.all_marked() && self.reported() > 0
+        // LOAD ORDER IS THE SNAPSHOT (the bot round-11 P1): the
+        // callback's program order is note_failure() THEN
+        // note_reported(), so reading `reported` FIRST puts this
+        // reader after that pair in the SeqCst total order — a
+        // non-zero report observed here implies the paired outcome
+        // (success or the latched failure) is already visible to the
+        // all_marked load that follows. The other order (latch read
+        // first) could observe all_marked==true, then the failing
+        // pair lands, then reported>0 — healthy() true with a known
+        // failure. Two SeqCst loads are not one snapshot; the order
+        // is what makes them one.
+        let reported = self.reported();
+        reported > 0 && self.all_marked()
     }
 
     fn note_failure(&self) {
