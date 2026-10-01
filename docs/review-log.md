@@ -3346,3 +3346,22 @@ Gates green at every level.
   #13 — the CI FIFO flake's root cause is gone from every tip.
 
 Gates green at every level.
+
+## 2026-10-01 — Round 17 + the CI root causes
+
+- **#13 (7fd485f)**: the FIFO test's CI flake was a real
+  memory-safety bug in the TEST — libc::mkfifo received
+  OsStr::as_bytes() without a NUL terminator (UB; read past the
+  buffer). Locally the next byte happened to be zero; on CI it
+  created a garbage-named file and the probe's open of the real
+  path got NotFound. Both sites build a CString now (the entry
+  site's return asserted too).
+- **#17 (a557ecb)**: the lockfile's nix 0.25.1 entry (the disclosed
+  S7 dependency) was dropped by the conflicted stash resolution —
+  every --locked job refused. Regenerated and verified with
+  cargo metadata --locked.
+- **#16 (64a0843)**: synthetic candidate IDs map back to caller IDs
+  at the state mirror (stable_peer_id strips the all-digit /{n}
+  suffix; real ids with slashes pass through); pinned.
+
+Gates green at every level after each fix.
