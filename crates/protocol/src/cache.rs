@@ -104,12 +104,11 @@ impl EncryptedCache {
                 // NotFound as "absent", and publishing into the
                 // still-missing parent would fail ENOENT before the
                 // with_key_bytes step that creates `dir` is reached.
-                if let Some(parent) = key_path.parent() {
-                    if !parent.as_os_str().is_empty() {
-                        fs::create_dir_all(parent).map_err(|error| {
-                            CacheError::KeyFile(format!("keyfile parent: {error}"))
-                        })?;
-                    }
+                if let Some(parent) = key_path.parent()
+                    && !parent.as_os_str().is_empty()
+                {
+                    fs::create_dir_all(parent)
+                        .map_err(|error| CacheError::KeyFile(format!("keyfile parent: {error}")))?;
                 }
                 let mut fresh = Zeroizing::new([0u8; KEY_LEN]);
                 getrandom::fill(fresh.as_mut_slice())
