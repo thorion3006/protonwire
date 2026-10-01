@@ -3329,3 +3329,20 @@ not stalling).
   epoch field, tracked to M6).
 
 Gates green at every level.
+
+## 2026-10-01 — Round 16 (2 threads on #17 + the CI propagation)
+
+- **#17 (7aeca01)**: the backlog disarms only on a QUIET queue —
+  receiving an event must NOT disarm (older states may sit behind
+  it); each loop-bottom reconcile re-publishes latest_state, so a
+  stale queued state is authoritative for at most one cadence, and
+  the timeout arm's emptiness proves the drain before disarming.
+- **#16 (6f9f7f8)**: update_agent_settings sends FIRST and advances
+  the epoch SECOND — a callback entering the send→advance gap
+  snapshots the OLD epoch and is discarded (fail-closed), closing
+  the round-15 ordering window the bot re-derived; the provenance
+  residual stays disclosed.
+- **#15 (dda7865)**: the hermetic relative-key pin propagated from
+  #13 — the CI FIFO flake's root cause is gone from every tip.
+
+Gates green at every level.
