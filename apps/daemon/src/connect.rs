@@ -186,6 +186,11 @@ impl ConnectionLane {
         // NO JOIN UNDER THE LANE LOCK (the refactor pass's P1): the
         // pump's retire_lane needs this same mutex on engine death —
         // dropping the guard before joining breaks the circular wait.
+        // The WINDOW is armed HERE (the bot round-14 P2: the round-13
+        // flag was checked but never SET — the interloper exclusion
+        // did not exist): reconnecting = true travels with the guard
+        // drop and is only cleared after the engine attempt.
+        lane.reconnecting = true;
         let superseded = lane.active.take();
         // The old owner is cleared BEFORE the engine attempt: a FAILED
         // reconnect must not leave a phantom owner locking every other
@@ -302,6 +307,7 @@ fn terminate_on_fatal(slot: &ConnectionSlot, lane: &SharedLane, core: &CoreState
 fn pump_events(slot: &ConnectionSlot, lane: &SharedLane, core: &CoreState) {
     let mut last: Option<VpnState> = None;
     let mut dropped_watermark: u64 = 0;
+    let mut backlog: bool = false;
     loop {
         let received = slot.lock().ok().and_then(|mut guard| {
             guard
@@ -309,7 +315,12 @@ fn pump_events(slot: &ConnectionSlot, lane: &SharedLane, core: &CoreState) {
                 .map(|connection| connection.events().recv_timeout(PUMP_POLL))
         });
         let event = match received {
-            Some(Ok(event)) => event,
+            Some(Ok(event)) => {
+                // A FRESH push supersedes any stale backlog (the bot
+                // round-14 P2): the queue has drained past the drop.
+                backlog = false;
+                event
+            }
             Some(Err(std::sync::mpsc::RecvTimeoutError::Timeout)) => {
                 // The quiet path still converges (the bot round's
                 // P2): a consumer that stalled while the bounded
@@ -317,7 +328,7 @@ fn pump_events(slot: &ConnectionSlot, lane: &SharedLane, core: &CoreState) {
                 // reconcile the core with the engine's authoritative
                 // poll surface instead of leaving the frontend state
                 // stale until the next (possibly never) push.
-                if reconcile_drops(slot, core, &mut last, &mut dropped_watermark) {
+                if reconcile_drops(slot, core, &mut last, &mut dropped_watermark, &mut backlog) {
                     terminate_on_fatal(slot, lane, core);
                     break;
                 }
@@ -366,7 +377,7 @@ fn pump_events(slot: &ConnectionSlot, lane: &SharedLane, core: &CoreState) {
             // lane.
             _ => {}
         }
-        if reconcile_drops(slot, core, &mut last, &mut dropped_watermark) {
+        if reconcile_drops(slot, core, &mut last, &mut dropped_watermark, &mut backlog) {
             terminate_on_fatal(slot, lane, core);
             break;
         }
@@ -381,6 +392,7 @@ fn reconcile_drops(
     core: &CoreState,
     last: &mut Option<VpnState>,
     watermark: &mut u64,
+    backlog: &mut bool,
 ) -> bool {
     let guard = match slot.lock() {
         Ok(guard) => guard,
@@ -405,11 +417,20 @@ fn reconcile_drops(
     // first; the latest_state clone (a lock + a String/Vec-carrying
     // struct) happens only when drops actually moved — the common
     // quiet tick pays one load.
+    // STALE-BACKLOG MODE (the bot round-14 P2): once a drop is
+    // observed, the queue holds PRE-DROP state events that can each
+    // overwrite the reconciled core after this pass — keep
+    /// re-reconciling on every quiet cadence until a FRESH push
+    /// (a non-timeout event) supersedes the backlog. The dirty flag
+    /// carries the mode; the watermark only ARMS it.
     let dropped = connection.dropped_states();
-    if dropped <= *watermark {
+    if dropped > *watermark {
+        *watermark = dropped;
+        *backlog = true;
+    }
+    if !*backlog {
         return false;
     }
-    *watermark = dropped;
     if let Some(state) = connection.latest_state() {
         let mapped = map_vpn_state(&state);
         if last.as_ref() != Some(&mapped) {
