@@ -3418,3 +3418,28 @@ the stack rebased — each PR's diff is its own again.
 
 Gates green at every level. The rounds keep shallowing (13 → 8 →
 5 → 5 → 5 → 3 → 3 → 2) — the loop is converging.
+
+## 2026-10-01 — Round 21 (5 threads, all genuine, all landed)
+
+- **#16 (09a2b67)**: each refused SETTING is its own recovery class
+  (the payload is the key — two overflowed refusals of different
+  settings both survive).
+- **#17 (f2c21ea)**: the pump's quiet cadence checks the lane
+  upgrade itself — a lane dropped without drain() now kills the
+  HEALTHY pump too (takes the connection, disconnects, exits); the
+  round-19 Weak only exited on terminal. drain() waits out the
+  reconnecting window (the blocking-shutdown contract). The
+  fork-selector disclosure is uniform on both paths: no provider is
+  wired in this stack; the Muon-refresh provision is M6's (the
+  recorded descope), and fabricating a refresh path with no session
+  store would be dishonest.
+
+The publication-gap race (#16's round-21 second finding) is
+DEFERRED with analysis: the window is between try_send(Full) and
+the slot store — milliseconds, and the consumer's recovery loop
+already polls take_critical_events() on every quiet cadence (the
+pump reconciles on the same 200ms), so the retained fatal is acted
+on within one cadence, not "indefinitely." A wakeup channel or an
+atomic drain protocol is real machinery; it is tracked for M5's
+route-commit lane, which is the consumer that must not sleep
+through a retained fatal.
