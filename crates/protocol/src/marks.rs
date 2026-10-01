@@ -125,6 +125,12 @@ fn set_mark(socket_fd: RawFd, mark: u32) -> io::Result<()> {
 pub struct MarkHealth {
     all_marked: AtomicBool,
     reported: AtomicUsize,
+    /// Callbacks currently inside the applier (the bot round-12 P1):
+    /// after one success, `reported`/`all_marked` stay green while a
+    /// LATER callback is still inside apply_mark — healthy() would
+    /// approve route commit over an unmarked in-flight socket. The
+    /// gate requires in-flight == 0.
+    in_flight: AtomicUsize,
 }
 
 impl MarkHealth {
@@ -133,6 +139,7 @@ impl MarkHealth {
         Self {
             all_marked: AtomicBool::new(true),
             reported: AtomicUsize::new(0),
+            in_flight: AtomicUsize::new(0),
         }
     }
 
@@ -166,8 +173,12 @@ impl MarkHealth {
         // pair lands, then reported>0 — healthy() true with a known
         // failure. Two SeqCst loads are not one snapshot; the order
         // is what makes them one.
+        // IN-FLIGHT == 0 (the bot round-12 P1): a nonzero report with
+        // a callback still inside apply_mark proves nothing about the
+        // socket it is marking. reported>0 FIRST (the round-11 order
+        // argument), then in-flight, then the latch.
         let reported = self.reported();
-        reported > 0 && self.all_marked()
+        reported > 0 && self.in_flight.load(Ordering::SeqCst) == 0 && self.all_marked()
     }
 
     fn note_failure(&self) {
@@ -176,6 +187,14 @@ impl MarkHealth {
 
     fn note_reported(&self) {
         self.reported.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn note_in_flight(&self) {
+        self.in_flight.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn note_done(&self) {
+        self.in_flight.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -218,9 +237,14 @@ impl OnSocketFdAvailableCallback for MarkingFdCallback {
         // over an unmarked socket. Both orderings below are
         // fail-closed: the failure latch lands BEFORE the report; a
         // success records the report last.
-        match self.applier.apply_mark(socket_fd) {
+        // The in-flight window: incremented BEFORE the applier runs,
+        // decremented after the outcome is recorded (the bot round-12
+        // P1 — healthy() refuses while any marking is in progress).
+        self.health.note_in_flight();
+        let outcome = self.applier.apply_mark(socket_fd);
+        match outcome {
             Ok(()) => self.health.note_reported(),
-            Err(error) => {
+            Err(ref error) => {
                 self.health.note_failure();
                 self.health.note_reported();
                 tracing::warn!(
@@ -230,6 +254,7 @@ impl OnSocketFdAvailableCallback for MarkingFdCallback {
                 );
             }
         }
+        self.health.note_done();
     }
 }
 #[cfg(test)]
@@ -326,5 +351,48 @@ mod tests {
         assert_eq!(by_default.all_marked(), by_new.all_marked());
         assert_eq!(by_default.reported(), by_new.reported());
         assert_eq!(by_default.healthy(), by_new.healthy());
+    }
+
+    /// The bot round-12 P1: a LATER callback still inside the
+    /// applier is IN FLIGHT — healthy() refuses even though the
+    /// earlier success left the latch green (routes must not commit
+    /// over an unmarked in-flight socket).
+    #[test]
+    fn a_callback_in_flight_blocks_the_gate() {
+        struct BlockingApplier {
+            entered: Arc<std::sync::Barrier>,
+            release: Arc<std::sync::Barrier>,
+        }
+        impl MarkApplier for BlockingApplier {
+            fn apply_mark(&self, _socket_fd: RawFd) -> io::Result<()> {
+                self.entered.wait();
+                self.release.wait();
+                Ok(())
+            }
+        }
+        let health = Arc::new(MarkHealth::new());
+        // A first SUCCESSFUL mark (the latch goes green, reported=1).
+        let done = Arc::new(RecordingApplier::default());
+        MarkingFdCallback::new(done, health.clone()).on_socket_fd_available(1);
+        assert!(health.healthy(), "the first success opens the gate");
+        // A second callback parks inside apply_mark.
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        let parked = MarkingFdCallback::new(
+            Arc::new(BlockingApplier {
+                entered: Arc::clone(&entered),
+                release: Arc::clone(&release),
+            }),
+            Arc::clone(&health),
+        );
+        let handle = std::thread::spawn(move || parked.on_socket_fd_available(2));
+        entered.wait();
+        assert!(
+            !health.healthy(),
+            "the in-flight mark must refuse the gate even after a success"
+        );
+        release.wait();
+        handle.join().unwrap();
+        assert!(health.healthy(), "the gate reopens once the marking lands");
     }
 }
