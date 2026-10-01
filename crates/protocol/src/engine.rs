@@ -850,38 +850,56 @@ struct EngineCallbacks {
     event_tx: SyncSender<EngineEvent>,
     drops: Arc<EventDrops>,
     recovery: Arc<RecoverySlots>,
-    latest: Arc<Mutex<Option<EngineVpnState>>>,
+    latest: Arc<Mutex<Option<Arc<EngineVpnState>>>>,
     reconciliation: Arc<Mutex<FeatureReconciliation>>,
 }
 
 impl EngineCallbacks {
     /// The never-blocking send with the drop policy.
     fn forward(&self, event: EngineEvent) {
-        match self.event_tx.try_send(event) {
-            Ok(()) => {}
+        match self.event_tx.try_send(event.clone()) {
+            Ok(()) => {
+                // The round-11 freshness contract: the recovery slot
+                // mirrors the queue on SUCCESS too — a consumer that
+                // drains the queue then polls reads the newest
+                // counters, never an older overflowed one.
+                if let EngineEvent::Stats(stats) = &event {
+                    let mut slot = self
+                        .recovery
+                        .latest_wg_stats
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    *slot = Some(*stats);
+                } else if let EngineEvent::AgentStats(stats) = &event {
+                    let mut slot = self
+                        .recovery
+                        .latest_agent_stats
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    *slot = Some(*stats);
+                }
+            }
             Err(std::sync::mpsc::TrySendError::Full(event)) => match &event {
-                // Latest-wins with a RECOVERY SLOT (the bot round's
-                // P2): FR-30's counters are pollable and a stale stat
-                // is worthless — the NEWEST lands in the slot, so a
-                // recovering consumer reads fresh numbers instead of
-                // replaying stale queued samples (the drop policy was
-                // oldest-wins in effect before).
+                // Latest-wins with INDEPENDENT recovery slots (the
+                // bot round-11 P2): the two counter streams never
+                // overwrite each other, and the NEWEST of each is
+                // what a recovering consumer reads.
                 EngineEvent::Stats(stats) => {
                     let mut slot = self
                         .recovery
-                        .latest_stats
+                        .latest_wg_stats
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    *slot = Some(LatestStats::WireGuard(*stats));
+                    *slot = Some(*stats);
                     self.drops.note_stats_drop();
                 }
                 EngineEvent::AgentStats(stats) => {
                     let mut slot = self
                         .recovery
-                        .latest_stats
+                        .latest_agent_stats
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    *slot = Some(LatestStats::Agent(*stats));
+                    *slot = Some(*stats);
                     self.drops.note_stats_drop();
                 }
                 // A dropped STATE is a bug alarm: the poll surface
@@ -889,18 +907,23 @@ impl EngineCallbacks {
                 // drops — the daemon reads `dropped_states() > 0` as
                 // a wedged consumer.
                 EngineEvent::State(_) => self.drops.note_state_drop(),
-                // CONTROL events have no poll surface at all (the
-                // bot round's P2): a CertificateFatal the consumer
-                // never sees leaves a dead tunnel reporting live —
-                // the NEWEST is retained in the recovery slot for
-                // the consumer that drains after the full queue.
+                // CONTROL events have no poll surface: the NEWEST is
+                // retained — but a TERMINAL event (CertificateFatal)
+                // is never displaced by a later one (the bot round-11
+                // P2): the consumer must learn the connection died
+                // even if a ForkSelectorNeeded arrives after.
                 critical => {
+                    let terminal = matches!(critical, EngineEvent::CertificateFatal);
                     let mut slot = self
                         .recovery
                         .critical
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    *slot = Some(critical.clone());
+                    let displaced_terminal =
+                        matches!(slot.as_ref(), Some(EngineEvent::CertificateFatal));
+                    if terminal || !displaced_terminal {
+                        *slot = Some(critical.clone());
+                    }
                     self.drops.note_state_drop();
                 }
             },
@@ -926,24 +949,35 @@ impl protun::api::connection::StateChangedCallback for EngineCallbacks {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             ledger.note_applied(settings_from_protun(info.settings.clone()));
-        } else if let ConnectionState::ConnectingToLocalAgent { .. }
-        | ConnectionState::Disconnected { .. } = &state.connection_state
-        {
-            // The bot round's P2: leaving Connected INVALIDATES the
-            // applied snapshot — until the new agent session answers,
-            // every requested setting reads UNCONFIRMED, never
-            // confirmed-by-the-previous-server.
+        } else {
+            // The bot round's P2 (the round-11 sharpening): EVERY
+            // state that is not a confirmed Connected report —
+            // Disconnected, ConnectingToLocalAgent, AND Connecting
+            // (peer cycling after an endpoint/network change passes
+            // through Connecting without the agent arm) — invalidates
+            // the applied snapshot AND the refusals (the round-11
+            // refusal finding: a previous negotiation's refusals must
+            // not survive into the new one; a replacement server that
+            // accepts everything emits no new refusal event). Only a
+            // Connected { agent_info } re-confirms.
             let mut ledger = self
                 .reconciliation
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             ledger.note_unconfirmed();
         }
+        // The snapshot is an Arc (the bot round-11 P2): the
+        // callback's store and the reader's clone are BOTH Arc bumps
+        // under the lock — a reader cloning server-provided
+        // groups/restrictions/jail strings can no longer stall
+        // ProTUN's connection thread (the deep clone happens OUTSIDE
+        // the lock, in latest_state()).
+        let snapshot = Arc::new(translated.clone());
         let mut slot = self
             .latest
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *slot = Some(translated.clone());
+        *slot = Some(snapshot);
         drop(slot);
         self.forward(EngineEvent::State(translated));
     }
@@ -972,10 +1006,30 @@ impl protun::api::connection::EventCallback for EngineCallbacks {
 /// RETAINED here for the consumer that drains after a full queue;
 /// the newest STATISTICS land here too (the drop policy is
 /// latest-wins, not oldest-wins).
+/// The newest statistics of BOTH streams, read atomically enough for
+/// status purposes (the two locks are adjacent; no consumer depends
+/// on cross-stream atomicity — see LatestStatsSnapshot's docs).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct LatestStatsSnapshot {
+    /// The newest WireGuard counters, if any arrived.
+    pub wg: Option<EngineStats>,
+    /// The newest LocalAgent counters, if any arrived.
+    pub agent: Option<EngineAgentStats>,
+}
+
 #[derive(Debug, Default)]
 pub struct RecoverySlots {
+    /// The newest retained control event. TERMINAL events
+    /// (CertificateFatal) are never displaced by later ones (the bot
+    /// round-11 P2): a fatal must reach the consumer even if a
+    /// ForkSelectorNeeded arrives after it.
     critical: Mutex<Option<EngineEvent>>,
-    latest_stats: Mutex<Option<LatestStats>>,
+    /// The newest WireGuard counters — an INDEPENDENT slot (the bot
+    /// round-11 P2): the two counter streams must not overwrite each
+    /// other.
+    latest_wg_stats: Mutex<Option<EngineStats>>,
+    /// The newest LocalAgent counters.
+    latest_agent_stats: Mutex<Option<EngineAgentStats>>,
 }
 
 /// The newest statistics of either class (the recovery slot's
@@ -997,7 +1051,7 @@ pub struct ActiveConnection {
     events: Receiver<EngineEvent>,
     drops: Arc<EventDrops>,
     recovery: Arc<RecoverySlots>,
-    latest: Arc<Mutex<Option<EngineVpnState>>>,
+    latest: Arc<Mutex<Option<Arc<EngineVpnState>>>>,
     reconciliation: Arc<Mutex<FeatureReconciliation>>,
     mode: EngineMode,
 }
@@ -1016,7 +1070,10 @@ impl ActiveConnection {
     /// The most recent state (a poll surface; the same value the last
     /// `State` event carried).
     pub fn latest_state(&self) -> Option<EngineVpnState> {
-        self.latest.lock().ok().and_then(|slot| slot.clone())
+        // The Arc bump is the only work under the lock; the deep
+        // clone of the state (server strings included) runs outside.
+        let snapshot = self.latest.lock().ok()?.clone();
+        snapshot.as_deref().cloned()
     }
 
     /// The FR-32B health cell (M5's route-commit gate).
@@ -1130,14 +1187,23 @@ impl ActiveConnection {
 
     /// The NEWEST statistics (the bot round's P2): the drop policy
     /// is latest-wins — a consumer recovering from a full queue
-    /// reads the freshest counters here instead of replaying
+    /// The NEWEST statistics, per INDEPENDENT stream (the bot
+    /// round-11 P2): the WireGuard and LocalAgent counter streams
+    /// never overwrite each other — a consumer recovering from a
+    /// full queue reads the freshest of each instead of replaying
     /// stale queued samples.
-    pub fn latest_stats(&self) -> Option<LatestStats> {
-        *self
+    pub fn latest_stats(&self) -> LatestStatsSnapshot {
+        let wg = *self
             .recovery
-            .latest_stats
+            .latest_wg_stats
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let agent = *self
+            .recovery
+            .latest_agent_stats
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        LatestStatsSnapshot { wg, agent }
     }
 
     /// The LIVE requested feature set (the bot round's P2):
@@ -1495,13 +1561,13 @@ mod tests {
         };
         callbacks.on_event(stale);
         callbacks.on_event(fresh);
-        let held = callbacks
+        let held = *callbacks
             .recovery
-            .latest_stats
+            .latest_wg_stats
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match *held {
-            Some(LatestStats::WireGuard(stats)) => {
+        match held {
+            Some(stats) => {
                 assert_eq!(
                     stats.received_bytes, 300,
                     "the NEWEST counters are retained"
