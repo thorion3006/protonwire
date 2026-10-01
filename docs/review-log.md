@@ -3284,3 +3284,28 @@ Gates green at every level. Three consecutive fix→re-review rounds
 (11, 12, 13) with real fresh evidence each time — the loop is
 converging (13 threads → 8 → 5, each round shallower than the
 last).
+
+## 2026-10-01 — Round 14 (5 threads, all genuine, all landed)
+
+- **#15 (282120a)**: in-flight is a COUNT (bits 1..14) — two
+  overlapping callbacks no longer collide on one bit (the first
+  completion cleared the second's admission; the second's subtract
+  borrowed into the neighboring fields); pinned with two
+  barrier-synchronized overlapping callbacks. The CHECK-TO-ACT
+  window is disclosed on healthy() as the contract (a check is not
+  a reservation; the commit-side lock belongs to M5's route-commit
+  lane — tracked). MIPS R6 joins the arch denylist
+  (mips32r6/mips64r6).
+- **#17 (3bfa867 + 3f93979)**: the round-13 reconnecting flag was
+  NEVER SET — checked and reset only, the interloper exclusion did
+  not exist (my round-13 perl silently failed to match; the
+  perl-no-match lesson strikes again, now twice in one session).
+  The window is armed at the guard drop. The stale-backlog
+  reconcile: a drop ARMS a backlog mode; every quiet cadence
+  re-reconciles the core onto latest_state while stale pre-drop
+  events drain, and only a FRESH push clears it.
+
+Gates green at every level. The convergence continues: 13 → 8 → 5 →
+5 (round 14's count held — but three of the five were fresh
+evidence against my own round-13 fixes, which is the loop working,
+not stalling).
