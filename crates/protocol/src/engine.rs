@@ -929,7 +929,12 @@ fn critical_class(event: &EngineEvent) -> ControlClass {
     match event {
         EngineEvent::CertificateFatal => ControlClass::CertificateFatal,
         EngineEvent::ForkSelectorNeeded => ControlClass::ForkSelector,
-        EngineEvent::SettingRefused(_) => ControlClass::SettingRefused,
+        EngineEvent::SettingRefused(setting) => {
+            // Each REFUSED SETTING is its own class (the bot round-21 P2):
+            // two overflowed refusals of different settings must both
+            /// survive — the payload is part of the recovery key.
+            ControlClass::SettingRefused(*setting as usize)
+        }
         EngineEvent::ApiError {
             refresh_token_invalid,
             ..
@@ -953,7 +958,7 @@ fn critical_class(event: &EngineEvent) -> ControlClass {
 enum ControlClass {
     CertificateFatal,
     ForkSelector,
-    SettingRefused,
+    SettingRefused(usize),
     ApiError,
     ApiErrorCredentialInvalid,
     Other,
