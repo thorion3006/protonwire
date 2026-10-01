@@ -20,7 +20,9 @@ use protonwire_protocol::engine::{
     ActiveConnection, ConnectionEngine, EngineConfig, EngineConnectionState, EngineEvent,
     EngineMode, EngineVpnState,
 };
-use protonwire_protocol::params::{ClientPrivateKey, PeerParams, SniStrategy, TunnelParams};
+use protonwire_protocol::params::{
+    ClientPrivateKey, PeerParams, SniStrategy, TransportEndpoint, TunnelParams,
+};
 
 const IF_NAME: &str = "pwengine0";
 const DEADLINE: Duration = Duration::from_secs(20);
@@ -35,11 +37,19 @@ fn key(bytes: u8) -> String {
 fn deterministic_peer(id: &str) -> PeerParams {
     PeerParams {
         id: id.to_owned(),
-        entry_ip: IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
         public_key_base64: key(0x42),
-        udp_ports: vec![51820],
-        tcp_ports: vec![443],
-        tls_ports: vec![8443],
+        udp: Some(TransportEndpoint {
+            entry_ip: IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
+            ports: vec![51820],
+        }),
+        tcp: Some(TransportEndpoint {
+            entry_ip: IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
+            ports: vec![443],
+        }),
+        tls: Some(TransportEndpoint {
+            entry_ip: IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
+            ports: vec![8443],
+        }),
         priority: 1,
         exit_label: Some("test-exit".to_owned()),
     }
@@ -218,7 +228,7 @@ fn it14_tcp_and_connectivity_arms() {
     // the candidates to that transport).
     let mut params = tunnel_params();
     params.protocol = protonwire_protocol::Protocol::WireGuardTcp;
-    params.peers[0].udp_ports.clear();
+    params.peers[0].udp = None;
 
     let mut connection = engine
         .connect(&params, Box::new(protonwire_protocol::NullCache::default()))
