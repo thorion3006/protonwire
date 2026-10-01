@@ -276,6 +276,21 @@ impl PersistenceFacade {
             .map(|op| (op.key_name(), op))
             .collect();
         for (key_name, op) in entries {
+            // NEWEST-WINS by sequence (the bot round-11 P1's other
+            // half): seq assignment and queue insertion can REORDER
+            // under concurrent callbacks, so the later-arriving op is
+            // not automatically the newer one — a stale arrival must
+            // not evict a newer op already parked here (the same
+            // guard the retry lane carries).
+            let superseded = overflow.iter().any(|existing| match existing {
+                Op::Put(existing_name, _, _) | Op::Remove(existing_name, _) => {
+                    *existing_name == key_name && existing.seq() >= op.seq()
+                }
+                Op::ClearAll(_) => false,
+            });
+            if superseded {
+                continue;
+            }
             overflow.retain(|existing| match existing {
                 Op::Put(existing_name, _, _) | Op::Remove(existing_name, _) => {
                     *existing_name != key_name
@@ -521,10 +536,27 @@ fn worker_loop(
         last_applied: &mut HashMap<String, u64>,
     ) {
         let mut batch = batch;
-        // Coalesce: keep the LAST op per key (and the last ClearAll,
-        // which dominates everything before it).
+        // Coalesce by SEQUENCE, not arrival order (the bot round-11
+        // P1): concurrent facade callbacks can interleave
+        // next_seq/send — seq N+1 may ENTER the queue before seq N,
+        // so "the last op seen per key" could keep the STALE one and
+        // drop the newer before the watermark guard ever saw it
+        // (disk permanently older than memory, silently). Keep the
+        // MAX-sequence op per key; a ClearAll (unexpanded yet)
+        // dominates only ops with SMALLER sequences, same as below.
         let mut coalesced: Vec<Op> = Vec::with_capacity(batch.len());
         let mut saw_clear = false;
+        // The ClearAll dominance needs the clear's sequence: a clear
+        // at seq S dominates per-key ops with seq < S, but a per-key
+        // op with seq > S is NEWER (the round-10 per-key model) and
+        // must survive the coalesce for its key.
+        let clear_seq = batch
+            .iter()
+            .filter_map(|op| match op {
+                Op::ClearAll(seq) => Some(*seq),
+                _ => None,
+            })
+            .max();
         for op in batch.drain(..).rev() {
             let name = match &op {
                 Op::Put(name, _, _) => Some(name.clone()),
@@ -539,17 +571,20 @@ fn worker_loop(
                     }
                 }
                 Some(name) => {
-                    if saw_clear {
-                        continue; // dominated by the newer ClearAll
+                    if saw_clear && op.seq() < clear_seq.unwrap_or(0) {
+                        continue; // dominated by the ClearAll
                     }
-                    let seen = coalesced.iter().any(|existing| match existing {
+                    // Max-sequence wins per key.
+                    let dominated = coalesced.iter().position(|existing| match existing {
                         Op::Put(existing_name, _, _) | Op::Remove(existing_name, _) => {
                             *existing_name == name
                         }
                         Op::ClearAll(_) => false,
                     });
-                    if !seen {
-                        coalesced.push(op);
+                    match dominated {
+                        Some(index) if coalesced[index].seq() >= op.seq() => {}
+                        Some(index) => coalesced[index] = op,
+                        None => coalesced.push(op),
                     }
                 }
             }
@@ -1428,6 +1463,58 @@ mod round9_tests {
             cache.get(CacheKey::Certificate),
             Some(b"newest".to_vec()),
             "the newer applied state survives the older clear"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The bot round-11 P1: the coalescer selects by SEQUENCE, not
+    /// arrival order — concurrent callbacks can interleave
+    /// next_seq/send, so the newer state may ENTER the queue first.
+    /// The stale arriving-later op must not evict the newer one
+    /// before the watermark guard ever sees it.
+    #[test]
+    fn coalesce_keeps_the_max_sequence_per_key_regardless_of_arrival() {
+        let dir = std::path::PathBuf::from(format!(
+            "/tmp/protonwire-r11-coalesce-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cache = Arc::new(EncryptedCache::with_key_bytes(&dir, &[29u8; 32]).unwrap());
+        let facade = PersistenceFacade::start(Arc::clone(&cache));
+        // The bot's interleaving, replayed: the NEWER state (seq 2)
+        // enters the overflow lane FIRST, the stale seq 1 second —
+        // the arrival-order coalescer kept seq 1 and dropped seq 2
+        // before the watermark guard ever saw it. The batch here is
+        // exactly [overflow seq 2, overflow seq 1].
+        let seq2 = facade.next_seq();
+        facade.overflow(Op::Put(
+            "Certificate".to_owned(),
+            Zeroizing::new(b"newer".to_vec()),
+            seq2,
+        ));
+        facade.overflow(Op::Put(
+            "Certificate".to_owned(),
+            Zeroizing::new(b"older".to_vec()),
+            seq2 - 1,
+        ));
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while cache.get(CacheKey::Certificate) != Some(b"newer".to_vec()) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the max-sequence op wins even when it arrived first"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // The stale op never lands after the newer one.
+        std::thread::sleep(OVERFLOW_POLL + Duration::from_millis(150));
+        assert_eq!(
+            cache.get(CacheKey::Certificate),
+            Some(b"newer".to_vec()),
+            "the stale sequence never overwrites the newer state"
         );
         std::fs::remove_dir_all(&dir).ok();
     }
