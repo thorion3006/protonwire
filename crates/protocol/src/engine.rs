@@ -166,7 +166,10 @@ pub enum EngineTransport {
 }
 
 /// The peer a state event names, engine-mirrored.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// SEC-5/FR-121 (the bot round-18 P2): the entry address never renders —
+/// the manual Debug redacts it (the TransportEndpoint precedent);
+/// the field stays available for authorized status readers.
+#[derive(Clone, PartialEq, Eq)]
 pub struct EnginePeerRef {
     /// The caller's peer id (from `PeerParams.id`).
     pub peer_id: String,
@@ -205,7 +208,9 @@ pub enum EngineRestriction {
 /// makes normative: groups FR-32DA, MTU + restrictions + exit IPs at
 /// PRD line 468/FR-123. The ISP-identity fields are deliberately NOT
 /// mirrored — no clause needs them at the engine surface).
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// SEC-5/FR-121: the exit addresses never render (manual Debug);
+/// the fields stay available for authorized status readers.
+#[derive(Clone, PartialEq, Eq)]
 pub struct EngineAgentInfo {
     /// The server's exit IPv4.
     pub server_exit_v4: Option<IpAddr>,
@@ -271,6 +276,31 @@ pub enum EngineJailReason {
     Other,
 }
 
+impl std::fmt::Debug for EnginePeerRef {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("EnginePeerRef")
+            .field("peer_id", &self.peer_id)
+            .field("entry_ip", &"[redacted]")
+            .field("protocol", &self.protocol)
+            .field("port", &self.port)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for EngineAgentInfo {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("EngineAgentInfo")
+            .field("server_exit_v4", &self.server_exit_v4.map(|_| "[redacted]"))
+            .field("server_exit_v6", &self.server_exit_v6.map(|_| "[redacted]"))
+            .field("server_mtu", &self.server_mtu)
+            .field("groups", &self.groups)
+            .field("restrictions", &self.restrictions)
+            .field("applied", &self.applied)
+            .finish()
+    }
+}
 /// The connection state machine, engine-mirrored (FR-29's raw
 /// material; the daemon lane shapes it for the frontend).
 #[derive(Debug, Clone, PartialEq)]
@@ -560,7 +590,7 @@ pub fn translate_state(state: &VpnState) -> EngineVpnState {
                 peers,
                 wait_reasons,
             } => EngineConnectionState::Connecting {
-                peer_ids: peers.iter().map(|p| p.peer_id.clone()).collect(),
+                peer_ids: peers.iter().map(|p| stable_peer_id(&p.peer_id)).collect(),
                 waiting_for_network: wait_reasons.iter().any(|r| {
                     matches!(
                         r,
@@ -570,7 +600,7 @@ pub fn translate_state(state: &VpnState) -> EngineVpnState {
             },
             ConnectionState::ConnectingToLocalAgent { peer, wait_reason } => {
                 EngineConnectionState::ConnectingToAgent {
-                    peer_id: peer.peer_id.clone(),
+                    peer_id: stable_peer_id(&peer.peer_id),
                     wait: wait_reason.as_ref().map(|reason| match reason {
                         protun::api::state::AgentConnectionWaitReason::SoftJailed => {
                             EngineAgentWait::SoftJailed
@@ -1667,5 +1697,38 @@ mod tests {
             "a slash with a non-digit tail is a REAL id, not a suffix"
         );
         assert_eq!(stable_peer_id("x/"), "x/", "an empty tail is not a suffix");
+    }
+
+    /// The bot round-18 P2: address fields never render — the peer
+    /// ref and the agent info redact them in Debug (the exact
+    /// `debug!("{state:?}")` diagnostics scenario).
+    #[test]
+    fn state_debug_never_renders_addresses() {
+        let state = EngineVpnState {
+            interface_up: true,
+            interface_error: None,
+            connection: EngineConnectionState::Connected {
+                peer: EnginePeerRef {
+                    peer_id: "uk-42".to_owned(),
+                    entry_ip: "185.159.158.1".parse().unwrap(),
+                    protocol: EngineTransport::WireGuardUdp,
+                    port: 51820,
+                },
+                agent: Some(EngineAgentInfo {
+                    server_exit_v4: Some("185.159.158.2".parse().unwrap()),
+                    server_exit_v6: None,
+                    server_mtu: None,
+                    groups: Vec::new(),
+                    restrictions: Vec::new(),
+                    applied: Default::default(),
+                }),
+            },
+        };
+        let rendered = format!("{state:?}");
+        assert!(rendered.contains("[redacted]"), "{rendered}");
+        assert!(
+            !rendered.contains("185.159.158"),
+            "no address family renders: {rendered}"
+        );
     }
 }
