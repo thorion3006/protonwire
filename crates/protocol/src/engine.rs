@@ -476,10 +476,31 @@ pub fn transport_from_protun(protocol: Protocol) -> EngineTransport {
 /// Translates one ProTUN peer reference into the engine mirror.
 pub fn peer_from_protun(peer: &PeerConnectionInfo) -> EnginePeerRef {
     EnginePeerRef {
-        peer_id: peer.peer_id.clone(),
+        // The caller-stable ID (the bot round-17 P2): multi-address
+        // peers carry decode_peer's synthetic `/{n}` candidate suffix
+        // — status and peer lookup must see the ORIGINAL catalog id,
+        // so the suffix is stripped at the mirror (the documented
+        // contract on PeerParams::id: strip with rsplit_once('/')).
+        peer_id: stable_peer_id(&peer.peer_id),
         entry_ip: ip_from_protun(peer.entry_ip),
         protocol: transport_from_protun(peer.protocol),
         port: peer.port,
+    }
+}
+
+/// Strips the synthetic candidate suffix from a peer id (`uk-42/0` →
+/// `uk-42`); an unsuffixed id passes through unchanged. A suffix is
+/// stripped only when it is all digits — the suffix scheme's own
+/// convention (documented on `PeerParams::id`: caller ids should not
+/// end in `/{digits}`).
+pub fn stable_peer_id(peer_id: &str) -> String {
+    match peer_id.rsplit_once('/') {
+        Some((stem, suffix))
+            if !suffix.is_empty() && suffix.bytes().all(|b| b.is_ascii_digit()) =>
+        {
+            stem.to_owned()
+        }
+        _ => peer_id.to_owned(),
     }
 }
 
@@ -1625,5 +1646,26 @@ mod tests {
             critical.take().is_none(),
             "a second take is empty — take, not peek"
         );
+    }
+
+    /// The bot round-17 P2: the synthetic candidate suffix never
+    /// reaches the state surface — status and peer lookup see the
+    /// caller-stable catalog id.
+    #[test]
+    fn synthetic_candidate_ids_map_back_to_caller_ids() {
+        use super::stable_peer_id;
+        assert_eq!(stable_peer_id("uk-42/0"), "uk-42");
+        assert_eq!(stable_peer_id("uk-42/1"), "uk-42");
+        assert_eq!(
+            stable_peer_id("uk-42"),
+            "uk-42",
+            "unsuffixed passes through"
+        );
+        assert_eq!(
+            stable_peer_id("proton:fastest-country"),
+            "proton:fastest-country",
+            "a slash with a non-digit tail is a REAL id, not a suffix"
+        );
+        assert_eq!(stable_peer_id("x/"), "x/", "an empty tail is not a suffix");
     }
 }
