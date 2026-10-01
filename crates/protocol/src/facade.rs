@@ -58,6 +58,34 @@ impl Op {
             Op::ClearAll(_) => String::new(),
         }
     }
+
+    /// Expands a ClearAll into its per-key Removes at the clear's OWN
+    /// sequence (the refactor pass's consolidation — the expansion
+    /// existed three times: overflow, the retry lane, apply_pass; one
+    /// home keeps the "each Remove carries the clear's own seq"
+    /// invariant from drifting). Every other op expands to itself.
+    fn expand_per_key(self) -> Vec<Op> {
+        match self {
+            Op::ClearAll(seq) => ALL_KEYS
+                .into_iter()
+                .map(|key| Op::Remove(name_for(key), seq))
+                .collect(),
+            per_key => vec![per_key],
+        }
+    }
+}
+
+/// The facade's three storage keys (the PersistentCache surface).
+const ALL_KEYS: [CacheKey; 3] = [
+    CacheKey::Certificate,
+    CacheKey::PrivateKey,
+    CacheKey::ApiSession,
+];
+
+/// The stable per-key name the worker tracks (the mapping the queue,
+/// the overflow, and the retry lane share; inverse of `key_from_name`).
+fn name_for(key: CacheKey) -> String {
+    format!("{key:?}")
 }
 
 /// The durable-write health surface (FR-7J): the last failure, the
@@ -239,35 +267,21 @@ impl PersistenceFacade {
     /// (bounded at one op per key; ClearAll expands per-key inside).
     fn overflow(&self, op: Op) {
         let mut overflow = self.overflow.lock().expect("overflow lock");
-        let name = match &op {
-            Op::Put(name, _, _) | Op::Remove(name, _) => name.clone(),
-            Op::ClearAll(_) => String::new(),
-        };
-        // A ClearAll in the overflow supersedes every per-key entry
-        // (expand it now, the retry lane's model — each Remove
-        // carries the clear's sequence).
-        let op_seq = op.seq();
-        let entries: Vec<(String, Op)> = if name.is_empty() {
-            [
-                CacheKey::Certificate,
-                CacheKey::PrivateKey,
-                CacheKey::ApiSession,
-            ]
-            .iter()
-            .map(|key| {
-                let key_name = format!("{key:?}");
-                let remove = Op::Remove(key_name.clone(), op_seq);
-                (key_name, remove)
-            })
-            .collect()
-        } else {
-            vec![(name, op)]
-        };
+        // A ClearAll expands into its per-key Removes (each carrying
+        // the clear's own sequence — the shared expansion),
+        // superseding every per-key entry.
+        let entries: Vec<(String, Op)> = op
+            .expand_per_key()
+            .into_iter()
+            .map(|op| (op.key_name(), op))
+            .collect();
         for (key_name, op) in entries {
             overflow.retain(|existing| match existing {
                 Op::Put(existing_name, _, _) | Op::Remove(existing_name, _) => {
                     *existing_name != key_name
                 }
+                // Unreachable since the expansion (only Removes and
+                // Puts enter this lane); kept exhaustively typed.
                 Op::ClearAll(_) => true,
             });
             overflow.push(op);
@@ -353,12 +367,16 @@ impl PersistentCache for PersistenceFacade {
 
     fn clear_all(&self) {
         self.memory.lock().expect("facade memory lock").clear();
+        // The sibling shape (the refactor pass's consistency note): the
+        /// op is built ONCE — the queue gets a clone, the overflow
+        /// gets the original (one sequence, not two).
+        let op = Op::ClearAll(self.next_seq());
         let send_result = self
             .sender
             .as_ref()
-            .map(|sender| sender.try_send(Op::ClearAll(self.next_seq())));
+            .map(|sender| sender.try_send(op.clone()));
         if matches!(send_result, Some(Err(mpsc::TrySendError::Full(_)))) {
-            self.overflow(Op::ClearAll(self.next_seq()));
+            self.overflow(op);
             record_failure(
                 &self.health,
                 "the persistence queue is full — a CLEAR-ALL was moved to the overflow \
@@ -383,7 +401,9 @@ fn record_failure(health: &HealthSlot, message: &str) {
 /// is at most one op per key (three keys — naturally bounded), and
 /// the backoff doubles per consecutive failure up to the cap.
 struct RetryLane {
-    /// The latest failed op per key (by name; ClearAll keyed "").
+    /// The latest failed op per key, by name (a ClearAll expands to
+    /// per-key Removes before it reaches this lane — it is never
+    /// held here as itself).
     pending: Vec<(String, Op, std::time::Instant)>,
     /// The current backoff (doubles per consecutive failure).
     backoff: Duration,
@@ -415,22 +435,11 @@ impl RetryLane {
     /// unconditional replace would lose the newest state's retry).
     fn retain(&mut self, op: Op) {
         let deadline = std::time::Instant::now() + self.backoff;
-        let op_seq = op.seq();
-        let expanded: Vec<(String, Op)> = match op {
-            Op::ClearAll(_) => [
-                CacheKey::Certificate,
-                CacheKey::PrivateKey,
-                CacheKey::ApiSession,
-            ]
-            .iter()
-            .map(|key| {
-                let name = format!("{key:?}");
-                let remove = Op::Remove(name.clone(), op_seq);
-                (name, remove)
-            })
-            .collect(),
-            Op::Put(ref name, _, _) | Op::Remove(ref name, _) => vec![(name.clone(), op)],
-        };
+        let expanded: Vec<(String, Op)> = op
+            .expand_per_key()
+            .into_iter()
+            .map(|op| (op.key_name(), op))
+            .collect();
         for (name, op) in expanded {
             // Newest-wins: an existing pending op with a sequence at
             // least as new keeps its place.
@@ -554,20 +563,7 @@ fn worker_loop(
         // would even lower its watermark. As per-key Removes the
         // existing sequence guard skips exactly those keys and
         // clears the rest; nothing below needs a ClearAll arm.
-        let expanded: Vec<Op> = coalesced
-            .into_iter()
-            .flat_map(|op| match op {
-                Op::ClearAll(seq) => [
-                    CacheKey::Certificate,
-                    CacheKey::PrivateKey,
-                    CacheKey::ApiSession,
-                ]
-                .into_iter()
-                .map(|key| Op::Remove(format!("{key:?}"), seq))
-                .collect::<Vec<_>>(),
-                per_key => vec![per_key],
-            })
-            .collect();
+        let expanded: Vec<Op> = coalesced.into_iter().flat_map(Op::expand_per_key).collect();
         for op in expanded {
             // The SEQUENCE GUARD (the bot round-9 P1): the queue and
             // the overflow are two lanes with no shared order — an
@@ -604,10 +600,13 @@ fn worker_loop(
                     Some(key) => cache.try_remove(key),
                     None => Ok(()),
                 },
-                // Unreachable since the expansion above (kept
-                // exhaustively typed): a ClearAll never reaches the
-                // attempt loop.
-                Op::ClearAll(_) => cache.try_clear_all(),
+                // Unreachable since the expansion above — and
+                // DELIBERATELY inert: try_clear_all is the
+                // whole-bucket path the round-10 P1 removed (it
+                // bypasses per-key watermarks); re-instating it as a
+                // fallback would silently re-introduce the fixed
+                // bug.
+                Op::ClearAll(_) => Ok(()),
             };
             match result {
                 Ok(()) => {
