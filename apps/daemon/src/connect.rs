@@ -433,12 +433,12 @@ fn reconcile_drops(
     // STALE-BACKLOG MODE (the bot rounds 14+16): once a drop is
     // observed, the queue holds PRE-DROP state events that can each
     // overwrite the reconciled core after this pass. The mode stays
-    /// armed until the queue is QUIET — this arm only runs on the
-    /// timeout path (an empty queue behind the cursor) or after a
-    /// received event (whose drain leaves the rest) — and every
-    /// invocation re-reconciles the core onto latest_state, so a
-    /// stale queued state is authoritative for at most one cadence
-    /// and never after the drain. The watermark only ARMS the mode.
+    // armed until the queue is QUIET — this arm only runs on the
+    // timeout path (an empty queue behind the cursor) or after a
+    // received event (whose drain leaves the rest) — and every
+    // invocation re-reconciles the core onto latest_state, so a
+    // stale queued state is authoritative for at most one cadence
+    // and never after the drain. The watermark only ARMS the mode.
     let dropped = connection.dropped_states();
     if dropped > *watermark {
         *watermark = dropped;
