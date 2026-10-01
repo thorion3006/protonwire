@@ -20,12 +20,27 @@ use crate::Protocol;
 /// address-and-ports PAIR per transport: the addresses may DIFFER
 /// across transports on one physical, which a single flattened
 /// address cannot express — the bot round-2 P1).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct TransportEndpoint {
     /// The entry address for THIS transport.
     pub entry_ip: IpAddr,
     /// Port candidates, priority order.
     pub ports: Vec<u16>,
+}
+
+/// SEC-5/FR-121 (the refactor pass's P2): the address-bearing type
+/// itself never renders one — a derived Debug would print `entry_ip`
+/// verbatim wherever a standalone endpoint is formatted. The manual
+/// impl redacts the address and passes the ports through (catalog
+/// data).
+impl std::fmt::Debug for TransportEndpoint {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TransportEndpoint")
+            .field("entry_ip", &"[redacted]")
+            .field("ports", &self.ports)
+            .finish()
+    }
 }
 
 /// One connection candidate physical: the network identity ProTUN
@@ -35,7 +50,13 @@ pub struct TransportEndpoint {
 #[derive(Clone, PartialEq)]
 pub struct PeerParams {
     /// The caller's stable id for the peer (rides ProTUN's state
-    /// events back — `peer_id`).
+    /// events back — `peer_id`). TRANSLATION CONTRACT: when a peer's
+    /// transports carry DIFFERENT entry addresses, `translate`
+    /// expands it into several candidates whose ids carry a `/{n}`
+    /// suffix (`uk-42/0`, `uk-42/1`, …). Map state events back with
+    /// the prefix (`id.rsplit_once('/')`) and do not end caller ids
+    /// in `/{digits}` — the suffix scheme is collision-free only
+    /// under that convention.
     pub id: String,
     /// The server's WireGuard X25519 public key (base64).
     pub public_key_base64: String,
@@ -53,26 +74,19 @@ pub struct PeerParams {
     pub exit_label: Option<String>,
 }
 
-/// SEC-5/FR-121: full entry addresses never render. A derived Debug
-/// would print every transport's `entry_ip` verbatim into the exact
-/// downstream `debug!("{params:?}")` scenario TunnelParams' manual
-/// Debug exists to make safe — the manual impl redacts them (the
-/// core redact.rs precedent; ports, keys, and labels are catalog
-/// data, not addresses).
+/// SEC-5/FR-121: full entry addresses never render (the manual
+/// `TransportEndpoint` Debug carries the redaction; this delegation
+/// keeps every field honest without re-implementing it per field —
+/// the refactor pass's shape).
 impl std::fmt::Debug for PeerParams {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let endpoint = |transport: &str, endpoint: &Option<TransportEndpoint>| {
-            endpoint.as_ref().map(|endpoint| {
-                format!("{transport}={{ip=[redacted], ports={:?}}}", endpoint.ports)
-            })
-        };
         formatter
             .debug_struct("PeerParams")
             .field("id", &self.id)
             .field("public_key_base64", &self.public_key_base64)
-            .field("udp", &endpoint("udp", &self.udp))
-            .field("tcp", &endpoint("tcp", &self.tcp))
-            .field("tls", &endpoint("tls", &self.tls))
+            .field("udp", &self.udp)
+            .field("tcp", &self.tcp)
+            .field("tls", &self.tls)
             .field("priority", &self.priority)
             .field("exit_label", &self.exit_label)
             .finish()

@@ -18,7 +18,7 @@
 pub mod params;
 pub mod translate;
 
-pub use params::{PeerParams, TunnelParams};
+pub use params::{PeerParams, TransportEndpoint, TunnelParams};
 pub use translate::translate;
 
 pub use protun;
