@@ -857,49 +857,39 @@ struct EngineCallbacks {
 impl EngineCallbacks {
     /// The never-blocking send with the drop policy.
     fn forward(&self, event: EngineEvent) {
-        match self.event_tx.try_send(event.clone()) {
-            Ok(()) => {
-                // The round-11 freshness contract: the recovery slot
-                // mirrors the queue on SUCCESS too — a consumer that
-                // drains the queue then polls reads the newest
-                // counters, never an older overflowed one.
-                if let EngineEvent::Stats(stats) = &event {
-                    let mut slot = self
-                        .recovery
-                        .latest_wg_stats
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    *slot = Some(*stats);
-                } else if let EngineEvent::AgentStats(stats) = &event {
-                    let mut slot = self
-                        .recovery
-                        .latest_agent_stats
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    *slot = Some(*stats);
-                }
+        // PUBLICATION ORDER (the bot round-12 P2): the recovery slot
+        // mirrors the event BEFORE the queue can expose it — a
+        // consumer that receives the event and immediately polls
+        // latest_stats() reads the NEWEST counters, never the
+        // previous overflowed one. The slot update is two atomic-ish
+        // stores; the queue send follows.
+        match &event {
+            EngineEvent::Stats(stats) => {
+                let mut slot = self
+                    .recovery
+                    .latest_wg_stats
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                *slot = Some(*stats);
             }
+            EngineEvent::AgentStats(stats) => {
+                let mut slot = self
+                    .recovery
+                    .latest_agent_stats
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                *slot = Some(*stats);
+            }
+            _ => {}
+        }
+        match self.event_tx.try_send(event.clone()) {
+            Ok(()) => {}
             Err(std::sync::mpsc::TrySendError::Full(event)) => match &event {
-                // Latest-wins with INDEPENDENT recovery slots (the
-                // bot round-11 P2): the two counter streams never
-                // overwrite each other, and the NEWEST of each is
-                // what a recovering consumer reads.
-                EngineEvent::Stats(stats) => {
-                    let mut slot = self
-                        .recovery
-                        .latest_wg_stats
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    *slot = Some(*stats);
-                    self.drops.note_stats_drop();
-                }
-                EngineEvent::AgentStats(stats) => {
-                    let mut slot = self
-                        .recovery
-                        .latest_agent_stats
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    *slot = Some(*stats);
+                // Latest-wins with INDEPENDENT recovery slots: the
+                // NEWEST of each stream is what a recovering consumer
+                // reads (the pre-send update above already landed for
+                // the stats arms).
+                EngineEvent::Stats(_) | EngineEvent::AgentStats(_) => {
                     self.drops.note_stats_drop();
                 }
                 // A dropped STATE is a bug alarm: the poll surface
@@ -909,9 +899,7 @@ impl EngineCallbacks {
                 EngineEvent::State(_) => self.drops.note_state_drop(),
                 // CONTROL events have no poll surface: the NEWEST is
                 // retained — but a TERMINAL event (CertificateFatal)
-                // is never displaced by a later one (the bot round-11
-                // P2): the consumer must learn the connection died
-                // even if a ForkSelectorNeeded arrives after.
+                // is never displaced by a later one.
                 critical => {
                     let terminal = matches!(critical, EngineEvent::CertificateFatal);
                     let mut slot = self
@@ -1113,11 +1101,19 @@ impl ActiveConnection {
     /// pass's single-source change) — `requested_settings()` reads
     /// through it, so there is no second snapshot to desync.
     pub fn update_agent_settings(&self, settings: EngineAgentSettings) {
-        let mut ledger = self
-            .reconciliation
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        ledger.note_requested(settings);
+        // The guard DROPS before ProTUN (the bot round-12 P2): a
+        // state or refusal callback firing on ProTUN's connection
+        // thread takes this same reconciliation mutex — holding it
+        // across update_local_agent_settings could block (or deadlock
+        // against) that callback, violating the FR-32D non-blocking
+        // contract.
+        {
+            let mut ledger = self
+                .reconciliation
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            ledger.note_requested(settings);
+        }
         self.connection
             .update_local_agent_settings(settings_to_protun(settings));
     }
