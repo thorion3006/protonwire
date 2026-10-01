@@ -699,6 +699,21 @@ fn local_agent_mode(mode: &EngineMode) -> Option<ConnectionMode> {
     }
 }
 
+impl EngineMode {
+    /// The key policy the mode implies (the refactor pass's
+    /// single-home change): production LocalAgent reads the key from
+    /// the persistent cache (FR-32A); agent-less tests must carry
+    /// one. The policy is a pure function of the mode — deriving it
+    /// makes that structural.
+    pub fn key_policy(&self) -> KeyPolicy {
+        match self {
+            EngineMode::LocalAgent { .. } => KeyPolicy::FromCache,
+            EngineMode::NoLocalAgent => KeyPolicy::Required,
+        }
+    }
+}
+
+/// The engine: stateless configuration plus the connect composition.
 /// The engine: stateless configuration plus the connect composition.
 #[derive(Debug, Clone)]
 pub struct ConnectionEngine {
@@ -798,11 +813,6 @@ impl ConnectionEngine {
             recovery: recovery.clone(),
             latest,
             reconciliation,
-            requested: Mutex::new(match &self.config.mode {
-                EngineMode::LocalAgent { settings, .. } => *settings,
-                EngineMode::NoLocalAgent => EngineAgentSettings::default(),
-            }),
-            key_policy,
             mode: self.config.mode.clone(),
         })
     }
@@ -857,15 +867,21 @@ impl EngineCallbacks {
                 // replaying stale queued samples (the drop policy was
                 // oldest-wins in effect before).
                 EngineEvent::Stats(stats) => {
-                    if let Ok(mut slot) = self.recovery.latest_stats.lock() {
-                        *slot = Some(LatestStats::WireGuard(*stats));
-                    }
+                    let mut slot = self
+                        .recovery
+                        .latest_stats
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    *slot = Some(LatestStats::WireGuard(*stats));
                     self.drops.note_stats_drop();
                 }
                 EngineEvent::AgentStats(stats) => {
-                    if let Ok(mut slot) = self.recovery.latest_stats.lock() {
-                        *slot = Some(LatestStats::Agent(*stats));
-                    }
+                    let mut slot = self
+                        .recovery
+                        .latest_stats
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    *slot = Some(LatestStats::Agent(*stats));
                     self.drops.note_stats_drop();
                 }
                 // A dropped STATE is a bug alarm: the poll surface
@@ -879,9 +895,12 @@ impl EngineCallbacks {
                 // the NEWEST is retained in the recovery slot for
                 // the consumer that drains after the full queue.
                 critical => {
-                    if let Ok(mut slot) = self.recovery.critical.lock() {
-                        *slot = Some(critical.clone());
-                    }
+                    let mut slot = self
+                        .recovery
+                        .critical
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    *slot = Some(critical.clone());
                     self.drops.note_state_drop();
                 }
             },
@@ -980,8 +999,6 @@ pub struct ActiveConnection {
     recovery: Arc<RecoverySlots>,
     latest: Arc<Mutex<Option<EngineVpnState>>>,
     reconciliation: Arc<Mutex<FeatureReconciliation>>,
-    requested: Mutex<EngineAgentSettings>,
-    key_policy: KeyPolicy,
     mode: EngineMode,
 }
 
@@ -1029,22 +1046,21 @@ impl ActiveConnection {
     }
 
     pub fn update_peers(&self, params: &TunnelParams) -> Result<(), ProtocolError> {
-        let translated = translate_with_policy(params, self.key_policy)?;
+        let translated = translate_with_policy(params, self.mode.key_policy())?;
         self.connection.update_peers(translated.peers);
         Ok(())
     }
     /// Updates the LocalAgent feature request on the live connection
     /// (FR-32C). The T-20 ledger resets: the new request has no
-    /// answer yet.
+    /// answer yet. The ledger OWNS the live request (the refactor
+    /// pass's single-source change) — `requested_settings()` reads
+    /// through it, so there is no second snapshot to desync.
     pub fn update_agent_settings(&self, settings: EngineAgentSettings) {
-        if let Ok(mut ledger) = self.reconciliation.lock() {
-            ledger.note_requested(settings);
-        }
-        // The live request slot follows the update (the bot round's
-        // P2): requested_settings() stays the honest view.
-        if let Ok(mut requested) = self.requested.lock() {
-            *requested = settings;
-        }
+        let mut ledger = self
+            .reconciliation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        ledger.note_requested(settings);
         self.connection
             .update_local_agent_settings(settings_to_protun(settings));
     }
@@ -1128,10 +1144,10 @@ impl ActiveConnection {
     /// `mode()` keeps the connect-time snapshot; this reflects
     /// `update_agent_settings` — the honest view for status.
     pub fn requested_settings(&self) -> EngineAgentSettings {
-        *self
-            .requested
+        self.reconciliation
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .requested()
     }
 }
 
@@ -1439,6 +1455,80 @@ mod tests {
             callbacks.drops.states.load(Ordering::Relaxed),
             1,
             "a dropped state is the alarm counter, never silent"
+        );
+    }
+
+    /// The bot round's P2 behaviors, pinned (the refactor pass's P2):
+    /// the recovery SLOTS — a full queue retains the newest stats
+    /// (latest-wins, not oldest-wins) and the newest control event
+    /// (take-once), the surfaces a recovering consumer reads.
+    #[test]
+    fn full_queue_retains_the_newest_stats_and_the_critical_event() {
+        let (event_tx, _event_rx) = std::sync::mpsc::sync_channel(1);
+        let callbacks = EngineCallbacks {
+            event_tx,
+            drops: Arc::new(EventDrops::default()),
+            recovery: Arc::new(RecoverySlots::default()),
+            latest: Arc::new(Mutex::new(None)),
+            reconciliation: Arc::new(Mutex::new(FeatureReconciliation::new(
+                EngineAgentSettings::default(),
+            ))),
+        };
+        use protun::api::connection::EventCallback as _;
+        // Fill the single slot with a stale stat, then overflow with
+        // a FRESH one: the slot must hold the fresh counters.
+        let stale = Event::ConnectionStats {
+            timestamp_ms: 1,
+            received_bytes: 100,
+            sent_bytes: 200,
+            time_since_last_handshake: Duration::ZERO,
+            estimated_loss: 0.0,
+            estimated_round_trip_time: Duration::ZERO,
+        };
+        let fresh = Event::ConnectionStats {
+            timestamp_ms: 2,
+            received_bytes: 300,
+            sent_bytes: 400,
+            time_since_last_handshake: Duration::from_secs(5),
+            estimated_loss: 0.25,
+            estimated_round_trip_time: Duration::from_millis(42),
+        };
+        callbacks.on_event(stale);
+        callbacks.on_event(fresh);
+        let held = callbacks
+            .recovery
+            .latest_stats
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match *held {
+            Some(LatestStats::WireGuard(stats)) => {
+                assert_eq!(
+                    stats.received_bytes, 300,
+                    "the NEWEST counters are retained"
+                );
+                assert_eq!(stats.estimated_round_trip_time, Duration::from_millis(42));
+            }
+            other => panic!("expected the retained WireGuard stats, got {other:?}"),
+        }
+        // And the critical class: a CertificateFatal past the full
+        // queue is RETAINED, taken ONCE (the control events have no
+        // poll surface — the slot is their only delivery).
+        let fatal = Event::Error {
+            error: ErrorEvent::CertificateRefreshFatalError,
+        };
+        callbacks.on_event(fatal);
+        let mut critical = callbacks
+            .recovery
+            .critical
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            matches!(critical.take(), Some(EngineEvent::CertificateFatal)),
+            "the retained control event is delivered once"
+        );
+        assert!(
+            critical.take().is_none(),
+            "a second take is empty — take, not peek"
         );
     }
 }

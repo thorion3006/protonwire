@@ -76,6 +76,14 @@ impl FeatureReconciliation {
         self.refused.clear();
     }
 
+    /// The live request (the refactor pass's single-source change):
+    /// the ledger OWNS the requested set — `update_agent_settings`
+    /// writes here, so a handle-level snapshot cannot disagree with
+    /// the divergence table.
+    pub fn requested(&self) -> EngineAgentSettings {
+        self.requested
+    }
+
     /// The server reported the applied set (a `Connected` state's
     /// agent info). Refusals recorded against the superseded request
     /// are stale — the new applied set is the answer.
