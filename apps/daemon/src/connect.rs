@@ -185,8 +185,14 @@ impl ConnectionLane {
         if self.draining.load(Ordering::SeqCst) {
             return Err(LaneRefusal::Draining.into());
         }
-        if lane.reconnecting || lane.disconnecting {
+        // The SPECIFIC window's refusal (the bot round-26 P2): the
+        // caller must be able to distinguish the two teardown
+        // windows — retry timing and diagnostics differ.
+        if lane.reconnecting {
             return Err(LaneRefusal::Reconnecting.into());
+        }
+        if lane.disconnecting {
+            return Err(LaneRefusal::Disconnecting.into());
         }
         // Reconnect by the owner: tear the previous session down first
         // (FR-28's reconnect IS a fresh connection — peer rotation on
@@ -292,9 +298,17 @@ impl ConnectionLane {
         let active = lane.active.take();
         lane.owner = None;
         drop(lane);
+        // DISCONNECTING is published BEFORE the teardown (the bot
+        // round-26 P2): the state machine must not jump straight to
+        // a pump-race Disconnected while the ProTUN thread and TUN
+        // still exist — GetState and subscribers would report no
+        // tunnel during the join. The terminal Disconnected lands
+        // AFTER the join (the pump's None arm or this publish).
+        self.core.set_vpn_state(VpnState::Disconnecting);
         if let Some(active) = active {
             active.teardown();
         }
+        self.core.set_vpn_state(VpnState::Disconnected);
         self.state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -512,6 +526,22 @@ fn reconcile_drops(
                     "a retained certificate-fatal surfaced from the drop lane — tearing the session down"
                 );
                 return true;
+            }
+            // The credential-invalid signal is NAMED distinctly (the
+            // bot round-26 P2): it is the one retained control whose
+            // loss leaves a failed session without reauthentication —
+            // WARN at its own level so the operator (and the M6 auth
+            // lane's log-based handoff until the wiring lands) sees
+            // REAUTHORIZE, not a generic routed-event line.
+            EngineEvent::ApiError {
+                refresh_token_invalid: true,
+                ..
+            } => {
+                tracing::error!(
+                    "a retained invalid-credential ApiError surfaced from the drop lane — \
+                     reauthentication is required (the M6 auth-recovery lane owns the \
+                     refresh; no provider is wired in this stack)"
+                );
             }
             other => {
                 tracing::warn!(
