@@ -17,13 +17,17 @@
 
 pub mod cache;
 pub mod facade;
+pub mod marks;
 pub mod params;
 pub mod translate;
+pub mod tun;
 
 pub use cache::{CacheError, EncryptedCache, NullCache};
 pub use facade::{PersistenceFacade, PersistenceHealth};
+pub use marks::{MarkApplier, MarkHealth, MarkingFdCallback, SoMarkApplier};
 pub use params::{PeerParams, TransportEndpoint, TunnelParams};
 pub use translate::translate;
+pub use tun::{DEFAULT_IF_NAME, TunAddressPlan, TunError, TunHandle, TunIfAddress};
 
 pub use protun;
 
@@ -39,10 +43,11 @@ pub trait TunnelEngine: Send + Sync {
 ///
 /// ProTUN v2.2.1 does not negotiate Linux TUN addresses through its public
 /// API. These values reproduce the integration addresses the pinned
-/// `pvpnclient` 3.0.3 source configures, and Milestone 4's adapter
-/// conformance test asserts the live adapter still configures exactly these
-/// values. If ProTUN ever exposes negotiated addresses, this contract is
-/// retired in favor of the public API.
+/// `pvpnclient` 3.0.3 source configures. PR-3 pins the parsed plan
+/// (the tun module exact-values test); M5 netlink read-back pins the live
+/// application against a real interface. If ProTUN ever exposes
+/// negotiated addresses, this contract is retired in favor of the public
+/// API.
 pub mod tun_contract {
     /// TUN interface IPv4 address.
     pub const IPV4_ADDRESS: &str = "10.2.0.2/32";
@@ -97,11 +102,12 @@ pub enum ProtocolError {
 mod tests {
     use super::*;
 
-    /// The tunnel address contract is pvpnclient-derived (OQ-15):
-    /// the M4 PR-3 conformance test asserts the LIVE adapter
-    /// configures exactly these values; here we pin the FORMAT
+    /// The tunnel address contract is pvpnclient-derived (OQ-15).
+    /// The split of proof: PR-3 pins the parsed PLAN (tun.rs exact-
+    /// values test), M5 pins the LIVE application (the netlink
+    /// read-back against a real interface); here we pin the FORMAT
     /// (address/prefix split, parseable v4 and v6) so a typo in the
-    /// constants cannot ride to that test.
+    /// constants cannot ride to either.
     #[test]
     fn tun_contract_addresses_are_well_formed() {
         let (address, prefix) = tun_contract::IPV4_ADDRESS

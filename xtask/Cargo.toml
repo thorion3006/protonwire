@@ -20,3 +20,4 @@ cargo_metadata = { workspace = true }
 toml = { workspace = true }
 sha2 = { workspace = true }
 protonwire-frontend-api = { workspace = true }
+protonwire-net = { workspace = true } # the netns gate flag (single source of truth)

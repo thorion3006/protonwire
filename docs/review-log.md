@@ -2948,3 +2948,64 @@ last-applied watermark (advancing only on durable success) and
 skips any op not newer. ClearAll checks/advances all three
 watermarks; the retry lane retains sequences. Pin: the
 stale-queued-op skip. 50 protocol tests.
+
+## 2026-09-30 — M4 PR-3 (m4/tun-fd-lifecycle): TUN/FD ownership + the netns IT harness
+
+The owner's stack-forward call ("finish the other PRs in the stack,
+then come back to the PR comments"): PR-3 built on the cache branch
+in the dedicated worktree, four commits (837daef tun, 59f5140 marks,
+388fd11 harness+IT+CI, 7153018 the gate fix round).
+
+What landed (FR-24/25/26/27/31, FR-32B, NFR-31, IT-1):
+
+- **TunHandle** — the codebase's FIRST sanctioned unsafe, hand-rolled
+  ~30-line TUNSETIFF (the decision record in tun.rs's module docs:
+  no tun crate for one ioctl; scoped allow, single buffer).
+  Exclusive attach (IFF_TUN_EXCL), idempotent close/Drop, one-shot
+  into_raw_fd transfer — protun's TunStreamUnix takes ownership
+  (File::from_raw_fd) and closes on disconnect, so our side forgets.
+  TunAddressPlan::contract(): FR-27's constants parsed for the M5
+  router (the conflict-detect arm is M5's netlink read-back).
+- **The FR-32B mark seam** — MarkApplier/SoMarkApplier (SO_MARK; a
+  SockType check first so a stale reused fd fails loudly, never
+  silently marks an unrelated descriptor) + MarkingFdCallback into
+  protun's OnSocketFdAvailableCallback, synchronous at
+  socket-creation (before connect — the happens-before seam IT-13
+  proves live in M5). MarkHealth.healthy() = all_marked &&
+  reported>0 — the fail-closed gate with the vacuous case closed.
+- **THE NETNS HARNESS** (the deliverable every later IT rides) —
+  netns::gate() in protonwire-net (skip-with-disclosure outside the
+  runner; even sudo skips — the flag is the only lane) +
+  `cargo xtask netns-it` (unshare --user --map-root-user --net; root
+  of an empty netns, no host mutation; probe discloses + exits 0
+  where userns is unavailable; ::warning:: + step-summary + executed-
+  count so a green job never reads as a green run) + a new CI
+  netns-it job. The gate arms only on flag + namespace-identity
+  nonce (readlink /proc/self/ns/net inside the namespace, compared
+  at the gate — a leaked flag under sudo -E does not arm; verified).
+  Observation rule pinned: netlink or /proc/net, never
+  /sys/class/net (sysfs shows the host mount).
+- **IT-1 green inside the namespace (4/4)**: create protonwire0 →
+  TunStreamInfo::TunFd hand-off → the exact File::from_raw_fd move →
+  device dies with the single owner; close idempotent; second attach
+  EBUSY (contractual via IFF_TUN_EXCL — the live run CORRECTED the
+  first draft's shared-attach assumption, kernel says exclusive);
+  SO_MARK round-trip through the callback.
+
+TDD: red-first per unit (the name-validation and mark-delegation
+panics observed on todo!() stubs, then green; should_panic pin for
+into_raw_fd-after-close). Gates: rust PASS (3×P2, 6×P3 — ALL landed
+in 7153018: IFF_TUN_EXCL, Default-vs-new, PR-2's two tracked doc
+items, to_ne_bytes, attribution, skip visibility, tautology, panic
+pin, lossy comment); SEC PASS (1×P2, 4×P3 — ALL landed: the vacuous
+MarkHealth + the nonce + the SockType check + the skip-path CI
+visibility + the PR-2 doc items). Both gates independently verified
+the unsafe premises against the pinned protun source (the factory
+calls the callback on a live fd before connect; TunStreamUnix owns).
+
+Local: fmt/clippy clean, 67 protocol+net unit tests green, xtask all
+PASS, netns-it --locked 4/4. Track items for later lanes: confirm
+the CI netns-it job actually EXECUTES on ubuntu-24.04 (not the
+disclosed skip) on first push; the harness grows GATED_TARGETS with
+M5; protun's panic-before-factory fd leak is protun-internal (PR-4
+notes it); mlock stays PR-5's daemon lane.
