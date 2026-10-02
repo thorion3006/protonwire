@@ -303,12 +303,15 @@ impl ConnectionLane {
         // a pump-race Disconnected while the ProTUN thread and TUN
         // still exist — GetState and subscribers would report no
         // tunnel during the join. The terminal Disconnected lands
-        // AFTER the join (the pump's None arm or this publish).
-        self.core.set_vpn_state(VpnState::Disconnecting);
+        // AFTER the join. IDEMPOTENT when NOTHING was taken (the bot
+        // round-27 P2): a repeated disconnect on an empty lane
+        // publishes nothing — no misleading state churn, no sequence
+        // advance.
         if let Some(active) = active {
+            self.core.set_vpn_state(VpnState::Disconnecting);
             active.teardown();
+            self.core.set_vpn_state(VpnState::Disconnected);
         }
-        self.core.set_vpn_state(VpnState::Disconnected);
         self.state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
