@@ -324,35 +324,25 @@ impl ConnectionLane {
     /// exits so no event races the IPC socket's close.
     pub fn drain(&self) {
         self.draining.store(true, Ordering::SeqCst);
-        // The in-progress RECONNECT teardown is waited out (the bot
-        // round-21 P2): a reconnect whose teardown the drain's take()
-        // missed (the entry was already taken, the join not yet run)
-        // left the old pump publishing after drain returned — the
-        // blocking-shutdown contract. The reconnecting flag names
-        // that window; spin until it closes, then take what is there.
-        loop {
-            let lane = self
+        // The flag check AND the take under ONE guard (the bot
+        // round-28 P2): a separate take-acquisition let a disconnect
+        // slip into the gap (set its flag, take the lane, start its
+        // join) — drain then saw None and returned while the pump
+        // still ran. The window check and active.take() are now one
+        // critical section; the join still runs guard-free (the
+        // round-21 no-join-under-lock discipline).
+        let active = loop {
+            let mut lane = self
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if !lane.reconnecting && !lane.disconnecting {
-                break;
+                lane.owner = None;
+                break lane.active.take();
             }
             drop(lane);
             std::thread::sleep(Duration::from_millis(5));
-        }
-        // Same no-join-under-lock discipline as disconnect (the
-        // refactor pass's P1).
-        let active = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .active
-            .take();
-        self.state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .owner = None;
+        };
         if let Some(active) = active {
             active.teardown();
         }
@@ -447,20 +437,34 @@ fn pump_events(slot: &ConnectionSlot, lane: &std::sync::Weak<Mutex<LaneState>>, 
             // (Disconnected, the slot still holding OUR connection)
             // retires the lane; a teardown-observed None belongs to
             // the CALLER's cleanup (disconnect/drain already own the
-            // join — the retire here would park on the lane mutex
-            // they hold, the circular wait).
+            // join AND the terminal publish — the bot round-28 P2:
+            // publishing Disconnected here raced the caller's
+            // after-join publication with a FALSE terminal while
+            // teardown still ran).
             Some(Err(std::sync::mpsc::RecvTimeoutError::Disconnected)) => {
                 core.set_vpn_state(VpnState::Disconnected);
                 retire_lane(slot, lane);
                 break;
             }
             None => {
-                core.set_vpn_state(VpnState::Disconnected);
+                // Teardown-observed: the caller publishes the terminal
+                // state after its join — exit publishing nothing.
                 break;
             }
         };
         match event {
             EngineEvent::State(state) => {
+                // STALE-BACKLOG SUPPRESSION (the bot round-28 P2):
+                // while recovery is armed, every queued State event is
+                // PRE-DROP (older than the authoritative snapshot the
+                // reconcile just published) — publishing one would
+                // transiently misreport (an old Disconnected reading
+                // as a real teardown). The quiet-cadence reconcile
+                // re-publishes latest_state; the backlog disarms only
+                // on a proven-empty queue.
+                if backlog {
+                    continue;
+                }
                 if let EngineConnectionState::Disconnected {
                     error: Some(ref detail),
                 } = state.connection
