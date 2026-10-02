@@ -107,8 +107,25 @@ impl EncryptedCache {
                 if let Some(parent) = key_path.parent()
                     && !parent.as_os_str().is_empty()
                 {
+                    // EVERY newly created component syncs IN ITS OWN
+                    /// parent (the bot round-24 P2): create_dir_all may
+                    /// create the STATE DIRECTORY itself — the later
+                    /// with_key_bytes sees it existing and skips its
+                    /// own new-dir sync, so the documented first-run
+                    /// shape could lose the whole state directory on
+                    /// crash. Track what did not exist and sync each
+                    /// creation bottom-up.
+                    let created = collect_new_components(parent);
                     fs::create_dir_all(parent)
                         .map_err(|error| CacheError::KeyFile(format!("keyfile parent: {error}")))?;
+                    for dir in created.iter().rev() {
+                        sync_parent_dir(dir).map_err(|error| {
+                            CacheError::KeyFile(format!(
+                                "new parent component {}: {error}",
+                                dir.display()
+                            ))
+                        })?;
+                    }
                 }
                 let mut fresh = Zeroizing::new([0u8; KEY_LEN]);
                 getrandom::fill(fresh.as_mut_slice())
@@ -332,6 +349,22 @@ impl EncryptedCache {
 /// bot round-4 P2s: a discarded sync publishes a durability the
 /// crash can contradict).
 #[cfg(unix)]
+
+/// The components of `root` that do not exist YET (the bot round-24
+/// P2): taken before create_dir_all, so each creation can be synced
+/// in its own parent afterwards (bottom-up).
+fn collect_new_components(root: &Path) -> Vec<PathBuf> {
+    let mut missing = Vec::new();
+    let mut current = Some(root.to_path_buf());
+    while let Some(path) = current {
+        if path.as_os_str().is_empty() || path.exists() {
+            break;
+        }
+        missing.push(path.clone());
+        current = path.parent().map(Path::to_path_buf);
+    }
+    missing
+}
 fn sync_parent_dir(path: &Path) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         // A RELATIVE path with no directory component yields an EMPTY

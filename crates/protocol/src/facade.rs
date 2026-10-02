@@ -564,6 +564,7 @@ fn worker_loop(
         health: &HealthSlot,
         retry: &mut RetryLane,
         last_applied: &mut HashMap<String, u64>,
+        overflow: &Mutex<Vec<Op>>,
     ) {
         let mut batch = batch;
         // Coalesce by SEQUENCE, not arrival order (the bot round-11
@@ -695,10 +696,19 @@ fn worker_loop(
                     // pending op (the failed newest state) survives.
                     last_applied.insert(op_name.clone(), seq);
                     retry.note_success(&op_name, seq);
-                    // The recovery (the bot round-22 P1): the success
-                    // that EMPTIES the retry lane clears the failure —
-                    // health recovers, not just the applied counter.
-                    if retry.pending.is_empty() {
+                    // The recovery (the bot rounds 22+24): the success that
+                    // empties the retry lane AND leaves the OVERFLOW lane
+                    // empty clears the failure. The overflow half (the
+                    // round-24 P1): an update the full queue refused is
+                    // still undurable — clearing on retry-emptiness alone
+                    // let health read green while disk held stale
+                    // credentials. The overflow lock is held for the
+                    // check-and-clear ordering (a producer that publishes
+                    // records its failure first; a clear observing an
+                    // empty lane is ordered after every recording whose
+                    // op it could have seen).
+                    let overflow_empty = overflow.lock().expect("overflow lock").is_empty();
+                    if retry.pending.is_empty() && overflow_empty {
                         note_recovered(health);
                     }
                     health
@@ -734,7 +744,14 @@ fn worker_loop(
         // were no longer pending for take_all to recover).
         let mut disconnected = false;
         if !batch.is_empty() {
-            apply_pass(batch, &cache, health, &mut retry, &mut last_applied);
+            apply_pass(
+                batch,
+                &cache,
+                health,
+                &mut retry,
+                &mut last_applied,
+                overflow,
+            );
             batch = Vec::new();
         }
         match retry.next_deadline() {
@@ -755,7 +772,14 @@ fn worker_loop(
         }
         if disconnected {
             if !batch.is_empty() {
-                apply_pass(batch, &cache, health, &mut retry, &mut last_applied);
+                apply_pass(
+                    batch,
+                    &cache,
+                    health,
+                    &mut retry,
+                    &mut last_applied,
+                    overflow,
+                );
             }
             break;
         }
@@ -765,7 +789,14 @@ fn worker_loop(
                 Err(_) => break,
             }
         }
-        apply_pass(batch, &cache, health, &mut retry, &mut last_applied);
+        apply_pass(
+            batch,
+            &cache,
+            health,
+            &mut retry,
+            &mut last_applied,
+            overflow,
+        );
     }
     // The SHUTDOWN DRAIN (the bot round-7 P1): a disconnect with
     // pending retries exited "clean" while the desired state was
@@ -782,7 +813,14 @@ fn worker_loop(
         .collect::<Vec<_>>();
     final_pass.extend(retry.take_all());
     if !final_pass.is_empty() {
-        apply_pass(final_pass, &cache, health, &mut retry, &mut last_applied);
+        apply_pass(
+            final_pass,
+            &cache,
+            health,
+            &mut retry,
+            &mut last_applied,
+            overflow,
+        );
         // A failure re-retained: the process is exiting — record
         // the un-drained state so the health surface tells the
         // truth on the way down.
