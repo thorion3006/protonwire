@@ -113,6 +113,10 @@ struct LaneState {
     // set, connect() refuses — an interloper cannot install a lane
     // the reconnecting owner would then clobber or leak.
     reconnecting: bool,
+    /// An ordinary disconnect's teardown window (the bot round-23 P2):
+    /// armed before the guard drop, cleared after the join — the lane
+    /// never looks free mid-teardown.
+    disconnecting: bool,
 }
 
 /// The lane's shared state: the pump must retire the lane when the
@@ -177,7 +181,7 @@ impl ConnectionLane {
         if self.draining.load(Ordering::SeqCst) {
             return Err(LaneRefusal::Draining.into());
         }
-        if lane.reconnecting {
+        if lane.reconnecting || lane.disconnecting {
             return Err(LaneRefusal::Reconnecting.into());
         }
         // Reconnect by the owner: tear the previous session down first
@@ -266,12 +270,22 @@ impl ConnectionLane {
         // NO JOIN UNDER THE LANE LOCK (the refactor pass's P1): take
         // the entry, clear the owner, DROP the guard, then join — the
         // pump's retire_lane parks on this mutex at engine death.
+        // The DISCONNECTING window is armed first (the bot round-23
+        // P2): the lane must not look free while the teardown runs —
+        // a concurrent connect hit a spurious setup failure (the old
+        // connection still owned the TUN), a concurrent drain
+        // returned without joining the pump.
+        lane.disconnecting = true;
         let active = lane.active.take();
         lane.owner = None;
         drop(lane);
         if let Some(active) = active {
             active.teardown();
         }
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .disconnecting = false;
         Ok(())
     }
 
@@ -291,7 +305,7 @@ impl ConnectionLane {
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if !lane.reconnecting {
+            if !lane.reconnecting && !lane.disconnecting {
                 break;
             }
             drop(lane);
