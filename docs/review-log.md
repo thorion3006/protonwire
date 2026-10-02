@@ -3443,3 +3443,27 @@ on within one cadence, not "indefinitely." A wakeup channel or an
 atomic drain protocol is real machinery; it is tracked for M5's
 route-commit lane, which is the consumer that must not sleep
 through a retained fatal.
+
+## 2026-10-02 — Round 22 on #13 (4 threads: 3 landed, 1 already satisfied)
+
+- **P1 (health recovery, dcc7734)**: a transient failure that fully
+  recovered never cleared last_failure — the sole health surface
+  read unhealthy forever, and the applied-counter inference is
+  unsafe while another key still retries. The success that EMPTIES
+  the retry lane clears the failure (note_recovered; pinned at the
+  unit seam + idempotence).
+- **P2 (new-dir parent sync)**: create_dir_all published a new cache
+  directory without syncing its PARENT — a crash could lose the
+  whole directory after durable-success reports. First-use open
+  parent-syncs; existing dirs no-op. Pinned.
+- **P2 (key temp unlink)**: a failed unlink of the nonce-named temp
+  after a successful hard_link was swallowed — the RAW master key
+  remained under the temp name indefinitely, surviving cache.key's
+  removal/rotation. Typed KeyFile error naming the temp path now.
+- **P2 (mkfifo NUL)**: already satisfied — 7fd485f (round 17's CI
+  root cause) landed the CString conversion BEFORE this comment was
+  posted; the sibling thread at the same timestamp was answered,
+  this one was missed and is answered now with the same evidence.
+
+Gates green on every tip after the bottom-up cascade (#13 → #15 →
+#16 → #17).
