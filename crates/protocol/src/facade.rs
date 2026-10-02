@@ -349,6 +349,13 @@ impl PersistentCache for PersistenceFacade {
             .sender
             .as_ref()
             .map(|sender| sender.try_send(op.clone()));
+        if matches!(send_result, Some(Err(mpsc::TrySendError::Disconnected(_)))) {
+            record_failure(
+                &self.health,
+                "the persistence worker is GONE (panicked?) — the in-memory value \
+                 may not survive restart",
+            );
+        }
         if matches!(send_result, Some(Err(mpsc::TrySendError::Full(_)))) {
             self.overflow(op);
             record_failure(
@@ -383,6 +390,13 @@ impl PersistentCache for PersistenceFacade {
             .sender
             .as_ref()
             .map(|sender| sender.try_send(op.clone()));
+        if matches!(send_result, Some(Err(mpsc::TrySendError::Disconnected(_)))) {
+            record_failure(
+                &self.health,
+                "the persistence worker is GONE (panicked?) — the in-memory value \
+                 may not survive restart",
+            );
+        }
         if matches!(send_result, Some(Err(mpsc::TrySendError::Full(_)))) {
             self.overflow(op);
             record_failure(
@@ -406,6 +420,13 @@ impl PersistentCache for PersistenceFacade {
             .sender
             .as_ref()
             .map(|sender| sender.try_send(op.clone()));
+        if matches!(send_result, Some(Err(mpsc::TrySendError::Disconnected(_)))) {
+            record_failure(
+                &self.health,
+                "the persistence worker is GONE (panicked?) — the in-memory value \
+                 may not survive restart",
+            );
+        }
         if matches!(send_result, Some(Err(mpsc::TrySendError::Full(_)))) {
             self.overflow(op);
             record_failure(
