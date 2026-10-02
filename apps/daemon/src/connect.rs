@@ -234,10 +234,27 @@ impl ConnectionLane {
         }
         lane.reconnecting = false;
         lane.owner = None;
-        let connection = self.engine.connect(
+        drop(lane);
+        let connection = match self.engine.connect(
             params,
             Box::new(SharedFacadeCache(Arc::clone(&self.facade))),
-        )?;
+        ) {
+            Ok(connection) => connection,
+            Err(error) => {
+                // The TERMINAL publish on the failure path (the bot
+                // round-29 P2): the previous lane is already torn
+                // down and the pump's None arm now intentionally
+                // publishes nothing — without this, the core could
+                // read Connected/Connecting forever with no active
+                // slot or TUN.
+                self.core.set_vpn_state(VpnState::Disconnected);
+                return Err(error.into());
+            }
+        };
+        let mut lane = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let slot: ConnectionSlot = Arc::new(Mutex::new(Some(connection)));
         let core = Arc::clone(&self.core);
         let pump_slot = Arc::clone(&slot);
@@ -389,16 +406,22 @@ fn pump_events(slot: &ConnectionSlot, lane: &std::sync::Weak<Mutex<LaneState>>, 
         });
         let event = match received {
             Some(Ok(event)) => {
+                // RECONCILE BEFORE PROCESSING (the bot round-29 P2):
+                // if the queue dropped a state, THIS dequeued item is
+                // pre-drop — arming the backlog and publishing the
+                // authoritative snapshot FIRST means the stale
+                // transition is suppressed here (its sequence was
+                // never spent on a misleading state).
+                if reconcile_drops(slot, core, &mut last, &mut dropped_watermark, &mut backlog) {
+                    terminate_on_fatal(slot, lane, core);
+                    break;
+                }
                 // A received event does NOT disarm the backlog (the
                 // bot round-16 P2): the queue may still hold PRE-DROP
-                // states behind this one — the first of them cleared
-                // the flag while the rest went on overwriting the
-                // reconciled core. The backlog stays armed until the
-                // queue is QUIET (the timeout arm's reconcile runs
-                // with an empty queue behind it); every quiet
-                // cadence re-reconciles in the meantime, so a stale
-                // queued state can be authoritative for at most one
-                // cadence — and never once the drain completes.
+                // states behind this one. The backlog stays armed until
+                // the queue is QUIET (the timeout arm's reconcile runs
+                // with an empty queue behind it); every quiet cadence
+                // re-reconciles in the meantime.
                 event
             }
             Some(Err(std::sync::mpsc::RecvTimeoutError::Timeout)) => {
