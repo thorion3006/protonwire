@@ -174,11 +174,21 @@ impl EncryptedCache {
         // even after try_put reported durable success (the later
         // writes sync only `dir` itself). An existing directory
         // needs nothing here (its parent entry is long durable).
-        let existed = dir.is_dir();
+        // EVERY newly created component syncs IN ITS OWN parent (the
+        // bot round-25 P2): the existed-boolean shape synced only
+        // the FINAL component's parent — a multi-component path
+        // could lose an earlier one, and with it the subtree. Same
+        // shape as the keyfile parent (collect, create, sync
+        // bottom-up).
+        let created = collect_new_components(dir);
         fs::create_dir_all(dir).map_err(|error| CacheError::Init(error.to_string()))?;
-        if !existed {
-            sync_parent_dir(dir)
-                .map_err(|error| CacheError::Init(format!("new cache dir parent: {error}")))?;
+        for component in created.iter().rev() {
+            sync_parent_dir(component).map_err(|error| {
+                CacheError::Init(format!(
+                    "new cache component {}: {error}",
+                    component.display()
+                ))
+            })?;
         }
         let cipher = XChaCha20Poly1305::new_from_slice(key.as_slice())
             .map_err(|error| CacheError::Init(error.to_string()))?;
