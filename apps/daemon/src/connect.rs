@@ -51,6 +51,10 @@ pub enum LaneRefusal {
     /// round-12 P2); retry.
     #[error("a reconnect is in progress; retry")]
     Reconnecting,
+    /// A disconnect is mid-teardown (the bot round-24 P2); retry —
+    /// the lane frees when the join completes.
+    #[error("a disconnect is in progress; retry")]
+    Disconnecting,
 }
 
 /// A failed connect: the typed refusal or the engine's own error.
