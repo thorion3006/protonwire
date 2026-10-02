@@ -1120,11 +1120,11 @@ impl protun::api::connection::EventCallback for EngineCallbacks {
                 };
                 if !accepted {
                     // A stale refusal (the bot round-24 P2): the
-                    /// ledger rejected it — the epoch it snapshotted
-                    /// predates the current request. Forwarding it
-                    /// anyway would let consumers attribute the
-                    /// PREVIOUS request's refusal to the new
-                    /// settings (they have no epoch). Suppressed.
+                    // ledger rejected it — the epoch it snapshotted
+                    // predates the current request. Forwarding it
+                    // anyway would let consumers attribute the
+                    // PREVIOUS request's refusal to the new
+                    // settings (they have no epoch). Suppressed.
                     continue;
                 }
             }
