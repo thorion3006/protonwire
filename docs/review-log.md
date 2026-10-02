@@ -3524,3 +3524,20 @@ Gates green at every level after the bottom-up cascade.
   refusals, and request_epoch() lets consumers filter queued ones.
 
 Gates green at every level after the cascade.
+
+## 2026-10-02 — Round 26 (#17 ×3, all landed)
+
+- The Disconnecting publish: an ordinary disconnect publishes
+  Disconnecting BEFORE the teardown and the terminal Disconnected
+  only after the join (GetState no longer reports no-tunnel while
+  the ProTUN thread and TUN still exist).
+- The typed window refusals: connect branches on the flags —
+  Reconnecting for the reconnect window, Disconnecting for the
+  disconnect window.
+- The named credential signal (disclosed): a retained
+  refresh_token_invalid ApiError surfaces at ERROR level naming the
+  reauthentication requirement — the M6 auth-recovery lane owns the
+  refresh (the recorded descope); the honest handoff this stack can
+  give.
+
+Gates green at every level.
