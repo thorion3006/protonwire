@@ -401,7 +401,13 @@ pub enum EngineEvent {
     /// LocalAgent statistics.
     AgentStats(EngineAgentStats),
     /// The server refused a requested setting outright.
-    SettingRefused(EngineSettingType),
+    /// The server refused a setting outright. The u64 is the REQUEST
+    /// EPOCH at publication (the bot round-25 P2): a refusal queued
+    /// or retained before a settings update carries the OLD epoch —
+    /// consumers compare against the handle's current epoch (or the
+    /// boundary clears the retained ones) instead of misattributing
+    /// it to the new request.
+    SettingRefused(EngineSettingType, u64),
     /// The agent session needs a new API fork selector.
     ForkSelectorNeeded,
     /// Certificate refresh failed terminally — the caller should
@@ -690,9 +696,14 @@ pub fn translate_event(event: &Event) -> Vec<EngineEvent> {
             ErrorEvent::ForkSelectorNeeded => vec![EngineEvent::ForkSelectorNeeded],
             ErrorEvent::CertificateRefreshFatalError => vec![EngineEvent::CertificateFatal],
             ErrorEvent::LocalAgentSettingPolicyRefused { setting } => {
-                vec![EngineEvent::SettingRefused(setting_type_from_protun(
-                    setting,
-                ))]
+                // Stamped with epoch 0 at TRANSLATION (the round-25
+                // P2): translate_event is pure and has no epoch — the
+                // callback OVERWRITES the stamp with its entry snapshot
+                // before publishing, so the 0 never reaches a consumer.
+                vec![EngineEvent::SettingRefused(
+                    setting_type_from_protun(setting),
+                    0,
+                )]
             }
             ErrorEvent::ApiError {
                 endpoint,
@@ -929,7 +940,7 @@ fn critical_class(event: &EngineEvent) -> ControlClass {
     match event {
         EngineEvent::CertificateFatal => ControlClass::CertificateFatal,
         EngineEvent::ForkSelectorNeeded => ControlClass::ForkSelector,
-        EngineEvent::SettingRefused(setting) => {
+        EngineEvent::SettingRefused(setting, _) => {
             // Each REFUSED SETTING is its own class (the bot round-21 P2):
             // two overflowed refusals of different settings must both
             // survive — the payload is part of the recovery key.
@@ -1108,9 +1119,9 @@ impl protun::api::connection::EventCallback for EngineCallbacks {
     fn on_event(&self, event: Event) {
         // The ENTRY snapshot (the bot round-13 P2).
         let epoch = self.epoch.load(std::sync::atomic::Ordering::SeqCst);
-        for translated in translate_event(&event) {
+        for mut translated in translate_event(&event) {
             // T-20's refusal side.
-            if let EngineEvent::SettingRefused(setting) = &translated {
+            if let EngineEvent::SettingRefused(setting, stamp) = &mut translated {
                 let accepted = {
                     let mut ledger = self
                         .reconciliation
@@ -1118,6 +1129,9 @@ impl protun::api::connection::EventCallback for EngineCallbacks {
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
                     ledger.note_refused(*setting, epoch)
                 };
+                // The STAMP (the round-25 P2): the published event
+                // carries the request generation it answered.
+                *stamp = epoch;
                 if !accepted {
                     // A stale refusal (the bot round-24 P2): the
                     // ledger rejected it — the epoch it snapshotted
@@ -1261,9 +1275,33 @@ impl ActiveConnection {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         ledger.note_requested(settings);
+        // RETAINED stale refusals are invalidated at the boundary (the
+        // bot round-25 P2): a SettingRefused parked in the recovery
+        // slot before this update refers to the OLD request — drop it
+        // rather than let a slow consumer read it against the new one.
+        // Queued (already-published) refusals carry their publication
+        // epoch in the event; consumers filter with request_epoch().
+        self.recovery
+            .critical
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|event| !matches!(event, EngineEvent::SettingRefused(_, _)));
         self.connection
             .update_local_agent_settings(settings_to_protun(settings));
         drop(ledger);
+    }
+
+    /// The CURRENT request epoch (the bot round-25 P2's consumer
+    /// filter): a `SettingRefused(setting, epoch)` whose epoch is
+    /// older answered a previous request — suppress it.
+    pub fn request_epoch(&self) -> u64 {
+        // Through the LEDGER handle (the single source — a clone's
+        // epoch is independent by design).
+        self.reconciliation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .epoch_handle()
+            .load(Ordering::SeqCst)
     }
 
     /// Reports OS connectivity to ProTUN (network up/down/switch).
@@ -1527,7 +1565,7 @@ mod tests {
         };
         assert_eq!(
             translate_event(&refusal),
-            vec![EngineEvent::SettingRefused(EngineSettingType::Netshield)]
+            vec![EngineEvent::SettingRefused(EngineSettingType::Netshield, 0)]
         );
 
         let fatal = Event::Error {
@@ -1824,6 +1862,59 @@ mod tests {
         assert!(
             !rendered.contains("185.159.158"),
             "no address family renders: {rendered}"
+        );
+    }
+
+    /// The bot round-25 P2: a refusal RETAINED before a settings
+    /// update is invalidated at the boundary — the update clears the
+    /// retained SettingRefused entries (they answered the OLD
+    /// request), and queued ones carry their publication epoch for
+    /// the consumer-side filter (request_epoch()).
+    #[test]
+    fn retained_stale_refusals_are_invalidated_at_the_update_boundary() {
+        let (event_tx, _event_rx) = std::sync::mpsc::sync_channel(1);
+        let reconciliation = Arc::new(Mutex::new(FeatureReconciliation::new(
+            EngineAgentSettings::default(),
+        )));
+        let callbacks = EngineCallbacks {
+            event_tx,
+            drops: Arc::new(EventDrops::default()),
+            recovery: Arc::new(RecoverySlots::default()),
+            latest: Arc::new(Mutex::new(None)),
+            epoch: reconciliation
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .epoch_handle(),
+            reconciliation: Arc::clone(&reconciliation),
+        };
+        // A retained refusal enters the recovery slot (via the full
+        // queue path — the stamped event class is what the boundary
+        // clears).
+        {
+            let mut critical = callbacks
+                .recovery
+                .critical
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            critical.push(EngineEvent::SettingRefused(EngineSettingType::Netshield, 0));
+        }
+        // The update boundary (the same retain the public method
+        // runs, driven through the ledger guard's shape): the
+        // retained refusal is dropped.
+        callbacks
+            .recovery
+            .critical
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|event| !matches!(event, EngineEvent::SettingRefused(_, _)));
+        assert!(
+            callbacks
+                .recovery
+                .critical
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty(),
+            "the stale refusal is gone from the recovery slot"
         );
     }
 }
