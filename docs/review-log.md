@@ -3506,3 +3506,21 @@ Gates green at every level after the cascade.
   mid-join) — typed Disconnecting, the reconnect symmetry.
 
 Gates green at every level after the bottom-up cascade.
+
+## 2026-10-02 — Round 25 (#13 ×2, #15 ×1, #16 ×1, all landed)
+
+- **#13 (f5d853c)**: a DISCONNECTED worker (panicked — alive
+  cleared only at worker_loop's normal end) accepted updates into
+  memory that reached no lane; all three mutators record the
+  terminal failure on Disconnected now. And with_key_bytes syncs
+  EVERY newly created cache component in its own parent (the
+  existed-boolean shape synced only the final one).
+- **#15 (a30792b)**: the prebuild's fail-loud guard, RESTORED — a
+  rebase had silently dropped the round-12 ExitStatus check (the
+  exact perl-no-match/rebase-loss class); a failed outside-namespace
+  build no longer retries inside the networkless one.
+- **#16 (69b9a26)**: SettingRefused carries its REQUEST EPOCH at
+  publication; the update boundary invalidates retained stale
+  refusals, and request_epoch() lets consumers filter queued ones.
+
+Gates green at every level after the cascade.
