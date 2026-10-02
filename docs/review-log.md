@@ -3565,3 +3565,16 @@ Gates green at every level.
   proven-empty queue disarms.
 
 Gates green at every level.
+
+## 2026-10-02 — Round 29 (#17 ×2, both landed)
+
+- The failed-owner-reconnect publishes the terminal Disconnected
+  (the previous lane is gone and the round-28 None arm publishes
+  nothing — the core would have read Connected forever with no
+  slot).
+- reconcile_drops runs at the TOP of the receive arm: the drop
+  watermark arms the backlog and publishes the authoritative
+  snapshot BEFORE a stale queued state reaches the suppression
+  check (one stale transition was still published first).
+
+Gates green at every level.
