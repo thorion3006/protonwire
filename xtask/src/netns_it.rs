@@ -100,10 +100,20 @@ pub(crate) fn run(root: &Path) -> Result<bool> {
     for (package, target) in GATED_TARGETS {
         build.args(["-p", package, "--test", target]);
     }
-    build
+    // FAIL-LOUD (the bot round-25 P2): a failed prebuild (fetch or
+    // compile) leaves Ok(ExitStatus) — `?` does not stop the runner,
+    // and it would retry the missing build inside the networkless
+    // namespace. The exit status is checked explicitly; a rebase had
+    // dropped this guard after round 12 added it.
+    let prebuilt = build
         .args(&cargo_args)
         .status()
         .with_context(|| "compiling the gated targets outside the namespace (registry access)")?;
+    if !prebuilt.success() {
+        return Err(anyhow::anyhow!(
+            "the gated-target prebuild failed outside the namespace ({prebuilt})"
+        ));
+    }
 
     let mut failures = Vec::new();
     for (package, target) in GATED_TARGETS {
