@@ -3487,3 +3487,22 @@ Gates green on every tip after the bottom-up cascade (#13 → #15 →
   indefinitely).
 
 Gates green at every level after the cascade.
+
+## 2026-10-02 — Round 24 (#13 ×2, #16 ×1, #17 ×1, all landed)
+
+- **#13 (81afd26)**: health recovery requires BOTH lanes empty —
+  the overflow lane held undurable credential updates while health
+  read green (and the producer's failure-recording could land after
+  the worker applied); apply_pass sees the overflow now, and the
+  check-AND-clear rides its lock. And every newly created
+  keyfile-parent component syncs in its own parent bottom-up (the
+  first-run shape could lose the whole state directory).
+- **#16 (044fa3c)**: stale refusals are suppressed at the FORWARD
+  site — note_refused returns acceptance, and the unaccepted event
+  never reaches consumers who have no epoch to attribute it with.
+- **#17 (445d787)**: a second disconnect refuses during another's
+  teardown window (the first took the lane with the lock down; the
+  second could "succeed" on the empty lane and clear the flag
+  mid-join) — typed Disconnecting, the reconnect symmetry.
+
+Gates green at every level after the bottom-up cascade.
