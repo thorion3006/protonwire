@@ -3578,3 +3578,12 @@ Gates green at every level.
   check (one stale transition was still published first).
 
 Gates green at every level.
+
+## 2026-10-02 — Round 30 (#17 ×1)
+
+- The reconnect window stays ARMED through engine.connect — it
+  clears only at the atomic install (active lane + owner + flag
+  under one guard) or on the failure arm's way out (with the
+  terminal publish). The mid-setup free-lane window is gone.
+
+Gates green at every level.
