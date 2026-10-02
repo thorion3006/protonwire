@@ -14,14 +14,25 @@ use zeroize::Zeroizing;
 use crate::ProtocolError;
 use crate::params::TunnelParams;
 
+/// Where the client's WireGuard key comes from (the engine's mode
+/// decides; `translate` alone cannot).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyPolicy {
+    /// The params must carry the key (agent-less mode: nothing else
+    /// reads one) — `None` refuses with `MissingKey`.
+    Required,
+    /// The key comes from the persistent cache (production
+    /// LocalAgent mode, FR-32A: ProTUN reads or generates it there);
+    /// `None` is legal and composes `NoLocalAgent { None }`, which
+    /// the engine then overrides with the LocalAgent mode.
+    FromCache,
+}
+
 /// Translates the connection request into ProTUN's config shape.
 ///
 /// # Errors
-/// * [`ProtocolError::MissingKey`] — `NoLocalAgent` mode (a
-///   non-Smart... any protocol) without a client private key: ProTUN
-///   would read one from the persistent cache, which PR-2 wires; the
-///   translation refuses the un-wired shape typed rather than
-///   letting the engine block on a cache that does not exist yet.
+/// * [`ProtocolError::MissingKey`] — a `Required` policy (the
+///   default [`translate`] form) without a client private key.
 /// * [`ProtocolError::InvalidKey`] — a malformed (non-base64, wrong
 ///   length) key: never trimmed, padded, or retried.
 /// * [`ProtocolError::InvalidPeer`] — a malformed peer key or entry
@@ -32,6 +43,15 @@ use crate::params::TunnelParams;
 ///   recheck: the pre-flight may have passed on a peer that
 ///   decoding then dropped).
 pub fn translate(params: &TunnelParams) -> Result<InitialConnectionConfig, ProtocolError> {
+    translate_with_policy(params, KeyPolicy::Required)
+}
+
+/// The policy-aware form the engine composes with (production
+/// LocalAgent connections run keyless params + the cache, FR-32A).
+pub fn translate_with_policy(
+    params: &TunnelParams,
+    key_policy: KeyPolicy,
+) -> Result<InitialConnectionConfig, ProtocolError> {
     // The dead-transport pre-flight AT the choke point (the gate
     // review's catch): every candidate lacking the requested
     // transport's ports is a connection cycle that cannot answer —
@@ -55,17 +75,21 @@ pub fn translate(params: &TunnelParams) -> Result<InitialConnectionConfig, Proto
         Some(key) => Some(decode_client_key(key.expose())?),
         None => None,
     };
-    // The connection mode is the SAME for every protocol in this
-    // milestone: no LocalAgent session engine exists yet (the M4
-    // PR-4 lane wires `ConnectionMode::LocalAgent`).
-    let connection_mode = match wg_private_key {
-        Some(key) => ConnectionMode::NoLocalAgent {
+    // The interim mode: the engine OVERRIDES this with the
+    // LocalAgent session for production (FR-32A, engine.rs) — the
+    // keyless shape is legal only under FromCache because that is
+    // the mode whose override the engine performs.
+    let connection_mode = match (wg_private_key, key_policy) {
+        (Some(key), _) => ConnectionMode::NoLocalAgent {
             wg_private_key: Some(key),
         },
-        None => {
+        (None, KeyPolicy::FromCache) => ConnectionMode::NoLocalAgent {
+            wg_private_key: None,
+        },
+        (None, KeyPolicy::Required) => {
             return Err(ProtocolError::MissingKey(
-                "the client private key is required until the LocalAgent lane wires the \
-                 persistent cache (PR-2/PR-4)"
+                "the client private key is required in agent-less mode (production \
+                 LocalAgent mode takes it from the persistent cache)"
                     .to_owned(),
             ));
         }
@@ -701,6 +725,33 @@ mod tests {
                 && !merged.tcp_ports.is_empty()
                 && merged.tls_ports.is_empty(),
             "the shared candidate carries exactly UDP+TCP"
+        );
+    }
+
+    /// The key policy (the rust gate's P2): production LocalAgent
+    /// connections run KEYLESS params — the cache holds the key
+    /// (FR-32A). `FromCache` accepts the keyless shape; `Required`
+    /// (the default translate form) keeps its typed refusal.
+    #[test]
+    fn key_policy_governs_the_keyless_shape() {
+        let mut keyless = params(vec![peer("uk-42", 1)]);
+        keyless.client_private_key = None;
+
+        let cache_mode = translate_with_policy(&keyless, KeyPolicy::FromCache)
+            .expect("the cache-sourced policy accepts keyless params");
+        assert!(
+            matches!(
+                cache_mode.connection_mode,
+                ConnectionMode::NoLocalAgent {
+                    wg_private_key: None
+                }
+            ),
+            "the engine's LocalAgent override replaces this interim mode"
+        );
+
+        assert!(
+            matches!(translate(&keyless), Err(ProtocolError::MissingKey(_))),
+            "the Required default still refuses the keyless shape"
         );
     }
 }
