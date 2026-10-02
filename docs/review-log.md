@@ -3467,3 +3467,23 @@ through a retained fatal.
 
 Gates green on every tip after the bottom-up cascade (#13 → #15 →
 #16 → #17).
+
+## 2026-10-02 — Round 23 (#16 ×2, #17 ×2, all landed)
+
+- **#16 (d7451fb)**: the protun-typed mapping helpers are
+  pub(crate) (their signatures expose the pinned upstream beta API
+  — the crate's boundary now holds mechanically); and round-16's
+  send-before-advance ordering was the race in REVERSE (a genuine
+  fast response wiped by the reset it answered): the ledger guard
+  now spans advance+send — update_local_agent_settings is a single
+  bounded channel POST (send_pvpn_message; no synchronous callback
+  round-trip), so the round-12 non-blocking concern does not apply,
+  and the straddle collapses to the one disclosed provenance limit.
+- **#17 (e0f9ad0)**: the ordinary disconnect's teardown window is
+  tracked (connect/drain can no longer see a free lane while the
+  old connection owns the TUN); and lane liveness is checked on
+  the RECEIVE path too (a dropped lane under a sustained event
+  stream never hit the timeout arm — the pump owned the session
+  indefinitely).
+
+Gates green at every level after the cascade.
