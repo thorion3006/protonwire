@@ -1111,11 +1111,22 @@ impl protun::api::connection::EventCallback for EngineCallbacks {
         for translated in translate_event(&event) {
             // T-20's refusal side.
             if let EngineEvent::SettingRefused(setting) = &translated {
-                let mut ledger = self
-                    .reconciliation
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                ledger.note_refused(*setting, epoch);
+                let accepted = {
+                    let mut ledger = self
+                        .reconciliation
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    ledger.note_refused(*setting, epoch)
+                };
+                if !accepted {
+                    // A stale refusal (the bot round-24 P2): the
+                    /// ledger rejected it — the epoch it snapshotted
+                    /// predates the current request. Forwarding it
+                    /// anyway would let consumers attribute the
+                    /// PREVIOUS request's refusal to the new
+                    /// settings (they have no epoch). Suppressed.
+                    continue;
+                }
             }
             self.forward(translated);
         }

@@ -167,15 +167,18 @@ impl FeatureReconciliation {
     /// (reconnects re-negotiate); the table names each setting once.
     /// `observed_epoch` is the callback's entry snapshot: a refusal
     /// queued before the request changed is discarded (the bot
-    /// round-13 P2).
-    pub fn note_refused(&mut self, setting: EngineSettingType, observed_epoch: u64) {
+    /// round-13 P2). Returns whether it was ACCEPTED (the bot
+    /// round-24 P2: the forward site suppresses a stale one instead
+    /// of publishing it to consumers who have no epoch).
+    pub fn note_refused(&mut self, setting: EngineSettingType, observed_epoch: u64) -> bool {
         let current = self.epoch.load(std::sync::atomic::Ordering::SeqCst);
         if observed_epoch != current {
-            return; // queued before the request changed
+            return false; // queued before the request changed
         }
         if !self.refused.contains(&setting) {
             self.refused.push(setting);
         }
+        true
     }
 
     /// The settings the server refused outright.
