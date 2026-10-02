@@ -266,6 +266,15 @@ impl ConnectionLane {
         if lane.reconnecting {
             return Err(LaneRefusal::Reconnecting);
         }
+        // A disconnect ALREADY IN ITS WINDOW refuses a second one (the
+        // bot round-24 P2): the first took the active lane and is
+        // joining its pump with the lock down — a second disconnect
+        // here would pass the (cleared) owner gate, observe an empty
+        // lane, "succeed", and CLEAR the window's flag while the
+        // first teardown still runs.
+        if lane.disconnecting {
+            return Err(LaneRefusal::Disconnecting);
+        }
         gate_owner(lane.owner, uid)?;
         // NO JOIN UNDER THE LANE LOCK (the refactor pass's P1): take
         // the entry, clear the owner, DROP the guard, then join — the
