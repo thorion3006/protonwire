@@ -2718,23 +2718,233 @@ key collision). The gate's PR-3 note recorded: the tun-contract
 prefixes are the PRD's /32//128, never pvpnclient's internal
 24/112 netstack values.
 
-## 2026-09-17 — PR#12 bot round 1 (M4 PR-1): the four findings
+## 2026-09-17 — M4 PR-2 (m4/encrypted-persistent-cache): the encrypted three-value store
 
-All verified GENUINE, fixed red-first at 7d799a7: (P1) FR-32G/ER-11
-transport constraint — constrain_transports clears the non-selected
-lists and omits non-serving peers (Smart keeps all); (P1) NFR-16A
-zeroizing key storage — ClientPrivateKey(Arc<Zeroizing<String>>),
-shared clones, two-layer Debug redaction, Zeroizing decode
-intermediate; (P2) the post-skip recheck — serves_translated over
-the DECODED survivors refuses Unavailable when the malformed peer
-was the only transport carrier; (P2) SNI strategy propagation —
-the engine-agnostic SniStrategy rides TunnelParams onto ProTUN's
-enum (pre-fix hard-coded Random). Protocol gains Default (Smart).
+Stacked on PR-1 (#12); opened as PR #13. The owner's key-source
+decision (a) implemented: the root-owned 0600 keyfile (refusing to
+re-key a wrong-size one), XChaCha20-Poly1305 over per-key files
+(zero new code — the AEAD rides the boringtun pin, lock-verified),
+tamper/wrong-key as absence, the 64 KiB budget both sides, the
+NullCache for hermetic lanes.
 
-Parallel-lane coordination, recorded: the identical hardening pass
-appeared UNCOMMITTED in the shared worktree mid-PR-2, was
-withdrawn, then re-derived independently against the bot threads
-here. The cache branch (PR #13) is the other lane's active surface
-(its c462b69 addresses the gate round there); the branches divide
-cleanly — PR-1 fixes on m4/params-translation, PR-2 fixes on
-m4/encrypted-persistent-cache, no shared files at this round.
+The combined rust+SEC gate FAILED first (the fix-verdict loop held):
+its P1s — the read-side unbounded allocation and the keyfile
+temp-window/residue (0644-then-chmod; failure-path .tmp leak) —
+plus its P2s (the Zeroizing windows incl. put's plaintext; the
+unique temp suffix; the honest with_key_bytes doc) and its four
+missing pins (oversize read, failure residue, nonce freshness,
+concurrent coherence) ALL landed in-commit at ff66372. Its P3s:
+the explicit threat-model sentence and the non-unix set_private
+note — tracked to the PR-3 lane's doc pass.
+
+Shared-worktree incident, honestly recorded: a parallel lane's
+uncommitted hardening pass on params.rs/translate.rs appeared in
+the working tree mid-build and was withdrawn by its owner mid-read
+(files changed between two reads); two orphaned import lines were
+the only residue, removed here. The interrupted first push left an
+identical-tree duplicate on the remote (d9c1f87), superseded by the
+amended ff66372 via force-with-lease over the identical base.
+
+## 2026-09-18 — M4 PR-2 (#13): the seven-finding bot round (the facade + the hardenings)
+
+The bot's round 1 on PR #13 (opened by the parallel lane at ff66372
+after the shared-worktree incident — its write-shape/read-cap/zeroize
+remediations and my c462b69 completion landed as one reviewed
+surface): SEVEN findings, all genuine, fixed at b6c6513.
+
+- **P1 the facade (FR-7JB/FR-32A, cited verbatim)**: synchronous
+  file I/O in the PersistentCache callbacks is prohibited on
+  ProTUN's connection thread. PersistenceFacade: preload at start,
+  get from the memory layer, put/remove/clear through a serialized
+  worker — the two-layer shape the PRD draws.
+- **P1 the health surface (FR-7J)**: PersistenceHealth (alive,
+  last_failure, applied_since_failure) — the daemon's poll target;
+  the trait callbacks stay infallible.
+- **P2 the keyfile race**: create_new on the FINAL path; the loser
+  reloads the winner's key (convergence pinned). Plus O_NOFOLLOW +
+  regular-file + mode validation on the reuse path (a pre-provisioned
+  symlink refuses typed), fsync + parent-dir sync before publication
+  (and my accidental 8-byte keyfile header removed — the raw 32
+  bytes under 0600 is the record), and the take()-bounded read
+  (TOCTOU closed).
+- **P2 AAD**: already at c462b69 (the bot reviewed the pre-fix
+  commit); the swap pin carries it.
+
+Process note, honestly recorded: the round was built in the
+DEDICATED worktree ../protonwire-cache after the parallel lane
+checked the MAIN checkout out to m4/params-translation mid-round —
+the memory's shared-worktree protocol held (no branch switches
+under the lane, no amends, pathspec commits, full disclosure in
+the commit message). The bot's TOCTOU/fsync/symlink findings were
+genuinely beyond my c462b69 pass — the round earned its keep.
+
+## 2026-09-30 — M4 PR-2 (#13) round 2: the seven hardening findings (rebased onto the lane's PR-12 round)
+
+The base conflict (the parallel lane's PR-12 round-1 at 55af2f3 —
+the ClientPrivateKey/SNI/transport-constraint hardening that had
+appeared-and-withdrew earlier) resolved by rebase (one manifest
+conflict, the review-log taken ours-then-appended). The round-2
+findings, all genuine, fixed at af1455a:
+
+- **P1 health propagation**: the worker used the infallible put —
+  failures were warned, never surfaced. try_put (the new fallible
+  pub(crate) path) records into the health slot and resets the
+  applied counter.
+- **P1 the draining shutdown**: Drop dropped the sender only after
+  drop() returned while joining — a DEADLOCK (the worker waits for
+  senders, the join waits for the worker); the sender now drops
+  first, then the join drains the queue. Pin:
+  drop_drains_the_queued_writes.
+- **P1 the bounded coalescing queue**: sync_channel(64) — a full
+  queue records the failure to health (pressure at the bound);
+  the worker batches and coalesces per key (last op wins;
+  ClearAll dominates). The coalescing claim is now code.
+- **P2 fsync on entries**: write_private sync_all + parent-dir
+  sync (power loss never publishes over unflushed bytes).
+- **P2 zeroizing facade memory**: Zeroizing<Vec<u8>> in the map.
+- **P2 the keyfile owner check**: descriptor uid == euid (nix's
+  safe geteuid — unsafe-free).
+- **P2 pre-encryption cap + Zeroizing-before-validation**: the
+  size cap refuses before ciphertext allocation; the keyfile read
+  wraps before any fallible check.
+
+Pins: the failed-write health recording (an unwritable target) and
+the drop-drain. 39 protocol tests. The curator pass ran in the
+background through the round (one dispatch-scope fix in /dream's
+command file; the meta-layer otherwise clean).
+
+## 2026-09-30 — M4 PR-2 (#13) round 3: the four durability findings
+
+All genuine, fixed at 85a7b20:
+
+- **P1 — destructive ops on a full queue**: remove/clear_all
+  silently discarded TrySendError::Full — a logout's clear emptied
+  memory while disk kept the credentials (resurrecting after
+  restart with no health failure). Both record the backpressure
+  failure like the put path.
+- **P2 — the atomic keyfile publish**: create_new published the
+  pathname before the bytes; a racing loser could reload a
+  half-written key. Now: unique temp (create_new + 0600 +
+  sync_all), then hard_link — an atomic no-replace publish; the
+  loser's EEXIST is against a COMPLETE file.
+- **P2 — the bounded keyfile read**: take(KEY_LEN + 1) — a
+  malformed huge keyfile cannot grow the buffer.
+- **P2 — the removal dir-sync**: remove_file syncs the parent —
+  a removal is durable when its directory entry is.
+
+Pins: the full-queue destructive-op recording (the stalled-write
+shape) and the publish completeness (no residue, 32 bytes,
+reload round-trip). 41 protocol tests.
+
+## 2026-09-30 — M4 PR-2 (#13) rounds 3+4: the durability ladder
+
+Round 3 (four findings at 85a7b20, amended into 475cfdd): the
+destructive-op backpressure (a full-queue remove/clear records —
+the logout-resurrection shape), the ATOMIC keyfile publish
+(temp-write + sync + hard_link; the loser's EEXIST is against a
+COMPLETE file), the bounded keyfile read (take KEY_LEN+1), and
+the removal dir-sync.
+
+Round 4 (seven findings at cd2cca1 — six fixed, one tracked):
+try_remove/try_clear_all (removal failures into health — the P1
+the round-2 put fix foreshadowed); the BOUNDED shutdown join (a
+joiner thread races recv_timeout(5s) — a stuck worker detaches
+with the loss reported, the daemon never blocks on shutdown);
+Zeroizing queue payloads; the PROPAGATED dir syncs (entry-rename,
+entry-removal, keyfile-publish — a discarded sync published a
+durability a crash can contradict); the cap before the facade
+clone. TRACKED: mlock — FR-7JB's locked-memory facade is a
+process-wide property (mlockall/RLIMIT_MEMLOCK) owned at daemon
+startup; the PR-5 lane wires it and brings the pin.
+
+A pin-discipline note: the round-3 destructive-op pin was
+de-raced at 10b9283 (a coalesced op can succeed after the
+failure records — the counter assertion moved to the round-2 pin
+that owns it). The ipc bind-socket test flaked ONCE under
+parallel workspace load (3/3 green isolated; the diff touches
+only crates/protocol) — watched, not dismissed.
+
+## 2026-09-30 — M4 PR-2 (#13) round 5: the off-by-overhead
+
+One P2, genuine, fixed at 5d226eb: the plaintext cap did not
+account for the 48-byte serialization overhead (magic + version +
+nonce + tag) — a 65,489..=65,536-byte plaintext passed both
+layers, encrypted, then the FILE check rejected the +48 result:
+the facade had accepted what persistence would drop, and the value
+vanished after restart. MAX_PLAINTEXT_LEN (file cap − 48) is now
+the ONE bound both layers refuse at. Pin: the at-the-bound
+round-trip.
+
+The M4 stack stands: #12 (the parallel lane's round 2 in flight)
+→ #13 (five bot rounds deep, 8/8 CI, MERGEABLE, 0 unresolved —
+19 findings: 17 fixed, AAD already-satisfied, mlock tracked to
+the PR-5 daemon lane).
+
+## 2026-09-30 — M4 PR-2 (#13) round 6: the retry lane (ER-18) + the sweep
+
+Seven findings, all genuine, fixed at 8665a09:
+
+- **P1 — the BOUNDED RETRY LANE (ER-18 verbatim)**: the worker
+  retains a failed op's LATEST desired state per key and re-applies
+  with a doubling backoff (250ms → 30s cap); success clears the
+  entry and resets the ladder. Pin: the block-fail-UNBLOCK
+  convergence with no new op. This was the round the PRD itself
+  had been waiting for — ER-18's exact sentence.
+- **P1 — the clear sweeps ALL**: try_clear_all attempts every
+  entry, the first failure returned AFTER the sweep.
+- **P2s**: the NotFound arm resyncs the parent (the retry-after-
+  failed-sync window); read_keyfile's success path resyncs the
+  keyfile's parent (the publish-failed-sync window); the facade
+  cap's early return scrubs (Zeroizing from entry); both temp-name
+  sites carry the full 192-bit nonce (the 16-bit collision that
+  could delete the winner's temp).
+
+Pins: the retry convergence and the sweep. 44 protocol tests.
+The ipc bind flake recurred under full parallel load (5/5 isolated;
+tracked for the ipc lane).
+
+## 2026-09-30 — M4 PR-2 (#13) round 7: the retry lane's own review
+
+Three P1s, all refinements of round 6's ER-18 lane, fixed at
+e17f456: the clear EXPANDS per-key in the lane (the latest-desired-
+state model — a successful clear cancels a stale put, a newer put
+supersedes a pending clear; the synthetic "" name gone); ready
+retries build the batch's FRONT (the coalescer's keep-last gives
+the newest state the win); and the SHUTDOWN DRAIN (one final
+take_all pass regardless of deadline, the shared apply_pass, a
+still-failing lane recorded). Pins: both expansion directions and
+the drop-with-pending-retry convergence. 47 protocol tests.
+
+The cache PR's review arc (rounds 1-7, 33 findings: 30 fixed, AAD
+already-satisfied, mlock tracked to the daemon lane, one ipc flake
+tracked) mirrors the M3 PR #9 pattern exactly — each fix's exposed
+edge becoming the next round's finding, the severity bar holding
+(P1s now, mlock tracked), the pins earning their keep (round 7's
+drain pin caught nothing this time but the round-6 pin caught its
+own race at 10b9283). The lane discipline: fix, pin, reply with
+evidence, resolve, record.
+
+## 2026-09-30 — M4 PR-2 (#13) round 8: the lane's success paths
+
+Three P1s — the retry lane's SUCCESS paths were the blind spot —
+fixed at 56b5488: a successful ClearAll now wipes the whole lane
+(the empty-name marker matched nothing; a stale put survived a
+successful logout-clear); the disconnect break applies the ready
+batch before exiting (take_ready's pulled ops were lost in the
+window); and the OVERFLOW lane carries ops the full queue refused
+— the newest desired state reaches the worker when the disk drains
+(the stale-restart shape), through a shared bounded lane drained
+into every batch's tail and the shutdown drain. Pins: the
+clear-wipe and the overflow convergence. 49 protocol tests.
+
+## 2026-09-30 — M4 PR-2 (#13) round 9: the cross-lane ordering guard
+
+One P1, genuine, fixed at 8d58901: the queue and the overflow are
+two lanes with no shared order — the newest overflow op could
+apply, then the stale queued batch overwrite it (memory and disk
+diverging with NO failure recorded). Every op now carries the
+facade's send-time sequence; the worker keeps a per-key
+last-applied watermark (advancing only on durable success) and
+skips any op not newer. ClearAll checks/advances all three
+watermarks; the retry lane retains sequences. Pin: the
+stale-queued-op skip. 50 protocol tests.
