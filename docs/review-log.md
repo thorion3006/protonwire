@@ -3541,3 +3541,11 @@ Gates green at every level after the cascade.
   give.
 
 Gates green at every level.
+
+## 2026-10-02 — Round 27 (#17 ×1)
+
+- The idempotent empty-lane disconnect: the round-26 publish was
+  unconditional — a repeated disconnect on an empty lane churned
+  Disconnecting→Disconnected (two misleading events, a sequence
+  advance). The teardown states publish only when an active lane was
+  taken.
