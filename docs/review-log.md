@@ -3064,3 +3064,526 @@ targets, xtask all PASS, netns-it 7/7. Carried: PR-5 wraps the
 facade as the cache box (Arc-forwarding adapter); the IT logger
 gains the redaction pre-filter when an agent-mode IT appears;
 mlock stays PR-5's daemon lane.
+
+## 2026-09-30 — M4 PR-5 (m4/connect-surface): the daemon lane + THE M4 EXIT TEST
+
+The stack's final element, six commits on m4/connection-engine:
+SharedFacadeCache, the ConnectionLane, ipc deadline+§9.5 flags, the
+M4 exit test, the fix round.
+
+**THE M4 EXIT TEST IS GREEN** (the milestone's §18 criterion):
+connect/disconnect lifecycle in the netns against a MOCKED WireGuard
+peer — a real boringtun StdTunn (in-graph via pvpnclient) answering
+handshakes on loopback. Engine compose → handshake → Connected{the
+deterministic peer, transport, port} → stats pull answered → mark
+health held → disconnect → the TUN dies. The test FORCED the harness
+fix that unblocked it: a fresh netns starts with lo DOWN (the client's
+handshakes vanished; a plain-UDP probe returned NetworkUnreachable) —
+the gate shim now brings lo up. That fix CORRECTED a wrong recorded
+pin: IT-14's 'EMPTY Connecting peer list' was an unreachable-network
+artifact, not a protun surface property; with lo up protun v2.2.1
+POPULATES the ids and the pin now asserts our peer's id (the
+supersession of the PR-4-recorded pin, per the gate's R8).
+
+What else landed: SharedFacadeCache (the process-wide facade rides
+ProTUN's per-connection Box without dying with it — pinned); the
+ConnectionLane (owner-gated connect/disconnect, active_owner_uid,
+the bounded-cadence event pump into core's sequenced set_vpn_state,
+drain); ipc's deadline module + the pub timeout; the CLI §9.5
+entry/exit flags (scoped to secure-core, pinned); proton-boringtun
+as a dev-dep (in-graph crate, but its std feature admits nix 0.25.1
+into the committed lock — dev-only, disclosed).
+
+Gates: combined rust+SEC — RUST FAIL (P1: the pump's blocking recv
+under the slot mutex — MY earlier fix had silently failed to apply
+and the gate caught the live code; plus the phantom-owner P2 and the
+stranded-terminal-state P2 — ALL landed in the fix round), SEC PASS
+(2×P2 latent-on-wiring, both closed by the same fix round; the owner
+gate has no bypass; the test key cannot leak; the shim has no
+injection surface).
+
+DESCOPED FROM THE PLAN ENTRY, recorded per the standing rule (the
+gate's R4): (1) the ipc Connect/Disconnect WIRING onto the lane —
+the daemon's Connect arm still refuses NotImplemented until the
+M6 composition lane lands (the lane is constructed, tested, and
+waiting for its consumer; wiring it through core's request
+dispatch + TunnelParams assembly from the selection winner is the
+M6 connect-composition item's first slice); (2) the r21 THREE
+provider-cell installs — the production install needs the api
+lane's session-mint helper (MuonAuth::mint_session over the shared
+client/store/key; MuonCatalog/MuonEntitlements per the S8/S10
+builder pattern) and that is M2-lane architecture, not a daemon
+one-liner — carried with this precise pointer; (3) mlock (PR-2's
+track) — process-wide, belongs with the daemon's privilege setup in
+the M6 lane. Netns suite: 8/8 gated green.
+
+## 2026-10-01 — The CI fix round across the stack (doc/fmt/test)
+
+The owner's "first fix the ci failures" pass, three root causes:
+
+- **doc FAIL on #15/#16/#17** — the netns module doc's `[`gate`]`
+  link does not resolve from `//!` docs (rustdoc resolves those
+  against the parent scope); fixed at the origin (#15) with the
+  crate-qualified path. Lesson re-learned the hard way: the M3
+  record itself says "cargo doc is a local gate" (r11) — it was not
+  run on the M4 PR branches before pushing. It is now in the local
+  gate set for every push (the exact CI command:
+  RUSTDOCFLAGS="--document-private-items -D warnings" cargo doc
+  --no-deps).
+- **fmt FAIL on #17** — the gate fix round was committed without
+  the fmt pass. fmt is in the pre-push set again (it had been).
+- **test FAIL on #15/#16 — a REAL BUG, not a flake**: the overflow
+  lane could not wake an IDLE worker (the idle wait was a blocking
+  recv; overflow fills exactly when the queue is full, so nothing
+  could wake it) — the newest desired state could sit undrained
+  until the next queue op or shutdown, breaking the round-8
+  guarantee in the idle case. The round-9 pin had passed only by
+  losing a startup race to the worker; CI's scheduling flipped it.
+  Fixed at the origin (#13): the idle wait polls on OVERFLOW_POLL
+  (250 ms), plus a deterministic pin that parks the worker FIRST
+  and asserts the drain (8/8 stable). Cascaded rebases through
+  #15→#16→#17, force-with-lease, full local gates re-verified at
+  every level.
+
+End state: #12 8/8, #13 8/8, #15/#16/#17 9/9 — every job green,
+netns-it EXECUTING on all three new PRs (25-38 s runs, not the
+disclosed skip; the M4-era track item closes).
+
+## 2026-10-01 — The bot round across the M4 stack (21 threads) + the five refactor passes
+
+The owner's "address the comments, and don't forget to run the
+refactor agents on each pr" round. 21 unresolved findings
+(#12×2, #13×4, #15×5, #16×7, #17×3) — EVERY one verified genuine
+and landed; then a refactor pass PER PR (the standing rule), all
+five findings-sets landed too.
+
+The P1s: per-transport entry addresses (#12 — the parallel lane's
+round-2 WIP taken over disclosed and completed: TransportEndpoint,
+per-address candidate expansion with the /{n} contract, redacting
+Debug); the retry lane's newest-pending + the per-key clear (#13 —
+retain is newest-wins, note_success takes the applied seq, apply_pass
+expands every ClearAll into per-key Removes; the whole-bucket
+try_clear_all arm is inert); mark health publish-after-outcome +
+the CONSUMING into_stream_info (#15); update_peers' key policy +
+update_tun consuming the handle (#16); and #17's round introduced
+its own P1 caught by its refactor pass — the retire_lane lock
+cycle (join under the lane mutex vs the pump's retirement) — fixed
+with guard-free joins, the split terminal arm, and the ptr_eq read.
+
+The refactor passes (one per PR, read-only, findings landed in
+sequenced commits): #12 (redaction moved onto the endpoint type;
+the /{n} contract documented at PeerParams::id; the partial-merge
+pin), #13 (Op::expand_per_key — THE expansion; ALL_KEYS/name_for;
+the inert arm; clear_all's single-op shape), #15 (relinquish()
+holds the forget ONCE behind twin panic pins; the marks leaf fns
+hoisted with ensure_socket renamed; the arch guard flipped to the
+denylist matching its comment), #16 (the recovery-slot pins FIRST;
+requested() single-sourced on the ledger; EngineMode::key_policy();
+the poison unification), #17 (the P1 above; the retained-critical
+drain on the quiet path; the watermark-gated reconcile).
+
+Deferred with triggers: the FIFO pin's nix::unistd::mkfifo helper;
+the OverflowRecord merge; the reconcile double-enumeration
+unification; the generation token + trait seam + the gated
+daemon-lane IT (required-before-M6-wiring — no test executes
+ConnectionLane::disconnect, which is why no gate caught the
+deadlock); finding 8's Connecting-arm invalidation (behavior,
+owner's call).
+
+Gates at every level: fmt/clippy/test/doc clean, netns-it green
+(the M4 exit test survives every rebase). Replies+resolves posted
+per-thread with the commit references.
+
+## 2026-10-01 — Round 11: the bots re-review the fixes (13 threads, 2 stale, 11 landed)
+
+The bots re-reviewed the pushed fix commits. Two STALE (already
+satisfied at tip, challenged with the commit refs): #12's
+TransportEndpoint Debug (the refactor pass landed the redacting
+manual impl before that review) and #17's lock-cycle P1 (eb2feb8).
+Eleven GENUINE, all landed bottom-up:
+
+- **#13 (8c29826 + 8cbe2e7)**: the P1's two halves — the coalescer
+  keeps the MAX-sequence op per key (ClearAll dominates only
+  smaller sequences) AND the overflow lane's replace is
+  seq-guarded newest-wins. Honest note: my first patch fixed only
+  the coalescer half; the pin REPRODUCED the miss through the
+  overflow half (the replace had already evicted seq 2 before the
+  worker ran) and forced the second arm — the pin did its job.
+  Plus the keyfile-parent P2 (first-run creates the parent).
+- **#15 (281b1ff)**: healthy() reads reported FIRST — the callback's
+  program order (failure latch THEN report) makes the load order
+  the snapshot; the old order could return true with a known
+  failure. Plus the runner builds every gated target OUTSIDE the
+  namespace first (a fresh checkout has no registry inside lo-only
+  netns).
+- **#16 (ae559d6)**: five freshness fixes — the Connecting arm
+  invalidates the ledger (the refactor pass's finding-8 owner's
+  call, settled by the bot's evidence); note_unconfirmed
+  supersedes refusals (one negotiation's answers, not forever); a
+  retained CertificateFatal is never displaced by a later
+  non-terminal critical; independent WireGuard/Agent stat slots
+  (LatestStatsSnapshot) that update on SUCCESS too; the
+  latest_state snapshot is an Arc (reader deep-clones OUTSIDE the
+  mutex — FR-32D holds against readers now).
+
+Gates at every level: fmt/clippy/test/doc clean, netns-it green.
+Process note: the pipe-gate (`cargo clippy | tail -1`) masked a
+-D-warnings error twice this session — clippy now runs unpiped or
+with explicit error grep before any push.
+
+## 2026-10-01 — Round 12: the re-review of the fixes (8 threads, all genuine, all landed)
+
+- **#13 (5b88160 + a3bed59)**: the two P1s — next_seq now runs
+  INSIDE the memory-lock critical section in all three mutators
+  (put/remove/clear_all: the value and its sequence are one atomic
+  transition; the worker can never persist an older value than
+  memory serves — pinned with a two-writer hammer converging
+  durable==served), and the coalescer retains the MAX-sequence
+  ClearAll itself (a stale clear entering later could otherwise be
+  the retained one and its removals watermark-skipped — pinned).
+- **#15 (b08c054)**: the in-flight P1 — MarkHealth tracks callbacks
+  currently inside the applier; healthy() requires in-flight == 0
+  (after one success the latch stays green while a later mark is
+  still in flight). Pinned with a barrier-synchronized blocking
+  applier. Plus the prebuild cwd P2 (root + fail-loud).
+- **#16 (97df6da)**: forward() mirrors the stat into its recovery
+  slot BEFORE the queue send (publication order = the contract);
+  update_agent_settings drops the reconciliation guard before the
+  ProTUN call (FR-32D covers our own locks).
+- **#17 (3a6f5af)**: the reconnect window is serialized (a
+  reconnecting flag refuses interlopers while the lock is down for
+  teardown+join); the recovered CertificateFatal now runs the same
+  terminate_on_fatal teardown as a delivered one.
+
+Gates at every level green (fmt/clippy/test/netns-it/doc). The
+bots' quality held through three rounds — each one caught real
+fresh evidence against the PREVIOUS fix, exactly the adversarial
+depth the process wants.
+
+## 2026-10-01 — Round 13 (5 threads, all genuine, all landed)
+
+- **#13 (66145a0)**: a relative key path's EMPTY parent (not None)
+  syncs as the current directory — File::open("") no longer ENOENTs
+  the resync after a successful publish. Pinned with a chdir'd
+  open + round-trip.
+- **#15 (0474fab)**: MarkHealth is ONE atomic word
+  (reported<<2 | in_flight<<1 | failed): admission, completion,
+  and the latch are each ONE RMW and healthy()'s single load has no
+  interleave window at all (the round-12 separate-atomics shape
+  could go green between loads while a mark was in flight).
+- **#16 (b12c24c)**: the ledger carries a shared request EPOCH —
+  callbacks snapshot at entry, answers predating a settings change
+  are discarded (the stale-refusal/false-clean race); pinned.
+  update_tun tracks the replacement's interface name (necessarily
+  differently named under IFF_TUN_EXCL).
+- **#17 (3f93979)**: the reconnect window rechecks the draining
+  flag after re-acquiring — a racing shutdown can no longer let a
+  reconnect install a tunnel outside the controlled teardown.
+
+Gates green at every level. Three consecutive fix→re-review rounds
+(11, 12, 13) with real fresh evidence each time — the loop is
+converging (13 threads → 8 → 5, each round shallower than the
+last).
+
+## 2026-10-01 — Round 14 (5 threads, all genuine, all landed)
+
+- **#15 (282120a)**: in-flight is a COUNT (bits 1..14) — two
+  overlapping callbacks no longer collide on one bit (the first
+  completion cleared the second's admission; the second's subtract
+  borrowed into the neighboring fields); pinned with two
+  barrier-synchronized overlapping callbacks. The CHECK-TO-ACT
+  window is disclosed on healthy() as the contract (a check is not
+  a reservation; the commit-side lock belongs to M5's route-commit
+  lane — tracked). MIPS R6 joins the arch denylist
+  (mips32r6/mips64r6).
+- **#17 (3bfa867 + 3f93979)**: the round-13 reconnecting flag was
+  NEVER SET — checked and reset only, the interloper exclusion did
+  not exist (my round-13 perl silently failed to match; the
+  perl-no-match lesson strikes again, now twice in one session).
+  The window is armed at the guard drop. The stale-backlog
+  reconcile: a drop ARMS a backlog mode; every quiet cadence
+  re-reconciles the core onto latest_state while stale pre-drop
+  events drain, and only a FRESH push clears it.
+
+Gates green at every level. The convergence continues: 13 → 8 → 5 →
+5 (round 14's count held — but three of the five were fresh
+evidence against my own round-13 fixes, which is the loop working,
+not stalling).
+
+## 2026-10-01 — Round 15 (3 threads on #16 + the CI flake root-caused)
+
+- **#13 (41ec3b6, the CI flake + the artifact)**: the relative-key
+  pin's first draft chdir'd the PROCESS — the only new global state,
+  racing every parallel test (the FIFO pin's CI NotFound), and its
+  try_put ran after the CWD restore, writing a randomized
+  certificate.bin into the crate dir (the bot's tracked-file dirt).
+  The pin is hermetic now (the empty-parent sync tested directly, no
+  chdir, no cache at a relative path); the artifact is removed.
+- **#16 (65f51a4)**: the snapshot Clone is manual — a snapshot owns
+  an INDEPENDENT epoch (mutating a returned snapshot can no longer
+  advance the live ledger's generation and discard a legitimate
+  in-flight callback); pinned. The response-provenance residual is
+  DISCLOSED (a response generated for the old request that enters
+  after the update is misattributed; closing it needs request/
+  response correlation ProTUN does not expose — documented on the
+  epoch field, tracked to M6).
+
+Gates green at every level.
+
+## 2026-10-01 — Round 16 (2 threads on #17 + the CI propagation)
+
+- **#17 (7aeca01)**: the backlog disarms only on a QUIET queue —
+  receiving an event must NOT disarm (older states may sit behind
+  it); each loop-bottom reconcile re-publishes latest_state, so a
+  stale queued state is authoritative for at most one cadence, and
+  the timeout arm's emptiness proves the drain before disarming.
+- **#16 (6f9f7f8)**: update_agent_settings sends FIRST and advances
+  the epoch SECOND — a callback entering the send→advance gap
+  snapshots the OLD epoch and is discarded (fail-closed), closing
+  the round-15 ordering window the bot re-derived; the provenance
+  residual stays disclosed.
+- **#15 (dda7865)**: the hermetic relative-key pin propagated from
+  #13 — the CI FIFO flake's root cause is gone from every tip.
+
+Gates green at every level.
+
+## 2026-10-01 — Round 17 + the CI root causes
+
+- **#13 (7fd485f)**: the FIFO test's CI flake was a real
+  memory-safety bug in the TEST — libc::mkfifo received
+  OsStr::as_bytes() without a NUL terminator (UB; read past the
+  buffer). Locally the next byte happened to be zero; on CI it
+  created a garbage-named file and the probe's open of the real
+  path got NotFound. Both sites build a CString now (the entry
+  site's return asserted too).
+- **#17 (a557ecb)**: the lockfile's nix 0.25.1 entry (the disclosed
+  S7 dependency) was dropped by the conflicted stash resolution —
+  every --locked job refused. Regenerated and verified with
+  cargo metadata --locked.
+- **#16 (64a0843)**: synthetic candidate IDs map back to caller IDs
+  at the state mirror (stable_peer_id strips the all-digit /{n}
+  suffix; real ids with slashes pass through); pinned.
+
+Gates green at every level after each fix.
+
+## 2026-10-01 — Round 18 (4 threads, all genuine, all landed)
+
+- **#16 (8bfe71d)**: the stable-id normalization covers EVERY
+  state variant (Connecting's peer_ids, ConnectingToAgent's
+  peer_id — the round-17 fix only covered Connected); and
+  EnginePeerRef/EngineAgentInfo get manual redacting Debug impls
+  (SEC-5/FR-121 — diagnostics can no longer write entry/exit
+  addresses; pinned).
+- **#17 (8b2f852)**: the pump holds a WEAK lane reference — the
+  strong Arc formed an ownership cycle (a ConnectionLane dropped
+  without drain() leaked the ProTUN session/TUN forever: nothing
+  could take the connection, ActiveConnection::drop never ran).
+  And ForkSelectorNeeded — delivered OR retained — is surfaced with
+  the engine-contract obligation named, routed to the M6
+  Muon-refresh lane (silently discarding it was the bug).
+
+Gates green at every level.
+
+## 2026-10-01 — Round 19 (3 threads, all genuine, all landed)
+
+- **#16 (9244b19)**: per-class control retention — the single
+  critical slot let a retained ForkSelectorNeeded be overwritten by
+  a later ApiError/SettingRefused; the store is a per-CLASS Vec
+  (fatal never displaced, take_critical_events drains with the
+  fatal last), and retained controls count on their OWN counter
+  (controls_retained()) — dropped_states() stays the pure
+  wedged-consumer alarm.
+- **#17 (fc24de6)**: the pump EXITS when the weak lane can no
+  longer upgrade — the lane's drop IS the teardown, so the pump
+  takes its slot with it: ActiveConnection::drop runs and the
+  ProTUN session/TUN die with the lane (the Weak alone left the
+  strong pump→slot→connection chain leaking).
+
+Gates green at every level. Branch-hygiene note: the engine-side
+change briefly landed on #17's branch; moved to #16 (9244b19) and
+the stack rebased — each PR's diff is its own again.
+
+## 2026-10-01 — Round 20 (2 threads, both genuine, both landed)
+
+- **#16 (836bc72)**: the credential-invalid signal is its own
+  retention class — an auth error with refresh_token_invalid=true
+  can no longer be displaced by a later ordinary refresh error
+  (the recovering consumer must learn reauthentication is
+  required).
+- **#17 (f5e49a4)**: disconnect honors the reconnect window — the
+  temporarily-cleared owner could admit a disconnect that
+  "succeeded" on the empty lane while the in-flight reconnect went
+  on to install a tunnel after it. Typed refusal (Reconnecting)
+  for the window's duration.
+
+Gates green at every level. The rounds keep shallowing (13 → 8 →
+5 → 5 → 5 → 3 → 3 → 2) — the loop is converging.
+
+## 2026-10-01 — Round 21 (5 threads, all genuine, all landed)
+
+- **#16 (09a2b67)**: each refused SETTING is its own recovery class
+  (the payload is the key — two overflowed refusals of different
+  settings both survive).
+- **#17 (f2c21ea)**: the pump's quiet cadence checks the lane
+  upgrade itself — a lane dropped without drain() now kills the
+  HEALTHY pump too (takes the connection, disconnects, exits); the
+  round-19 Weak only exited on terminal. drain() waits out the
+  reconnecting window (the blocking-shutdown contract). The
+  fork-selector disclosure is uniform on both paths: no provider is
+  wired in this stack; the Muon-refresh provision is M6's (the
+  recorded descope), and fabricating a refresh path with no session
+  store would be dishonest.
+
+The publication-gap race (#16's round-21 second finding) is
+DEFERRED with analysis: the window is between try_send(Full) and
+the slot store — milliseconds, and the consumer's recovery loop
+already polls take_critical_events() on every quiet cadence (the
+pump reconciles on the same 200ms), so the retained fatal is acted
+on within one cadence, not "indefinitely." A wakeup channel or an
+atomic drain protocol is real machinery; it is tracked for M5's
+route-commit lane, which is the consumer that must not sleep
+through a retained fatal.
+
+## 2026-10-02 — Round 22 on #13 (4 threads: 3 landed, 1 already satisfied)
+
+- **P1 (health recovery, dcc7734)**: a transient failure that fully
+  recovered never cleared last_failure — the sole health surface
+  read unhealthy forever, and the applied-counter inference is
+  unsafe while another key still retries. The success that EMPTIES
+  the retry lane clears the failure (note_recovered; pinned at the
+  unit seam + idempotence).
+- **P2 (new-dir parent sync)**: create_dir_all published a new cache
+  directory without syncing its PARENT — a crash could lose the
+  whole directory after durable-success reports. First-use open
+  parent-syncs; existing dirs no-op. Pinned.
+- **P2 (key temp unlink)**: a failed unlink of the nonce-named temp
+  after a successful hard_link was swallowed — the RAW master key
+  remained under the temp name indefinitely, surviving cache.key's
+  removal/rotation. Typed KeyFile error naming the temp path now.
+- **P2 (mkfifo NUL)**: already satisfied — 7fd485f (round 17's CI
+  root cause) landed the CString conversion BEFORE this comment was
+  posted; the sibling thread at the same timestamp was answered,
+  this one was missed and is answered now with the same evidence.
+
+Gates green on every tip after the bottom-up cascade (#13 → #15 →
+#16 → #17).
+
+## 2026-10-02 — Round 23 (#16 ×2, #17 ×2, all landed)
+
+- **#16 (d7451fb)**: the protun-typed mapping helpers are
+  pub(crate) (their signatures expose the pinned upstream beta API
+  — the crate's boundary now holds mechanically); and round-16's
+  send-before-advance ordering was the race in REVERSE (a genuine
+  fast response wiped by the reset it answered): the ledger guard
+  now spans advance+send — update_local_agent_settings is a single
+  bounded channel POST (send_pvpn_message; no synchronous callback
+  round-trip), so the round-12 non-blocking concern does not apply,
+  and the straddle collapses to the one disclosed provenance limit.
+- **#17 (e0f9ad0)**: the ordinary disconnect's teardown window is
+  tracked (connect/drain can no longer see a free lane while the
+  old connection owns the TUN); and lane liveness is checked on
+  the RECEIVE path too (a dropped lane under a sustained event
+  stream never hit the timeout arm — the pump owned the session
+  indefinitely).
+
+Gates green at every level after the cascade.
+
+## 2026-10-02 — Round 24 (#13 ×2, #16 ×1, #17 ×1, all landed)
+
+- **#13 (81afd26)**: health recovery requires BOTH lanes empty —
+  the overflow lane held undurable credential updates while health
+  read green (and the producer's failure-recording could land after
+  the worker applied); apply_pass sees the overflow now, and the
+  check-AND-clear rides its lock. And every newly created
+  keyfile-parent component syncs in its own parent bottom-up (the
+  first-run shape could lose the whole state directory).
+- **#16 (044fa3c)**: stale refusals are suppressed at the FORWARD
+  site — note_refused returns acceptance, and the unaccepted event
+  never reaches consumers who have no epoch to attribute it with.
+- **#17 (445d787)**: a second disconnect refuses during another's
+  teardown window (the first took the lane with the lock down; the
+  second could "succeed" on the empty lane and clear the flag
+  mid-join) — typed Disconnecting, the reconnect symmetry.
+
+Gates green at every level after the bottom-up cascade.
+
+## 2026-10-02 — Round 25 (#13 ×2, #15 ×1, #16 ×1, all landed)
+
+- **#13 (f5d853c)**: a DISCONNECTED worker (panicked — alive
+  cleared only at worker_loop's normal end) accepted updates into
+  memory that reached no lane; all three mutators record the
+  terminal failure on Disconnected now. And with_key_bytes syncs
+  EVERY newly created cache component in its own parent (the
+  existed-boolean shape synced only the final one).
+- **#15 (a30792b)**: the prebuild's fail-loud guard, RESTORED — a
+  rebase had silently dropped the round-12 ExitStatus check (the
+  exact perl-no-match/rebase-loss class); a failed outside-namespace
+  build no longer retries inside the networkless one.
+- **#16 (69b9a26)**: SettingRefused carries its REQUEST EPOCH at
+  publication; the update boundary invalidates retained stale
+  refusals, and request_epoch() lets consumers filter queued ones.
+
+Gates green at every level after the cascade.
+
+## 2026-10-02 — Round 26 (#17 ×3, all landed)
+
+- The Disconnecting publish: an ordinary disconnect publishes
+  Disconnecting BEFORE the teardown and the terminal Disconnected
+  only after the join (GetState no longer reports no-tunnel while
+  the ProTUN thread and TUN still exist).
+- The typed window refusals: connect branches on the flags —
+  Reconnecting for the reconnect window, Disconnecting for the
+  disconnect window.
+- The named credential signal (disclosed): a retained
+  refresh_token_invalid ApiError surfaces at ERROR level naming the
+  reauthentication requirement — the M6 auth-recovery lane owns the
+  refresh (the recorded descope); the honest handoff this stack can
+  give.
+
+Gates green at every level.
+
+## 2026-10-02 — Round 27 (#17 ×1)
+
+- The idempotent empty-lane disconnect: the round-26 publish was
+  unconditional — a repeated disconnect on an empty lane churned
+  Disconnecting→Disconnected (two misleading events, a sequence
+  advance). The teardown states publish only when an active lane was
+  taken.
+
+## 2026-10-02 — Round 28 (#17 ×3, all landed)
+
+- drain's flag check AND active.take() are one critical section (a
+  disconnect slipped between the separate acquisitions and drain
+  returned with the pump running).
+- The pump's None arm (teardown-observed) publishes NOTHING — the
+  caller owns the terminal publish after its join (the false
+  terminal while teardown still ran is gone).
+- Stale queued State events are suppressed while backlog recovery
+  is armed (an old Disconnected no longer transiently misreports a
+  teardown against the authoritative connected snapshot); the
+  quiet-cadence reconcile re-publishes latest_state and only a
+  proven-empty queue disarms.
+
+Gates green at every level.
+
+## 2026-10-02 — Round 29 (#17 ×2, both landed)
+
+- The failed-owner-reconnect publishes the terminal Disconnected
+  (the previous lane is gone and the round-28 None arm publishes
+  nothing — the core would have read Connected forever with no
+  slot).
+- reconcile_drops runs at the TOP of the receive arm: the drop
+  watermark arms the backlog and publishes the authoritative
+  snapshot BEFORE a stale queued state reaches the suppression
+  check (one stale transition was still published first).
+
+Gates green at every level.
+
+## 2026-10-02 — Round 30 (#17 ×1)
+
+- The reconnect window stays ARMED through engine.connect — it
+  clears only at the atomic install (active lane + owner + flag
+  under one guard) or on the failure arm's way out (with the
+  terminal publish). The mid-setup free-lane window is gone.
+
+Gates green at every level.

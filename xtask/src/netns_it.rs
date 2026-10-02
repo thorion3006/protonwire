@@ -31,6 +31,7 @@ use crate::Reporter;
 const GATED_TARGETS: &[(&str, &str)] = &[
     ("protonwire-protocol", "it_tun_lifecycle"),
     ("protonwire-protocol", "it_engine_lifecycle"),
+    ("protonwire-protocol", "it_m4_exit"),
 ];
 
 /// `unshare` flags creating the isolated user + network namespace.
@@ -44,8 +45,12 @@ const UNSHARE_ARGS: &[&str] = &["--user", "--map-root-user", "--net"];
 /// (both names are pinned on the net side).
 fn gate_shim() -> String {
     use protonwire_net::netns::{MANAGED_NETNS_ENV, MANAGED_NETNS_ID_ENV};
+    // A fresh namespace starts with `lo` DOWN — loopback-dependent ITs
+    // (the M4 exit's mocked peer) need it up. iproute2 exists on the
+    // devshell and CI images; its absence fails the shim loudly
+    // (the `&&` chain breaks before any test runs).
     format!(
-        "ns=$(readlink /proc/self/ns/net) && exec env \
+        "ns=$(readlink /proc/self/ns/net) && ip link set lo up && exec env \
          {MANAGED_NETNS_ENV}=1 {MANAGED_NETNS_ID_ENV}=\"$ns\" \"$0\" \"$@\""
     )
 }

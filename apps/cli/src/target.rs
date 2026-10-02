@@ -8,8 +8,21 @@ use protonwire_frontend_api::{ConnectTarget, RpcError, RpcErrorCode, SpecialClas
 pub struct ConnectTargetArgs;
 
 impl ConnectTargetArgs {
-    /// Parses the word list into a typed [`ConnectTarget`].
+    /// Parses the word list into a typed [`ConnectTarget`] (the
+    /// pre-§9.5 call sites — no Secure Core flags).
     pub fn parse(words: &[String]) -> Result<ConnectTarget, ClientError> {
+        Self::parse_with_secure_core(words, None, None)
+    }
+
+    /// Parses the word list into a typed [`ConnectTarget`]. The
+    /// Secure Core entry/exit flags (PRD 9.5) arrive as Options and
+    /// ride ONLY the `secure-core` target; the caller rejects them
+    /// on every other target before parsing.
+    pub fn parse_with_secure_core(
+        words: &[String],
+        entry_country: Option<&str>,
+        exit_country: Option<&str>,
+    ) -> Result<ConnectTarget, ClientError> {
         let invalid = |detail: String| {
             ClientError::Rpc(RpcError::new(
                 RpcErrorCode::InvalidParams,
@@ -31,8 +44,8 @@ impl ConnectTargetArgs {
                 class: SpecialClass::Tor,
             }),
             "secure-core" if rest.is_empty() => Ok(ConnectTarget::SecureCore {
-                entry_country: None,
-                exit_country: None,
+                entry_country: entry_country.map(str::to_owned),
+                exit_country: exit_country.map(str::to_owned),
             }),
             "country" | "state" | "city" | "server" | "gateway" | "group" | "profile" => {
                 let [value] = rest else {

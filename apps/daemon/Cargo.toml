@@ -30,6 +30,7 @@ nix = { workspace = true }
 # service only through protonwire-client) does not apply to this edge.
 protonwire-api = { workspace = true }
 protonwire-core = { workspace = true }
+protonwire-protocol = { workspace = true }
 protonwire-frontend-api = { workspace = true }
 protonwire-ipc = { workspace = true }
 protonwire-store = { workspace = true }

@@ -1309,6 +1309,68 @@ mod round7_tests {
     }
 }
 
+/// The connection-lane cache box (M4 PR-5): ProTUN's
+/// `unix_connect` takes `Box<dyn PersistentCache>` and DROPS it on
+/// disconnect, but the facade is process-wide (preloaded at daemon
+/// start, one durable lane). This adapter forwards each call into a
+/// shared `Arc<PersistenceFacade>` — ProTUN dropping the box drops
+/// one reference, and the facade survives to the next connection.
+pub struct SharedFacadeCache(pub Arc<PersistenceFacade>);
+
+impl PersistentCache for SharedFacadeCache {
+    fn put(&self, key: CacheKey, bytes: Vec<u8>) {
+        self.0.put(key, bytes);
+    }
+    fn get(&self, key: CacheKey) -> Option<Vec<u8>> {
+        self.0.get(key)
+    }
+    fn remove(&self, key: CacheKey) {
+        self.0.remove(key);
+    }
+    fn clear_all(&self) {
+        self.0.clear_all();
+    }
+}
+
+#[cfg(test)]
+mod shared_cache_tests {
+    use protun::api::connection::{CacheKey, PersistentCache};
+
+    use super::*;
+
+    /// The lane's ownership shape: a connection dropping its box must
+    /// not take the process-wide facade with it — reads keep serving
+    /// after every box is gone.
+    #[test]
+    fn dropping_the_box_keeps_the_facade_alive() {
+        let dir = std::env::temp_dir().join(format!(
+            "pw-shared-facade-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cache = EncryptedCache::open(&dir, &dir.join("cache.key")).expect("cache opens");
+        let facade = Arc::new(PersistenceFacade::start(Arc::new(cache)));
+
+        {
+            let boxed: Box<dyn PersistentCache> = Box::new(SharedFacadeCache(Arc::clone(&facade)));
+            boxed.put(CacheKey::Certificate, b"cert-bytes".to_vec());
+            drop(boxed); // ProTUN's disconnect drop
+        }
+
+        // The facade (still Arc'd by the daemon) serves the read the
+        // next connection will preload from.
+        assert_eq!(
+            facade.get(CacheKey::Certificate),
+            Some(b"cert-bytes".to_vec()),
+        );
+        drop(facade);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
 #[cfg(test)]
 mod round8_tests {
     use std::sync::Arc;

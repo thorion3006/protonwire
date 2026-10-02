@@ -88,6 +88,16 @@ pub enum Command {
         #[arg(long)]
         protocol: Option<String>,
 
+        /// Secure Core entry country (PRD 9.5; `connect secure-core`
+        /// only — refused on every other target).
+        #[arg(long = "entry-country", value_name = "COUNTRY_CODE")]
+        entry_country: Option<String>,
+
+        /// Secure Core exit country (PRD 9.5; `connect secure-core`
+        /// only).
+        #[arg(long = "exit-country", value_name = "COUNTRY_CODE")]
+        exit_country: Option<String>,
+
         /// Resolve and print the selection without connecting (Milestone 3).
         #[arg(long)]
         dry_run: bool,
@@ -311,15 +321,33 @@ pub fn run(command: &Command, socket: Option<&Path>, no_input: bool) -> RunResul
             exclude_exit_countries,
             require,
             protocol,
+            entry_country,
+            exit_country,
             dry_run,
             json,
         } => {
+            // PRD 9.5: the Secure Core entry/exit flags ride ONLY the
+            // `secure-core` target — a typed refusal on every other
+            // target, before anything parses.
+            if (entry_country.is_some() || exit_country.is_some())
+                && target.first().map(String::as_str) != Some("secure-core")
+            {
+                return Err(ClientError::Rpc(RpcError::new(
+                    RpcErrorCode::InvalidParams,
+                    "--entry-country/--exit-country ride `connect secure-core` only (PRD 9.5)",
+                )));
+            }
+            let parsed_target = ConnectTargetArgs::parse_with_secure_core(
+                target,
+                entry_country.as_deref(),
+                exit_country.as_deref(),
+            )?;
+
             // `--dry-run` is the M3 selection surface: resolve and
             // print, never connect — and it carries the FULL `select`
             // modifier surface (round 15, P2: pre-fix clap rejected
             // every modifier but --by/--protocol before this path).
             if *dry_run {
-                let target = ConnectTargetArgs::parse(target)?;
                 let modifiers = SelectionModifiers {
                     by: by.clone(),
                     physical_country: physical_country.clone(),
@@ -333,7 +361,7 @@ pub fn run(command: &Command, socket: Option<&Path>, no_input: bool) -> RunResul
                     optional_features: Vec::new(),
                     required_protocol: parse_protocol(protocol.as_deref())?,
                 };
-                return select_command(socket, target, modifiers, *json);
+                return select_command(socket, parsed_target, modifiers, *json);
             }
             // Declared-but-unhonored modifiers must refuse rather than
             // be discarded: sending the unmodified target would
@@ -357,8 +385,7 @@ pub fn run(command: &Command, socket: Option<&Path>, no_input: bool) -> RunResul
                     ),
                 )));
             }
-            let target = ConnectTargetArgs::parse(target)?;
-            connect_command(socket, target)
+            connect_command(socket, parsed_target)
         }
         Command::Disconnect => {
             let mut client = connect(socket)?;
@@ -1380,6 +1407,8 @@ mod tests {
                     exclude_exit_countries: Vec::new(),
                     require: Vec::new(),
                     protocol: None,
+                    entry_country: None,
+                    exit_country: None,
                     dry_run: false,
                     json: false,
                 },
@@ -1399,6 +1428,8 @@ mod tests {
                     exclude_exit_countries: Vec::new(),
                     require: Vec::new(),
                     protocol: Some("stealth".into()),
+                    entry_country: None,
+                    exit_country: None,
                     dry_run: false,
                     json: false,
                 },
@@ -1469,6 +1500,8 @@ mod tests {
                 exclude_exit_countries: Vec::new(),
                 require: Vec::new(),
                 protocol: None,
+                entry_country: None,
+                exit_country: None,
                 dry_run: true,
                 json: false,
             },
@@ -1558,6 +1591,8 @@ mod tests {
                 exclude_exit_countries: Vec::new(),
                 require: Vec::new(),
                 protocol: None,
+                entry_country: None,
+                exit_country: None,
                 dry_run: false,
                 json: false,
             },
@@ -1573,6 +1608,8 @@ mod tests {
                 exclude_exit_countries: Vec::new(),
                 require: Vec::new(),
                 protocol: None,
+                entry_country: None,
+                exit_country: None,
                 dry_run: false,
                 json: true,
             },
@@ -1683,6 +1720,8 @@ mod tests {
                     exclude_exit_countries: Vec::new(),
                     require: Vec::new(),
                     protocol: None,
+                    entry_country: None,
+                    exit_country: None,
                     dry_run: false,
                     json: false,
                 },
@@ -1754,5 +1793,47 @@ mod tests {
                  DaemonUnavailable was required, never a panic"
             );
         }
+    }
+
+    /// PRD 9.5: the Secure Core entry/exit flags ride ONLY the
+    /// `secure-core` target — every other target refuses typed, and the
+    /// flags reach the parsed target when they do ride it.
+    #[test]
+    fn secure_core_entry_exit_flags_are_scoped_to_secure_core() {
+        use crate::target::ConnectTargetArgs;
+        use protonwire_frontend_api::ConnectTarget;
+
+        let refused = || Command::Connect {
+            target: vec!["fastest".to_string()],
+            by: None,
+            physical_country: None,
+            exclude_countries: Vec::new(),
+            exclude_states: Vec::new(),
+            exclude_cities: Vec::new(),
+            exclude_servers: Vec::new(),
+            exclude_entry_countries: Vec::new(),
+            exclude_exit_countries: Vec::new(),
+            require: Vec::new(),
+            protocol: None,
+            entry_country: Some("CH".into()),
+            exit_country: None,
+            dry_run: false,
+            json: false,
+        };
+        let ClientError::Rpc(error) = run(&refused(), None, true).unwrap_err() else {
+            panic!("the mis-scoped flag must refuse");
+        };
+        assert_eq!(error.code, RpcErrorCode::InvalidParams);
+
+        let words: Vec<String> = vec!["secure-core".into()];
+        let target = ConnectTargetArgs::parse_with_secure_core(&words, Some("CH"), Some("GB"))
+            .expect("the flags ride the secure-core target");
+        assert_eq!(
+            target,
+            ConnectTarget::SecureCore {
+                entry_country: Some("CH".into()),
+                exit_country: Some("GB".into()),
+            }
+        );
     }
 }

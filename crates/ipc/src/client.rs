@@ -20,8 +20,9 @@ use tracing::warn;
 use crate::frame::{FrameError, FrameReader, write_msg, write_msg_within};
 use crate::peer::PeerCredentials;
 
-/// Default request timeout.
-const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+/// Default request timeout (pub per the r11 tracked item — the daemon
+/// cites the same budget server-side).
+pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Cap on events buffered mid-request, when `request()` reads events it
 /// cannot yet deliver (pr-champion round 6, WO-W3). Mirrors the
