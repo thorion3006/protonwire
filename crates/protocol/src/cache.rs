@@ -151,7 +151,18 @@ impl EncryptedCache {
                 key.len()
             )));
         }
+        // A NEWLY CREATED directory is synced IN ITS PARENT (the bot
+        // round-22 P2): create_dir_all publishes the entry without
+        // syncing — a crash could lose the entire cache directory
+        // even after try_put reported durable success (the later
+        // writes sync only `dir` itself). An existing directory
+        // needs nothing here (its parent entry is long durable).
+        let existed = dir.is_dir();
         fs::create_dir_all(dir).map_err(|error| CacheError::Init(error.to_string()))?;
+        if !existed {
+            sync_parent_dir(dir)
+                .map_err(|error| CacheError::Init(format!("new cache dir parent: {error}")))?;
+        }
         let cipher = XChaCha20Poly1305::new_from_slice(key.as_slice())
             .map_err(|error| CacheError::Init(error.to_string()))?;
         Ok(Self {
@@ -639,7 +650,19 @@ fn create_keyfile_no_replace(
                 )))
             };
         }
-        let _ = fs::remove_file(&temp);
+        // The unlink failure PROPAGATES (the bot round-22 P2): the
+        // temp holds the RAW master key — leaving it behind (a
+        // permission change or transient error after the successful
+        // hard_link) plants an untracked second keyfile that survives
+        // cache.key's later removal or rotation. A failed cleanup is
+        // a keyfile error, not a best-effort `let _`.
+        if let Err(error) = fs::remove_file(&temp) {
+            return Err(CreateKeyfileError::Io(CacheError::KeyFile(format!(
+                "the published keyfile's raw temp could not be removed — the master key \
+                 remains at {}: {error}",
+                temp.display()
+            ))));
+        }
         // The dir sync PROPAGATED (the bot round-4 P2): a failed
         // sync after the hard_link means the key can vanish on
         // crash while ciphertext survives — the next startup

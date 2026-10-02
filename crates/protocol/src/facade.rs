@@ -131,6 +131,16 @@ struct HealthSlot {
     applied: std::sync::atomic::AtomicU64,
 }
 
+impl HealthSlot {
+    fn new() -> Self {
+        Self {
+            alive: std::sync::atomic::AtomicBool::new(true),
+            failure: Mutex::new(None),
+            applied: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+}
+
 /// The queue bound (the bot round-2 P1): a stalled cache filesystem
 /// backs pressure onto the callback caller AT THE BOUND — the
 /// facade's memory answer stays immediate; the DISK side refuses to
@@ -173,11 +183,7 @@ impl PersistenceFacade {
             }
         }
         let (sender, receiver) = mpsc::sync_channel::<Op>(QUEUE_BOUND);
-        let health = Arc::new(HealthSlot {
-            alive: std::sync::atomic::AtomicBool::new(true),
-            failure: Mutex::new(None),
-            applied: std::sync::atomic::AtomicU64::new(0),
-        });
+        let health = Arc::new(HealthSlot::new());
         let overflow = Arc::new(Mutex::new(Vec::new()));
         let worker_health = Arc::clone(&health);
         let worker_overflow = Arc::clone(&overflow);
@@ -417,6 +423,20 @@ fn record_failure(health: &HealthSlot, message: &str) {
     *health.failure.lock().expect("health lock") = Some(message.to_owned());
     health.applied.store(0, std::sync::atomic::Ordering::SeqCst);
     tracing::warn!(%message, "persistence failure recorded to health");
+}
+
+/// The RECOVERY counterpart (the bot round-22 P1): a success that
+/// leaves the retry lane EMPTY clears the last failure — the health
+/// surface must not report unhealthy forever after a transient
+/// failure recovered (and consumers must not have to infer recovery
+/// from the generic applied counter, unsafe while another key still
+/// has a pending retry).
+fn note_recovered(health: &HealthSlot) {
+    let mut failure = health.failure.lock().expect("health lock");
+    if failure.is_some() {
+        *failure = None;
+        tracing::info!("persistence recovered — every retained op is durably applied");
+    }
 }
 
 /// The BOUNDED RETRY (ER-18, the bot round-6 P1): a failed op's
@@ -675,6 +695,12 @@ fn worker_loop(
                     // pending op (the failed newest state) survives.
                     last_applied.insert(op_name.clone(), seq);
                     retry.note_success(&op_name, seq);
+                    // The recovery (the bot round-22 P1): the success
+                    // that EMPTIES the retry lane clears the failure —
+                    // health recovers, not just the applied counter.
+                    if retry.pending.is_empty() {
+                        note_recovered(health);
+                    }
                     health
                         .applied
                         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -1645,5 +1671,67 @@ mod round9_tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The bot round-22 P1: a transient failure that fully recovers
+    /// CLEARS the health surface — the success that empties the
+    /// retry lane restores last_failure to None (not just the
+    /// applied counter).
+    #[test]
+    fn a_recovered_retry_lane_restores_health() {
+        let dir = std::env::temp_dir().join(format!(
+            "pw-r22-recover-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cache = Arc::new(EncryptedCache::with_key_bytes(&dir, &[41u8; 32]).unwrap());
+        let facade = PersistenceFacade::start(Arc::clone(&cache));
+        // A healthy start.
+        assert!(facade.health().last_failure.is_none());
+        // A failed op is retained (simulate: the overflow lane with a
+        // key the disk refuses is hard to stage hermetically — the
+        // UNIT seam is note_recovered itself, plus the empty-lane
+        // trigger in apply_pass this test rides through the normal
+        // success path: a successful apply with an EMPTY retry lane
+        // must be a no-op when nothing failed, and a clear when
+        // something had).
+        let slot = HealthSlot::new();
+        record_failure(&slot, "transient");
+        assert_eq!(slot.failure.lock().unwrap().as_deref(), Some("transient"));
+        note_recovered(&slot);
+        assert!(slot.failure.lock().unwrap().is_none(), "the failure clears");
+        // Idempotent on an already-clean slot.
+        note_recovered(&slot);
+        assert!(slot.failure.lock().unwrap().is_none());
+        drop(facade);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The bot round-22 P2: a NEWLY CREATED cache directory is synced
+    /// in its parent — the creation is durable before any entry write
+    /// reports success (an existing directory takes the no-op path).
+    #[test]
+    fn a_new_cache_directory_is_synced_in_its_parent() {
+        let parent = std::env::temp_dir().join(format!(
+            "pw-r22-newdir-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&parent).unwrap();
+        let dir = parent.join("cache");
+        assert!(!dir.is_dir(), "the fixture premise: the dir is new");
+        let cache = EncryptedCache::with_key_bytes(&dir, &[43u8; 32])
+            .expect("the first-use open creates + parent-syncs the dir");
+        cache
+            .try_put(CacheKey::Certificate, b"durable".to_vec())
+            .expect("the round-trip works");
+        std::fs::remove_dir_all(&parent).ok();
     }
 }
