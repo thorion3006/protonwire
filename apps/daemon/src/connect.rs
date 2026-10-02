@@ -227,12 +227,17 @@ impl ConnectionLane {
         // round-13 P2): drain may have set it and observed the
         // temporarily empty slot while the lock was down — starting
         // an engine connection now would install a tunnel outside
-        // the administrator's controlled teardown.
+        // the administrator's controlled teardown. The reconnecting
+        // flag STAYS ARMED through the setup (the bot round-30 P2):
+        // clearing it before engine.connect let the lane look
+        // completely free mid-setup — a drain observed no active
+        // lane and returned before the installation, a concurrent
+        // connect superseded it. It clears only when the result is
+        // atomically installed (or on the way out of a failure).
         if self.draining.load(Ordering::SeqCst) {
             lane.reconnecting = false;
             return Err(LaneRefusal::Draining.into());
         }
-        lane.reconnecting = false;
         lane.owner = None;
         drop(lane);
         let connection = match self.engine.connect(
@@ -248,6 +253,10 @@ impl ConnectionLane {
                 // read Connected/Connecting forever with no active
                 // slot or TUN.
                 self.core.set_vpn_state(VpnState::Disconnected);
+                self.state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .reconnecting = false;
                 return Err(error.into());
             }
         };
@@ -274,6 +283,11 @@ impl ConnectionLane {
             pump,
         });
         lane.owner = Some(uid);
+        // The window closes HERE (the bot round-30 P2): the result is
+        // atomically installed — active lane, owner, and the flag
+        // clear under one guard; the mid-setup free-lane window no
+        // longer exists.
+        lane.reconnecting = false;
         Ok(())
     }
 
