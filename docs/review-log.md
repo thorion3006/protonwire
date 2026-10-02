@@ -3549,3 +3549,19 @@ Gates green at every level.
   Disconnecting→Disconnected (two misleading events, a sequence
   advance). The teardown states publish only when an active lane was
   taken.
+
+## 2026-10-02 — Round 28 (#17 ×3, all landed)
+
+- drain's flag check AND active.take() are one critical section (a
+  disconnect slipped between the separate acquisitions and drain
+  returned with the pump running).
+- The pump's None arm (teardown-observed) publishes NOTHING — the
+  caller owns the terminal publish after its join (the false
+  terminal while teardown still ran is gone).
+- Stale queued State events are suppressed while backlog recovery
+  is armed (an old Disconnected no longer transiently misreports a
+  teardown against the authoritative connected snapshot); the
+  quiet-cadence reconcile re-publishes latest_state and only a
+  proven-empty queue disarms.
+
+Gates green at every level.
