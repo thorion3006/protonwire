@@ -421,18 +421,30 @@ const PUMP_POLL: Duration = Duration::from_millis(200);
 /// every step is non-blocking on the engine side.
 /// The terminal teardown (the engine contract: the caller must close
 /// the connection on a fatal certificate-refresh failure — delivered
-/// OR recovered from the drop lane; the bot round-12 P2).
 fn terminate_on_fatal(
     slot: &ConnectionSlot,
     lane: &std::sync::Weak<Mutex<LaneState>>,
     core: &CoreState,
-) {
+) -> bool {
+    // CLAIM-OR-YIELD (the bot round-35 P2): take the connection to
+    // establish this pump owns the fatal cleanup; a teardown that
+    // retired the slot first owns the terminal publish — publishing
+    // here would overwrite its Disconnecting with a false terminal
+    // mid-join. Returns whether the caller should continue its own
+    // teardown handling (the claimed arm disconnects, publishes the
+    // terminal, retires the lane).
+    let Some(connection) = slot.lock().ok().and_then(|mut guard| guard.take()) else {
+        tracing::warn!(
+            "certificate refresh failed terminally — teardown already owns the slot; \
+             the caller publishes the terminal state"
+        );
+        return true;
+    };
     tracing::warn!("certificate refresh failed terminally — tearing the session down");
-    if let Some(connection) = slot.lock().ok().and_then(|mut guard| guard.take()) {
-        connection.disconnect();
-    }
+    connection.disconnect();
     core.set_vpn_state(VpnState::Disconnected);
     retire_lane(slot, lane);
+    true
 }
 
 fn pump_events(slot: &ConnectionSlot, lane: &std::sync::Weak<Mutex<LaneState>>, core: &CoreState) {
@@ -537,25 +549,24 @@ fn pump_events(slot: &ConnectionSlot, lane: &std::sync::Weak<Mutex<LaneState>>, 
                 if backlog {
                     continue;
                 }
-                // RETIREMENT SUPPRESSION (the bot rounds 32+34 P2):
-                // the event was dequeued BEFORE the teardown took the
-                // connection — publishing it now would falsely revert
-                // the just-published Disconnecting to an old
-                // Connecting/Connected while disconnect_and_wait still
-                // runs (or leave a stale state through a slow
-                // replacement setup). The check AND the publish run
-                // under ONE hold of the slot guard (the round-34
-                // atom): releasing between the check and
-                // set_vpn_state let a retire-first teardown land in
-                // the gap and the stale state overwrote the
-                // transition anyway. A retired slot's states never
-                // publish; the caller owns the terminal transition.
+                // RETIREMENT SUPPRESSION (the bot rounds 32+34+35
+                // P2): the event was dequeued BEFORE the teardown
+                // took the connection — publishing it now would
+                // falsely revert the just-published Disconnecting to
+                // an old Connecting/Connected while
+                // disconnect_and_wait still runs (or leave a stale
+                // state through a slow replacement setup). The guard
+                // is held THROUGH the publish (the round-35 atom: the
+                // round-34 shape dropped it after the check — a
+                // retire-first teardown landed in that exact gap). A
+                // retirement can now only land before the check
+                // (stale — suppressed) or after the guard releases
+                // (a genuinely newer transition).
                 let guard = slot.lock();
                 let retired = match &guard {
                     Ok(inner) => inner.as_ref().is_none(),
                     Err(_) => true,
                 };
-                drop(guard);
                 if retired {
                     continue;
                 }
@@ -570,6 +581,7 @@ fn pump_events(slot: &ConnectionSlot, lane: &std::sync::Weak<Mutex<LaneState>>, 
                     core.set_vpn_state(mapped);
                     last = Some(mapped);
                 }
+                drop(guard);
             }
             // The engine contract: the caller must close the
             // connection (the bot round's P2). Same for a retained
