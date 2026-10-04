@@ -113,7 +113,7 @@ impl ActiveLane {
     /// slot the moment the caller decides to tear down — a dequeued
     /// stale state can no longer observe the populated slot and
     /// publish through the transition. The caller then publishes the
-    /// transition and calls [`finish`] to disconnect and join.
+    /// transition and calls finish_tear to disconnect and join.
     fn retire(self) -> (Option<ActiveConnection>, JoinHandle<()>) {
         let taken = self.connection.lock().map(|mut slot| slot.take());
         (taken.ok().flatten(), self.pump)
