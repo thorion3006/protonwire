@@ -508,6 +508,17 @@ fn pump_events(slot: &ConnectionSlot, lane: &std::sync::Weak<Mutex<LaneState>>, 
                 if backlog {
                     continue;
                 }
+                // RETIREMENT SUPPRESSION (the bot round-32 P2): the
+                // event was dequeued BEFORE the teardown took the
+                // connection — publishing it now would falsely revert
+                // the just-published Disconnecting to an old
+                // Connecting/Connected while disconnect_and_wait still
+                // runs (or leave a stale state through a slow
+                // replacement setup). A retired slot's states never
+                // publish; the caller owns the terminal transition.
+                if slot.lock().is_ok_and(|guard| guard.as_ref().is_none()) {
+                    continue;
+                }
                 if let EngineConnectionState::Disconnected {
                     error: Some(ref detail),
                 } = state.connection
@@ -527,6 +538,22 @@ fn pump_events(slot: &ConnectionSlot, lane: &std::sync::Weak<Mutex<LaneState>>, 
             EngineEvent::CertificateFatal => {
                 terminate_on_fatal(slot, lane, core);
                 break;
+            }
+            // The DELIVERED credential-invalid signal (the bot
+            // round-32's second P2): the queue had capacity, so the
+            // common path — the retained arm below already carries the
+            // named ERROR line; the delivered arm was silently
+            // discarded. Same named recovery surface on both paths;
+            // the refresh itself stays the M6 auth-recovery lane's.
+            EngineEvent::ApiError {
+                refresh_token_invalid: true,
+                ..
+            } => {
+                tracing::error!(
+                    "LocalAgent reports the refresh token is invalid — reauthentication \
+                     is required (the M6 auth-recovery lane owns the refresh; no provider \
+                     is wired in this stack)"
+                );
             }
             // Stats/refusals ride the engine's own recovery surfaces;
             // the daemon's stat broadcast is the M6 observability
