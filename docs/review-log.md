@@ -3629,3 +3629,14 @@ Gates green at every level.
   teardown() (no transition to protect).
 
 Gates green at every level.
+
+## 2026-10-04 — Round 34 (#17 ×2, both landed)
+
+- The retirement check and the state publish run under ONE hold of
+  the slot guard (the round-32 check released the mutex first — a
+  retire-first teardown landed in the gap).
+- The engine-death arm treats an empty slot as teardown-owned and
+  exits publishing nothing (the caller's Disconnecting can no longer
+  be overwritten by a false terminal before the join).
+
+Gates green at every level.
