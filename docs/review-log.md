@@ -3640,3 +3640,14 @@ Gates green at every level.
   be overwritten by a false terminal before the join).
 
 Gates green at every level.
+
+## 2026-10-04 — Round 35 (#17 ×3, all landed)
+
+- The slot guard holds THROUGH the state publication (the round-34
+  drop(guard)-after-check recreated the exact gap).
+- terminate_on_fatal CLAIMS (takes the connection) or YIELDS to an
+  in-progress teardown (the caller's Disconnecting owns the
+  terminal); the engine-death arm takes-to-claim as well —
+  observation-only checks had retire-in-the-gap windows.
+
+Gates green at every level.
