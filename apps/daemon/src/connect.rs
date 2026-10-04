@@ -504,8 +504,16 @@ fn pump_events(slot: &ConnectionSlot, lane: &std::sync::Weak<Mutex<LaneState>>, 
             // join AND the terminal publish — the bot round-28 P2:
             // publishing Disconnected here raced the caller's
             // after-join publication with a FALSE terminal while
-            // teardown still ran).
+            // teardown still ran). The engine-death arm ALSO yields
+            // to a teardown that won the race (the bot round-34 P2):
+            // an empty slot means the caller retired it mid-teardown
+            // and owns the terminal publish — exit publishing
+            // nothing.
             Some(Err(std::sync::mpsc::RecvTimeoutError::Disconnected)) => {
+                let teardown_owned = slot.lock().is_ok_and(|guard| guard.is_none());
+                if teardown_owned {
+                    break;
+                }
                 core.set_vpn_state(VpnState::Disconnected);
                 retire_lane(slot, lane);
                 break;
@@ -529,15 +537,26 @@ fn pump_events(slot: &ConnectionSlot, lane: &std::sync::Weak<Mutex<LaneState>>, 
                 if backlog {
                     continue;
                 }
-                // RETIREMENT SUPPRESSION (the bot round-32 P2): the
-                // event was dequeued BEFORE the teardown took the
+                // RETIREMENT SUPPRESSION (the bot rounds 32+34 P2):
+                // the event was dequeued BEFORE the teardown took the
                 // connection — publishing it now would falsely revert
                 // the just-published Disconnecting to an old
                 // Connecting/Connected while disconnect_and_wait still
                 // runs (or leave a stale state through a slow
-                // replacement setup). A retired slot's states never
+                // replacement setup). The check AND the publish run
+                // under ONE hold of the slot guard (the round-34
+                // atom): releasing between the check and
+                // set_vpn_state let a retire-first teardown land in
+                // the gap and the stale state overwrote the
+                // transition anyway. A retired slot's states never
                 // publish; the caller owns the terminal transition.
-                if slot.lock().is_ok_and(|guard| guard.as_ref().is_none()) {
+                let guard = slot.lock();
+                let retired = match &guard {
+                    Ok(inner) => inner.as_ref().is_none(),
+                    Err(_) => true,
+                };
+                drop(guard);
+                if retired {
                     continue;
                 }
                 if let EngineConnectionState::Disconnected {
