@@ -3587,3 +3587,22 @@ Gates green at every level.
   terminal publish). The mid-setup free-lane window is gone.
 
 Gates green at every level.
+
+## 2026-10-02 — Round 31 (#17 ×3: 1 fixed, 2 challenged with the recorded descope)
+
+- FIXED: the reconnect's replacement publishes Disconnecting before
+  the join (the silent teardown arm + no replacement transition read
+  the old Connected as live through setup).
+- CHALLENGED (the P1 lane-wiring + the owner-mirror P2): both are
+  the recorded descope — the ipc Connect/Disconnect wiring onto the
+  lane is the M6 composition lane's first slice (the owner's
+  plan-of-record: the PR-5 entry and the round-16 descope note; the
+  Connect arm's NotImplemented is the honest fail-closed answer
+  while selection→physical→TunnelParams composition does not exist).
+  The bot's evidence is accurate (the lane has no production
+  consumer; the exit test drives the engine directly — the exact
+  tracked required-before-M6-wiring gap) and the challenge is
+  recorded for the owner: either accept the descope boundary or
+  pull the M6 wiring slice forward.
+
+Gates green at every level.
