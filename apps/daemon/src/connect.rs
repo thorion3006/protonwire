@@ -214,6 +214,12 @@ impl ConnectionLane {
         lane.owner = None;
         drop(lane);
         if let Some(active) = superseded {
+            // The REPLACEMENT publishes its transition too (the bot
+            // round-31 P2): teardown-observed publishing is silent
+            // (round-28) and the old Connected would read as live
+            // through the whole setup — publish Disconnecting before
+            // the join, exactly as the ordinary disconnect does.
+            self.core.set_vpn_state(VpnState::Disconnecting);
             active.teardown();
         }
         let mut lane = self
