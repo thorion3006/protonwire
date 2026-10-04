@@ -522,12 +522,18 @@ fn pump_events(slot: &ConnectionSlot, lane: &std::sync::Weak<Mutex<LaneState>>, 
             // and owns the terminal publish — exit publishing
             // nothing.
             Some(Err(std::sync::mpsc::RecvTimeoutError::Disconnected)) => {
-                let teardown_owned = slot.lock().is_ok_and(|guard| guard.is_none());
-                if teardown_owned {
-                    break;
+                // CLAIM-TO-PUBLISH (the bot round-36 P2): the
+                // observation-only check could release the guard and a
+                // teardown's retire() + Disconnecting landed before
+                // this publish. The TAKE establishes ownership — only
+                // the take that succeeds publishes the terminal; the
+                // loser (a teardown emptied the slot) owns it.
+                let claimed = slot.lock().ok().and_then(|mut guard| guard.take());
+                if let Some(connection) = claimed {
+                    connection.disconnect();
+                    core.set_vpn_state(VpnState::Disconnected);
+                    retire_lane(slot, lane);
                 }
-                core.set_vpn_state(VpnState::Disconnected);
-                retire_lane(slot, lane);
                 break;
             }
             None => {
