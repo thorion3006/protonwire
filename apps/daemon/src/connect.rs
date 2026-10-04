@@ -107,6 +107,26 @@ impl ActiveLane {
         }
         let _ = self.pump.join();
     }
+
+    /// RETIRES the slot first (the bot round-33 P2), handing the
+    /// connection back: the pump's retirement check sees an empty
+    /// slot the moment the caller decides to tear down — a dequeued
+    /// stale state can no longer observe the populated slot and
+    /// publish through the transition. The caller then publishes the
+    /// transition and calls [`finish`] to disconnect and join.
+    fn retire(self) -> (Option<ActiveConnection>, JoinHandle<()>) {
+        let taken = self.connection.lock().map(|mut slot| slot.take());
+        (taken.ok().flatten(), self.pump)
+    }
+}
+
+/// The second half of [`ActiveLane::retire`]: disconnect the retired
+/// connection and join the pump.
+fn finish_tear(retired: Option<ActiveConnection>, pump: JoinHandle<()>) {
+    if let Some(connection) = retired {
+        connection.disconnect();
+    }
+    let _ = pump.join();
 }
 
 #[derive(Default)]
@@ -217,10 +237,13 @@ impl ConnectionLane {
             // The REPLACEMENT publishes its transition too (the bot
             // round-31 P2): teardown-observed publishing is silent
             // (round-28) and the old Connected would read as live
-            // through the whole setup — publish Disconnecting before
-            // the join, exactly as the ordinary disconnect does.
+            // through the whole setup. RETIRE FIRST (the bot round-33
+            // P2): the slot empties BEFORE the transition publishes —
+            // a just-dequeued stale state meets an empty slot at the
+            // retirement check and never reverts Disconnecting.
+            let (retired, pump) = active.retire();
             self.core.set_vpn_state(VpnState::Disconnecting);
-            active.teardown();
+            finish_tear(retired, pump);
         }
         let mut lane = self
             .state
@@ -335,18 +358,16 @@ impl ConnectionLane {
         let active = lane.active.take();
         lane.owner = None;
         drop(lane);
-        // DISCONNECTING is published BEFORE the teardown (the bot
-        // round-26 P2): the state machine must not jump straight to
-        // a pump-race Disconnected while the ProTUN thread and TUN
-        // still exist — GetState and subscribers would report no
-        // tunnel during the join. The terminal Disconnected lands
-        // AFTER the join. IDEMPOTENT when NOTHING was taken (the bot
-        // round-27 P2): a repeated disconnect on an empty lane
-        // publishes nothing — no misleading state churn, no sequence
-        // advance.
+        // RETIRE FIRST (the bot round-33 P2): the slot empties
+        // BEFORE Disconnecting publishes — a just-dequeued stale
+        // state meets the empty slot at the retirement check and
+        // cannot revert the transition mid-join. The terminal lands
+        // after the join (round-26); idempotent when nothing was
+        // taken (round-27).
         if let Some(active) = active {
+            let (retired, pump) = active.retire();
             self.core.set_vpn_state(VpnState::Disconnecting);
-            active.teardown();
+            finish_tear(retired, pump);
             self.core.set_vpn_state(VpnState::Disconnected);
         }
         self.state
