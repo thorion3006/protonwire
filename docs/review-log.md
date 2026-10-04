@@ -3606,3 +3606,15 @@ Gates green at every level.
   pull the M6 wiring slice forward.
 
 Gates green at every level.
+
+## 2026-10-04 — Round 32 (#17 ×2, both landed)
+
+- RETIREMENT SUPPRESSION: an event dequeued before the teardown took
+  the connection could still publish an old Connecting/Connected —
+  reverting the just-published Disconnecting mid-join. The State arm
+  checks the slot; a retired slot's states never publish.
+- The DELIVERED invalid-credential ApiError surfaces on the same
+  named ERROR line as the retained arm (the queue-capacity path was
+  the silent one); the refresh stays M6's.
+
+Gates green at every level.
