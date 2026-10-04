@@ -3618,3 +3618,14 @@ Gates green at every level.
   the silent one); the refresh stays M6's.
 
 Gates green at every level.
+
+## 2026-10-04 — Round 33 (#17 ×1)
+
+- RETIRE-FIRST: ActiveLane::retire() empties the slot BEFORE the
+  teardown transition publishes (disconnect and the reconnect
+  replacement both) — the round-32 suppression met only an
+  already-empty slot, and the just-dequeued stale Connected could
+  revert Disconnecting in the publish-to-take gap. drain keeps
+  teardown() (no transition to protect).
+
+Gates green at every level.
