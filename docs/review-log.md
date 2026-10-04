@@ -3651,3 +3651,11 @@ Gates green at every level.
   observation-only checks had retire-in-the-gap windows.
 
 Gates green at every level.
+
+## 2026-10-04 — Round 36 (#17 ×1)
+
+- The engine-death arm takes-to-claim (the is_none() read had the
+  retire-in-the-gap window): the successful take disconnects,
+  publishes, retires; the loser owns the terminal.
+
+Gates green at every level.
