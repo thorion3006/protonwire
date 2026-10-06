@@ -3677,7 +3677,7 @@ Gates green at every level.
 Gates green at every level after the cascade (#17's fixture rides
 the widened shape).
 
-## 2026-10-06 — Round 38 (#17 ×3)
+## 2026-10-06 — Round 38 (#17 ×4)
 
 - #17: the devshell DECLARES iproute2 — the netns gate shim invokes
   `ip link set lo up`, but the tool resolved only via the host
@@ -3712,6 +3712,18 @@ the widened shape).
   drain_waits_out_windows_and_concurrent_teardowns. The armed/clear
   pairing's executable home is the recorded gated daemon-lane IT
   deferral.
+
+- #17: the backlog disarms only on CURRENT emptiness — the timeout
+  arm disarmed unconditionally, but the timeout's emptiness proof
+  went stale during the reconcile above it (a snapshot publish when
+  armed): states enqueued in that window left a non-empty queue
+  under a disarmed suppression, and the next receive published the
+  queued state OLDER than the just-published snapshot (Disconnected
+  after a Connected snapshot) and reverted it. The disarm is now a
+  zero-time try_recv probe taken after the reconcile: Empty disarms;
+  an Event defers into the normal receive path with the suppression
+  armed (the rounds 14+16 only-emptiness-disarms discipline);
+  Disconnected/vanished-slot defers to the next iteration's arm.
 
 Gates green at every level, both directions where they apply: the
 devshell resolves its own /nix/store/...-iproute2-7.1.0/bin/ip with
