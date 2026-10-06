@@ -41,9 +41,14 @@ impl NetworkAdapter for NativeAdapter {
 
 /// The routing-table plan (FR-34, IT-25): preferred-not-guaranteed
 /// ids, persisted-mapping ownership proof, conflict-free allocation,
-/// lookalike refusal. The M1 `route_tables` id constants placeholder
+/// lookalike refusal. The M1 `route_tables` id-constants placeholder
 /// grew into this.
 pub mod tables;
+
+/// The transactional netlink writer (FR-33/38): batched route/rule
+/// operations with rollback of the applied prefix, every op gated by
+/// the table plan (IT-25's lookalike refusal wired into the writer).
+pub mod route_txn;
 
 /// The network-namespace integration-test harness (NFR-31). Shared by
 /// every netns-gated integration test in the workspace (`protocol`'s
