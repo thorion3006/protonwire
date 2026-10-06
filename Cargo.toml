@@ -138,3 +138,7 @@ protonwire-policy = { path = "crates/policy", version = "0.1.0" }
 protonwire-pf = { path = "crates/port-forwarding", version = "0.1.0" }
 protonwire-store = { path = "crates/store", version = "0.1.0" }
 proton-boringtun = { version = "=3.0.0", registry = "proton", features = ["std"] } # EXACT: 3.0.1+ moved to proton-os-interface 0.3, which splits the graph pvpnclient 3.0.3 compiles against (the 2026-10-06 sweep); in-graph via protun->pvpnclient; the M4 exit IT's mocked peer. The proton subtree moves as one train — PROTON_TRAIN in xtask/src/deps.rs
+
+rtnetlink = "0.23"
+tokio = { version = "1", features = ["rt", "macros"] }
+futures-util = "0.3" # in-graph via rtnetlink; stream consumption in the executor + ITs
