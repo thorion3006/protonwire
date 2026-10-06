@@ -189,7 +189,7 @@ pub fn parse_rt_tables(text: &str) -> BTreeMap<u32, String> {
         // whitespace-delimited token and ignores trailing commentary
         // (`51820 protonwire-main # managed locally`); our whole-rest
         // read rejected such lines as absent — claiming the id.
-        let Some(name) = name.trim().split_whitespace().next() else {
+        let Some(name) = name.split_whitespace().next() else {
             continue;
         };
         if name.starts_with('#') {
