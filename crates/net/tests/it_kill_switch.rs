@@ -96,11 +96,26 @@ fn it_kill_switch() {
         let plan = protonwire_net::route_txn::plan_with(&mut executor, "", None)
             .await
             .expect("survey");
+        // THE CONNECT SEQUENCE'S CONTRACT (the round-1 P1): the kill
+        // switch ARMS BEFORE the routing state installs — routes
+        // first would leave an escape window (v6 egress through the
+        // uplink, the default route before the switch lands) until
+        // the switch catches up. Interfaces first (the switch needs
+        // their indices); the switch next; the routes last.
+        let policy = KillSwitchPolicy {
+            tun_ifindex: tun_oif,
+            allow_dhcp_v4: true,
+            lan_permits: Vec::new(),
+            bypass_mark: 0x21,
+        };
+        kill_switch::apply(TUN_STANDIN, UPLINK_STANDIN, &policy, GenerationId(1), None)
+            .expect("the switch arms before any routing");
         let desired =
             protonwire_net::route_drift::desired_ops(&protonwire_net::route_drift::DesiredRoutes {
                 plan: plan.clone(),
                 tun_oif,
                 bypass_mark: 0,
+                ipv6: protonwire_net::route_drift::Ipv6Desired::Blocked,
             });
         let mut txn = protonwire_net::route_txn::RouteTransaction::new(plan);
         for op in desired {
@@ -119,12 +134,10 @@ fn it_kill_switch() {
         bypass_mark: 0x21,
     };
 
-    // 1. FRESH APPLY + VALIDATE + BEHAVIORAL PROBE: the marker
-    //    generation, the output chain, the exact rendered rule count,
-    //    and a leak-shaped probe that DIES at the counted drop. No
-    //    prior record exists for a FIRST install.
-    kill_switch::apply(TUN_STANDIN, UPLINK_STANDIN, &policy, GenerationId(1), None)
-        .expect("fresh apply validates");
+    // 1. THE ARMED SWITCH, verified after the routing landed: the
+    //    marker generation, the output chain, the exact rendered rule
+    //    count — the apply itself ran in the setup, BEFORE the routes
+    //    (the connect sequence's contract).
     kill_switch::validate(&policy, GenerationId(1)).expect("post-apply validation");
     kill_switch::enforcement_probe(UPLINK_STANDIN).expect("behavioral enforcement proof");
 
