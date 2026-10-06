@@ -9,19 +9,28 @@
 //! with its own proof surface). [`crate::route_drift::repair_ops`] is the FR-40 diff:
 //! desired state that has gone missing while connected, restored
 //! idempotently (a present-and-correct host yields an EMPTY repair —
-//! no-op reconnects). The executor's `owned_ops` (on
-//! [`crate::route_txn::NetlinkExecutor`]) enumerates disconnect's
-//! cleanup set: live state referencing PLAN tables only — FR-39's
-//! "leave concurrently changed unowned state intact" is the
-//! enumeration's table filter itself.
+//! no-op reconnects). The executor's `cleanup_ops` (on
+//! [`crate::route_txn::NetlinkExecutor`]) inverts the SESSION's
+//! still-present operations — exactly what this session installed,
+//! never anything a foreign manager placed in a plan table
+//! mid-session (FR-39's "leave concurrently changed unowned state
+//! intact" is the session scoping itself).
 
-use crate::route_txn::{DestPrefix, NetOp, RouteSpec, RuleSpec};
+use crate::route_txn::{DestPrefix, KERNEL_MAIN, NetOp, RouteSpec, RuleSpec};
 use crate::tables::{TableKind, TablePlan};
 
 /// The policy-rule priority band ProtonWire installs its rules at
 /// (below the kernel's reserved 0–32766 user range ceiling; one band
 /// for every ProtonWire rule, stable across reconnects).
 pub const FULL_TUNNEL_RULE_PRIORITY: u32 = 31700;
+
+/// The bypass rule sits ONE above the tunnel band: evaluated first,
+/// it keeps the daemon's own marked outer sockets on the normal
+/// uplink — without it the unconditional full-tunnel rule swallows
+/// ProTUN's transport and routes the tunnel back into itself (the
+/// marks.rs contract; the round-1 P1). The IPv6 sibling of this rule
+/// lands with the v6 desired-state slice (FR-37's lane).
+pub const BYPASS_RULE_PRIORITY: u32 = FULL_TUNNEL_RULE_PRIORITY - 1;
 
 /// The desired routing state for one connected full-tunnel session.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -30,26 +39,38 @@ pub struct DesiredRoutes {
     pub plan: TablePlan,
     /// The TUN interface's kernel index (routes' output interface).
     pub tun_oif: u32,
+    /// The daemon's bypass mark (0 disables the bypass rule — tests
+    /// and dry-runs; production always passes the real mark, FR-61:
+    /// only the active daemon/ProTUN instance marks its sockets).
+    pub bypass_mark: u32,
 }
 
-/// Render the full-tunnel desired operations: the policy rule into
-/// `protonwire-main` plus the v4 default route through the TUN
-/// (FR-35). Deterministic order — the rule first, so a route never
+/// Render the full-tunnel desired operations. Deterministic order:
+/// the MARK BYPASS rule first (it must win lookup before the
+/// catch-all), then the tunnel rule and the v4 default route through
+/// the TUN — FR-35; the rule before the route, so a route never
 /// exists unruled.
 pub fn desired_ops(state: &DesiredRoutes) -> Vec<NetOp> {
     let main = state.plan.assignment(TableKind::Main).id;
-    vec![
-        NetOp::AddRule(RuleSpec {
-            table: main,
-            priority: FULL_TUNNEL_RULE_PRIORITY,
-            fwmark: None,
-        }),
-        NetOp::AddRoute(RouteSpec {
-            table: main,
-            dest: DestPrefix::V4_DEFAULT,
-            oif: state.tun_oif,
-        }),
-    ]
+    let mut ops = Vec::new();
+    if state.bypass_mark != 0 {
+        ops.push(NetOp::AddRule(RuleSpec {
+            table: KERNEL_MAIN,
+            priority: BYPASS_RULE_PRIORITY,
+            fwmark: Some(state.bypass_mark),
+        }));
+    }
+    ops.push(NetOp::AddRule(RuleSpec {
+        table: main,
+        priority: FULL_TUNNEL_RULE_PRIORITY,
+        fwmark: None,
+    }));
+    ops.push(NetOp::AddRoute(RouteSpec {
+        table: main,
+        dest: DestPrefix::V4_DEFAULT,
+        oif: state.tun_oif,
+    }));
+    ops
 }
 
 /// The FR-40 repair diff: `desired` operations whose state is NOT in
@@ -76,6 +97,15 @@ mod tests {
         DesiredRoutes {
             plan: plan(),
             tun_oif: oif,
+            bypass_mark: 0,
+        }
+    }
+
+    fn desired_bypass(oif: u32, mark: u32) -> DesiredRoutes {
+        DesiredRoutes {
+            plan: plan(),
+            tun_oif: oif,
+            bypass_mark: mark,
         }
     }
 
@@ -96,6 +126,35 @@ mod tests {
                     oif: 7,
                 }),
             ]
+        );
+    }
+
+    #[test]
+    fn a_bypass_mark_renders_the_outer_socket_route_out_first() {
+        // The round-1 P1: without a higher-priority mark rule the
+        // unconditional full-tunnel rule swallows ProTUN's own marked
+        // outer sockets — the tunnel routed back into itself.
+        let ops = desired_ops(&desired_bypass(7, 0x21));
+        assert_eq!(
+            ops,
+            vec![
+                NetOp::AddRule(RuleSpec {
+                    table: KERNEL_MAIN,
+                    priority: BYPASS_RULE_PRIORITY,
+                    fwmark: Some(0x21),
+                }),
+                NetOp::AddRule(RuleSpec {
+                    table: 51820,
+                    priority: FULL_TUNNEL_RULE_PRIORITY,
+                    fwmark: None,
+                }),
+                NetOp::AddRoute(RouteSpec {
+                    table: 51820,
+                    dest: DestPrefix::V4_DEFAULT,
+                    oif: 7,
+                }),
+            ],
+            "the bypass rule precedes the catch-all it must outrank"
         );
     }
 

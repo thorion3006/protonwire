@@ -131,12 +131,15 @@ pub trait NetlinkExecutor {
         desired: &[NetOp],
     ) -> impl Future<Output = Result<Vec<NetOp>, NetOpError>> + Send;
 
-    /// Every live rule/route referencing a PLAN table, as delete ops
-    /// — disconnect's cleanup set (FR-39: foreign tables are never
-    /// enumerated; concurrently changed unowned state stays).
-    fn owned_ops(
+    /// Disconnect's cleanup set (FR-39): the INVERSE of the
+    /// session's still-present operations — exactly the objects THIS
+    /// session installed. A TablePlan proves the table ALLOCATION,
+    /// not every object a foreign manager later placed in the table
+    /// (the round-1 P1): enumeration-by-table would delete such
+    /// unowned state; session-scoped cleanup cannot.
+    fn cleanup_ops(
         &mut self,
-        plan: &TablePlan,
+        session: &[NetOp],
     ) -> impl Future<Output = Result<Vec<NetOp>, NetOpError>> + Send;
 }
 
@@ -185,9 +188,15 @@ impl RouteTransaction {
 
     /// Add one op, refusing lookalike tables at CONSTRUCTION — a
     /// transaction containing an op on a table the plan does not own
-    /// can never exist.
+    /// can never exist. ONE exemption: the mark-BYPASS rule into the
+    /// KERNEL MAIN table (a RULE with a fwmark, FR-61's outer-socket
+    /// route-out) — main is the kernel's, not a lookalike, and only
+    /// the marked-rule shape may touch it; a route into main, or an
+    /// unmarked rule, still refuses.
     pub fn op(mut self, op: NetOp) -> Result<Self, LookalikeTable> {
-        if !self.plan.owns(op.table()) {
+        let bypass_into_main = matches!(op, NetOp::AddRule(spec) | NetOp::DelRule(spec)
+            if spec.table == KERNEL_MAIN && spec.fwmark.is_some());
+        if !bypass_into_main && !self.plan.owns(op.table()) {
             return Err(LookalikeTable {
                 table: op.table(),
                 owned: self.plan.ids(),
@@ -263,6 +272,11 @@ use rtnetlink::packet_route::{AddressFamily, route::RouteAddress};
 /// The kernel's "real table id is in the attributes" marker for ids
 /// that do not fit the u8 header field.
 const RT_TABLE_COMPAT: u8 = 252;
+
+/// The kernel's `main` table — the only non-plan table a transaction
+/// may touch, and only through the mark-bypass RULE (the outer
+/// sockets' route-out; FR-61).
+pub const KERNEL_MAIN: u32 = 254;
 
 /// rtnetlink-backed executor: add/del rule + route, survey by dump.
 pub struct RtnetlinkExecutor {
@@ -536,88 +550,12 @@ impl NetlinkExecutor for RtnetlinkExecutor {
         Ok(present)
     }
 
-    async fn owned_ops(&mut self, plan: &TablePlan) -> Result<Vec<NetOp>, NetOpError> {
-        let ids = plan.ids();
-        let mut owned = Vec::new();
-        let mut rules = self.handle.rule().get(rtnetlink::IpVersion::V4).execute();
-        while let Some(message) = rules.next().await {
-            let message = message.map_err(|error| format!("rule dump: {error}"))?;
-            let table = Self::rule_table(&message);
-            if !ids.contains(&table) {
-                continue; // FR-39: foreign tables are never enumerated
-            }
-            let priority = message
-                .attributes
-                .iter()
-                .find_map(|attribute| match attribute {
-                    RuleAttribute::Priority(priority) => Some(*priority),
-                    _ => None,
-                });
-            // A dumped rule without FRA_PRIORITY cannot be spec-matched
-            // for deletion — our rules always carry one; anything else
-            // in our tables is left for the enumeration's next round
-            // (documented, not silently half-deleted).
-            let Some(priority) = priority else {
-                continue;
-            };
-            let fwmark = message
-                .attributes
-                .iter()
-                .find_map(|attribute| match attribute {
-                    RuleAttribute::FwMark(mark) => Some(*mark),
-                    _ => None,
-                });
-            owned.push(NetOp::DelRule(RuleSpec {
-                table,
-                priority,
-                fwmark,
-            }));
-        }
-        let mut routes = self.handle.route().get(RouteMessage::default()).execute();
-        while let Some(message) = routes.next().await {
-            let message = message.map_err(|error| format!("route dump: {error}"))?;
-            let table = Self::route_table(&message);
-            if !ids.contains(&table) {
-                continue; // FR-39: foreign tables are never enumerated
-            }
-            if message.header.address_family != AddressFamily::Inet {
-                continue; // v4 this slice; FR-37 owns the v6 surface
-            }
-            let len = message.header.destination_prefix_length;
-            let destination = message
-                .attributes
-                .iter()
-                .find_map(|attribute| match attribute {
-                    RouteAttribute::Destination(addr) => Some(addr),
-                    _ => None,
-                });
-            // Reconstruct the spec's destination: an explicit v4
-            // address, or the omitted-RTA_DST default (len 0).
-            // Anything else (v6/MPLS payloads, v4 without oif) is not
-            // representable in this slice's specs — skipped, never
-            // half-deleted.
-            let dest = match destination {
-                Some(RouteAddress::Inet(addr)) => DestPrefix {
-                    addr: IpAddr::V4(*addr),
-                    len,
-                },
-                None if len == 0 => DestPrefix::V4_DEFAULT,
-                _ => continue,
-            };
-            let Some(RouteAttribute::Oif(oif)) = message
-                .attributes
-                .iter()
-                .find(|attribute| matches!(attribute, RouteAttribute::Oif(_)))
-            else {
-                continue;
-            };
-            owned.push(NetOp::DelRoute(RouteSpec {
-                table,
-                dest,
-                oif: *oif,
-            }));
-        }
-        Ok(owned)
+    async fn cleanup_ops(&mut self, session: &[NetOp]) -> Result<Vec<NetOp>, NetOpError> {
+        // Session-scoped by construction: probe the session's own
+        // specs and invert what is present. Nothing a foreign manager
+        // placed anywhere — plan table or not — is ever probed.
+        let present = self.present_ops(session).await?;
+        Ok(present.iter().map(|op| inverse(*op)).collect())
     }
 }
 
@@ -652,7 +590,7 @@ mod tests {
         async fn present_ops(&mut self, _desired: &[NetOp]) -> Result<Vec<NetOp>, NetOpError> {
             Ok(Vec::new())
         }
-        async fn owned_ops(&mut self, _plan: &TablePlan) -> Result<Vec<NetOp>, NetOpError> {
+        async fn cleanup_ops(&mut self, _session: &[NetOp]) -> Result<Vec<NetOp>, NetOpError> {
             Ok(Vec::new())
         }
     }
@@ -743,7 +681,7 @@ mod tests {
             async fn present_ops(&mut self, _desired: &[NetOp]) -> Result<Vec<NetOp>, NetOpError> {
                 Ok(Vec::new())
             }
-            async fn owned_ops(&mut self, _plan: &TablePlan) -> Result<Vec<NetOp>, NetOpError> {
+            async fn cleanup_ops(&mut self, _session: &[NetOp]) -> Result<Vec<NetOp>, NetOpError> {
                 Ok(Vec::new())
             }
         }
@@ -799,6 +737,12 @@ mod tests {
             async fn survey(&mut self, _: &str) -> Result<TableSurvey, NetOpError> {
                 Ok(TableSurvey::default())
             }
+            async fn present_ops(&mut self, _desired: &[NetOp]) -> Result<Vec<NetOp>, NetOpError> {
+                Ok(Vec::new())
+            }
+            async fn cleanup_ops(&mut self, _session: &[NetOp]) -> Result<Vec<NetOp>, NetOpError> {
+                Ok(Vec::new())
+            }
         }
         let failing = NetOp::AddRoute(route(51820));
         let txn = RouteTransaction::new(plan())
@@ -846,7 +790,7 @@ mod tests {
             async fn present_ops(&mut self, _desired: &[NetOp]) -> Result<Vec<NetOp>, NetOpError> {
                 Ok(Vec::new())
             }
-            async fn owned_ops(&mut self, _plan: &TablePlan) -> Result<Vec<NetOp>, NetOpError> {
+            async fn cleanup_ops(&mut self, _session: &[NetOp]) -> Result<Vec<NetOp>, NetOpError> {
                 Ok(Vec::new())
             }
         }
