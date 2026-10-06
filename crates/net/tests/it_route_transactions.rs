@@ -140,11 +140,12 @@ async fn it_route_drift_and_cleanup() {
     tokio::spawn(connection);
     let mut executor = RtnetlinkExecutor::new(handle.clone());
 
-    let plan = plan_with(&mut executor, "").await.expect("survey");
+    let plan = plan_with(&mut executor, "", None).await.expect("survey");
     let lo = lo_index(&handle).await;
     let desired = desired_ops(&DesiredRoutes {
         plan: plan.clone(),
         tun_oif: lo,
+        bypass_mark: 0,
     });
     let NetOp::AddRoute(owned_route) = desired[1] else {
         panic!("desired[1] is the default route");
@@ -197,7 +198,10 @@ async fn it_route_drift_and_cleanup() {
         .expect("foreign rule");
 
     // CLEANUP enumerates only plan-table state — our rule + our route.
-    let cleanup = executor.owned_ops(&plan).await.expect("owned enumeration");
+    let cleanup = executor
+        .cleanup_ops(&desired)
+        .await
+        .expect("owned enumeration");
     assert_eq!(cleanup.len(), 2, "exactly our rule and our route");
     assert!(cleanup.iter().any(|op| matches!(op, NetOp::DelRule(_))));
     assert!(cleanup.iter().any(|op| matches!(op, NetOp::DelRoute(_))));
