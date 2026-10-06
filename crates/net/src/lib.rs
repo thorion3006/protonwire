@@ -50,6 +50,11 @@ pub mod tables;
 /// the table plan (IT-25's lookalike refusal wired into the writer).
 pub mod route_txn;
 
+/// The routing desired-state lifecycle (FR-35/39/40): the
+/// full-tunnel desired ops, the drift repair diff, and the
+/// owned-state cleanup enumeration.
+pub mod route_drift;
+
 /// The network-namespace integration-test harness (NFR-31). Shared by
 /// every netns-gated integration test in the workspace (`protocol`'s
 /// IT-1 today, this crate's M5 suite next); the runner is

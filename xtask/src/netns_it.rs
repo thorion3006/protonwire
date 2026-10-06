@@ -152,7 +152,20 @@ pub(crate) fn run(root: &Path) -> Result<bool> {
             .arg(&cargo)
             .arg("test")
             .args(&cargo_args)
-            .args(["-p", package, "--test", target, "--", "--nocapture"])
+            // SERIAL inside the namespace (the drift IT's first run:
+            // two tests in one binary share the kernel state, and
+            // default thread-parallelism collided identical rules
+            // with EEXIST). Every gated target mutates namespace
+            // state by definition — there is no parallel-safe one.
+            .args([
+                "-p",
+                package,
+                "--test",
+                target,
+                "--",
+                "--nocapture",
+                "--test-threads=1",
+            ])
             .status()
             .with_context(|| format!("spawning {label} inside the namespace"))?;
         if status.success() {
