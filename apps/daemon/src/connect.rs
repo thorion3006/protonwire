@@ -776,7 +776,12 @@ mod tests {
             interface_up: true,
             interface_error: None,
             connection: EngineConnectionState::ConnectingToAgent {
-                peer_id: "uk-42".to_owned(),
+                peer: protonwire_protocol::engine::EnginePeerRef {
+                    peer_id: "uk-42".to_owned(),
+                    entry_ip: "185.159.158.1".parse().unwrap(),
+                    protocol: protonwire_protocol::engine::EngineTransport::WireGuardUdp,
+                    port: 51820,
+                },
                 wait: None,
             },
         };
