@@ -3676,3 +3676,20 @@ Gates green at every level.
 
 Gates green at every level after the cascade (#17's fixture rides
 the widened shape).
+
+## 2026-10-06 — Round 38 (#17 ×1)
+
+- #17: the devshell DECLARES iproute2 — the netns gate shim invokes
+  `ip link set lo up`, but the tool resolved only via the host
+  system profile leaking into the devshell PATH (CI's ubuntu images
+  ship iproute2, so CI stayed green while the declared environment
+  was incomplete). shell.nix carries the declaration (README and
+  CONTRIBUTING ride it), and an iproute2 preflight turns its absence
+  into a named error BEFORE the prebuild — an error, not a skip:
+  the host can run the gated targets, the environment is just
+  missing a declared tool.
+
+Gates green at every level, verified both directions: the devshell
+resolves its own /nix/store/...-iproute2-7.1.0/bin/ip with netns-it
+3/3 inside it; a PATH carrying unshare but not ip exits 1 with the
+named message before anything builds.
