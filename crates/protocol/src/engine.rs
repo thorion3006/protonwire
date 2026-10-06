@@ -319,9 +319,15 @@ pub enum EngineConnectionState {
     },
     /// WG up, LocalAgent session negotiating (the wait/jail reason
     /// surfaces — FR-7M).
+    /// WG up, LocalAgent session negotiating (the wait/jail reason
+    /// surfaces — FR-7M). The full selected ENDPOINT rides the state
+    /// (the bot round-37 P2): a jailed session may never reach
+    /// Connected, and FR-29/FR-123 status must expose the selected
+    /// entry IP, protocol, and port during negotiation — not only the
+    /// ID.
     ConnectingToAgent {
-        /// The peer whose tunnel carries the agent session.
-        peer_id: String,
+        /// The selected peer (id, entry IP, transport, port).
+        peer: EnginePeerRef,
         /// Why the session is waiting, if reported.
         wait: Option<EngineAgentWait>,
     },
@@ -606,7 +612,7 @@ pub fn translate_state(state: &VpnState) -> EngineVpnState {
             },
             ConnectionState::ConnectingToLocalAgent { peer, wait_reason } => {
                 EngineConnectionState::ConnectingToAgent {
-                    peer_id: stable_peer_id(&peer.peer_id),
+                    peer: peer_from_protun(peer),
                     wait: wait_reason.as_ref().map(|reason| match reason {
                         protun::api::state::AgentConnectionWaitReason::SoftJailed => {
                             EngineAgentWait::SoftJailed
@@ -1671,8 +1677,13 @@ mod tests {
         };
         let translated = translate_state(&state);
         match translated.connection {
-            EngineConnectionState::ConnectingToAgent { peer_id, wait } => {
-                assert_eq!(peer_id, "uk-42");
+            EngineConnectionState::ConnectingToAgent { peer, wait } => {
+                assert_eq!(peer.peer_id, "uk-42");
+                // The full selected endpoint rides the negotiating
+                // state (the bot round-37 P2 — a jailed session never
+                // reaches Connected; FR-29/FR-123 must expose it).
+                assert_eq!(peer.entry_ip, "185.159.158.1".parse::<IpAddr>().unwrap());
+                assert_eq!(peer.protocol, EngineTransport::WireGuardUdp);
                 match wait {
                     Some(EngineAgentWait::HardJailed { jails }) => {
                         assert_eq!(jails.len(), 1);
