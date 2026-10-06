@@ -121,6 +121,23 @@ pub trait NetlinkExecutor {
         &mut self,
         rt_tables_text: &str,
     ) -> impl Future<Output = Result<TableSurvey, NetOpError>> + Send;
+
+    /// Which of `desired`'s operations have their state present on
+    /// the host — a PROBE, no mutation, no plan validation (drift
+    /// detection may probe anything; FR-40's repair diff is
+    /// [`crate::route_drift::repair_ops`]).
+    fn present_ops(
+        &mut self,
+        desired: &[NetOp],
+    ) -> impl Future<Output = Result<Vec<NetOp>, NetOpError>> + Send;
+
+    /// Every live rule/route referencing a PLAN table, as delete ops
+    /// — disconnect's cleanup set (FR-39: foreign tables are never
+    /// enumerated; concurrently changed unowned state stays).
+    fn owned_ops(
+        &mut self,
+        plan: &TablePlan,
+    ) -> impl Future<Output = Result<Vec<NetOp>, NetOpError>> + Send;
 }
 
 /// A transaction refused before it started — the op's table is a
@@ -500,6 +517,108 @@ impl NetlinkExecutor for RtnetlinkExecutor {
             persisted: None,
         })
     }
+
+    async fn present_ops(&mut self, desired: &[NetOp]) -> Result<Vec<NetOp>, NetOpError> {
+        let mut present = Vec::new();
+        for op in desired {
+            let there = match op {
+                NetOp::AddRule(spec) | NetOp::DelRule(spec) => {
+                    self.find_rule(*spec).await?.is_some()
+                }
+                NetOp::AddRoute(spec) | NetOp::DelRoute(spec) => {
+                    self.find_route(*spec).await?.is_some()
+                }
+            };
+            if there {
+                present.push(*op);
+            }
+        }
+        Ok(present)
+    }
+
+    async fn owned_ops(&mut self, plan: &TablePlan) -> Result<Vec<NetOp>, NetOpError> {
+        let ids = plan.ids();
+        let mut owned = Vec::new();
+        let mut rules = self.handle.rule().get(rtnetlink::IpVersion::V4).execute();
+        while let Some(message) = rules.next().await {
+            let message = message.map_err(|error| format!("rule dump: {error}"))?;
+            let table = Self::rule_table(&message);
+            if !ids.contains(&table) {
+                continue; // FR-39: foreign tables are never enumerated
+            }
+            let priority = message
+                .attributes
+                .iter()
+                .find_map(|attribute| match attribute {
+                    RuleAttribute::Priority(priority) => Some(*priority),
+                    _ => None,
+                });
+            // A dumped rule without FRA_PRIORITY cannot be spec-matched
+            // for deletion — our rules always carry one; anything else
+            // in our tables is left for the enumeration's next round
+            // (documented, not silently half-deleted).
+            let Some(priority) = priority else {
+                continue;
+            };
+            let fwmark = message
+                .attributes
+                .iter()
+                .find_map(|attribute| match attribute {
+                    RuleAttribute::FwMark(mark) => Some(*mark),
+                    _ => None,
+                });
+            owned.push(NetOp::DelRule(RuleSpec {
+                table,
+                priority,
+                fwmark,
+            }));
+        }
+        let mut routes = self.handle.route().get(RouteMessage::default()).execute();
+        while let Some(message) = routes.next().await {
+            let message = message.map_err(|error| format!("route dump: {error}"))?;
+            let table = Self::route_table(&message);
+            if !ids.contains(&table) {
+                continue; // FR-39: foreign tables are never enumerated
+            }
+            if message.header.address_family != AddressFamily::Inet {
+                continue; // v4 this slice; FR-37 owns the v6 surface
+            }
+            let len = message.header.destination_prefix_length;
+            let destination = message
+                .attributes
+                .iter()
+                .find_map(|attribute| match attribute {
+                    RouteAttribute::Destination(addr) => Some(addr),
+                    _ => None,
+                });
+            // Reconstruct the spec's destination: an explicit v4
+            // address, or the omitted-RTA_DST default (len 0).
+            // Anything else (v6/MPLS payloads, v4 without oif) is not
+            // representable in this slice's specs — skipped, never
+            // half-deleted.
+            let dest = match destination {
+                Some(RouteAddress::Inet(addr)) => DestPrefix {
+                    addr: IpAddr::V4(*addr),
+                    len,
+                },
+                None if len == 0 => DestPrefix::V4_DEFAULT,
+                _ => continue,
+            };
+            let Some(RouteAttribute::Oif(oif)) = message
+                .attributes
+                .iter()
+                .find(|attribute| matches!(attribute, RouteAttribute::Oif(_)))
+            else {
+                continue;
+            };
+            owned.push(NetOp::DelRoute(RouteSpec {
+                table,
+                dest,
+                oif: *oif,
+            }));
+        }
+        Ok(owned)
+    }
 }
 
 #[cfg(test)]
@@ -529,6 +648,12 @@ mod tests {
 
         async fn survey(&mut self, _rt_tables_text: &str) -> Result<TableSurvey, NetOpError> {
             Ok(TableSurvey::default())
+        }
+        async fn present_ops(&mut self, _desired: &[NetOp]) -> Result<Vec<NetOp>, NetOpError> {
+            Ok(Vec::new())
+        }
+        async fn owned_ops(&mut self, _plan: &TablePlan) -> Result<Vec<NetOp>, NetOpError> {
+            Ok(Vec::new())
         }
     }
 
@@ -614,6 +739,12 @@ mod tests {
             }
             async fn survey(&mut self, _: &str) -> Result<TableSurvey, NetOpError> {
                 Ok(TableSurvey::default())
+            }
+            async fn present_ops(&mut self, _desired: &[NetOp]) -> Result<Vec<NetOp>, NetOpError> {
+                Ok(Vec::new())
+            }
+            async fn owned_ops(&mut self, _plan: &TablePlan) -> Result<Vec<NetOp>, NetOpError> {
+                Ok(Vec::new())
             }
         }
         let failing_op = NetOp::DelRule(RuleSpec {
@@ -711,6 +842,12 @@ mod tests {
             }
             async fn survey(&mut self, _: &str) -> Result<TableSurvey, NetOpError> {
                 Ok(TableSurvey::default())
+            }
+            async fn present_ops(&mut self, _desired: &[NetOp]) -> Result<Vec<NetOp>, NetOpError> {
+                Ok(Vec::new())
+            }
+            async fn owned_ops(&mut self, _plan: &TablePlan) -> Result<Vec<NetOp>, NetOpError> {
+                Ok(Vec::new())
             }
         }
         let txn = RouteTransaction::new(plan())

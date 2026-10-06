@@ -9,6 +9,7 @@
 
 use futures_util::StreamExt;
 use protonwire_net::netns;
+use protonwire_net::route_drift::{DesiredRoutes, desired_ops, repair_ops};
 use protonwire_net::route_txn::{
     DestPrefix, NetOp, NetlinkExecutor, RouteSpec, RouteTransaction, RtnetlinkExecutor, RuleSpec,
     plan_with,
@@ -120,5 +121,113 @@ async fn it_route_transactions() {
     assert!(
         !survey.occupied.contains(&51820),
         "cleanup leaves no reference to the main table"
+    );
+}
+
+/// The desired-state lifecycle against the real kernel (FR-35/39/40,
+/// M5 slice 3): apply the full-tunnel desired ops, prove an undrifted
+/// host yields an EMPTY repair, drift a route away behind the
+/// daemon's back and repair exactly it, then enumerate disconnect's
+/// cleanup set — and prove a FOREIGN rule (another manager's, on a
+/// non-plan table, installed raw because our writer would refuse it)
+/// SURVIVES our cleanup (FR-39).
+#[tokio::test]
+async fn it_route_drift_and_cleanup() {
+    if !netns::gate("it_route_drift_and_cleanup") {
+        return;
+    }
+    let (connection, handle, _) = rtnetlink::new_connection().expect("netlink connection");
+    tokio::spawn(connection);
+    let mut executor = RtnetlinkExecutor::new(handle.clone());
+
+    let plan = plan_with(&mut executor, "").await.expect("survey");
+    let lo = lo_index(&handle).await;
+    let desired = desired_ops(&DesiredRoutes {
+        plan: plan.clone(),
+        tun_oif: lo,
+    });
+    let NetOp::AddRoute(owned_route) = desired[1] else {
+        panic!("desired[1] is the default route");
+    };
+
+    // Apply: the undrifted probe sees everything; the repair is EMPTY.
+    RouteTransaction::new(plan.clone())
+        .op(desired[0])
+        .expect("plan table")
+        .op(desired[1])
+        .expect("plan table")
+        .apply(&mut executor)
+        .await
+        .expect("apply");
+    let present = executor.present_ops(&desired).await.expect("probe");
+    assert_eq!(present.len(), desired.len());
+    assert!(repair_ops(&desired, &present).is_empty(), "undrifted host");
+
+    // DRIFT: the route disappears; the probe misses exactly it; the
+    // repair restores exactly it.
+    RouteTransaction::new(plan.clone())
+        .op(NetOp::DelRoute(owned_route))
+        .expect("plan table")
+        .apply(&mut executor)
+        .await
+        .expect("drift the route away");
+    let present = executor.present_ops(&desired).await.expect("probe");
+    assert_eq!(present, vec![desired[0]]);
+    let repair = repair_ops(&desired, &present);
+    assert_eq!(repair, vec![desired[1]]);
+    RouteTransaction::new(plan.clone())
+        .op(repair[0])
+        .expect("plan table")
+        .apply(&mut executor)
+        .await
+        .expect("repair");
+    let present = executor.present_ops(&desired).await.expect("probe");
+    assert_eq!(present.len(), desired.len());
+
+    // FOREIGN state: another manager's rule on a non-plan table,
+    // installed RAW (our writer refuses non-plan ops by construction).
+    handle
+        .rule()
+        .add()
+        .table_id(4000)
+        .priority(32000)
+        .v4()
+        .execute()
+        .await
+        .expect("foreign rule");
+
+    // CLEANUP enumerates only plan-table state — our rule + our route.
+    let cleanup = executor.owned_ops(&plan).await.expect("owned enumeration");
+    assert_eq!(cleanup.len(), 2, "exactly our rule and our route");
+    assert!(cleanup.iter().any(|op| matches!(op, NetOp::DelRule(_))));
+    assert!(cleanup.iter().any(|op| matches!(op, NetOp::DelRoute(_))));
+    let mut txn = RouteTransaction::new(plan.clone());
+    for op in cleanup {
+        txn = txn.op(op).expect("plan table");
+    }
+    txn.apply(&mut executor).await.expect("cleanup");
+
+    // FR-39: no plan-table reference remains; the foreign rule
+    // SURVIVED our cleanup untouched.
+    let survey = executor.survey("").await.expect("final survey");
+    for id in plan.ids() {
+        assert!(
+            !survey.occupied.contains(&id),
+            "plan table {id} unreferenced after cleanup"
+        );
+    }
+    let foreign = RuleSpec {
+        table: 4000,
+        priority: 32000,
+        fwmark: None,
+    };
+    let survived = executor
+        .present_ops(&[NetOp::AddRule(foreign)])
+        .await
+        .expect("probe");
+    assert_eq!(
+        survived,
+        vec![NetOp::AddRule(foreign)],
+        "unowned state stays"
     );
 }
