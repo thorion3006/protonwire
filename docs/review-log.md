@@ -3790,3 +3790,42 @@ Gates green at every level: fmt, clippy -D warnings (unpiped),
 cargo test (32 suites, 0 failed), netns-it --locked 3/3, rustdoc
 -D warnings, cargo audit (4 allowed), xtask all (39 PASS,
 including the new train rule).
+
+## 2026-10-06 — M5 stack round 2 (the full-stack review wave: 14 findings, all landed)
+
+The bot reviewed the whole open stack; 14 findings (11×P1, 3×P2),
+every one genuine, every one landed bottom-up with cascade rebases:
+
+- #19 (56759da): base-aware rt_tables parsing (iproute2 fread_id_name
+  semantics — hex ids read occupied, not absent); persisted-record
+  validation (reserved ids, per-lane collisions rejected).
+- #20 (9143c57): exec reports kernel-state CHANGED — rollback undoes
+  only mutations (an absent delete's inverse would have CREATED the
+  absent rule); adds idempotent find-first (Linux accepts duplicate
+  rules); plan_with threads the daemon's persisted record (a crash's
+  stale rules no longer push the planner to an uncleanable new id).
+- #21 (d189f56): the MARK BYPASS rule outranks the catch-all (marked
+  outer sockets stay on the uplink — the tunnel no longer routes
+  into itself); cleanup is SESSION-scoped (cleanup_ops inverts the
+  session's present ops — a plan proves the table allocation, not
+  every object later placed in it; enumeration-by-table deleted
+  foreign state).
+- #22 (588f4ec): the kill switch's marker must match the PERSISTED
+  PRIOR generation (forgeable names are not ownership); the DHCP
+  permit is nfproto-v4-scoped with NETWORK-order port bytes (the LE
+  literal matched port 17152); LAN permits are destination-PREFIX +
+  interface (interface-only opened the whole off-tunnel Internet);
+  multiple same-named tables are an ambiguous lookalike.
+- #23 (dd3c1e4, rebuilt on the fixed stack): the connect sequence
+  pins KILL-SWITCH-FIRST (interfaces → switch → routes) in the doc
+  and the IT's order — no v6 escape window in the Blocked posture.
+
+PROCESS (the owner's challenge answered): the pre-open reviewer
+dispatch had been skipped — the bot's post-open rounds substituted
+for it, which is exactly the trade the standing rule prohibits. The
+correction: the reviewer set (sec-auditor on the kill switch,
+rust-reviewer, qa-engineer) now runs on the stack BEFORE any merge
+call, and every remaining M5 slice dispatches its reviewers BEFORE
+its PR opens.
+
+Gates green at every tip (netns-it 5/5 targets, 6 PASS lines).
