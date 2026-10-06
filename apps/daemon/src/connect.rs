@@ -148,6 +148,37 @@ struct LaneState {
 // pump and the daemon-side methods share.
 type SharedLane = Arc<Mutex<LaneState>>;
 
+/// The disconnect ADMISSION decision: which window (if any) refuses
+/// this disconnect before the owner gate. Pure so the window contract
+/// is testable without a live engine (the round-38 gap was a missing
+/// arm here). Administrator first: a draining daemon owns the lane
+/// outright — the user windows only refuse when no drain is armed.
+///
+/// The windows it guards (each a landed round): RECONNECTING (the
+/// round-20 P2 — an owner reconnect temporarily sets owner=None with
+/// no active lane; a disconnect here would "succeed" on the empty
+/// lane and the in-flight reconnect would then install a tunnel AFTER
+/// the completed disconnect), DISCONNECTING (the round-24 P2 — the
+/// first disconnect took the lane and is joining its pump; a second
+/// would "succeed" on the empty lane and CLEAR the window's flag
+/// while the first teardown still runs), and DRAINING (the round-38
+/// P2 — drain takes the lane and tears it down with no transition
+/// flag armed; between its take and the join the lane reads empty
+/// and unowned, and a disconnect "succeeded" on it while the pump
+/// and TUN teardown still ran).
+fn disconnect_refusal(lane: &LaneState, draining: bool) -> Option<LaneRefusal> {
+    if draining {
+        return Some(LaneRefusal::Draining);
+    }
+    if lane.reconnecting {
+        return Some(LaneRefusal::Reconnecting);
+    }
+    if lane.disconnecting {
+        return Some(LaneRefusal::Disconnecting);
+    }
+    None
+}
+
 /// The lane. Construct once at daemon startup with the production
 /// mode; the engine inside is stateless configuration.
 pub struct ConnectionLane {
@@ -327,23 +358,15 @@ impl ConnectionLane {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // The RECONNECTING window is honored here too (the bot
-        // round-20 P2): an owner reconnect temporarily sets
-        // owner=None with no active lane — a disconnect here would
-        // pass the gate, "succeed" on the empty lane, and the
-        // in-flight reconnect would then install a tunnel AFTER the
-        // completed disconnect. Refuse for the window's duration.
-        if lane.reconnecting {
-            return Err(LaneRefusal::Reconnecting);
-        }
-        // A disconnect ALREADY IN ITS WINDOW refuses a second one (the
-        // bot round-24 P2): the first took the active lane and is
-        // joining its pump with the lock down — a second disconnect
-        // here would pass the (cleared) owner gate, observe an empty
-        // lane, "succeed", and CLEAR the window's flag while the
-        // first teardown still runs.
-        if lane.disconnecting {
-            return Err(LaneRefusal::Disconnecting);
+        // The window refusals are ONE admission decision (pure, so
+        // the contract is testable without a live engine). The
+        // draining read rides THIS guard: drain arms the flag before
+        // its take (round-28), so a disconnect acquiring the guard
+        // after the take sees it — and one that won the guard first
+        // is waited out by drain's loop, its teardown finishing
+        // before its own Ok.
+        if let Some(refusal) = disconnect_refusal(&lane, self.draining.load(Ordering::SeqCst)) {
+            return Err(refusal);
         }
         gate_owner(lane.owner, uid)?;
         // NO JOIN UNDER THE LANE LOCK (the refactor pass's P1): take
@@ -755,6 +778,43 @@ mod tests {
             gate_owner(Some(1000), 1001),
             Err(LaneRefusal::NotOwner { owner: 1000 })
         );
+    }
+
+    #[test]
+    fn disconnect_refuses_through_every_window() {
+        // The round-38 arm: drain takes the lane with no transition
+        // flag armed — between its take and the join the lane reads
+        // empty and unowned, and the admission decision must refuse
+        // (the empty-lane idempotent success is ONLY for a lane no
+        // window owns).
+        assert_eq!(
+            disconnect_refusal(&LaneState::default(), true),
+            Some(LaneRefusal::Draining)
+        );
+        // Administrator first: a reconnect already in flight when the
+        // drain armed still refuses as Draining — the drain loop owns
+        // what happens to that lane next.
+        let reconnecting = LaneState {
+            reconnecting: true,
+            ..LaneState::default()
+        };
+        assert_eq!(
+            disconnect_refusal(&reconnecting, true),
+            Some(LaneRefusal::Draining)
+        );
+        assert_eq!(
+            disconnect_refusal(&reconnecting, false),
+            Some(LaneRefusal::Reconnecting)
+        );
+        let disconnecting = LaneState {
+            disconnecting: true,
+            ..LaneState::default()
+        };
+        assert_eq!(
+            disconnect_refusal(&disconnecting, false),
+            Some(LaneRefusal::Disconnecting)
+        );
+        assert_eq!(disconnect_refusal(&LaneState::default(), false), None);
     }
 
     #[test]
