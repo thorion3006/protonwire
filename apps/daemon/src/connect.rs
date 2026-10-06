@@ -514,12 +514,21 @@ fn pump_events(slot: &ConnectionSlot, lane: &std::sync::Weak<Mutex<LaneState>>, 
     let mut last: Option<VpnState> = None;
     let mut dropped_watermark: u64 = 0;
     let mut backlog: bool = false;
+    // The disarm probe's catch (the bot round-38 P2): an event the
+    // zero-time probe found after the quiet reconcile is processed
+    // by the NEXT iteration's normal receive path — the suppression
+    // stays armed behind it.
+    let mut pending: Option<EngineEvent> = None;
     loop {
-        let received = slot.lock().ok().and_then(|mut guard| {
-            guard
-                .as_mut()
-                .map(|connection| connection.events().recv_timeout(PUMP_POLL))
-        });
+        let received = if let Some(event) = pending.take() {
+            Some(Ok(event))
+        } else {
+            slot.lock().ok().and_then(|mut guard| {
+                guard
+                    .as_mut()
+                    .map(|connection| connection.events().recv_timeout(PUMP_POLL))
+            })
+        };
         let event = match received {
             Some(Ok(event)) => {
                 // RECONCILE BEFORE PROCESSING (the bot round-29 P2):
@@ -535,9 +544,9 @@ fn pump_events(slot: &ConnectionSlot, lane: &std::sync::Weak<Mutex<LaneState>>, 
                 // A received event does NOT disarm the backlog (the
                 // bot round-16 P2): the queue may still hold PRE-DROP
                 // states behind this one. The backlog stays armed until
-                // the queue is QUIET (the timeout arm's reconcile runs
-                // with an empty queue behind it); every quiet cadence
-                // re-reconciles in the meantime.
+                // the queue is QUIET (the timeout arm's zero-time
+                // probe proves the queue empty AFTER its reconcile);
+                // every quiet cadence re-reconciles in the meantime.
                 event
             }
             Some(Err(std::sync::mpsc::RecvTimeoutError::Timeout)) => {
@@ -564,12 +573,33 @@ fn pump_events(slot: &ConnectionSlot, lane: &std::sync::Weak<Mutex<LaneState>>, 
                     terminate_on_fatal(slot, lane, core);
                     break;
                 }
-                // The queue is QUIET here (the timeout proves the
-                // cursor sat at an empty channel): the stale backlog
-                // has fully drained — disarm (the bot rounds 14+16:
-                // receiving an event must NOT disarm, because older
-                // states may sit behind it; only emptiness does).
-                backlog = false;
+                // DISARM ON CURRENT EMPTINESS (the bot round-38 P2):
+                // the timeout's emptiness is STALE by now — events
+                // enqueued during the reconcile above leave a
+                // non-empty queue that a disarm here would expose:
+                // the queued state predates the reconcile's
+                // just-published snapshot (a Disconnected landing
+                // after a Connected snapshot) and would publish and
+                // revert it on the next receive. The zero-time probe
+                // is the disarm's proof, taken AFTER the reconcile:
+                // EMPTY disarms — anything arriving later is newer
+                // than every published snapshot, so in-order
+                // publishing is correct; an EVENT defers to the next
+                // iteration's receive path with the suppression
+                // still armed (the rounds 14+16 discipline: only
+                // emptiness disarms); a DISCONNECTED channel or a
+                // vanished slot changes nothing here — the next
+                // iteration's recv surfaces the engine death (or the
+                // teardown-observed None) through its own arm.
+                match slot.lock().ok().and_then(|mut guard| {
+                    guard
+                        .as_mut()
+                        .map(|connection| connection.events().try_recv())
+                }) {
+                    Some(Err(std::sync::mpsc::TryRecvError::Empty)) => backlog = false,
+                    Some(Ok(event)) => pending = Some(event),
+                    _ => {}
+                }
                 continue;
             }
             // SPLIT ARMS (the refactor pass's P1): engine death
