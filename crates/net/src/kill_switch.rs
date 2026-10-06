@@ -24,9 +24,11 @@
 //! chain, and the exact rendered rule count — anything else is an
 //! error, never a silent maybe.
 
+use std::net::IpAddr;
+
 use rustables::expr::{
-    Cmp, CmpOp, Counter, HighLevelPayload, Immediate, Meta, MetaType, TransportHeaderField,
-    UDPHeaderField, VerdictKind,
+    Bitwise, Cmp, CmpOp, Counter, HighLevelPayload, IPv4HeaderField, IPv6HeaderField, Immediate,
+    Meta, MetaType, NetworkHeaderField, TransportHeaderField, UDPHeaderField, VerdictKind,
 };
 use rustables::{
     Batch, Chain, ChainPolicy, Hook, HookClass, MsgType, ProtocolFamily, Rule, Table, iface_index,
@@ -48,16 +50,28 @@ pub struct KillSwitchPolicy {
     /// The TUN interface's kernel index (its traffic is the VPN's
     /// own — always permitted).
     pub tun_ifindex: u32,
-    /// Permit v4 DHCP bootstrap (udp/67) — the active uplink's
-    /// lease renewal while the tunnel is down or establishing.
+    /// Permit v4 DHCP bootstrap (nfproto v4 + udp/67) — the active
+    /// uplink's lease renewal while the tunnel is down or
+    /// establishing.
     pub allow_dhcp_v4: bool,
-    /// The LAN interface's kernel index when LAN access is enabled
-    /// (FR-36; exact-CIDR LAN scoping rides the LAN slice).
-    pub lan_ifindex: Option<u32>,
+    /// Validated LAN permits — destination PREFIX + output
+    /// interface each (FR-36): interface alone would accept the
+    /// entire off-tunnel Internet the uplink routes (the round-1
+    /// P1); the prefix is the scope, the interface the path.
+    pub lan_permits: Vec<LanPermit>,
     /// The daemon's private bypass mark — only sockets the active
     /// daemon/ProTUN instance marked match (identity, not a
     /// destination allowlist; FR-61).
     pub bypass_mark: u32,
+}
+
+/// One LAN access permit: traffic to `dest` leaving via `oif`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LanPermit {
+    /// The validated local prefix (LAN or link-local).
+    pub dest: crate::route_txn::DestPrefix,
+    /// The egress interface's kernel index.
+    pub oif: u32,
 }
 
 /// The generation of one kill-switch apply — persisted by the
@@ -87,23 +101,32 @@ impl GenerationId {
 pub enum ApplyDecision {
     /// No `protonwire` table exists — a fresh install.
     FreshApply,
-    /// Our marker chain is present — an OWNED replace (atomic
-    /// delete+recreate in one batch).
+    /// The table's marker matches the PERSISTED prior generation —
+    /// an OWNED replace (atomic delete+recreate in one batch).
     ReplaceOwned(GenerationId),
-    /// A `protonwire` table exists with NO marker of ours — a
-    /// lookalike: refuse, flush nothing, fail closed (FR-59/65).
+    /// Anything else — no table with a record to prove it, a marker
+    /// that does not match the record, or MULTIPLE markers — is a
+    /// lookalike: refuse, flush nothing, fail closed (FR-59/65; the
+    /// round-1 P1: a chain merely NAMED like our marker is not
+    /// ownership — names are forgeable; the private persisted record
+    /// is the proof).
     RefuseLookalike,
 }
 
-/// Decide the apply from the observed nftables state (pure): `None`
-/// = no table (fresh); `Some(markers)` = the table's marker chains —
-/// empty markers on an EXISTING table is exactly the lookalike case
-/// (a fresh apply over it would be a flush of unowned state).
-pub fn decide_live(table_markers: Option<&[GenerationId]>) -> ApplyDecision {
-    match table_markers {
-        None => ApplyDecision::FreshApply,
-        Some([]) => ApplyDecision::RefuseLookalike,
-        Some(markers) => ApplyDecision::ReplaceOwned(*markers.last().expect("non-empty")),
+/// Decide the apply from the observed nftables state (pure):
+/// `None` = no table (fresh, with no prior record required for a
+/// FIRST install); `Some(markers)` = the live table's marker chains,
+/// which must be EXACTLY the caller's persisted prior generation —
+/// zero markers, a mismatched marker, or several markers all refuse.
+pub fn decide_live(
+    table_markers: Option<&[GenerationId]>,
+    persisted_prior: Option<GenerationId>,
+) -> ApplyDecision {
+    match (table_markers, persisted_prior) {
+        (None, _) => ApplyDecision::FreshApply,
+        (Some([]), _) => ApplyDecision::RefuseLookalike,
+        (Some([marker]), Some(prior)) if *marker == prior => ApplyDecision::ReplaceOwned(*marker),
+        _ => ApplyDecision::RefuseLookalike,
     }
 }
 
@@ -147,13 +170,12 @@ impl From<std::io::Error> for KillSwitchError {
     }
 }
 
-fn our_table() -> Result<Option<Table>, KillSwitchError> {
-    for table in list_tables()? {
-        if table.get_name().is_some_and(|name| name == TABLE_NAME) {
-            return Ok(Some(table));
-        }
-    }
-    Ok(None)
+/// Tables named `protonwire` (nftables identity is family AND name; rustables keeps the family accessor crate-private, so a same-name other-family table is indistinguishable from here). ZERO = no table; ONE = the candidate; MORE = ambiguity, which the caller treats as a lookalike (refuse — never guess). Ownership is NOT this name match: it is the PERSISTED-PRIOR-verified marker; a same-name wrong-family table carries no marker of ours and refuses on its own.
+fn tables_named_us() -> Result<Vec<Table>, KillSwitchError> {
+    Ok(list_tables()?
+        .into_iter()
+        .filter(|table| table.get_name().is_some_and(|name| name == TABLE_NAME))
+        .collect())
 }
 
 /// The marker generations found in the live `protonwire` table
@@ -176,7 +198,7 @@ fn marker_generations(table: &Table) -> Result<Vec<GenerationId>, KillSwitchErro
 fn expected_rule_count(policy: &KillSwitchPolicy) -> usize {
     2 /* tun + loopback */
         + usize::from(policy.allow_dhcp_v4)
-        + usize::from(policy.lan_ifindex.is_some())
+        + policy.lan_permits.len()
         + 1 /* bypass mark */
         + 1 /* the counted terminal drop */
 }
@@ -199,16 +221,24 @@ fn render_rules(chain: &Chain, policy: &KillSwitchPolicy) -> Result<Vec<Rule>, K
     if policy.allow_dhcp_v4 {
         rules.push(
             Rule::new(chain)?
+                // FAMILY FIRST (the round-1 P1): an inet chain matches
+                // both families — a bare transport match would permit
+                // off-tunnel IPv6 UDP to the same port. NFPROTO_IPV4 = 2.
+                .with_expr(Meta::new(MetaType::NfProto))
+                .with_expr(Cmp::new(CmpOp::Eq, [2_u8]))
                 .with_expr(
                     HighLevelPayload::Transport(TransportHeaderField::Udp(UDPHeaderField::Dport))
                         .build(),
                 )
-                .with_expr(Cmp::new(CmpOp::Eq, 67_u16.to_le_bytes()))
+                // NETWORK byte order (the round-1 P1): payload-header
+                // registers hold wire-order bytes — the little-endian
+                // literal matched port 17152 (0x4300), not DHCP's 67.
+                .with_expr(Cmp::new(CmpOp::Eq, 67_u16.to_be_bytes()))
                 .with_expr(Immediate::new_verdict(VerdictKind::Accept)),
         );
     }
-    if let Some(lan_ifindex) = policy.lan_ifindex {
-        rules.push(allow_oif(chain, lan_ifindex)?);
+    for permit in &policy.lan_permits {
+        rules.push(render_lan_permit(chain, permit)?);
     }
     rules.push(
         Rule::new(chain)?
@@ -224,6 +254,75 @@ fn render_rules(chain: &Chain, policy: &KillSwitchPolicy) -> Result<Vec<Rule>, K
     Ok(rules)
 }
 
+/// One validated LAN permit: destination PREFIX + output interface.
+/// Interface alone would accept EVERYTHING that interface routes —
+/// enabling LAN access must not open the whole off-tunnel Internet
+/// through the uplink (the round-1 P1).
+fn render_lan_permit(chain: &Chain, permit: &LanPermit) -> Result<Rule, KillSwitchError> {
+    let mask_len = {
+        let probe = prefix_mask(permit.dest);
+        probe.len()
+    };
+    let mask = prefix_mask(permit.dest);
+    let network = network_address(permit.dest);
+    let mut rule = Rule::new(chain)?
+        .with_expr(Meta::new(MetaType::Oif))
+        .with_expr(Cmp::new(CmpOp::Eq, permit.oif.to_le_bytes()));
+    rule = match permit.dest.addr {
+        IpAddr::V4(_) => rule
+            .with_expr(Meta::new(MetaType::NfProto))
+            .with_expr(Cmp::new(CmpOp::Eq, [2_u8]))
+            .with_expr(
+                HighLevelPayload::Network(NetworkHeaderField::IPv4(IPv4HeaderField::Daddr)).build(),
+            ),
+        IpAddr::V6(_) => rule
+            .with_expr(Meta::new(MetaType::NfProto))
+            .with_expr(Cmp::new(CmpOp::Eq, [10_u8]))
+            .with_expr(
+                HighLevelPayload::Network(NetworkHeaderField::IPv6(IPv6HeaderField::Daddr)).build(),
+            ),
+    };
+    Ok(rule
+        .with_expr(Bitwise::new(mask, vec![0_u8; mask_len]).map_err(
+            |error: rustables::error::BuilderError| {
+                KillSwitchError::Netfilter(format!("lan mask: {error}"))
+            },
+        )?)
+        .with_expr(Cmp::new(CmpOp::Eq, network))
+        .with_expr(Immediate::new_verdict(VerdictKind::Accept)))
+}
+
+/// The wire-order netmask for a prefix (big-endian bytes, host bits
+/// zero).
+fn prefix_mask(dest: crate::route_txn::DestPrefix) -> Vec<u8> {
+    let (bytes, len) = match dest.addr {
+        IpAddr::V4(addr) => (addr.octets().to_vec(), dest.len as u32),
+        IpAddr::V6(addr) => (addr.octets().to_vec(), dest.len as u32),
+    };
+    bytes
+        .iter()
+        .enumerate()
+        .map(|(index, _)| {
+            let bit = index as u32 * 8;
+            match len.saturating_sub(bit) {
+                0 => 0,
+                covered if covered >= 8 => 0xff,
+                covered => 0xff_u8 << (8 - covered),
+            }
+        })
+        .collect()
+}
+
+/// The wire-order network address for a prefix (host bits zeroed).
+fn network_address(dest: crate::route_txn::DestPrefix) -> Vec<u8> {
+    let mask = prefix_mask(dest);
+    let bytes = match dest.addr {
+        IpAddr::V4(addr) => addr.octets().to_vec(),
+        IpAddr::V6(addr) => addr.octets().to_vec(),
+    };
+    bytes.iter().zip(&mask).map(|(byte, m)| byte & m).collect()
+}
+
 /// Atomically install the kill switch at `generation`: decide
 /// ownership (refusing lookalikes), then ONE batch — delete the
 /// owned table if present, recreate table + marker + output chain +
@@ -235,6 +334,7 @@ pub fn apply(
     uplink_ifname: &str,
     policy: &KillSwitchPolicy,
     generation: GenerationId,
+    persisted_prior: Option<GenerationId>,
 ) -> Result<(), KillSwitchError> {
     let tun_ifindex = iface_index(tun_ifname)
         .map_err(|_| KillSwitchError::MissingInterface(tun_ifname.to_owned()))?
@@ -244,12 +344,19 @@ pub fn apply(
         ..policy.clone()
     };
 
-    let existing = our_table()?;
+    let named = tables_named_us()?;
+    if named.len() > 1 {
+        return Err(KillSwitchError::Lookalike);
+    }
+    let existing = named.into_iter().next();
     let markers = match &existing {
         Some(table) => marker_generations(table)?,
         None => Vec::new(),
     };
-    match decide_live(existing.as_ref().map(|_| markers.as_slice())) {
+    match decide_live(
+        existing.as_ref().map(|_| markers.as_slice()),
+        persisted_prior,
+    ) {
         ApplyDecision::RefuseLookalike => return Err(KillSwitchError::Lookalike),
         ApplyDecision::FreshApply | ApplyDecision::ReplaceOwned(_) => {}
     }
@@ -293,7 +400,14 @@ pub fn validate(
     generation: GenerationId,
 ) -> Result<(), KillSwitchError> {
     let fail = |message: &str| KillSwitchError::Validation(message.to_owned());
-    let table = our_table()?.ok_or_else(|| fail("no protonwire table exists"))?;
+    let named = tables_named_us()?;
+    if named.len() > 1 {
+        return Err(fail("multiple protonwire tables — ambiguous, refusing"));
+    }
+    let table = named
+        .into_iter()
+        .next()
+        .ok_or_else(|| fail("no protonwire table exists"))?;
     let markers = marker_generations(&table)?;
     if markers != vec![generation] {
         return Err(fail(&format!(
@@ -356,10 +470,17 @@ pub fn enforcement_probe(uplink_ifname: &str) -> Result<(), KillSwitchError> {
 
 /// Remove the kill switch — ONLY our table (marker-proven); a
 /// lookalike refuses as always.
-pub fn remove() -> Result<(), KillSwitchError> {
-    let table = our_table()?.ok_or(KillSwitchError::Netfilter("nothing to remove".into()))?;
+pub fn remove(persisted_prior: Option<GenerationId>) -> Result<(), KillSwitchError> {
+    let named = tables_named_us()?;
+    if named.len() > 1 {
+        return Err(KillSwitchError::Lookalike);
+    }
+    let table = named
+        .into_iter()
+        .next()
+        .ok_or(KillSwitchError::Netfilter("nothing to remove".into()))?;
     let markers = marker_generations(&table)?;
-    match decide_live(Some(&markers)) {
+    match decide_live(Some(&markers), persisted_prior) {
         ApplyDecision::RefuseLookalike => Err(KillSwitchError::Lookalike),
         _ => {
             let mut batch = Batch::new();
@@ -373,8 +494,10 @@ pub fn remove() -> Result<(), KillSwitchError> {
 /// Read back the terminal drop rule's packet counter — the
 /// enforcement proof surface (the netns IT).
 pub fn dropped_packets() -> Result<u64, KillSwitchError> {
-    let table =
-        our_table()?.ok_or_else(|| KillSwitchError::Validation("no protonwire table".into()))?;
+    let table = tables_named_us()?
+        .into_iter()
+        .next()
+        .ok_or_else(|| KillSwitchError::Validation("no protonwire table".into()))?;
     for chain in list_chains_for_table(&table)? {
         if !chain.get_name().is_some_and(|name| name == OUTPUT_CHAIN) {
             continue;
@@ -429,10 +552,29 @@ mod tests {
 
     #[test]
     fn apply_decisions_follow_the_live_observation() {
-        assert_eq!(decide_live(None), ApplyDecision::FreshApply);
+        assert_eq!(decide_live(None, None), ApplyDecision::FreshApply);
         assert_eq!(
-            decide_live(Some(&[GenerationId(7)])),
+            decide_live(Some(&[GenerationId(7)]), Some(GenerationId(7))),
             ApplyDecision::ReplaceOwned(GenerationId(7))
+        );
+        // A marker WITHOUT the caller's matching record is a
+        // lookalike — names are forgeable; the private record is the
+        // proof (the round-1 P1).
+        assert_eq!(
+            decide_live(Some(&[GenerationId(7)]), None),
+            ApplyDecision::RefuseLookalike
+        );
+        assert_eq!(
+            decide_live(Some(&[GenerationId(7)]), Some(GenerationId(6))),
+            ApplyDecision::RefuseLookalike
+        );
+        // Multiple markers are ambiguous — refuse.
+        assert_eq!(
+            decide_live(
+                Some(&[GenerationId(7), GenerationId(8)]),
+                Some(GenerationId(7))
+            ),
+            ApplyDecision::RefuseLookalike
         );
     }
 
@@ -441,11 +583,24 @@ mod tests {
         // The live-side contract the IT pins with the kernel: table
         // present + zero markers => RefuseLookalike, never a fresh
         // apply over someone else's table.
-        assert_eq!(decide_live(Some(&[])), ApplyDecision::RefuseLookalike);
         assert_eq!(
-            decide_live(Some(&[GenerationId(3)])),
+            decide_live(Some(&[]), Some(GenerationId(3))),
+            ApplyDecision::RefuseLookalike
+        );
+        assert_eq!(
+            decide_live(Some(&[GenerationId(3)]), Some(GenerationId(3))),
             ApplyDecision::ReplaceOwned(GenerationId(3))
         );
+    }
+
+    fn lan(dest_addr: &str, len: u8, oif: u32) -> LanPermit {
+        LanPermit {
+            dest: crate::route_txn::DestPrefix {
+                addr: dest_addr.parse().unwrap(),
+                len,
+            },
+            oif,
+        }
     }
 
     #[test]
@@ -453,7 +608,7 @@ mod tests {
         let base = KillSwitchPolicy {
             tun_ifindex: 5,
             allow_dhcp_v4: false,
-            lan_ifindex: None,
+            lan_permits: Vec::new(),
             bypass_mark: 0x21,
         };
         assert_eq!(expected_rule_count(&base), 4);
@@ -466,7 +621,7 @@ mod tests {
         );
         assert_eq!(
             expected_rule_count(&KillSwitchPolicy {
-                lan_ifindex: Some(9),
+                lan_permits: vec![lan("192.168.1.0", 24, 9)],
                 ..base.clone()
             }),
             5
@@ -474,10 +629,27 @@ mod tests {
         assert_eq!(
             expected_rule_count(&KillSwitchPolicy {
                 allow_dhcp_v4: true,
-                lan_ifindex: Some(9),
+                lan_permits: vec![lan("192.168.1.0", 24, 9), lan("fe80::", 10, 9)],
                 ..base
             }),
-            6
+            7
         );
+    }
+
+    #[test]
+    fn lan_masks_and_networks_are_wire_order() {
+        let dest = crate::route_txn::DestPrefix {
+            addr: "192.168.5.130".parse().unwrap(),
+            len: 24,
+        };
+        assert_eq!(prefix_mask(dest), vec![255, 255, 255, 0]);
+        assert_eq!(network_address(dest), vec![192, 168, 5, 0]);
+        let dest = crate::route_txn::DestPrefix {
+            addr: "fe80::1".parse().unwrap(),
+            len: 10,
+        };
+        let mask = prefix_mask(dest);
+        assert_eq!(mask[..2], [0xff, 0xc0]);
+        assert_eq!(network_address(dest)[..2], [0xfe, 0x80]);
     }
 }
