@@ -157,6 +157,9 @@ pub struct TableSurvey {
 /// Parse `/etc/iproute2/rt_tables` content: `#` comments, blank
 /// lines, `<id> <name>` entries; later entries override earlier ones
 /// with the same id (iproute2's behavior); anything else is skipped.
+/// IDs parse BASE-AWARE like iproute2 itself (`fread_id_name`):
+/// `0xca6c` is as valid as `51820` — a decimal-only parse would read
+/// a hex-named table as absent and claim its id (the round-1 P1).
 pub fn parse_rt_tables(text: &str) -> BTreeMap<u32, String> {
     let mut named = BTreeMap::new();
     for line in text.lines() {
@@ -167,7 +170,10 @@ pub fn parse_rt_tables(text: &str) -> BTreeMap<u32, String> {
         let Some((id, name)) = line.split_once(char::is_whitespace) else {
             continue;
         };
-        let Ok(id) = id.trim().parse::<u32>() else {
+        // Radix-aware like iproute2 strtoul-base-0 (fread_id_name):
+        // 0x hex, legacy-0 octal, 0b binary, else decimal — Rust has
+        // no radix-0, so spelled out.
+        let Ok(id) = parse_rt_tables_id(id.trim()) else {
             continue;
         };
         let name = name.trim();
@@ -177,6 +183,26 @@ pub fn parse_rt_tables(text: &str) -> BTreeMap<u32, String> {
         named.insert(id, name.to_owned());
     }
     named
+}
+
+/// iproute2's base-aware rt_tables id: `0x` hex, a leading zero
+/// (beyond a lone `0`) octal, `0b` binary, else decimal — strtoul
+/// with base 0, as `fread_id_name` reads the file.
+fn parse_rt_tables_id(text: &str) -> Result<u32, std::num::ParseIntError> {
+    let (digits, radix) =
+        if let Some(rest) = text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")) {
+            (rest, 16)
+        } else if let Some(rest) = text.strip_prefix("0b").or_else(|| text.strip_prefix("0B")) {
+            (rest, 2)
+        } else if text.len() > 1
+            && text.starts_with('0')
+            && text[1..].bytes().all(|byte| byte.is_ascii_digit())
+        {
+            (&text[1..], 8)
+        } else {
+            (text, 10)
+        };
+    u32::from_str_radix(digits, radix)
 }
 
 /// Decide the plan: per kind — the persisted id unless contradicted
@@ -194,8 +220,8 @@ pub fn plan_tables(survey: &TableSurvey) -> TablePlan {
     TablePlan { assignments }
 }
 
-/// One kind's resolution: persisted (uncontradicted) → preferred
-/// (free) → first free id above the preferred one.
+/// One kind's resolution: persisted (uncontradicted AND valid) →
+/// preferred (free) → first free id above the preferred one.
 fn resolve(kind: TableKind, survey: &TableSurvey, claimed: &BTreeSet<u32>) -> TableAssignment {
     if let Some(persisted) = &survey.persisted {
         let id = persisted.for_kind(kind);
@@ -203,7 +229,20 @@ fn resolve(kind: TableKind, survey: &TableSurvey, claimed: &BTreeSet<u32>) -> Ta
             .named
             .get(&id)
             .is_some_and(|name| name != kind.canonical_name());
-        if !contradicted {
+        // A syntactically valid state file can still hold a CORRUPT
+        // record: a kernel-reserved id (e.g. `main: 254`), an id the
+        // record assigns to a SIBLING lane too (ambiguous — only the
+        // colliding lanes distrust it; a distinct sibling entry is
+        // still evidence), or an id another lane already resolved to
+        // this run — none of that is ownership evidence (the round-1
+        // P2). Reject and fall through to allocation. Occupied-by-
+        // rules does NOT invalidate (after our own crash our stale
+        // rules still reference it — cleanup owns those).
+        let collides_with_sibling = TableKind::ALL
+            .iter()
+            .any(|other| *other != kind && persisted.for_kind(*other) == id);
+        let valid = id > KERNEL_RESERVED_MAX && !collides_with_sibling && !claimed.contains(&id);
+        if !contradicted && valid {
             return TableAssignment {
                 kind,
                 id,
@@ -417,6 +456,71 @@ not-an-entry
         assert_eq!(plan.assignment(TableKind::Main).id, 51832);
         assert_eq!(plan.assignment(TableKind::Bypass).id, 51833);
         assert_eq!(plan.assignment(TableKind::Lan).id, 51834);
+    }
+
+    #[test]
+    fn hex_ids_parse_like_iproute2() {
+        // The round-1 P1: iproute2 accepts 0x-prefixed ids — a
+        // decimal-only parse read this table as absent and claimed
+        // its id (0xca6c == 51820).
+        let named = parse_rt_tables("0xca6c  corp-vpn\n0x101  also-hex\n");
+        assert_eq!(named[&51820], "corp-vpn");
+        assert_eq!(named[&257], "also-hex");
+        let plan = plan_tables(&survey(&[(51820, "corp-vpn")], &[], None));
+        assert!(
+            !plan.owns(51820),
+            "the hex-named foreign table is never claimed"
+        );
+    }
+
+    #[test]
+    fn corrupt_persisted_records_fall_back_to_allocation() {
+        // The round-1 P2: reserved ids and duplicate lanes in a
+        // syntactically valid state file are not ownership.
+        let reserved = PersistedTables {
+            main: 254,
+            bypass: 51821,
+            lan: 51822,
+        };
+        let plan = plan_tables(&survey(&[], &[], Some(reserved)));
+        assert_eq!(
+            plan.assignment(TableKind::Main).provenance,
+            Provenance::Preferred,
+            "the reserved record is rejected; the free preferred id is taken instead"
+        );
+        assert_eq!(plan.assignment(TableKind::Main).id, 51820);
+        assert!(!plan.owns(254), "the kernel main table is never claimed");
+        assert_eq!(
+            plan.assignment(TableKind::Bypass).provenance,
+            Provenance::Persisted
+        );
+
+        let duplicate = PersistedTables {
+            main: 53000,
+            bypass: 53000,
+            lan: 53002,
+        };
+        let plan = plan_tables(&survey(&[], &[], Some(duplicate)));
+        // The record is ambiguous for BOTH duplicate lanes — neither
+        // can prove which one owns 53000, so neither trusts it.
+        assert_eq!(
+            plan.assignment(TableKind::Main).provenance,
+            Provenance::Preferred
+        );
+        assert_eq!(
+            plan.assignment(TableKind::Bypass).provenance,
+            Provenance::Preferred
+        );
+        assert!(!plan.owns(53000), "the ambiguous id is not claimed");
+        assert_ne!(
+            plan.assignment(TableKind::Bypass).id,
+            plan.assignment(TableKind::Main).id
+        );
+        // The non-duplicate lane still trusts its record.
+        assert_eq!(
+            plan.assignment(TableKind::Lan).provenance,
+            Provenance::Persisted
+        );
     }
 
     #[test]
