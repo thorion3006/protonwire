@@ -370,8 +370,11 @@ impl RtnetlinkExecutor {
             .unwrap_or(u32::from(message.header.table))
     }
 
-    /// Whether a live rule message is OURS by spec (table, priority,
-    /// fwmark).
+    /// Whether a live rule message is OURS by FULL SHAPE (table,
+    // priority, fwmark, ACTION, and the fwmask) — partial matches
+    // are foreign state, never "present": a foreign rule with our
+    // tuple but extra selectors or the pre-fix UNSPEC action must
+    // not satisfy our spec (rust-review #8 + sec-audit F4).
     fn rule_matches(message: &RuleMessage, spec: RuleSpec) -> bool {
         let priority = message
             .attributes
@@ -387,9 +390,27 @@ impl RtnetlinkExecutor {
                 RuleAttribute::FwMark(mark) => Some(*mark),
                 _ => None,
             });
+        // The pre-fix writer armed the builder's default action
+        // (Unspec — "lookup none"): such surviving rules must NOT
+        // read as ours (the round-2 P1) — only ToTable matches.
+        if message.header.action != rtnetlink::packet_route::rule::RuleAction::ToTable {
+            return false;
+        }
+        // FWMASK: our adds never set one — the kernel default
+        // (0xffffffff) is ours; a narrower foreign mask with our
+        // tuple is not.
+        let fwmask = message
+            .attributes
+            .iter()
+            .find_map(|attribute| match attribute {
+                RuleAttribute::FwMask(mask) => Some(*mask),
+                _ => None,
+            })
+            .unwrap_or(0xffff_ffff);
         Self::rule_table(message) == spec.table
             && priority == Some(spec.priority)
             && fwmark == spec.fwmark
+            && fwmask == 0xffff_ffff
     }
 
     /// The table a live route message references.
@@ -444,10 +465,22 @@ impl RtnetlinkExecutor {
                 RouteAttribute::Oif(index) => Some(*index),
                 _ => None,
             });
+        // SCOPE and GATEWAY close the foreign-lookalike pair (the
+        // round-2 P1s): our renders are ALWAYS scope Link (the
+        // gateway-less EINVAL lesson) and NEVER carry a gateway — a
+        // surviving parent-era UNIVERSE-scope route or a routed
+        // (gateway) route with our tuple is foreign state, not ours.
+        let gateway = message
+            .attributes
+            .iter()
+            .any(|attribute| matches!(attribute, RouteAttribute::Gateway(_)));
         Self::route_table(message) == spec.table
             && message.header.destination_prefix_length == spec.dest.len
             && dest_matches
             && oif == Some(spec.oif)
+            && (message.header.address_family == AddressFamily::Inet6
+                || message.header.scope == RouteScope::Link)
+            && !gateway
     }
 
     async fn find_rule(&mut self, spec: RuleSpec) -> Result<Option<RuleMessage>, NetOpError> {
@@ -586,8 +619,10 @@ impl NetlinkExecutor for RtnetlinkExecutor {
                 // accident). Our crash residue is rules-dominated:
                 // routes die with their interface, our rules linger —
                 // so rules carry the proof.
-                let priority =
-                    message.attributes.iter().find_map(|attribute| match attribute {
+                let priority = message
+                    .attributes
+                    .iter()
+                    .find_map(|attribute| match attribute {
                         RuleAttribute::Priority(priority) => Some(*priority),
                         _ => None,
                     });
@@ -714,6 +749,7 @@ mod tests {
         // route.
         let mut v4_message = RouteMessage::default();
         v4_message.header.address_family = AddressFamily::Inet;
+        v4_message.header.scope = RouteScope::Link;
         v4_message.header.table = RT_TABLE_COMPAT;
         v4_message.attributes = vec![RouteAttribute::Table(51820), RouteAttribute::Oif(7)];
         assert!(RtnetlinkExecutor::route_matches(
