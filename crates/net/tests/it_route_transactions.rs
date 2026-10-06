@@ -193,6 +193,7 @@ async fn it_route_drift_and_cleanup() {
     handle
         .rule()
         .add()
+        .action(rtnetlink::packet_route::rule::RuleAction::ToTable)
         .table_id(4000)
         .priority(32000)
         .v4()
@@ -300,6 +301,7 @@ async fn it_v6_occupation_is_surveyed() {
     handle
         .rule()
         .add()
+        .action(rtnetlink::packet_route::rule::RuleAction::ToTable)
         .table_id(51820)
         .priority(9000)
         .v6()
