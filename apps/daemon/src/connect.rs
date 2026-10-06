@@ -386,13 +386,21 @@ impl ConnectionLane {
         // NO JOIN UNDER THE LANE LOCK (the refactor pass's P1): take
         // the entry, clear the owner, DROP the guard, then join — the
         // pump's retire_lane parks on this mutex at engine death.
-        // The DISCONNECTING window is armed first (the bot round-23
-        // P2): the lane must not look free while the teardown runs —
-        // a concurrent connect hit a spurious setup failure (the old
-        // connection still owned the TUN), a concurrent drain
-        // returned without joining the pump.
-        lane.disconnecting = true;
+        // The DISCONNECTING window is armed ONLY FOR A REAL TEARDOWN
+        // (the bot round-38 P2, the round-23 window narrowed): an
+        // empty lane has nothing to protect — arming it anyway
+        // briefly refused a concurrent idempotent disconnect (typed
+        // Disconnecting) and a concurrent connect with no teardown
+        // running. Take first, arm on Some — the same shape drain's
+        // take uses for drain_in_progress; when a lane IS taken the
+        // window means what round-23 said: the lane must not look
+        // free while the teardown runs (a concurrent connect hit a
+        // spurious setup failure, a concurrent drain returned without
+        // joining the pump).
         let active = lane.active.take();
+        if active.is_some() {
+            lane.disconnecting = true;
+        }
         lane.owner = None;
         drop(lane);
         // RETIRE FIRST (the bot round-33 P2): the slot empties
