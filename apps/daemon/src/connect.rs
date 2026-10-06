@@ -398,7 +398,8 @@ impl ConnectionLane {
         // spurious setup failure, a concurrent drain returned without
         // joining the pump).
         let active = lane.active.take();
-        if active.is_some() {
+        let armed = active.is_some();
+        if armed {
             lane.disconnecting = true;
         }
         lane.owner = None;
@@ -415,10 +416,20 @@ impl ConnectionLane {
             finish_tear(retired, pump);
             self.core.set_vpn_state(VpnState::Disconnected);
         }
-        self.state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .disconnecting = false;
+        // CLEAR ONLY THE WINDOW THIS CALL ARMED (the bot round-38 P2,
+        // the narrowing's consequence): the empty path now holds NO
+        // flag across its guard-drop gap — an unconditional clear
+        // landing after a deschedule could strip a SECOND
+        // disconnect's real window (a connection installed in the
+        // gap, its owner mid-teardown) and free the lane while that
+        // teardown still joins. The armed-local pairing matches
+        // drain's drain_in_progress.
+        if armed {
+            self.state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .disconnecting = false;
+        }
         Ok(())
     }
 
