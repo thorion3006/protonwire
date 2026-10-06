@@ -118,13 +118,11 @@ impl EncryptedCache {
                     let created = collect_new_components(parent);
                     fs::create_dir_all(parent)
                         .map_err(|error| CacheError::KeyFile(format!("keyfile parent: {error}")))?;
-                    for dir in created.iter().rev() {
-                        sync_parent_dir(dir).map_err(|error| {
-                            CacheError::KeyFile(format!(
-                                "new parent component {}: {error}",
-                                dir.display()
-                            ))
-                        })?;
+                    if let Err(error) = sync_new_components(&created) {
+                        remove_created_components(&created);
+                        return Err(CacheError::KeyFile(format!(
+                            "new parent component chain {error}"
+                        )));
                     }
                 }
                 let mut fresh = Zeroizing::new([0u8; KEY_LEN]);
@@ -182,14 +180,13 @@ impl EncryptedCache {
         // bottom-up).
         let created = collect_new_components(dir);
         fs::create_dir_all(dir).map_err(|error| CacheError::Init(error.to_string()))?;
-        for component in created.iter().rev() {
-            sync_parent_dir(component).map_err(|error| {
-                CacheError::Init(format!(
-                    "new cache component {}: {error}",
-                    component.display()
-                ))
-            })?;
+        if let Err(error) = sync_new_components(&created) {
+            remove_created_components(&created);
+            return Err(CacheError::Init(format!(
+                "new cache component chain {error}"
+            )));
         }
+
         let cipher = XChaCha20Poly1305::new_from_slice(key.as_slice())
             .map_err(|error| CacheError::Init(error.to_string()))?;
         Ok(Self {
@@ -390,6 +387,22 @@ fn collect_new_components(root: &Path) -> Vec<PathBuf> {
         current = path.parent().map(Path::to_path_buf);
     }
     missing
+}
+
+/// BEST-EFFORT rollback of a failed creation batch (the bot round-37
+/// P2): if a parent sync fails AFTER create_dir_all succeeded, the
+/// directories exist — a later init would collect an EMPTY list and
+/// skip the sync forever, reporting success over an unsynced
+/// ancestor. Removing the (all-empty at this point — nothing has
+/// been written into the cache yet) created components makes the
+/// next initialization redo the full create+sync. Removal itself is
+/// best-effort: on failure the original error still surfaces.
+fn remove_created_components(created: &[PathBuf]) {
+    // created[0] is the deepest component; children go before
+    // parents so remove_dir sees empty dirs.
+    for dir in created {
+        let _ = fs::remove_dir(dir);
+    }
 }
 
 #[cfg(not(unix))]
@@ -1305,4 +1318,15 @@ mod round5_tests {
         super::sync_parent_dir(Path::new("cache.key"))
             .expect("the empty parent syncs as the current directory");
     }
+}
+
+/// Syncs each newly created component in its own parent, bottom-up
+/// (highest ancestor first — an ancestor entry must be durable
+/// before its children's contents are). Returns the failing
+/// component's description on error; the CALLER rolls back.
+fn sync_new_components(created: &[PathBuf]) -> Result<(), String> {
+    for dir in created.iter().rev() {
+        sync_parent_dir(dir).map_err(|error| format!("{}: {error}", dir.display()))?;
+    }
+    Ok(())
 }
