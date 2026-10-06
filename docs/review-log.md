@@ -3677,7 +3677,7 @@ Gates green at every level.
 Gates green at every level after the cascade (#17's fixture rides
 the widened shape).
 
-## 2026-10-06 — Round 38 (#17 ×4)
+## 2026-10-06 — Round 38 (#17 ×5)
 
 - #17: the devshell DECLARES iproute2 — the netns gate shim invokes
   `ip link set lo up`, but the tool resolved only via the host
@@ -3724,6 +3724,14 @@ the widened shape).
   an Event defers into the normal receive path with the suppression
   armed (the rounds 14+16 only-emptiness-disarms discipline);
   Disconnected/vanished-slot defers to the next iteration's arm.
+
+- #17: the disconnecting window ARMS ONLY FOR A REAL TEARDOWN — an
+  empty lane armed the round-23 window with nothing to protect, so
+  the arm-to-clear gap refused a concurrent idempotent disconnect
+  (typed Disconnecting) and a concurrent connect spuriously. Take
+  first, arm on Some — the same shape drain's take was given for
+  drain_in_progress; reconnect's unconditional arming is deliberately
+  unchanged (its window guards real setup work on an empty lane).
 
 Gates green at every level, both directions where they apply: the
 devshell resolves its own /nix/store/...-iproute2-7.1.0/bin/ip with
