@@ -33,7 +33,8 @@ on entry:
 ```sh
 direnv allow                        # core: rustc/cargo/rustfmt/clippy,
                                     # gcc, cargo-audit, git,
-                                    # iproute2 (netns-it harness)
+                                    # iproute2 (netns-it harness),
+                                    # libclang (kill switch bindgen)
 PROTONWIRE_GUI=1 direnv allow       # + webkit2gtk stack for protonwire-gui
 ```
 

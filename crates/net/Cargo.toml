@@ -16,6 +16,8 @@ thiserror = { workspace = true }
 serde = { workspace = true }
 rtnetlink = { workspace = true }
 futures-util = { workspace = true }
+rustables = { workspace = true }
+nix = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }

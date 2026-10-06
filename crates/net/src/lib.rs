@@ -55,6 +55,12 @@ pub mod route_txn;
 /// owned-state cleanup enumeration.
 pub mod route_drift;
 
+/// The nftables kill switch (FR-56..65): an atomically replaced inet
+/// table whose output chain defaults to DROP, ownership by marker
+/// chain + persisted generation, lookalike refusal, fail-closed
+/// validation.
+pub mod kill_switch;
+
 /// The network-namespace integration-test harness (NFR-31). Shared by
 /// every netns-gated integration test in the workspace (`protocol`'s
 /// IT-1 today, this crate's M5 suite next); the runner is

@@ -91,8 +91,9 @@ commit on stock Ubuntu runners. Two supported paths:
 
 **Nix devshell (recommended, any distro with Nix installed)** — the
 entire toolchain (rustc 1.98.1, cargo, rustfmt, clippy, gcc,
-cargo-audit, git, iproute2 for the netns-it harness) comes from the
-repo, nothing installed system-wide.
+cargo-audit, git, iproute2 for the netns-it harness, libclang for
+the nftables kill switch) comes from the repo, nothing installed
+system-wide.
 With direnv it activates on entry:
 
 ```sh
