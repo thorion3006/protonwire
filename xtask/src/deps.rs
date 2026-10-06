@@ -133,6 +133,19 @@ pub fn run(root: &Path) -> Result<bool> {
     }
     reporter.rule("single workspace Cargo.lock", &lockfile_violations);
 
+    // THE TRAIN FREEZE (the 2026-10-06 dependency sweep): the
+    // proton-registry subtree is held at the recorded versions —
+    // PROTON_TRAIN's comment carries the os-interface 0.2/0.3 split a
+    // piecemeal update causes. Checked at the LOCKFILE level because
+    // no manifest names these transitive crates; the manifest's exact
+    // pins own muon and proton-boringtun, and protun's rev pin owns
+    // the git source (a missing lockfile already failed above).
+    let mut train_violations = Vec::new();
+    if let Ok(lock_text) = fs::read_to_string(root.join("Cargo.lock")) {
+        train_violations.extend(proton_train_violations(&lock_text));
+    }
+    reporter.rule("proton registry train freeze", &train_violations);
+
     let mut wildcard_violations = Vec::new();
     for package in &members {
         let manifest = fs::read_to_string(package.manifest_path.as_std_path())
@@ -399,6 +412,84 @@ pub(crate) fn find_lock_files(dir: &Path) -> Vec<PathBuf> {
     found
 }
 
+/// The proton-registry TRAIN: every package the Proton sparse registry
+/// contributes to the lockfile, at the versions the M4 verification ran
+/// against (the 2026-10-06 dependency sweep). The subtree is a
+/// COORDINATED train — muon 2.6.3+, proton-boringtun 3.0.1+, and the
+/// proton-pfff 0.13.2 family all moved to proton-os-interface 0.3,
+/// while the pinned protun v2.2.1 keeps pvpnclient at ~3.0.1
+/// (os-interface 0.2). Drifting ANY entry piecemeal (a bare `cargo
+/// update`) splits the graph into two proton-os-interface copies and
+/// pvpnclient stops compiling — its muon interop breaks across the
+/// two trait copies. The train moves as ONE unit, anchored by a protun
+/// tag that requires the newer set; every entry here changes in the
+/// same commit when that happens.
+pub(crate) const PROTON_TRAIN: &[(&str, &str)] = &[
+    ("muon", "2.6.2"),
+    ("muon-rest", "0.1.0"),
+    ("proton-boringtun", "3.0.0"),
+    ("proton-os-interface", "0.2.7"),
+    ("proton-pfff", "0.13.0"),
+    ("proton-pfff-config", "0.1.0"),
+    ("proton-pfff-core", "0.1.1"),
+    ("proton-pfff-module", "0.8.5"),
+    ("proton-srp", "0.8.3"),
+    ("proton-tls-parser", "0.4.0"),
+    ("proton-vpn-haproxyv2", "0.1.0"),
+    ("proton-vpn-local-agent", "0.12.3"),
+    ("proton-vpn-netstack", "0.6.5"),
+    ("proton-vpn-rcrl", "0.2.2"),
+    ("proton-vpn-toolkit", "0.1.0"),
+    ("proton-vpn-utils", "0.2.2"),
+    ("proton-vpn-yaourt", "0.2.2"),
+    ("pvpnclient", "3.0.3"),
+];
+
+/// The sparse-index source prefix identifying a proton-registry
+/// package in the lockfile.
+const PROTON_REGISTRY_SOURCE: &str = "sparse+https://rust-registry.proton.me";
+
+/// Every proton-registry entry in a Cargo.lock that is NOT at its
+/// recorded [`PROTON_TRAIN`] version, plus any proton-registry package
+/// missing from the table — a NEW proton crate entering the graph is a
+/// train change too and must be recorded consciously, not absorbed by
+/// an update.
+pub(crate) fn proton_train_violations(lock_text: &str) -> Vec<String> {
+    let mut violations = Vec::new();
+    let mut name: Option<String> = None;
+    let mut version: Option<String> = None;
+    for line in lock_text.lines() {
+        let line = line.trim();
+        if let Some(value) = line.strip_prefix("name = ") {
+            name = Some(value.trim_matches('"').to_owned());
+            version = None;
+        } else if let Some(value) = line.strip_prefix("version = ") {
+            version = Some(value.trim_matches('"').to_owned());
+        } else if line.starts_with("source = ") && line.contains(PROTON_REGISTRY_SOURCE) {
+            let (Some(name), Some(version)) = (name.as_ref(), version.as_ref()) else {
+                continue; // malformed block; other rules own lockfile shape
+            };
+            match PROTON_TRAIN
+                .iter()
+                .find(|(train_name, _)| train_name == name)
+            {
+                Some((_, recorded)) if recorded == version => {}
+                Some((_, recorded)) => violations.push(format!(
+                    "{name} v{version} drifts the proton train (recorded {recorded}); \
+                     the subtree moves as ONE unit behind a protun tag — see \
+                     PROTON_TRAIN in xtask/src/deps.rs"
+                )),
+                None => violations.push(format!(
+                    "{name} v{version} is a proton-registry package missing from \
+                     PROTON_TRAIN — record it (or hold it) consciously; an update \
+                     must not absorb new proton crates silently"
+                )),
+            }
+        }
+    }
+    violations
+}
+
 /// Whether git tracks the root `Cargo.lock`. A developer-global gitignore
 /// commonly excludes Rust lockfiles for libraries; for this application
 /// workspace the committed lockfile is the resolution authority, so its
@@ -540,6 +631,54 @@ mod tests {
         assert!(
             forbidden_edges("protonwire-daemon", &["protonwire-core", "protonwire-net"]).is_empty()
         );
+    }
+
+    /// One [[package]] block in the sparse-registry lockfile shape.
+    fn proton_lock_entry(name: &str, version: &str) -> String {
+        format!(
+            "[[package]]\nname = \"{name}\"\nversion = \"{version}\"\nsource = \
+             \"sparse+https://rust-registry.proton.me/index/\"\nchecksum = \"x\"\n"
+        )
+    }
+
+    #[test]
+    fn proton_train_accepts_the_recorded_versions() {
+        let mut lock = String::new();
+        for (name, version) in PROTON_TRAIN {
+            lock.push_str(&proton_lock_entry(name, version));
+        }
+        // A crates.io package alongside the train is none of the
+        // rule's business.
+        lock.push_str(
+            "[[package]]\nname = \"serde\"\nversion = \"1.0.2\"\nsource = \
+                       \"registry+https://github.com/rust-lang/crates.io-index\"\n",
+        );
+        assert!(proton_train_violations(&lock).is_empty());
+    }
+
+    #[test]
+    fn proton_train_rejects_a_drifted_version() {
+        // The live failure of the 2026-10-06 sweep: muon 2.6.3 and
+        // proton-boringtun 3.0.2 drag proton-os-interface 0.3 in
+        // alongside pvpnclient 3.0.3's 0.2 copy.
+        let lock = format!(
+            "{}{}{}",
+            proton_lock_entry("muon", "2.6.3"),
+            proton_lock_entry("proton-os-interface", "0.3.4"),
+            proton_lock_entry("pvpnclient", "3.0.3"),
+        );
+        let violations = proton_train_violations(&lock);
+        assert_eq!(violations.len(), 2, "{violations:?}");
+        assert!(violations[0].contains("muon v2.6.3"));
+        assert!(violations[1].contains("proton-os-interface v0.3.4"));
+    }
+
+    #[test]
+    fn proton_train_rejects_an_unrecorded_proton_package() {
+        let lock = proton_lock_entry("proton-vpn-newthing", "0.1.0");
+        let violations = proton_train_violations(&lock);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(violations[0].contains("missing from PROTON_TRAIN"));
     }
 
     #[test]
