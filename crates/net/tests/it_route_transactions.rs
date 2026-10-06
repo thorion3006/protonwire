@@ -40,7 +40,7 @@ async fn it_route_transactions() {
 
     // 1. PLAN against the live namespace: no policy rules, only the
     //    kernel's own tables — the preferred ids must be chosen.
-    let plan = plan_with(&mut executor, "").await.expect("survey");
+    let plan = plan_with(&mut executor, "", None).await.expect("survey");
     assert_eq!(plan.assignment(TableKind::Main).id, 51820);
     assert_eq!(plan.assignment(TableKind::Bypass).id, 51821);
     assert_eq!(plan.assignment(TableKind::Lan).id, 51822);

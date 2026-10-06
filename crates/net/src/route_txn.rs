@@ -104,10 +104,14 @@ pub type NetOpError = String;
 /// real netlink. Send-bounded RPIT (not `async fn`): the future must
 /// travel across the daemon's runtime; the CALLER owns the runtime.
 pub trait NetlinkExecutor {
-    /// Apply one operation. Deletes are IDEMPOTENT (an absent rule or
-    /// route deletes cleanly) — rollback must not fail on state a
-    /// failed op never created.
-    fn exec(&mut self, op: NetOp) -> impl Future<Output = Result<(), NetOpError>> + Send;
+    /// Apply one operation; the flag reports whether KERNEL STATE
+    /// CHANGED. Adds are IDEMPOTENT (an already-present spec is a
+    /// no-op — Linux accepts duplicate rules, and a duplicate would
+    /// survive single-match deletion), deletes are idempotent (an
+    /// absent rule or route deletes cleanly). Rollback replays the
+    /// inverse of CHANGED ops only — undoing a no-op delete would
+    /// CREATE previously-absent state (the round-1 P1).
+    fn exec(&mut self, op: NetOp) -> impl Future<Output = Result<bool, NetOpError>> + Send;
 
     /// The host's live rule/route tables as a survey: every table id
     /// referenced by any (v4) rule or route — owner unknowable from
@@ -172,40 +176,53 @@ impl RouteTransaction {
         Ok(self)
     }
 
-    /// Apply in order; on the first failure roll the applied prefix
-    /// back in REVERSE order and report.
+    /// Apply in order; on the first failure roll the CHANGED prefix
+    /// back in REVERSE order and report. No-op operations (an absent
+    /// delete, a present re-add) never enter the rollback set —
+    /// undoing them would CREATE state that was never there (the
+    /// round-1 P1).
     pub async fn apply<E: NetlinkExecutor>(
         self,
         executor: &mut E,
     ) -> Result<Vec<NetOp>, ApplyFailure> {
         let mut applied = Vec::new();
         for op in &self.ops {
-            if let Err(error) = executor.exec(*op).await {
-                let mut rollback_errors = Vec::new();
-                for done in applied.iter().rev() {
-                    if let Err(rollback_error) = executor.exec(inverse(*done)).await {
-                        rollback_errors.push(rollback_error);
+            match executor.exec(*op).await {
+                Ok(true) => applied.push(*op),
+                Ok(false) => {} // idempotent no-op — nothing to undo
+                Err(error) => {
+                    let mut rollback_errors = Vec::new();
+                    for done in applied.iter().rev() {
+                        if let Err(rollback_error) = executor.exec(inverse(*done)).await {
+                            rollback_errors.push(rollback_error);
+                        }
                     }
+                    return Err(ApplyFailure {
+                        failed: *op,
+                        error,
+                        rolled_back: applied.len(),
+                        rollback_errors,
+                    });
                 }
-                return Err(ApplyFailure {
-                    failed: *op,
-                    error,
-                    rolled_back: applied.len(),
-                    rollback_errors,
-                });
             }
-            applied.push(*op);
         }
         Ok(applied)
     }
 }
 
 /// Survey + plan in one step: the connect path's entry point.
+/// `persisted` is the daemon's OWN allocation record — the survey
+/// alone cannot know it, and WITHOUT it a crash-restart's stale
+/// rules (which make the former table read occupied) would push the
+/// planner to a NEW id, leaving the stale state outside the plan's
+/// ownership gate and uncleanable (the round-1 P1).
 pub async fn plan_with<E: NetlinkExecutor>(
     executor: &mut E,
     rt_tables_text: &str,
+    persisted: Option<crate::tables::PersistedTables>,
 ) -> Result<TablePlan, NetOpError> {
-    let survey = executor.survey(rt_tables_text).await?;
+    let mut survey = executor.survey(rt_tables_text).await?;
+    survey.persisted = persisted;
     Ok(plan_tables(&survey))
 }
 
@@ -365,9 +382,16 @@ impl RtnetlinkExecutor {
 }
 
 impl NetlinkExecutor for RtnetlinkExecutor {
-    async fn exec(&mut self, op: NetOp) -> Result<(), NetOpError> {
+    async fn exec(&mut self, op: NetOp) -> Result<bool, NetOpError> {
         match op {
             NetOp::AddRule(spec) => {
+                // Idempotent (the round-1 P1): Linux ACCEPTS duplicate
+                // rules — a blind re-add after a retry/reconnect would
+                // leave a duplicate that survives single-match
+                // deletion. Present means done, not mutated.
+                if self.find_rule(spec).await?.is_some() {
+                    return Ok(false);
+                }
                 let mut request = self.handle.rule().add();
                 request = request.table_id(spec.table).priority(spec.priority);
                 if let Some(mark) = spec.fwmark {
@@ -377,37 +401,45 @@ impl NetlinkExecutor for RtnetlinkExecutor {
                     .v4()
                     .execute()
                     .await
-                    .map_err(|error| format!("add rule: {error}"))
+                    .map_err(|error| format!("add rule: {error}"))?;
+                Ok(true)
             }
             NetOp::DelRule(spec) => {
-                // Idempotent: absent means already gone.
+                // Idempotent: absent means already gone — NOT mutated.
                 let Some(message) = self.find_rule(spec).await? else {
-                    return Ok(());
+                    return Ok(false);
                 };
                 self.handle
                     .rule()
                     .del(message)
                     .execute()
                     .await
-                    .map_err(|error| format!("del rule: {error}"))
+                    .map_err(|error| format!("del rule: {error}"))?;
+                Ok(true)
             }
-            NetOp::AddRoute(spec) => self
-                .handle
-                .route()
-                .add(Self::build_route(spec))
-                .execute()
-                .await
-                .map_err(|error| format!("add route: {error}")),
+            NetOp::AddRoute(spec) => {
+                if self.find_route(spec).await?.is_some() {
+                    return Ok(false);
+                }
+                self.handle
+                    .route()
+                    .add(Self::build_route(spec))
+                    .execute()
+                    .await
+                    .map_err(|error| format!("add route: {error}"))?;
+                Ok(true)
+            }
             NetOp::DelRoute(spec) => {
                 let Some(message) = self.find_route(spec).await? else {
-                    return Ok(());
+                    return Ok(false);
                 };
                 self.handle
                     .route()
                     .del(message)
                     .execute()
                     .await
-                    .map_err(|error| format!("del route: {error}"))
+                    .map_err(|error| format!("del route: {error}"))?;
+                Ok(true)
             }
         }
     }
@@ -454,9 +486,9 @@ mod tests {
     }
 
     impl NetlinkExecutor for FakeExecutor {
-        async fn exec(&mut self, op: NetOp) -> Result<(), NetOpError> {
+        async fn exec(&mut self, op: NetOp) -> Result<bool, NetOpError> {
             self.calls.borrow_mut().push(op);
-            (self.fail)(op).map_or(Ok(()), Err)
+            (self.fail)(op).map_or(Ok(true), Err)
         }
 
         async fn survey(&mut self, _rt_tables_text: &str) -> Result<TableSurvey, NetOpError> {
@@ -535,13 +567,13 @@ mod tests {
             calls: std::cell::RefCell<Vec<NetOp>>,
         }
         impl NetlinkExecutor for FailDelRule9 {
-            async fn exec(&mut self, op: NetOp) -> Result<(), NetOpError> {
+            async fn exec(&mut self, op: NetOp) -> Result<bool, NetOpError> {
                 self.calls.borrow_mut().push(op);
                 match op {
                     NetOp::DelRule(spec) if spec.priority == 9 => {
                         Err("del-rule: kernel refused".into())
                     }
-                    _ => Ok(()),
+                    _ => Ok(true),
                 }
             }
             async fn survey(&mut self, _: &str) -> Result<TableSurvey, NetOpError> {
@@ -581,19 +613,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn no_op_deletes_are_never_rolled_back() {
+        // The round-1 P1: a DelRule that found nothing is Ok(false) —
+        // a LATER failure must not re-CREATE the absent rule by
+        // replaying its inverse.
+        struct NoOpDeletes {
+            calls: std::cell::RefCell<Vec<NetOp>>,
+        }
+        impl NetlinkExecutor for NoOpDeletes {
+            async fn exec(&mut self, op: NetOp) -> Result<bool, NetOpError> {
+                self.calls.borrow_mut().push(op);
+                match op {
+                    NetOp::DelRule(_) | NetOp::DelRoute(_) => Ok(false),
+                    NetOp::AddRule(_) => Ok(true),
+                    NetOp::AddRoute(_) => Err("add route: kernel refused".into()),
+                }
+            }
+            async fn survey(&mut self, _: &str) -> Result<TableSurvey, NetOpError> {
+                Ok(TableSurvey::default())
+            }
+        }
+        let failing = NetOp::AddRoute(route(51820));
+        let txn = RouteTransaction::new(plan())
+            .op(NetOp::DelRule(rule(51821)))
+            .expect("plan table")
+            .op(failing)
+            .expect("plan table");
+        let mut executor = NoOpDeletes {
+            calls: std::cell::RefCell::new(Vec::new()),
+        };
+        let failure = txn.apply(&mut executor).await.expect_err("route add fails");
+        assert_eq!(
+            failure.rolled_back, 0,
+            "the no-op delete never entered the rollback set"
+        );
+        assert!(
+            executor
+                .calls
+                .borrow()
+                .iter()
+                .all(|call| !matches!(call, NetOp::AddRule(_))),
+            "no inverse was replayed — nothing was created"
+        );
+    }
+
+    #[tokio::test]
     async fn rollback_errors_are_surfaced_not_swallowed() {
         struct FailDelsAndSecondAdd {
             calls: std::cell::RefCell<Vec<NetOp>>,
         }
         impl NetlinkExecutor for FailDelsAndSecondAdd {
-            async fn exec(&mut self, op: NetOp) -> Result<(), NetOpError> {
+            async fn exec(&mut self, op: NetOp) -> Result<bool, NetOpError> {
                 self.calls.borrow_mut().push(op);
                 match op {
                     NetOp::DelRule(_) | NetOp::DelRoute(_) => Err("rollback refused".into()),
                     NetOp::AddRule(spec) if spec.priority == 42 => {
                         Err("add-rule: kernel refused".into())
                     }
-                    _ => Ok(()),
+                    _ => Ok(true),
                 }
             }
             async fn survey(&mut self, _: &str) -> Result<TableSurvey, NetOpError> {
