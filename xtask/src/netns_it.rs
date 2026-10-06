@@ -46,9 +46,11 @@ const UNSHARE_ARGS: &[&str] = &["--user", "--map-root-user", "--net"];
 fn gate_shim() -> String {
     use protonwire_net::netns::{MANAGED_NETNS_ENV, MANAGED_NETNS_ID_ENV};
     // A fresh namespace starts with `lo` DOWN — loopback-dependent ITs
-    // (the M4 exit's mocked peer) need it up. iproute2 exists on the
-    // devshell and CI images; its absence fails the shim loudly
-    // (the `&&` chain breaks before any test runs).
+    // (the M4 exit's mocked peer) need it up. iproute2 is declared in
+    // the devshell (shell.nix) and ships on CI images; the runner's
+    // preflight turns its absence into a named error before anything
+    // builds (the `&&` chain would otherwise break inside the shim
+    // after the prebuild, as a bare `command not found`).
     format!(
         "ns=$(readlink /proc/self/ns/net) && ip link set lo up && exec env \
          {MANAGED_NETNS_ENV}=1 {MANAGED_NETNS_ID_ENV}=\"$ns\" \"$0\" \"$@\""
@@ -79,6 +81,19 @@ pub(crate) fn run(root: &Path) -> Result<bool> {
         return Ok(true);
     }
     reporter.rule("userns availability probe", &[]);
+
+    // Not a skip: this host COULD run the gated targets, the
+    // environment is just missing a tool the harness invokes — a
+    // green-looking skip would hide that (the round-38 #17 finding).
+    if !probe_iproute2() {
+        return Err(anyhow::anyhow!(
+            "the netns gate shim runs `ip link set lo up` inside the \
+             namespace, but `ip` (iproute2) is not on PATH. It is \
+             declared in the devshell (shell.nix) and ships on the CI \
+             images — enter the devshell (nix-shell / direnv) or \
+             install iproute2"
+        ));
+    }
 
     // `cargo xtask netns-it --locked` forwards the lockfile discipline
     // to the inner `cargo test` invocations (CI's FR-127A shape).
@@ -160,6 +175,18 @@ fn probe_userns() -> bool {
         .args(UNSHARE_ARGS)
         .arg("--")
         .arg("true")
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+/// Whether `ip` (iproute2) — the gate shim's loopback-up call — is
+/// on PATH. The devshell declares it (shell.nix); the preflight turns
+/// its absence into a named error instead of the shim's bare
+/// `command not found` after the whole prebuild has run.
+fn probe_iproute2() -> bool {
+    Command::new("ip")
+        .arg("-Version")
         .status()
         .map(|status| status.success())
         .unwrap_or(false)

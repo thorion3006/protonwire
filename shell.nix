@@ -30,6 +30,7 @@ let
     gcc # linker for the engine chain's C code
     cargo-audit
     git
+    iproute2 # `ip` — the netns-it gate shim brings `lo` up inside the namespace
   ];
 
   # The Tauri GUI's system libraries; CI installs the deb equivalents in
