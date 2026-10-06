@@ -93,13 +93,14 @@ fn it_kill_switch() {
             .await
             .expect("uplink stand-in address");
         let mut executor = protonwire_net::route_txn::RtnetlinkExecutor::new(handle.clone());
-        let plan = protonwire_net::route_txn::plan_with(&mut executor, "")
+        let plan = protonwire_net::route_txn::plan_with(&mut executor, "", None)
             .await
             .expect("survey");
         let desired =
             protonwire_net::route_drift::desired_ops(&protonwire_net::route_drift::DesiredRoutes {
                 plan: plan.clone(),
                 tun_oif,
+                bypass_mark: 0,
             });
         let mut txn = protonwire_net::route_txn::RouteTransaction::new(plan);
         for op in desired {
@@ -114,14 +115,15 @@ fn it_kill_switch() {
     let policy = KillSwitchPolicy {
         tun_ifindex: tun_oif,
         allow_dhcp_v4: true,
-        lan_ifindex: None,
+        lan_permits: Vec::new(),
         bypass_mark: 0x21,
     };
 
     // 1. FRESH APPLY + VALIDATE + BEHAVIORAL PROBE: the marker
     //    generation, the output chain, the exact rendered rule count,
-    //    and a leak-shaped probe that DIES at the counted drop.
-    kill_switch::apply(TUN_STANDIN, UPLINK_STANDIN, &policy, GenerationId(1))
+    //    and a leak-shaped probe that DIES at the counted drop. No
+    //    prior record exists for a FIRST install.
+    kill_switch::apply(TUN_STANDIN, UPLINK_STANDIN, &policy, GenerationId(1), None)
         .expect("fresh apply validates");
     kill_switch::validate(&policy, GenerationId(1)).expect("post-apply validation");
     kill_switch::enforcement_probe(UPLINK_STANDIN).expect("behavioral enforcement proof");
@@ -159,13 +161,32 @@ fn it_kill_switch() {
         allow_dhcp_v4: false,
         ..policy.clone()
     };
-    kill_switch::apply(TUN_STANDIN, UPLINK_STANDIN, &changed, GenerationId(2))
-        .expect("owned replace validates");
+    kill_switch::apply(
+        TUN_STANDIN,
+        UPLINK_STANDIN,
+        &changed,
+        GenerationId(2),
+        Some(GenerationId(1)),
+    )
+    .expect("owned replace validates — the live marker matches the persisted prior");
     kill_switch::validate(&changed, GenerationId(2)).expect("generation 2 validated");
     kill_switch::enforcement_probe(UPLINK_STANDIN).expect("still enforced after the replace");
 
-    // 5. OWNED REMOVE: clean; nothing left.
-    kill_switch::remove().expect("owned removal");
+    // 4b. A WRONG prior record refuses: the marker on the wire is
+    //     generation 2; claiming 1 must not own the table (names are
+    //     forgeable — the private record is the proof).
+    let refusal = kill_switch::apply(
+        TUN_STANDIN,
+        UPLINK_STANDIN,
+        &changed,
+        GenerationId(3),
+        Some(GenerationId(1)),
+    )
+    .expect_err("a mismatched prior must not own the live table");
+    assert!(matches!(refusal, KillSwitchError::Lookalike), "{refusal:?}");
+
+    // 5. OWNED REMOVE with the matching prior: clean; nothing left.
+    kill_switch::remove(Some(GenerationId(2))).expect("owned removal");
 
     // 6. THE LOOKALIKE: a foreign `protonwire` table (no marker) —
     //    apply REFUSES, fails closed, and the foreign table is
@@ -174,7 +195,7 @@ fn it_kill_switch() {
     let table = Table::new(ProtocolFamily::Inet).with_name("protonwire");
     foreign.add(&table, MsgType::Add);
     foreign.send().expect("the foreign table installs");
-    let refusal = kill_switch::apply(TUN_STANDIN, UPLINK_STANDIN, &policy, GenerationId(3))
+    let refusal = kill_switch::apply(TUN_STANDIN, UPLINK_STANDIN, &policy, GenerationId(3), None)
         .expect_err("a table without our marker is a lookalike");
     assert!(matches!(refusal, KillSwitchError::Lookalike), "{refusal:?}");
     // Intact: still present, and still marker-less (our apply would
@@ -203,13 +224,16 @@ fn it_kill_switch() {
 fn the_decision_logic_is_pinned() {
     // Belt to the kernel test's braces: the pure decision the live
     // path consults (unit-level, runs everywhere).
-    assert_eq!(kill_switch::decide_live(None), ApplyDecision::FreshApply);
     assert_eq!(
-        kill_switch::decide_live(Some(&[])),
+        kill_switch::decide_live(None, None),
+        ApplyDecision::FreshApply
+    );
+    assert_eq!(
+        kill_switch::decide_live(Some(&[]), Some(GenerationId(9))),
         ApplyDecision::RefuseLookalike
     );
     assert_eq!(
-        kill_switch::decide_live(Some(&[GenerationId(9)])),
+        kill_switch::decide_live(Some(&[GenerationId(9)]), Some(GenerationId(9))),
         ApplyDecision::ReplaceOwned(GenerationId(9))
     );
 }
