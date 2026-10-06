@@ -3677,7 +3677,7 @@ Gates green at every level.
 Gates green at every level after the cascade (#17's fixture rides
 the widened shape).
 
-## 2026-10-06 — Round 38 (#17 ×1)
+## 2026-10-06 — Round 38 (#17 ×2)
 
 - #17: the devshell DECLARES iproute2 — the netns gate shim invokes
   `ip link set lo up`, but the tool resolved only via the host
@@ -3685,11 +3685,22 @@ the widened shape).
   ship iproute2, so CI stayed green while the declared environment
   was incomplete). shell.nix carries the declaration (README and
   CONTRIBUTING ride it), and an iproute2 preflight turns its absence
-  into a named error BEFORE the prebuild — an error, not a skip:
+  into a named error before the prebuild — an error, not a skip:
   the host can run the gated targets, the environment is just
   missing a declared tool.
+- #17: disconnect REFUSES while the lane is draining — drain takes
+  the active lane with no transition flag armed, so between its take
+  and teardown's join the lane read empty and unowned and
+  disconnect() returned success while the pump/TUN teardown still
+  ran (the one admission path that never read `draining`; connect
+  and reconnect already refused). The three window refusals are now
+  one pure admission decision, disconnect_refusal, red→green through
+  disconnect_refuses_through_every_window (None vs Some(Draining) on
+  the missing arm); the flag is read under the lane guard, where
+  drain's arm-before-take ordering closes the interleave.
 
-Gates green at every level, verified both directions: the devshell
-resolves its own /nix/store/...-iproute2-7.1.0/bin/ip with netns-it
-3/3 inside it; a PATH carrying unshare but not ip exits 1 with the
-named message before anything builds.
+Gates green at every level, both directions where they apply: the
+devshell resolves its own /nix/store/...-iproute2-7.1.0/bin/ip with
+netns-it 3/3 inside it; a PATH carrying unshare but not ip exits 1
+with the named message before anything builds; the daemon suite
+carries the window-contract test (19ee82b).
