@@ -3747,3 +3747,46 @@ devshell resolves its own /nix/store/...-iproute2-7.1.0/bin/ip with
 netns-it 3/3 inside it; a PATH carrying unshare but not ip exits 1
 with the named message before anything builds; the daemon suite
 carries the window-contract test (19ee82b).
+
+## 2026-10-06 — Dependency sweep (post-M4-merge, owner-ordered)
+
+The owner merged #12/#13/#15/#16/#17 (rebase-merges, verified by
+PR state + landed content) and ordered a full dependency update
+before other work. Executed as d7207a7 with the evidence below.
+
+What moved: every crates.io dependency refreshed to the latest
+MSRV-1.97-compatible versions (~90 packages).
+
+What held, with evidence:
+
+- protun stays v2.2.1 (rev 12e7755a): it is the newest TAG;
+  upstream master (1829b00a) REGRESSES pvpnclient to ^1.5.1 —
+  below the parity contract's 3.0.3 baseline and the M2/M4
+  adapters. No upgrade exists to take.
+- muon stays =2.6.2: 2.6.3 (and 3.x/4.1.0) sit on the
+  proton-os-interface 0.3 train; protun 2.2.1's pvpnclient ~3.0.1
+  needs 0.2. Verified live: drifting boringtun to 3.0.2 split the
+  graph into two proton-os-interface copies and pvpnclient stopped
+  compiling.
+- proton-boringtun req becomes EXACT =3.0.0 (the caret let cargo
+  drift it to 3.0.2 — the split above); 3.0.1+ all cross to 0.3.
+- pvpnclient/proton-boringtun transitives (pfff family,
+  local-agent, yaourt, srp, vpn-utils) held at the M4-verified
+  versions — all boundary-crossers.
+- Rust stays 1.98.1: 1.99.0 released 2026-10-01 but nixpkgs has
+  not packaged it (no bump commit through 2026-10-06), and the
+  devshell must provide the rust-toolchain.toml compiler
+  (rustup shims are bypassed inside it). Revisit when nixpkgs
+  catches up.
+
+Made durable: dep-graph's PROTON TRAIN FREEZE — every
+proton-registry entry in Cargo.lock must match the recorded
+18-crate train (PROTON_TRAIN in xtask/src/deps.rs); a drift OR an
+unrecorded new proton crate fails the gate. Three unit tests; the
+drifted-muon fixture reproduces the live split. A future train move
+is one deliberate commit behind a protun tag that anchors it.
+
+Gates green at every level: fmt, clippy -D warnings (unpiped),
+cargo test (32 suites, 0 failed), netns-it --locked 3/3, rustdoc
+-D warnings, cargo audit (4 allowed), xtask all (39 PASS,
+including the new train rule).
