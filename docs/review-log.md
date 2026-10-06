@@ -3677,7 +3677,7 @@ Gates green at every level.
 Gates green at every level after the cascade (#17's fixture rides
 the widened shape).
 
-## 2026-10-06 — Round 38 (#17 ×5)
+## 2026-10-06 — Round 38 (#17 ×6)
 
 - #17: the devshell DECLARES iproute2 — the netns gate shim invokes
   `ip link set lo up`, but the tool resolved only via the host
@@ -3732,6 +3732,15 @@ the widened shape).
   first, arm on Some — the same shape drain's take was given for
   drain_in_progress; reconnect's unconditional arming is deliberately
   unchanged (its window guards real setup work on an empty lane).
+
+- #17: clear only the disconnect window THIS call armed — the
+  conditional-arming fix left the trailing clear unconditional, so a
+  descheduled idempotent disconnect (nothing armed) could resume and
+  strip a second disconnect's real window (a connection installed in
+  the gap, its teardown joining), freeing the lane mid-join. The
+  armed-local pairing (drain's drain_in_progress shape) lands it;
+  the previous reply's unconditional-clear safety claim was wrong
+  and the correction is disclosed in the thread.
 
 Gates green at every level, both directions where they apply: the
 devshell resolves its own /nix/store/...-iproute2-7.1.0/bin/ip with
