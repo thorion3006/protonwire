@@ -31,6 +31,8 @@ let
     cargo-audit
     git
     iproute2 # `ip` — the netns-it gate shim brings `lo` up inside the namespace
+    libclang # rustables' build-time bindgen (the nftables kill switch)
+    linuxHeaders # rustables' bindgen reads linux/netlink.h & friends
   ];
 
   # The Tauri GUI's system libraries; CI installs the deb equivalents in
@@ -47,6 +49,11 @@ in
 pkgs.mkShell {
   name = "protonwire" + pkgs.lib.optionalString gui "-gui";
   packages = core ++ pkgs.lib.optionals gui gui-libs;
+  # rustables' bindgen looks this up itself; nixpkgs does not
+  # propagate the library path into the shell environment.
+  LIBCLANG_PATH = "${pkgs.libclang.lib}/lib";
+  # Same for the kernel headers bindgen reads through clang.
+  BINDGEN_EXTRA_CLANG_ARGS = "-I${pkgs.linuxHeaders}/include";
   shellHook = ''
     echo "protonwire devshell: $(rustc --version | cut -d' ' -f2)${
       pkgs.lib.optionalString gui " + webkit2gtk (protonwire-gui compiles here)"

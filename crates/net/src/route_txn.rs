@@ -305,12 +305,25 @@ impl RtnetlinkExecutor {
             RT_TABLE_COMPAT
         };
         message.header.protocol = RouteProtocol::Static;
-        message.header.scope = RouteScope::Universe;
+        // A gateway-less device route must be scope LINK — universe
+        // is invalid without a gateway: ip rejects it client-side,
+        // while raw netlink ACCEPTS the route and every send over it
+        // then fails EINVAL (caught live by the kill-switch IT's
+        // enforcement probe).
+        message.header.scope = RouteScope::Link;
         message.header.kind = RouteType::Unicast;
-        message.attributes = vec![
-            RouteAttribute::Destination(spec.dest.addr.into()),
-            RouteAttribute::Oif(spec.oif),
-        ];
+        // The kernel's canonical form OMITS RTA_DST on a default
+        // route — writing an explicit UNSPECIFIED destination is
+        // non-canonical (the read-side matcher learned the same
+        // lesson; the write side now matches).
+        message.attributes = if spec.dest.len == 0 {
+            vec![RouteAttribute::Oif(spec.oif)]
+        } else {
+            vec![
+                RouteAttribute::Destination(spec.dest.addr.into()),
+                RouteAttribute::Oif(spec.oif),
+            ]
+        };
         if spec.table > 255 {
             message.attributes.push(RouteAttribute::Table(spec.table));
         }
@@ -434,7 +447,14 @@ impl NetlinkExecutor for RtnetlinkExecutor {
                     return Ok(false);
                 }
                 let mut request = self.handle.rule().add();
-                request = request.table_id(spec.table).priority(spec.priority);
+                // ACTION TO TABLE explicitly — the builder's default
+                // (Unspec) installs an "action none" rule that makes
+                // every lookup through it EINVAL (caught live by the
+                // kill-switch IT's diagnostics: "lookup 51820 none").
+                request = request
+                    .action(rtnetlink::packet_route::rule::RuleAction::ToTable)
+                    .table_id(spec.table)
+                    .priority(spec.priority);
                 if let Some(mark) = spec.fwmark {
                     request = request.fw_mark(mark);
                 }
