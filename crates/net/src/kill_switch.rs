@@ -22,8 +22,13 @@
 //! Validation (FR-64/65): [`crate::kill_switch::validate`] re-dumps the table after
 //! apply and proves the marker generation, the drop-policy output
 //! chain, and the exact rendered rule count — anything else is an
-//! error, never a silent maybe.
-
+/// error, never a silent maybe.
+///
+/// SYNCHRONOUS BY CONTRACT (rust-review #5): every public fn here
+/// blocks on netlink dumps and a UDP send — the daemon calls them
+/// from spawn_blocking, never directly on a tokio worker (the
+/// sibling route_txn module documents its async-runtime contract
+/// the same way).
 use std::net::IpAddr;
 
 use rustables::expr::{
@@ -194,14 +199,24 @@ fn marker_generations(table: &Table) -> Result<Vec<GenerationId>, KillSwitchErro
 }
 
 /// How many rules [`render_rules`] produces for a policy — the
-/// validation's exact count (FR-64).
+/// validation's exact count (FR-64). The count and the render are
+/// pinned to each other by an always-run unit (rust-review #4): a
+/// future edit to one without the other fails the plain test lane,
+/// not only the netns IT.
 fn expected_rule_count(policy: &KillSwitchPolicy) -> usize {
     2 /* tun + loopback */
         + usize::from(policy.allow_dhcp_v4)
         + policy.lan_permits.len()
         + 1 /* bypass mark */
+        + 1 /* the probe counter (non-terminating) */
         + 1 /* the counted terminal drop */
 }
+
+/// The enforcement probe's destination — RFC 5737 TEST-NET-1: no
+/// legitimate host traffic targets it, so a counter rule matching
+/// exactly this destination attributes its movement to PROBE-shaped
+/// packets alone (the shared-counter false-pass, sec-audit F1).
+pub const PROBE_DESTINATION: std::net::Ipv4Addr = std::net::Ipv4Addr::new(192, 0, 2, 1);
 
 fn allow_oif(chain: &Chain, ifindex: u32) -> Result<Rule, KillSwitchError> {
     Ok(Rule::new(chain)?
@@ -245,6 +260,24 @@ fn render_rules(chain: &Chain, policy: &KillSwitchPolicy) -> Result<Vec<Rule>, K
             .with_expr(Meta::new(MetaType::Mark))
             .with_expr(Cmp::new(CmpOp::Eq, policy.bypass_mark.to_le_bytes()))
             .with_expr(Immediate::new_verdict(VerdictKind::Accept)),
+    );
+    // THE PROBE COUNTER, non-terminating, immediately before the
+    // terminal drop (sec-audit F1 + the round-2 P1): a counter rule
+    // matching exactly the probe's identity (nfproto v4 + the
+    // TEST-NET-1 destination) counts PROBE-shaped packets only — the
+    // terminal drop's shared counter could false-pass on a noisy
+    // host, where unrelated blocked traffic moves it inside the
+    // probe's dump window. No verdict: matched packets fall through
+    // to the terminal drop (that fall-through IS the enforcement).
+    rules.push(
+        Rule::new(chain)?
+            .with_expr(Meta::new(MetaType::NfProto))
+            .with_expr(Cmp::new(CmpOp::Eq, [2_u8]))
+            .with_expr(
+                HighLevelPayload::Network(NetworkHeaderField::IPv4(IPv4HeaderField::Daddr)).build(),
+            )
+            .with_expr(Cmp::new(CmpOp::Eq, PROBE_DESTINATION.octets()))
+            .with_expr(Counter::default()),
     );
     rules.push(
         Rule::new(chain)?
@@ -336,6 +369,36 @@ pub fn apply(
     generation: GenerationId,
     persisted_prior: Option<GenerationId>,
 ) -> Result<(), KillSwitchError> {
+    // A ZERO bypass mark is a config error, not a disabled feature
+    // (the round-2 P1 + sec-audit F3 + rust-review #2): mark==0
+    // matches every UNMARKED packet — the entire non-VPN population
+    // — and the switch silently accepts everything it exists to
+    // drop. route_drift's 0-disables convention belongs to the
+    // ROUTING side only; the kill switch requires the real mark.
+    if policy.bypass_mark == 0 {
+        return Err(KillSwitchError::Validation(
+            "bypass_mark is zero — `meta mark 0 accept` would match every unmarked packet \
+             and hollow the kill switch (FR-61); pass the daemon's real mark"
+                .into(),
+        ));
+    }
+    // LAN permits carry real prefixes (rust-review #3): a /0 permit
+    // is interface-only (the round-1 shape), an over-wide length
+    // silently clamps to host-route semantics — both refuse here,
+    // at the last line before the kernel.
+    for permit in &policy.lan_permits {
+        let width = match permit.dest.addr {
+            IpAddr::V4(_) => 32,
+            IpAddr::V6(_) => 128,
+        };
+        if permit.dest.len == 0 || permit.dest.len > width {
+            return Err(KillSwitchError::Validation(format!(
+                "LAN permit {}/{} is not a usable prefix (width {width}) — a /0 permit is \
+                 interface-only and an over-wide length silently clamps",
+                permit.dest.addr, permit.dest.len
+            )));
+        }
+    }
     let tun_ifindex = iface_index(tun_ifname)
         .map_err(|_| KillSwitchError::MissingInterface(tun_ifname.to_owned()))?
         as u32;
@@ -475,10 +538,13 @@ pub fn remove(persisted_prior: Option<GenerationId>) -> Result<(), KillSwitchErr
     if named.len() > 1 {
         return Err(KillSwitchError::Lookalike);
     }
-    let table = named
-        .into_iter()
-        .next()
-        .ok_or(KillSwitchError::Netfilter("nothing to remove".into()))?;
+    // Idempotent no-table (rust-review #9): a disconnect after a
+    // connect that failed before apply — or after someone else's
+    // cleanup — is SUCCESS, matching the idempotent-delete
+    // philosophy everywhere else in the stack.
+    let Some(table) = named.into_iter().next() else {
+        return Ok(());
+    };
     let markers = marker_generations(&table)?;
     match decide_live(Some(&markers), persisted_prior) {
         ApplyDecision::RefuseLookalike => Err(KillSwitchError::Lookalike),
@@ -491,10 +557,21 @@ pub fn remove(persisted_prior: Option<GenerationId>) -> Result<(), KillSwitchErr
     }
 }
 
-/// Read back the terminal drop rule's packet counter — the
-/// enforcement proof surface (the netns IT).
+/// Read back the PROBE counter rule's packet count — the
+/// enforcement proof surface. This is NOT the terminal drop's
+/// counter: the probe rule matches only the probe's identity
+/// (nfproto v4 + TEST-NET-1 destination), so its movement attributes
+/// to probe-shaped packets alone; the shared terminal counter could
+/// false-pass on a noisy host (sec-audit F1). Multiple same-named
+/// tables are an AMBIGUOUS evidence source — refuse (sec-audit F5).
 pub fn dropped_packets() -> Result<u64, KillSwitchError> {
-    let table = tables_named_us()?
+    let named = tables_named_us()?;
+    if named.len() > 1 {
+        return Err(KillSwitchError::Validation(
+            "multiple protonwire tables — ambiguous evidence".into(),
+        ));
+    }
+    let table = named
         .into_iter()
         .next()
         .ok_or_else(|| KillSwitchError::Validation("no protonwire table".into()))?;
@@ -506,6 +583,19 @@ pub fn dropped_packets() -> Result<u64, KillSwitchError> {
             let Some(expressions) = rule.get_expressions() else {
                 continue;
             };
+            // THE PROBE RULE carries a counter and NO verdict (the
+            // terminal drop carries counter + Drop) — first-wins on
+            // any counter would misattribute to a permit rule the
+            // day one grows a counter (rust-review #4).
+            let has_verdict = expressions.iter().any(|expression| {
+                matches!(
+                    expression.get_data(),
+                    Some(rustables::expr::ExpressionVariant::Immediate(_))
+                )
+            });
+            if has_verdict {
+                continue;
+            }
             for expression in expressions.iter() {
                 if let Some(rustables::expr::ExpressionVariant::Counter(counter)) =
                     expression.get_data()
@@ -518,7 +608,7 @@ pub fn dropped_packets() -> Result<u64, KillSwitchError> {
         }
     }
     Err(KillSwitchError::Validation(
-        "the counted drop rule is missing".into(),
+        "the probe counter rule is missing".into(),
     ))
 }
 
@@ -611,20 +701,20 @@ mod tests {
             lan_permits: Vec::new(),
             bypass_mark: 0x21,
         };
-        assert_eq!(expected_rule_count(&base), 4);
+        assert_eq!(expected_rule_count(&base), 5);
         assert_eq!(
             expected_rule_count(&KillSwitchPolicy {
                 allow_dhcp_v4: true,
                 ..base.clone()
             }),
-            5
+            6
         );
         assert_eq!(
             expected_rule_count(&KillSwitchPolicy {
                 lan_permits: vec![lan("192.168.1.0", 24, 9)],
                 ..base.clone()
             }),
-            5
+            6
         );
         assert_eq!(
             expected_rule_count(&KillSwitchPolicy {
@@ -632,8 +722,82 @@ mod tests {
                 lan_permits: vec![lan("192.168.1.0", 24, 9), lan("fe80::", 10, 9)],
                 ..base
             }),
-            7
+            8
         );
+    }
+
+    #[test]
+    fn the_rendered_rules_count_matches_offline() {
+        // rust-review #4: the literals above and the RENDER must
+        // co-vary in the always-run lane — only iface_index(lo)
+        // touches the system, which every Linux test host has.
+        let table = Table::new(ProtocolFamily::Inet).with_name(TABLE_NAME);
+        let chain = Chain::new(&table).with_name(OUTPUT_CHAIN);
+        for policy in [
+            KillSwitchPolicy {
+                tun_ifindex: 5,
+                allow_dhcp_v4: false,
+                lan_permits: Vec::new(),
+                bypass_mark: 0x21,
+            },
+            KillSwitchPolicy {
+                tun_ifindex: 5,
+                allow_dhcp_v4: true,
+                lan_permits: vec![lan("192.168.1.0", 24, 9)],
+                bypass_mark: 0x21,
+            },
+        ] {
+            let rendered = render_rules(&chain, &policy).expect("offline render");
+            assert_eq!(
+                rendered.len(),
+                expected_rule_count(&policy),
+                "render and count drifted for {policy:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_zero_bypass_mark_is_refused() {
+        // The round-2 P1: mark 0 would accept every UNMARKED packet.
+        let policy = KillSwitchPolicy {
+            tun_ifindex: 1,
+            allow_dhcp_v4: false,
+            lan_permits: Vec::new(),
+            bypass_mark: 0,
+        };
+        let refusal = apply("lo", "lo", &policy, GenerationId(1), None)
+            .expect_err("zero mark refuses before any netfilter work");
+        assert!(
+            matches!(refusal, KillSwitchError::Validation(_)),
+            "{refusal:?}"
+        );
+    }
+
+    #[test]
+    fn unusable_lan_prefixes_are_refused() {
+        for dest in [
+            crate::route_txn::DestPrefix {
+                addr: "0.0.0.0".parse().unwrap(),
+                len: 0,
+            },
+            crate::route_txn::DestPrefix {
+                addr: "10.1.0.0".parse().unwrap(),
+                len: 33,
+            },
+        ] {
+            let policy = KillSwitchPolicy {
+                tun_ifindex: 1,
+                allow_dhcp_v4: false,
+                lan_permits: vec![LanPermit { dest, oif: 9 }],
+                bypass_mark: 0x21,
+            };
+            let refusal = apply("lo", "lo", &policy, GenerationId(1), None)
+                .expect_err("unusable prefix refuses");
+            assert!(
+                matches!(refusal, KillSwitchError::Validation(_)),
+                "{refusal:?}"
+            );
+        }
     }
 
     #[test]
