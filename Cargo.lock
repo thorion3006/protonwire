@@ -5181,6 +5181,8 @@ name = "protonwire-net"
 version = "0.1.0"
 dependencies = [
  "protonwire-frontend-api",
+ "serde",
+ "serde_json",
  "thiserror 2.0.21",
 ]
 
