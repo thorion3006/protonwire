@@ -3677,7 +3677,7 @@ Gates green at every level.
 Gates green at every level after the cascade (#17's fixture rides
 the widened shape).
 
-## 2026-10-06 — Round 38 (#17 ×2)
+## 2026-10-06 — Round 38 (#17 ×3)
 
 - #17: the devshell DECLARES iproute2 — the netns gate shim invokes
   `ip link set lo up`, but the tool resolved only via the host
@@ -3698,6 +3698,20 @@ the widened shape).
   disconnect_refuses_through_every_window (None vs Some(Draining) on
   the missing arm); the flag is read under the lane guard, where
   drain's arm-before-take ordering closes the interleave.
+
+- #17: concurrent drain callers SERIALIZE — the first caller's
+  teardown armed no lane state (the `draining` atomic refuses new
+  work forever; it cannot carry in-progress-ness), so a second
+  shutdown path observed the taken lane as idle and returned while
+  the first pump/TUN teardown still ran, breaking drain's
+  blocking-shutdown contract for every caller but the take-winner.
+  LaneState::drain_in_progress arms under the take guard and clears
+  after the teardown joins; the wait decision is the pure
+  drain_waits (drain_in_progress || the round-28 windows),
+  red→green through
+  drain_waits_out_windows_and_concurrent_teardowns. The armed/clear
+  pairing's executable home is the recorded gated daemon-lane IT
+  deferral.
 
 Gates green at every level, both directions where they apply: the
 devshell resolves its own /nix/store/...-iproute2-7.1.0/bin/ip with
