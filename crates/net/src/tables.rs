@@ -142,7 +142,9 @@ impl PersistedTables {
 
 /// Everything the planner needs to know about the host before
 /// deciding: named tables (rt_tables), ids referenced by live
-/// rules/routes (any owner), and the daemon's persisted mapping.
+/// rules/routes (any owner), which of those carry OUR canonical
+/// entry shapes (entry-level ownership proof), and the daemon's
+/// persisted mapping.
 #[derive(Debug, Clone, Default)]
 pub struct TableSurvey {
     /// id → name, from `/etc/iproute2/rt_tables` ([`parse_rt_tables`]).
@@ -150,6 +152,13 @@ pub struct TableSurvey {
     /// Ids referenced by active policy rules or routes — owner
     /// unknown from netlink alone.
     pub occupied: BTreeSet<u32>,
+    /// The subset of `occupied` whose referencing entries PROVE
+    /// ProtonWire's canonical shapes (the executor's entry-level
+    /// check: priority band, from-all, our rule/route shapes). The
+    /// ONLY occupied ids a persisted record may reclaim — occupied
+    /// without proof could be a foreign squatter on our stale id
+    /// (the round-3 P1), and reclaiming would mix FR-34's lanes.
+    pub occupied_by_us: BTreeSet<u32>,
     /// The previous run's mapping, if the state file exists.
     pub persisted: Option<PersistedTables>,
 }
@@ -176,8 +185,14 @@ pub fn parse_rt_tables(text: &str) -> BTreeMap<u32, String> {
         let Ok(id) = parse_rt_tables_id(id.trim()) else {
             continue;
         };
-        let name = name.trim();
-        if name.is_empty() || name.starts_with('#') {
+        // ONE name token (the round-3 P2): iproute2 reads the first
+        // whitespace-delimited token and ignores trailing commentary
+        // (`51820 protonwire-main # managed locally`); our whole-rest
+        // read rejected such lines as absent — claiming the id.
+        let Some(name) = name.trim().split_whitespace().next() else {
+            continue;
+        };
+        if name.starts_with('#') {
             continue;
         }
         named.insert(id, name.to_owned());
@@ -225,6 +240,22 @@ pub fn plan_tables(survey: &TableSurvey) -> TablePlan {
 fn resolve(kind: TableKind, survey: &TableSurvey, claimed: &BTreeSet<u32>) -> TableAssignment {
     if let Some(persisted) = &survey.persisted {
         let id = persisted.for_kind(kind);
+        // OCCUPIED state demands entry-level proof (the round-3 P1):
+        // a persisted id referenced by live rules/routes is ours only
+        // when the entries PROVE it — the survey's occupied_by_us
+        // (the executor's canonical-shape check) or a corroborating
+        // rt_tables name. The bare private record plus unproven
+        // occupation could be a foreign squatter on our stale id:
+        // reclaiming would mix FR-34's lanes and strand the plan's
+        // ownership gate. OUR crash residue passes the shape check,
+        // so a genuine restart still reclaims (nothing strips a
+        // clean restart's id).
+        let occupied = survey.occupied.contains(&id);
+        let proven_ours = survey.occupied_by_us.contains(&id)
+            || survey
+                .named
+                .get(&id)
+                .is_some_and(|name| name == kind.canonical_name());
         let contradicted = survey
             .named
             .get(&id)
@@ -235,14 +266,12 @@ fn resolve(kind: TableKind, survey: &TableSurvey, claimed: &BTreeSet<u32>) -> Ta
         // colliding lanes distrust it; a distinct sibling entry is
         // still evidence), or an id another lane already resolved to
         // this run — none of that is ownership evidence (the round-1
-        // P2). Reject and fall through to allocation. Occupied-by-
-        // rules does NOT invalidate (after our own crash our stale
-        // rules still reference it — cleanup owns those).
+        // P2). Reject and fall through to allocation.
         let collides_with_sibling = TableKind::ALL
             .iter()
             .any(|other| *other != kind && persisted.for_kind(*other) == id);
         let valid = id > KERNEL_RESERVED_MAX && !collides_with_sibling && !claimed.contains(&id);
-        if !contradicted && valid {
+        if !contradicted && valid && (!occupied || proven_ours) {
             return TableAssignment {
                 kind,
                 id,
@@ -306,6 +335,7 @@ mod tests {
                 .map(|(id, name)| (*id, (*name).to_owned()))
                 .collect(),
             occupied: occupied.iter().copied().collect(),
+            occupied_by_us: BTreeSet::new(),
             persisted,
         }
     }
@@ -378,16 +408,19 @@ not-an-entry
     }
 
     #[test]
-    fn persisted_mapping_is_reused_when_uncontradicted() {
+    fn persisted_mapping_is_reused_when_our_shapes_occupy_it() {
         let persisted = PersistedTables {
             main: 53000,
             bypass: 51821,
             lan: 53002,
         };
-        // No rt_tables names at all (the daemon never names tables),
-        // and 53000 is even rule-occupied — after OUR crash our own
-        // stale rules still reference it; that is not a contradiction.
-        let plan = plan_tables(&survey(&[], &[53000], Some(persisted.clone())));
+        // No rt_tables names (the daemon never names tables), and
+        // 53000 is rule-occupied by OUR canonical shapes — after our
+        // own crash our stale rules still reference it, and the
+        // entry-level proof (occupied_by_us) keeps it reclaimable.
+        let mut our_crash = survey(&[], &[53000], Some(persisted.clone()));
+        our_crash.occupied_by_us.insert(53000);
+        let plan = plan_tables(&our_crash);
         assert_eq!(
             plan.assignment(TableKind::Main),
             TableAssignment {
@@ -399,6 +432,109 @@ not-an-entry
         assert_eq!(plan.assignment(TableKind::Bypass).id, 51821);
         assert_eq!(plan.assignment(TableKind::Lan).id, 53002);
         assert!(plan.owns(53000));
+    }
+
+    #[test]
+    fn squatted_occupation_without_entry_proof_is_not_reclaimed() {
+        // The round-3 P1: another manager took our stale id while we
+        // were stopped — the persisted record alone must not reclaim
+        // an id their (unproven) rules occupy; allocate elsewhere.
+        let persisted = PersistedTables {
+            main: 53000,
+            bypass: 53001,
+            lan: 53002,
+        };
+        let plan = plan_tables(&survey(&[], &[53000], Some(persisted)));
+        assert_eq!(
+            plan.assignment(TableKind::Main).provenance,
+            Provenance::Preferred,
+            "unproven occupation pushes to a fresh id — never mix lanes"
+        );
+        assert!(!plan.owns(53000));
+        // A corroborating canonical NAME is entry-level proof too.
+        let persisted = PersistedTables {
+            main: 53000,
+            bypass: 53001,
+            lan: 53002,
+        };
+        let plan = plan_tables(&survey(
+            &[(53000, "protonwire-main")],
+            &[53000],
+            Some(persisted),
+        ));
+        assert_eq!(
+            plan.assignment(TableKind::Main).provenance,
+            Provenance::Persisted
+        );
+    }
+
+    #[test]
+    fn rt_tables_names_read_one_token_with_trailing_comment() {
+        // The round-3 P2: the whole-rest read rejected this valid
+        // iproute2 line (name would carry the comment) — the id read
+        // as absent and the planner could claim it.
+        let named = parse_rt_tables("51820 protonwire-main # managed locally\n");
+        assert_eq!(named[&51820], "protonwire-main");
+        // The canonical name now matches — a persisted+occupied id
+        // with this line is name-proven.
+        let persisted = PersistedTables {
+            main: 51820,
+            bypass: 51821,
+            lan: 51822,
+        };
+        let plan = plan_tables(&survey(
+            &[(51820, "protonwire-main")],
+            &[51820],
+            Some(persisted),
+        ));
+        assert_eq!(
+            plan.assignment(TableKind::Main).provenance,
+            Provenance::Persisted
+        );
+    }
+
+    #[test]
+    fn octal_ids_parse_like_iproute2() {
+        assert_eq!(parse_rt_tables("0620 legacy-octal\n")[&400], "legacy-octal");
+    }
+
+    #[test]
+    fn plan_invariants_hold_under_sweeps() {
+        // The brute-force pin (rust-review #10): across named/occupied
+        // combinations the plan's invariants never bend — ids unique,
+        // outside the kernel range, never foreign-named, allocations
+        // outside the preferred set.
+        let mut named = std::collections::BTreeMap::new();
+        named.insert(51820_u32, "someone-else".to_owned());
+        named.insert(51821_u32, "protonwire-bypass".to_owned());
+        for occupied_extra in [0_u32, 51822, 51823, 51824] {
+            let mut occupied = std::collections::BTreeSet::from([51820, 51821]);
+            if occupied_extra != 0 {
+                occupied.insert(occupied_extra);
+            }
+            let plan = plan_tables(&TableSurvey {
+                named: named.clone(),
+                occupied: occupied.clone(),
+                occupied_by_us: Default::default(),
+                persisted: None,
+            });
+            let ids: Vec<_> = TableKind::ALL.map(|kind| plan.assignment(kind).id).to_vec();
+            for id in &ids {
+                assert!(*id > 255);
+                assert_ne!(named.get(id).map(String::as_str), Some("someone-else"));
+                assert!(!occupied.contains(id) || *id == 51821);
+            }
+            let mut unique = ids.clone();
+            unique.sort_unstable();
+            unique.dedup();
+            assert_eq!(unique.len(), ids.len(), "ids unique: {ids:?}");
+            for kind in TableKind::ALL {
+                let assignment = plan.assignment(kind);
+                if assignment.provenance == Provenance::Allocated {
+                    assert!(assignment.id > 51822);
+                }
+            }
+        }
     }
 
     #[test]
