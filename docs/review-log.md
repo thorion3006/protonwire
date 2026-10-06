@@ -3659,3 +3659,20 @@ Gates green at every level.
   publishes, retires; the loser owns the terminal.
 
 Gates green at every level.
+
+## 2026-10-06 — Round 37 (#13 ×1, #16 ×1, both landed)
+
+- #13: a failed creation-batch sync ROLLS BACK — the transient
+  failure left the directories existing, so the next init collected
+  an empty list and skipped the sync forever (success over an
+  unsynced ancestor; a crash could still lose the subtree). Both
+  creation sites share sync_new_components + remove_created_components:
+  either the whole chain is created AND synced, or it is gone and the
+  retry redoes the full work.
+- #16: ConnectingToAgent mirrors the FULL selected endpoint
+  (EnginePeerRef — the same mirror Connected uses): a jailed session
+  may never reach Connected, and FR-29/FR-123 status must expose the
+  selected entry IP/protocol/port during negotiation.
+
+Gates green at every level after the cascade (#17's fixture rides
+the widened shape).
