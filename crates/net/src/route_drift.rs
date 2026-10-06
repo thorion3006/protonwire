@@ -16,7 +16,7 @@
 //! mid-session (FR-39's "leave concurrently changed unowned state
 //! intact" is the session scoping itself).
 
-use crate::route_txn::{DestPrefix, Family, KERNEL_MAIN, NetOp, RouteSpec, RuleSpec};
+use crate::route_txn::{DestPrefix, Family, KERNEL_MAIN, NetOp, RouteSpec, RuleKind, RuleSpec};
 use crate::tables::{TableKind, TablePlan};
 
 /// The policy-rule priority band ProtonWire installs its rules at
@@ -80,12 +80,14 @@ pub fn desired_ops(state: &DesiredRoutes) -> Vec<NetOp> {
             priority: BYPASS_RULE_PRIORITY,
             fwmark: Some(state.bypass_mark),
             family: Family::V4,
+            action: RuleKind::ToTable,
         }));
         ops.push(NetOp::AddRule(RuleSpec {
             table: KERNEL_MAIN,
             priority: BYPASS_RULE_PRIORITY,
             fwmark: Some(state.bypass_mark),
             family: Family::V6,
+            action: RuleKind::ToTable,
         }));
     }
     ops.push(NetOp::AddRule(RuleSpec {
@@ -93,6 +95,7 @@ pub fn desired_ops(state: &DesiredRoutes) -> Vec<NetOp> {
         priority: FULL_TUNNEL_RULE_PRIORITY,
         fwmark: None,
         family: Family::V4,
+        action: RuleKind::ToTable,
     }));
     ops.push(NetOp::AddRoute(RouteSpec {
         table: main,
@@ -105,6 +108,7 @@ pub fn desired_ops(state: &DesiredRoutes) -> Vec<NetOp> {
             priority: FULL_TUNNEL_RULE_PRIORITY,
             fwmark: None,
             family: Family::V6,
+            action: RuleKind::ToTable,
         }));
         ops.push(NetOp::AddRoute(RouteSpec {
             table: main,
@@ -164,6 +168,7 @@ mod tests {
                     priority: FULL_TUNNEL_RULE_PRIORITY,
                     fwmark: None,
                     family: Family::V4,
+                    action: RuleKind::ToTable,
                 }),
                 NetOp::AddRoute(RouteSpec {
                     table: 51820,
@@ -188,18 +193,21 @@ mod tests {
                     priority: BYPASS_RULE_PRIORITY,
                     fwmark: Some(0x21),
                     family: Family::V4,
+                    action: RuleKind::ToTable,
                 }),
                 NetOp::AddRule(RuleSpec {
                     table: KERNEL_MAIN,
                     priority: BYPASS_RULE_PRIORITY,
                     fwmark: Some(0x21),
                     family: Family::V6,
+                    action: RuleKind::ToTable,
                 }),
                 NetOp::AddRule(RuleSpec {
                     table: 51820,
                     priority: FULL_TUNNEL_RULE_PRIORITY,
                     fwmark: None,
                     family: Family::V4,
+                    action: RuleKind::ToTable,
                 }),
                 NetOp::AddRoute(RouteSpec {
                     table: 51820,
@@ -227,6 +235,7 @@ mod tests {
             priority: 9,
             fwmark: None,
             family: Family::V4,
+            action: RuleKind::ToTable,
         }));
         assert!(repair_ops(&desired, &superset).is_empty());
     }
