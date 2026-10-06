@@ -39,16 +39,11 @@ impl NetworkAdapter for NativeAdapter {
     }
 }
 
-/// Preferred policy-routing table IDs (PRD 7.5); dynamically reallocated on
-/// conflict by the Milestone 5 router (integration test IT-25).
-pub mod route_tables {
-    /// First preferred table.
-    pub const PRIMARY: u32 = 51820;
-    /// Second preferred table.
-    pub const SECONDARY: u32 = 51821;
-    /// Third preferred table.
-    pub const TERTIARY: u32 = 51822;
-}
+/// The routing-table plan (FR-34, IT-25): preferred-not-guaranteed
+/// ids, persisted-mapping ownership proof, conflict-free allocation,
+/// lookalike refusal. The M1 `route_tables` id constants placeholder
+/// grew into this.
+pub mod tables;
 
 /// The network-namespace integration-test harness (NFR-31). Shared by
 /// every netns-gated integration test in the workspace (`protocol`'s
