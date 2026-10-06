@@ -141,6 +141,20 @@ struct LaneState {
     /// armed before the guard drop, cleared after the join — the lane
     /// never looks free mid-teardown.
     disconnecting: bool,
+    /// A drain's teardown is IN PROGRESS (the bot round-38 P2): armed
+    /// by the drain caller that took the active lane, cleared after
+    /// its teardown joins — concurrent drain callers wait it out, so
+    /// the blocking-shutdown contract holds for EVERY caller, not
+    /// just the one that won the take.
+    drain_in_progress: bool,
+}
+
+/// Whether drain's wait loop must yield right now: a user window
+/// (reconnecting/disconnecting — the round-28 discipline) or ANOTHER
+/// drain's in-progress teardown. Pure so the serialization contract
+/// is testable without a live engine.
+fn drain_waits(lane: &LaneState) -> bool {
+    lane.drain_in_progress || lane.reconnecting || lane.disconnecting
 }
 
 /// The lane's shared state: the pump must retire the lane when the
@@ -412,20 +426,46 @@ impl ConnectionLane {
         // still ran. The window check and active.take() are now one
         // critical section; the join still runs guard-free (the
         // round-21 no-join-under-lock discipline).
+        //
+        // Concurrent drain callers SERIALIZE (the bot round-38 P2):
+        // the first caller's teardown arms no transition flag, so a
+        // second shutdown path observed the taken lane as idle and
+        // returned while the first pump/TUN teardown still ran. The
+        // take-armed drain_in_progress (cleared below, after the
+        // teardown joins) makes every later caller WAIT for the
+        // teardown's completion — this method blocks for EVERY
+        // caller, not just the one that won the take. The `draining`
+        // atomic stays armed forever (shutdown is terminal; it only
+        // refuses new work) and cannot carry this meaning.
+        let mut armed = false;
         let active = loop {
             let mut lane = self
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if !lane.reconnecting && !lane.disconnecting {
-                lane.owner = None;
-                break lane.active.take();
+            if drain_waits(&lane) {
+                drop(lane);
+                std::thread::sleep(Duration::from_millis(5));
+                continue;
             }
-            drop(lane);
-            std::thread::sleep(Duration::from_millis(5));
+            if lane.active.is_some() {
+                lane.drain_in_progress = true;
+                armed = true;
+            }
+            lane.owner = None;
+            break lane.active.take();
         };
         if let Some(active) = active {
             active.teardown();
+        }
+        if armed {
+            // Released only by the caller that armed it; a waiter
+            // that looped past another drain's teardown breaks on
+            // the empty lane with armed == false and clears nothing.
+            self.state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .drain_in_progress = false;
         }
     }
 }
@@ -815,6 +855,33 @@ mod tests {
             Some(LaneRefusal::Disconnecting)
         );
         assert_eq!(disconnect_refusal(&LaneState::default(), false), None);
+    }
+
+    #[test]
+    fn drain_waits_out_windows_and_concurrent_teardowns() {
+        // An idle lane takes immediately: nothing runs, nothing to
+        // wait for.
+        assert!(!drain_waits(&LaneState::default()));
+        // The round-28 user windows still gate the take.
+        let reconnecting = LaneState {
+            reconnecting: true,
+            ..LaneState::default()
+        };
+        let disconnecting = LaneState {
+            disconnecting: true,
+            ..LaneState::default()
+        };
+        assert!(drain_waits(&reconnecting));
+        assert!(drain_waits(&disconnecting));
+        // The round-38 serialization: another drain's teardown is in
+        // progress — the second caller WAITS for its completion
+        // instead of observing the taken lane as idle and returning
+        // while the first pump/TUN teardown still runs.
+        let draining_now = LaneState {
+            drain_in_progress: true,
+            ..LaneState::default()
+        };
+        assert!(drain_waits(&draining_now));
     }
 
     #[test]
