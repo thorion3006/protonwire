@@ -23,6 +23,15 @@ use futures_util::StreamExt;
 
 use crate::tables::{TablePlan, TableSurvey, plan_tables};
 
+/// What a policy rule DOES with matched traffic. ToTable is the
+/// tunnel/bypass shape; Blackhole is routing-level blocking (FR-37:
+/// v6 enforcement independent of the kill switch — the round-3 P1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuleKind {
+    ToTable,
+    Blackhole,
+}
+
 /// Which address family a rule speaks — rules are family-scoped in
 /// the kernel (a v4 rule never steers v6 packets, and vice versa),
 /// so the desired state carries one rule per family it tunnels.
@@ -42,11 +51,13 @@ impl Family {
     }
 }
 
+/// What a policy rule DOES with matched traffic. ToTable is the
 /// One policy rule: everything ProtonWire puts in a rule, everything
 /// the writer needs to find and remove it again.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RuleSpec {
-    /// The plan-owned table the rule routes into.
+    /// The plan-owned table the rule routes into (0 for Blackhole —
+    /// a block has no destination table).
     pub table: u32,
     /// Rule priority (lower wins; ProtonWire uses a fixed band).
     pub priority: u32,
@@ -54,6 +65,8 @@ pub struct RuleSpec {
     pub fwmark: Option<u32>,
     /// The family the rule steers.
     pub family: Family,
+    /// What the rule does.
+    pub action: RuleKind,
 }
 
 /// A destination prefix, family carried by the address.
@@ -292,6 +305,7 @@ pub async fn plan_with<E: NetlinkExecutor>(
 use rtnetlink::packet_route::route::{
     RouteAttribute, RouteMessage, RouteProtocol, RouteScope, RouteType,
 };
+use rtnetlink::packet_route::rule::RuleAction as NetlinkRuleAction;
 use rtnetlink::packet_route::rule::{RuleAttribute, RuleMessage};
 use rtnetlink::packet_route::{AddressFamily, route::RouteAddress};
 
@@ -393,7 +407,7 @@ impl RtnetlinkExecutor {
         // The pre-fix writer armed the builder's default action
         // (Unspec — "lookup none"): such surviving rules must NOT
         // read as ours (the round-2 P1) — only ToTable matches.
-        if message.header.action != rtnetlink::packet_route::rule::RuleAction::ToTable {
+        if message.header.action != NetlinkRuleAction::ToTable {
             return false;
         }
         // FWMASK: our adds never set one — the kernel default
@@ -531,7 +545,7 @@ impl NetlinkExecutor for RtnetlinkExecutor {
                 // every lookup through it EINVAL (caught live by the
                 // kill-switch IT's diagnostics: "lookup 51820 none").
                 request = request
-                    .action(rtnetlink::packet_route::rule::RuleAction::ToTable)
+                    .action(NetlinkRuleAction::ToTable)
                     .table_id(spec.table)
                     .priority(spec.priority);
                 if let Some(mark) = spec.fwmark {
@@ -728,6 +742,7 @@ mod tests {
             priority: 31700,
             fwmark: None,
             family: Family::V4,
+            action: RuleKind::ToTable,
         }
     }
 
@@ -848,6 +863,7 @@ mod tests {
             priority: 9,
             fwmark: Some(7),
             family: Family::V4,
+            action: RuleKind::ToTable,
         });
         let txn = RouteTransaction::new(plan())
             .op(NetOp::AddRule(rule(51820)))
@@ -968,6 +984,7 @@ mod tests {
                     priority: 31700,
                     fwmark: None,
                     family: Family::V4,
+                    action: RuleKind::ToTable,
                 }),
                 NetOp::AddRule(rule(51820)),
             ])
@@ -1014,6 +1031,7 @@ mod tests {
                 priority: 42,
                 fwmark: None,
                 family: Family::V4,
+                action: RuleKind::ToTable,
             }))
             .expect("plan table");
         let mut executor = FailDelsAndSecondAdd {

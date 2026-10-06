@@ -12,7 +12,7 @@ use protonwire_net::netns;
 use protonwire_net::route_drift::{DesiredRoutes, Ipv6Desired, desired_ops, repair_ops};
 use protonwire_net::route_txn::{
     DestPrefix, Family, NetOp, NetlinkExecutor, RouteSpec, RouteTransaction, RtnetlinkExecutor,
-    RuleSpec, plan_with,
+    RuleKind, RuleSpec, plan_with,
 };
 use protonwire_net::tables::TableKind;
 
@@ -54,6 +54,7 @@ async fn it_route_transactions() {
         priority: 31700,
         fwmark: None,
         family: Family::V4,
+        action: RuleKind::ToTable,
     };
     let route = RouteSpec {
         table: 51820,
@@ -91,6 +92,7 @@ async fn it_route_transactions() {
             priority: 31701,
             fwmark: None,
             family: Family::V4,
+            action: RuleKind::ToTable,
         }))
         .expect("plan table")
         .op(NetOp::AddRoute(doomed))
@@ -229,6 +231,7 @@ async fn it_route_drift_and_cleanup() {
         priority: 32000,
         fwmark: None,
         family: Family::V4,
+        action: RuleKind::ToTable,
     };
     let survived = executor
         .present_ops(&[NetOp::AddRule(foreign)])
