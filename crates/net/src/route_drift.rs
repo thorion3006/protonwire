@@ -16,7 +16,7 @@
 //! mid-session (FR-39's "leave concurrently changed unowned state
 //! intact" is the session scoping itself).
 
-use crate::route_txn::{DestPrefix, KERNEL_MAIN, NetOp, RouteSpec, RuleSpec};
+use crate::route_txn::{DestPrefix, Family, KERNEL_MAIN, NetOp, RouteSpec, RuleSpec};
 use crate::tables::{TableKind, TablePlan};
 
 /// The policy-rule priority band ProtonWire installs its rules at
@@ -24,12 +24,26 @@ use crate::tables::{TableKind, TablePlan};
 /// for every ProtonWire rule, stable across reconnects).
 pub const FULL_TUNNEL_RULE_PRIORITY: u32 = 31700;
 
-/// The bypass rule sits ONE above the tunnel band: evaluated first,
-/// it keeps the daemon's own marked outer sockets on the normal
-/// uplink — without it the unconditional full-tunnel rule swallows
+/// What the session wants from IPv6 (FR-35's ::/0 vs FR-37's leak
+/// block).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ipv6Desired {
+    /// The tunnel carries v6: a v6 rule + the ::/0 default route
+    /// through the TUN (FR-35).
+    Tunnelled,
+    /// IPv6 over VPN is unavailable: NO v6 routing is installed and
+    /// the kill switch's inet-family default drop blocks every v6
+    /// egress (FR-37/FR-62 — a blocked family needs no rules of its
+    /// own to die).
+    Blocked,
+}
+
+/// The bypass rules sit ONE above the tunnel band: evaluated first,
+/// they keep the daemon's own marked outer sockets on the normal
+/// uplink — without them the unconditional full-tunnel rule swallows
 /// ProTUN's transport and routes the tunnel back into itself (the
-/// marks.rs contract; the round-1 P1). The IPv6 sibling of this rule
-/// lands with the v6 desired-state slice (FR-37's lane).
+/// marks.rs contract; the round-1 P1). BOTH families: the outer
+/// sockets may be v6 even when the tunnel carries no v6.
 pub const BYPASS_RULE_PRIORITY: u32 = FULL_TUNNEL_RULE_PRIORITY - 1;
 
 /// The desired routing state for one connected full-tunnel session.
@@ -39,17 +53,24 @@ pub struct DesiredRoutes {
     pub plan: TablePlan,
     /// The TUN interface's kernel index (routes' output interface).
     pub tun_oif: u32,
-    /// The daemon's bypass mark (0 disables the bypass rule — tests
+    /// The daemon's bypass mark (0 disables the bypass rules — tests
     /// and dry-runs; production always passes the real mark, FR-61:
     /// only the active daemon/ProTUN instance marks its sockets).
     pub bypass_mark: u32,
+    /// The session's IPv6 posture.
+    pub ipv6: Ipv6Desired,
 }
 
 /// Render the full-tunnel desired operations. Deterministic order:
-/// the MARK BYPASS rule first (it must win lookup before the
-/// catch-all), then the tunnel rule and the v4 default route through
-/// the TUN — FR-35; the rule before the route, so a route never
-/// exists unruled.
+/// the MARK BYPASS rules first (they must win lookup before the
+/// catch-all; BOTH families — the daemon's outer sockets may be v6),
+/// then per family the tunnel rule and its default route through the
+/// TUN — FR-35, v4 always, v6 when tunnelled; rules before routes,
+/// so a route never exists unruled. Blocked v6 renders NOTHING for
+/// v6: the kill switch's inet-family default drop is the block
+/// (FR-37), and the KILL SWITCH ARMS BEFORE these ops apply — the
+/// connect sequence's contract (round-1 P1: routing first would
+/// leave a v6 escape window until the switch lands).
 pub fn desired_ops(state: &DesiredRoutes) -> Vec<NetOp> {
     let main = state.plan.assignment(TableKind::Main).id;
     let mut ops = Vec::new();
@@ -58,18 +79,39 @@ pub fn desired_ops(state: &DesiredRoutes) -> Vec<NetOp> {
             table: KERNEL_MAIN,
             priority: BYPASS_RULE_PRIORITY,
             fwmark: Some(state.bypass_mark),
+            family: Family::V4,
+        }));
+        ops.push(NetOp::AddRule(RuleSpec {
+            table: KERNEL_MAIN,
+            priority: BYPASS_RULE_PRIORITY,
+            fwmark: Some(state.bypass_mark),
+            family: Family::V6,
         }));
     }
     ops.push(NetOp::AddRule(RuleSpec {
         table: main,
         priority: FULL_TUNNEL_RULE_PRIORITY,
         fwmark: None,
+        family: Family::V4,
     }));
     ops.push(NetOp::AddRoute(RouteSpec {
         table: main,
         dest: DestPrefix::V4_DEFAULT,
         oif: state.tun_oif,
     }));
+    if state.ipv6 == Ipv6Desired::Tunnelled {
+        ops.push(NetOp::AddRule(RuleSpec {
+            table: main,
+            priority: FULL_TUNNEL_RULE_PRIORITY,
+            fwmark: None,
+            family: Family::V6,
+        }));
+        ops.push(NetOp::AddRoute(RouteSpec {
+            table: main,
+            dest: DestPrefix::V6_DEFAULT,
+            oif: state.tun_oif,
+        }));
+    }
     ops
 }
 
@@ -98,6 +140,7 @@ mod tests {
             plan: plan(),
             tun_oif: oif,
             bypass_mark: 0,
+            ipv6: Ipv6Desired::Blocked,
         }
     }
 
@@ -106,6 +149,7 @@ mod tests {
             plan: plan(),
             tun_oif: oif,
             bypass_mark: mark,
+            ipv6: Ipv6Desired::Blocked,
         }
     }
 
@@ -119,6 +163,7 @@ mod tests {
                     table: 51820,
                     priority: FULL_TUNNEL_RULE_PRIORITY,
                     fwmark: None,
+                    family: Family::V4,
                 }),
                 NetOp::AddRoute(RouteSpec {
                     table: 51820,
@@ -142,11 +187,19 @@ mod tests {
                     table: KERNEL_MAIN,
                     priority: BYPASS_RULE_PRIORITY,
                     fwmark: Some(0x21),
+                    family: Family::V4,
+                }),
+                NetOp::AddRule(RuleSpec {
+                    table: KERNEL_MAIN,
+                    priority: BYPASS_RULE_PRIORITY,
+                    fwmark: Some(0x21),
+                    family: Family::V6,
                 }),
                 NetOp::AddRule(RuleSpec {
                     table: 51820,
                     priority: FULL_TUNNEL_RULE_PRIORITY,
                     fwmark: None,
+                    family: Family::V4,
                 }),
                 NetOp::AddRoute(RouteSpec {
                     table: 51820,
@@ -173,6 +226,7 @@ mod tests {
             table: 51821,
             priority: 9,
             fwmark: None,
+            family: Family::V4,
         }));
         assert!(repair_ops(&desired, &superset).is_empty());
     }

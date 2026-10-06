@@ -23,6 +23,25 @@ use futures_util::StreamExt;
 
 use crate::tables::{TablePlan, TableSurvey, plan_tables};
 
+/// Which address family a rule speaks — rules are family-scoped in
+/// the kernel (a v4 rule never steers v6 packets, and vice versa),
+/// so the desired state carries one rule per family it tunnels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Family {
+    V4,
+    V6,
+}
+
+impl Family {
+    /// The netlink rule-dump filter for this family.
+    fn ip_version(self) -> rtnetlink::IpVersion {
+        match self {
+            Family::V4 => rtnetlink::IpVersion::V4,
+            Family::V6 => rtnetlink::IpVersion::V6,
+        }
+    }
+}
+
 /// One policy rule: everything ProtonWire puts in a rule, everything
 /// the writer needs to find and remove it again.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,6 +52,8 @@ pub struct RuleSpec {
     pub priority: u32,
     /// The fwmark the rule matches, if any.
     pub fwmark: Option<u32>,
+    /// The family the rule steers.
+    pub family: Family,
 }
 
 /// A destination prefix, family carried by the address.
@@ -297,7 +318,13 @@ impl RtnetlinkExecutor {
 
     fn build_route(spec: RouteSpec) -> RouteMessage {
         let mut message = RouteMessage::default();
-        message.header.address_family = AddressFamily::Inet;
+        // The family follows the DESTINATION (a v6 default sent with
+        // an Inet header is a duplicate of the v4 default — EEXIST;
+        // caught by the isolated v6 IT after the branch rebuild).
+        message.header.address_family = match spec.dest.addr {
+            IpAddr::V4(_) => AddressFamily::Inet,
+            IpAddr::V6(_) => AddressFamily::Inet6,
+        };
         message.header.destination_prefix_length = spec.dest.len;
         message.header.table = if spec.table <= 255 {
             spec.table as u8
@@ -380,9 +407,20 @@ impl RtnetlinkExecutor {
             .unwrap_or_default()
     }
 
-    /// Whether a live route message is OURS by spec (table, dest,
-    /// oif).
+    /// Whether a live route message is OURS by spec (table, family,
+    // dest, oif) — the FAMILY is load-bearing: a destination-less /0
+    // with the same table and oif exists in BOTH families, so without
+    // the header check a surviving v4 default makes a drifted v6
+    // default look present (repair never restores it) and a delete
+    // can select the other family's route.
     fn route_matches(message: &RouteMessage, spec: RouteSpec) -> bool {
+        let expected_family = match spec.dest.addr {
+            IpAddr::V4(_) => AddressFamily::Inet,
+            IpAddr::V6(_) => AddressFamily::Inet6,
+        };
+        if message.header.address_family != expected_family {
+            return false;
+        }
         let expected_dest = RouteAddress::from(spec.dest.addr);
         let dest = message
             .attributes
@@ -413,7 +451,7 @@ impl RtnetlinkExecutor {
     }
 
     async fn find_rule(&mut self, spec: RuleSpec) -> Result<Option<RuleMessage>, NetOpError> {
-        let mut stream = self.handle.rule().get(rtnetlink::IpVersion::V4).execute();
+        let mut stream = self.handle.rule().get(spec.family.ip_version()).execute();
         while let Some(message) = stream.next().await {
             let message = message.map_err(|error| format!("rule dump: {error}"))?;
             if Self::rule_matches(&message, spec) {
@@ -424,7 +462,15 @@ impl RtnetlinkExecutor {
     }
 
     async fn find_route(&mut self, spec: RouteSpec) -> Result<Option<RouteMessage>, NetOpError> {
-        let mut stream = self.handle.route().get(RouteMessage::default()).execute();
+        // Dump only the spec's family — the matcher carries the same
+        // check as a belt, but the narrow dump keeps same-table-same-
+        // oif cross-family candidates out of the search entirely.
+        let mut template = RouteMessage::default();
+        template.header.address_family = match spec.dest.addr {
+            IpAddr::V4(_) => AddressFamily::Inet,
+            IpAddr::V6(_) => AddressFamily::Inet6,
+        };
+        let mut stream = self.handle.route().get(template).execute();
         while let Some(message) = stream.next().await {
             let message = message.map_err(|error| format!("route dump: {error}"))?;
             if Self::route_matches(&message, spec) {
@@ -458,11 +504,13 @@ impl NetlinkExecutor for RtnetlinkExecutor {
                 if let Some(mark) = spec.fwmark {
                     request = request.fw_mark(mark);
                 }
-                request
-                    .v4()
-                    .execute()
-                    .await
-                    .map_err(|error| format!("add rule: {error}"))?;
+                // v4()/v6() return differently-parameterized request
+                // types — execute within each arm.
+                let result = match spec.family {
+                    Family::V4 => request.v4().execute().await,
+                    Family::V6 => request.v6().execute().await,
+                };
+                result.map_err(|error| format!("add rule: {error}"))?;
                 Ok(true)
             }
             NetOp::DelRule(spec) => {
@@ -519,27 +567,33 @@ impl NetlinkExecutor for RtnetlinkExecutor {
     async fn survey(&mut self, rt_tables_text: &str) -> Result<TableSurvey, NetOpError> {
         let mut occupied = BTreeSet::new();
         let mut occupied_by_us = BTreeSet::new();
-        let mut rules = self.handle.rule().get(rtnetlink::IpVersion::V4).execute();
-        while let Some(message) = rules.next().await {
-            let message = message.map_err(|error| format!("rule dump: {error}"))?;
-            let table = Self::rule_table(&message);
-            occupied.insert(table);
-            // ENTRY-LEVEL OWNERSHIP PROOF (the planner's round-2 P1
-            // contract): a table is occupied-by-US when a dumped rule
-            // carries our canonical priority BAND — 31699..=31700,
-            // route_drift's BYPASS/FULL_TUNNEL constants (a private
-            // band no other manager picks by accident). Our crash
-            // residue is rules-dominated: routes die with their
-            // interface, our rules linger — so rules carry the proof.
-            let priority = message
-                .attributes
-                .iter()
-                .find_map(|attribute| match attribute {
-                    RuleAttribute::Priority(priority) => Some(*priority),
-                    _ => None,
-                });
-            if priority.is_some_and(|priority| (31699..=31700).contains(&priority)) {
-                occupied_by_us.insert(table);
+        // BOTH rule families (rules dump per-family — there is no
+        // unspec rule dump): a table referenced only by another
+        // manager's IPv6 rule read as FREE from a v4-only dump — the
+        // planner would claim it and a session owning that table
+        // would then delete the foreign rule (FR-39's violation).
+        for family in [rtnetlink::IpVersion::V4, rtnetlink::IpVersion::V6] {
+            let mut rules = self.handle.rule().get(family).execute();
+            while let Some(message) = rules.next().await {
+                let message = message.map_err(|error| format!("rule dump: {error}"))?;
+                let table = Self::rule_table(&message);
+                occupied.insert(table);
+                // ENTRY-LEVEL OWNERSHIP PROOF (the planner's round-2
+                // P1 contract): a table is occupied-by-US when a
+                // dumped rule carries our canonical priority BAND —
+                // 31699..=31700, route_drift's BYPASS/FULL_TUNNEL
+                // constants (a private band no other manager picks by
+                // accident). Our crash residue is rules-dominated:
+                // routes die with their interface, our rules linger —
+                // so rules carry the proof.
+                let priority =
+                    message.attributes.iter().find_map(|attribute| match attribute {
+                        RuleAttribute::Priority(priority) => Some(*priority),
+                        _ => None,
+                    });
+                if priority.is_some_and(|priority| (31699..=31700).contains(&priority)) {
+                    occupied_by_us.insert(table);
+                }
             }
         }
         let mut routes = self.handle.route().get(RouteMessage::default()).execute();
@@ -638,6 +692,7 @@ mod tests {
             table,
             priority: 31700,
             fwmark: None,
+            family: Family::V4,
         }
     }
 
@@ -647,6 +702,39 @@ mod tests {
             dest: DestPrefix::V4_DEFAULT,
             oif: 1,
         }
+    }
+
+    #[test]
+    fn route_matching_never_crosses_families() {
+        // A v4 default-route message (family Inet, no RTA_DST — the
+        // kernel's canonical /0) must NOT match a v6-default spec
+        // with the same table and oif: without the family check a
+        // surviving v4 default masks a drifted v6 default in
+        // present_ops, and a delete can select the other family's
+        // route.
+        let mut v4_message = RouteMessage::default();
+        v4_message.header.address_family = AddressFamily::Inet;
+        v4_message.header.table = RT_TABLE_COMPAT;
+        v4_message.attributes = vec![RouteAttribute::Table(51820), RouteAttribute::Oif(7)];
+        assert!(RtnetlinkExecutor::route_matches(
+            &v4_message,
+            RouteSpec {
+                table: 51820,
+                dest: DestPrefix::V4_DEFAULT,
+                oif: 7
+            }
+        ));
+        assert!(
+            !RtnetlinkExecutor::route_matches(
+                &v4_message,
+                RouteSpec {
+                    table: 51820,
+                    dest: DestPrefix::V6_DEFAULT,
+                    oif: 7
+                }
+            ),
+            "a surviving v4 default must not mask a drifted v6 default"
+        );
     }
 
     #[test]
@@ -723,6 +811,7 @@ mod tests {
             table: 51821,
             priority: 9,
             fwmark: Some(7),
+            family: Family::V4,
         });
         let txn = RouteTransaction::new(plan())
             .op(NetOp::AddRule(rule(51820)))
@@ -842,6 +931,7 @@ mod tests {
                     table: 51820,
                     priority: 31700,
                     fwmark: None,
+                    family: Family::V4,
                 }),
                 NetOp::AddRule(rule(51820)),
             ])
@@ -887,6 +977,7 @@ mod tests {
                 table: 51820,
                 priority: 42,
                 fwmark: None,
+                family: Family::V4,
             }))
             .expect("plan table");
         let mut executor = FailDelsAndSecondAdd {

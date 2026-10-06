@@ -9,10 +9,10 @@
 
 use futures_util::StreamExt;
 use protonwire_net::netns;
-use protonwire_net::route_drift::{DesiredRoutes, desired_ops, repair_ops};
+use protonwire_net::route_drift::{DesiredRoutes, Ipv6Desired, desired_ops, repair_ops};
 use protonwire_net::route_txn::{
-    DestPrefix, NetOp, NetlinkExecutor, RouteSpec, RouteTransaction, RtnetlinkExecutor, RuleSpec,
-    plan_with,
+    DestPrefix, Family, NetOp, NetlinkExecutor, RouteSpec, RouteTransaction, RtnetlinkExecutor,
+    RuleSpec, plan_with,
 };
 use protonwire_net::tables::TableKind;
 
@@ -53,6 +53,7 @@ async fn it_route_transactions() {
         table: 51820,
         priority: 31700,
         fwmark: None,
+        family: Family::V4,
     };
     let route = RouteSpec {
         table: 51820,
@@ -89,6 +90,7 @@ async fn it_route_transactions() {
             table: 51821,
             priority: 31701,
             fwmark: None,
+            family: Family::V4,
         }))
         .expect("plan table")
         .op(NetOp::AddRoute(doomed))
@@ -146,6 +148,7 @@ async fn it_route_drift_and_cleanup() {
         plan: plan.clone(),
         tun_oif: lo,
         bypass_mark: 0,
+        ipv6: Ipv6Desired::Blocked,
     });
     let NetOp::AddRoute(owned_route) = desired[1] else {
         panic!("desired[1] is the default route");
@@ -224,6 +227,7 @@ async fn it_route_drift_and_cleanup() {
         table: 4000,
         priority: 32000,
         fwmark: None,
+        family: Family::V4,
     };
     let survived = executor
         .present_ops(&[NetOp::AddRule(foreign)])
@@ -234,4 +238,104 @@ async fn it_route_drift_and_cleanup() {
         vec![NetOp::AddRule(foreign)],
         "unowned state stays"
     );
+}
+
+/// The tunnelled-v6 pass (FR-35's ::/0): the desired set carries
+/// both families; everything applies, probes complete, and the
+/// session-scoped cleanup removes exactly it.
+#[tokio::test]
+async fn it_tunnelled_v6_end_to_end() {
+    if !netns::gate("it_tunnelled_v6_end_to_end") {
+        return;
+    }
+    let (connection, handle, _) = rtnetlink::new_connection().expect("netlink connection");
+    tokio::spawn(connection);
+    let mut executor = RtnetlinkExecutor::new(handle.clone());
+    let plan = plan_with(&mut executor, "", None).await.expect("survey");
+    let lo = lo_index(&handle).await;
+    let desired = desired_ops(&DesiredRoutes {
+        plan: plan.clone(),
+        tun_oif: lo,
+        bypass_mark: 0,
+        ipv6: Ipv6Desired::Tunnelled,
+    });
+    assert_eq!(desired.len(), 4, "v4 pair + v6 pair");
+    let mut txn = RouteTransaction::new(plan.clone());
+    for op in &desired {
+        txn = txn.op(*op).expect("plan table");
+    }
+    txn.apply(&mut executor).await.expect("v6 tunnelled apply");
+    let present = executor.present_ops(&desired).await.expect("probe");
+    assert_eq!(present.len(), 4, "both families present");
+    assert!(repair_ops(&desired, &present).is_empty());
+    let cleanup = executor.cleanup_ops(&desired).await.expect("cleanup set");
+    assert_eq!(cleanup.len(), 4, "the session's four objects");
+    let mut txn = RouteTransaction::new(plan.clone());
+    for op in cleanup {
+        txn = txn.op(op).expect("plan table");
+    }
+    txn.apply(&mut executor).await.expect("final cleanup");
+    let survey = executor.survey("").await.expect("final survey");
+    for id in plan.ids() {
+        assert!(
+            !survey.occupied.contains(&id),
+            "plan table {id} unreferenced after the v6 cleanup"
+        );
+    }
+}
+
+/// A preferred table referenced ONLY by another manager's IPv6 rule
+/// is OCCUPIED: the survey must see v6 rules before the planner
+/// claims the table (else a session owning that table would delete
+/// the foreign rule — FR-39's violation).
+#[tokio::test]
+async fn it_v6_occupation_is_surveyed() {
+    if !netns::gate("it_v6_occupation_is_surveyed") {
+        return;
+    }
+    let (connection, handle, _) = rtnetlink::new_connection().expect("netlink connection");
+    tokio::spawn(connection);
+    let mut executor = RtnetlinkExecutor::new(handle.clone());
+
+    handle
+        .rule()
+        .add()
+        .table_id(51820)
+        .priority(9000)
+        .v6()
+        .execute()
+        .await
+        .expect("foreign v6 rule");
+
+    let survey = executor.survey("").await.expect("survey");
+    assert!(
+        survey.occupied.contains(&51820),
+        "a v6-rule-referenced table is occupied"
+    );
+
+    let plan = plan_with(&mut executor, "", None).await.expect("re-plan");
+    let main = plan.assignment(TableKind::Main).id;
+    assert_ne!(main, 51820, "the v6-occupied preferred id is never claimed");
+    assert!(!plan.owns(51820));
+
+    // Tidy: remove the foreign rule by raw dump-and-delete.
+    let mut rules = handle.rule().get(rtnetlink::IpVersion::V6).execute();
+    while let Some(message) = rules.next().await {
+        let message = message.expect("v6 rule dump");
+        let table = message
+            .attributes
+            .iter()
+            .find_map(|attribute| match attribute {
+                rtnetlink::packet_route::rule::RuleAttribute::Table(table) => Some(*table),
+                _ => None,
+            });
+        if table == Some(51820) {
+            handle
+                .rule()
+                .del(message)
+                .execute()
+                .await
+                .expect("foreign cleanup");
+        }
+    }
 }
