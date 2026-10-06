@@ -135,14 +135,18 @@ pub struct LookalikeTable {
 /// A failed apply: which op failed, why, how many ops before it were
 /// rolled back (reverse order), and any rollback errors — a rollback
 /// error means state may remain and MUST be surfaced, not swallowed.
+/// Rollback errors are PAIRED with the op whose inverse failed
+/// (replay order) — an unpaired list cannot be attributed once more
+/// than one accumulates (rust-review #6).
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("op {failed:?} failed ({error}); rolled back {rolled_back} op(s) in reverse order")]
 pub struct ApplyFailure {
     pub failed: NetOp,
     pub error: NetOpError,
     pub rolled_back: usize,
-    /// Rollback errors, in replay order — empty on a clean rollback.
-    pub rollback_errors: Vec<NetOpError>,
+    /// Rollback failures as (op-which-failed-to-undo, why), in
+    /// replay order — empty on a clean rollback.
+    pub rollback_errors: Vec<(NetOp, NetOpError)>,
 }
 
 /// A built transaction: validated ops plus the plan they were
@@ -193,8 +197,9 @@ impl RouteTransaction {
                 Err(error) => {
                     let mut rollback_errors = Vec::new();
                     for done in applied.iter().rev() {
-                        if let Err(rollback_error) = executor.exec(inverse(*done)).await {
-                            rollback_errors.push(rollback_error);
+                        let undo = inverse(*done);
+                        if let Err(rollback_error) = executor.exec(undo).await {
+                            rollback_errors.push((undo, rollback_error));
                         }
                     }
                     return Err(ApplyFailure {
@@ -405,17 +410,28 @@ impl NetlinkExecutor for RtnetlinkExecutor {
                 Ok(true)
             }
             NetOp::DelRule(spec) => {
-                // Idempotent: absent means already gone — NOT mutated.
-                let Some(message) = self.find_rule(spec).await? else {
-                    return Ok(false);
-                };
-                self.handle
-                    .rule()
-                    .del(message)
-                    .execute()
-                    .await
-                    .map_err(|error| format!("del rule: {error}"))?;
-                Ok(true)
+                // Idempotent: absent means already gone — NOT
+                // mutated. LOOP the delete (rust-review #7):
+                // Linux accepts duplicate rules, and twins installed
+                // by a pre-fix version (or by hand) would otherwise
+                // survive single-match deletion — the removal side of
+                // the duplicate hazard the find-first add fixed.
+                let mut mutated = false;
+                // A sane bound (three lifetimes of duplicates) so a
+                // pathological kernel can't loop us forever.
+                for _ in 0..3 {
+                    let Some(message) = self.find_rule(spec).await? else {
+                        break;
+                    };
+                    self.handle
+                        .rule()
+                        .del(message)
+                        .execute()
+                        .await
+                        .map_err(|error| format!("del rule: {error}"))?;
+                    mutated = true;
+                }
+                Ok(mutated)
             }
             NetOp::AddRoute(spec) => {
                 if self.find_route(spec).await?.is_some() {
@@ -446,10 +462,29 @@ impl NetlinkExecutor for RtnetlinkExecutor {
 
     async fn survey(&mut self, rt_tables_text: &str) -> Result<TableSurvey, NetOpError> {
         let mut occupied = BTreeSet::new();
+        let mut occupied_by_us = BTreeSet::new();
         let mut rules = self.handle.rule().get(rtnetlink::IpVersion::V4).execute();
         while let Some(message) = rules.next().await {
             let message = message.map_err(|error| format!("rule dump: {error}"))?;
-            occupied.insert(Self::rule_table(&message));
+            let table = Self::rule_table(&message);
+            occupied.insert(table);
+            // ENTRY-LEVEL OWNERSHIP PROOF (the planner's round-2 P1
+            // contract): a table is occupied-by-US when a dumped rule
+            // carries our canonical priority BAND — 31699..=31700,
+            // route_drift's BYPASS/FULL_TUNNEL constants (a private
+            // band no other manager picks by accident). Our crash
+            // residue is rules-dominated: routes die with their
+            // interface, our rules linger — so rules carry the proof.
+            let priority = message
+                .attributes
+                .iter()
+                .find_map(|attribute| match attribute {
+                    RuleAttribute::Priority(priority) => Some(*priority),
+                    _ => None,
+                });
+            if priority.is_some_and(|priority| (31699..=31700).contains(&priority)) {
+                occupied_by_us.insert(table);
+            }
         }
         let mut routes = self.handle.route().get(RouteMessage::default()).execute();
         while let Some(message) = routes.next().await {
@@ -461,6 +496,7 @@ impl NetlinkExecutor for RtnetlinkExecutor {
         Ok(TableSurvey {
             named: crate::tables::parse_rt_tables(rt_tables_text),
             occupied,
+            occupied_by_us,
             persisted: None,
         })
     }
@@ -691,6 +727,10 @@ mod tests {
         };
         let failure = txn.apply(&mut executor).await.expect_err("second op fails");
         assert_eq!(failure.rolled_back, 1);
-        assert_eq!(failure.rollback_errors, vec!["rollback refused".to_owned()]);
+        assert_eq!(
+            failure.rollback_errors,
+            vec![(NetOp::DelRule(rule(51820)), "rollback refused".to_owned())],
+            "the failed undo is PAIRED with its op"
+        );
     }
 }
