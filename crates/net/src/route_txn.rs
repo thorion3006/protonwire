@@ -132,11 +132,16 @@ pub trait NetlinkExecutor {
     ) -> impl Future<Output = Result<Vec<NetOp>, NetOpError>> + Send;
 
     /// Disconnect's cleanup set (FR-39): the INVERSE of the
-    /// session's still-present operations — exactly the objects THIS
-    /// session installed. A TablePlan proves the table ALLOCATION,
-    /// not every object a foreign manager later placed in the table
-    /// (the round-1 P1): enumeration-by-table would delete such
-    /// unowned state; session-scoped cleanup cannot.
+    /// session's still-present ADD-shaped operations — exactly the
+    /// objects THIS session INSTALLED. `session` is what
+    /// [`RouteTransaction::apply`] RETURNED (the mutations), never
+    /// the built desired list: pre-existing state a session merely
+    /// found already present was not installed and must not be
+    /// removed. Del-shaped entries are ignored (their inverse would
+    /// CREATE state — rust-review #1's FR-39 violation); the natural
+    /// caller never passes them anyway. A TablePlan proves the table
+    /// ALLOCATION, not every object a foreign manager later placed
+    /// in the table; session scoping cannot touch those.
     fn cleanup_ops(
         &mut self,
         session: &[NetOp],
@@ -552,9 +557,18 @@ impl NetlinkExecutor for RtnetlinkExecutor {
 
     async fn cleanup_ops(&mut self, session: &[NetOp]) -> Result<Vec<NetOp>, NetOpError> {
         // Session-scoped by construction: probe the session's own
-        // specs and invert what is present. Nothing a foreign manager
-        // placed anywhere — plan table or not — is ever probed.
-        let present = self.present_ops(session).await?;
+        // ADD-shaped specs and invert what is present. Nothing a
+        // foreign manager placed anywhere — plan table or not — is
+        // ever probed. Del-shaped entries are filtered BEFORE the
+        // probe: a present Del's inverse is an ADD, and inverting it
+        // would CREATE state at disconnect (rust-review #1) — the
+        // exact FR-39 violation the session scoping exists to ban.
+        let adds: Vec<NetOp> = session
+            .iter()
+            .copied()
+            .filter(|op| matches!(op, NetOp::AddRule(_) | NetOp::AddRoute(_)))
+            .collect();
+        let present = self.present_ops(&adds).await?;
         Ok(present.iter().map(|op| inverse(*op)).collect())
     }
 }
@@ -765,6 +779,58 @@ mod tests {
                 .iter()
                 .all(|call| !matches!(call, NetOp::AddRule(_))),
             "no inverse was replayed — nothing was created"
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_never_inverts_del_shaped_session_entries() {
+        /// rust-review #1: a Del-shaped session entry that is
+        /// (still) present must NEVER be inverted — its inverse is
+        /// an ADD, and disconnect would CREATE state.
+        struct DelShapedPresent {
+            calls: std::cell::RefCell<Vec<NetOp>>,
+        }
+        impl NetlinkExecutor for DelShapedPresent {
+            async fn exec(&mut self, op: NetOp) -> Result<bool, NetOpError> {
+                self.calls.borrow_mut().push(op);
+                Ok(true)
+            }
+            async fn survey(&mut self, _: &str) -> Result<TableSurvey, NetOpError> {
+                Ok(TableSurvey::default())
+            }
+            async fn present_ops(&mut self, desired: &[NetOp]) -> Result<Vec<NetOp>, NetOpError> {
+                // Everything probed is present — the adversarial
+                // shape: whatever survives the filter gets inverted.
+                Ok(desired.to_vec())
+            }
+            async fn cleanup_ops(&mut self, session: &[NetOp]) -> Result<Vec<NetOp>, NetOpError> {
+                let adds: Vec<NetOp> = session
+                    .iter()
+                    .copied()
+                    .filter(|op| matches!(op, NetOp::AddRule(_) | NetOp::AddRoute(_)))
+                    .collect();
+                let present = self.present_ops(&adds).await?;
+                Ok(present.iter().map(|op| inverse(*op)).collect())
+            }
+        }
+        let mut executor = DelShapedPresent {
+            calls: std::cell::RefCell::new(Vec::new()),
+        };
+        let cleanup = executor
+            .cleanup_ops(&[
+                NetOp::DelRule(RuleSpec {
+                    table: 51820,
+                    priority: 31700,
+                    fwmark: None,
+                }),
+                NetOp::AddRule(rule(51820)),
+            ])
+            .await
+            .expect("cleanup");
+        assert_eq!(
+            cleanup,
+            vec![NetOp::DelRule(rule(51820))],
+            "only the ADD-shaped entry inverts; the Del never becomes an Add"
         );
     }
 
