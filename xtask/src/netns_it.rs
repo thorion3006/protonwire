@@ -35,6 +35,7 @@ const GATED_TARGETS: &[(&str, &str)] = &[
     ("protonwire-net", "it_route_transactions"),
     ("protonwire-net", "it_kill_switch"),
     ("protonwire-net", "it_dns_lifecycle"),
+    ("protonwire-net", "it_session"),
 ];
 
 /// `unshare` flags creating the isolated user + network namespace.
