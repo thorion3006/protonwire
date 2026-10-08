@@ -611,6 +611,49 @@ pub fn dropped_packets() -> Result<u64, KillSwitchError> {
         "the probe counter rule is missing".into(),
     ))
 }
+pub fn terminal_drop_packets() -> Result<u64, KillSwitchError> {
+    let named = tables_named_us()?;
+    if named.len() > 1 {
+        return Err(KillSwitchError::Validation(
+            "multiple protonwire tables — ambiguous evidence".into(),
+        ));
+    }
+    let table = named
+        .into_iter()
+        .next()
+        .ok_or_else(|| KillSwitchError::Validation("no protonwire table".into()))?;
+    for chain in list_chains_for_table(&table)? {
+        if !chain.get_name().is_some_and(|name| name == OUTPUT_CHAIN) {
+            continue;
+        }
+        for rule in rustables::list_rules_for_chain(&chain)? {
+            let Some(expressions) = rule.get_expressions() else {
+                continue;
+            };
+            // The TERMINAL drop carries a counter AND a Drop verdict.
+            let has_drop = expressions.iter().any(|expression| {
+                matches!(
+                    expression.get_data(),
+                    Some(rustables::expr::ExpressionVariant::Immediate(imm))
+                        if imm.get_dreg() == Some(&rustables::expr::Register::Verdict)
+                )
+            });
+            if !has_drop {
+                continue;
+            }
+            for expression in expressions.iter() {
+                if let Some(rustables::expr::ExpressionVariant::Counter(counter)) =
+                    expression.get_data()
+                {
+                    return Ok(counter.nb_packets.unwrap_or(0));
+                }
+            }
+        }
+    }
+    Err(KillSwitchError::Validation(
+        "the terminal drop rule is missing".into(),
+    ))
+}
 
 #[cfg(test)]
 mod tests {
