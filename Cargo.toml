@@ -56,14 +56,15 @@ unsafe_code = "deny"
 
 [workspace.dependencies]
 # --- Pinned Proton engines ------------------------------------------------
-# ProTUN pin (tag v2.2.1). The tag carries no upstream lockfile; the committed
-# root Cargo.lock of this repository is the resolution authority (PRD 6.5).
-protun = { git = "https://github.com/ProtonVPN/protun", rev = "12e7755a112f59b7b843da79290b3de25febf653", features = [
+# ProTUN pin (tag v3.0.1 — GPLv3 LICENSE, the OQ-2 clearance). The tag carries
+# no upstream lockfile; the committed root Cargo.lock of this repository is
+# the resolution authority (PRD 6.5). The v3 train: muon 3, pvpnclient 4.
+protun = { git = "https://github.com/ProtonVPN/protun", rev = "1c3aa646175ae12e22f17621306d403ad2a37017", features = [
     "linux",
     "local-agent",
 ] }
-# Muon pin from Proton's public sparse registry; configured in .cargo/config.toml.
-muon = { version = "=2.6.2", registry = "proton", default-features = false, features = [
+# Muon 3 (the v3 train; protun v3 requires muon ^3). GPLv3-cleared.
+muon = { version = "=3.0.0", registry = "proton", default-features = false, features = [
     "transport-hyper",
     "lenient",
     "other-product",
@@ -137,7 +138,7 @@ protonwire-net = { path = "crates/net", version = "0.1.0" }
 protonwire-policy = { path = "crates/policy", version = "0.1.0" }
 protonwire-pf = { path = "crates/port-forwarding", version = "0.1.0" }
 protonwire-store = { path = "crates/store", version = "0.1.0" }
-proton-boringtun = { version = "=3.0.0", registry = "proton", features = ["std"] } # EXACT: 3.0.1+ moved to proton-os-interface 0.3, which splits the graph pvpnclient 3.0.3 compiles against (the 2026-10-06 sweep); in-graph via protun->pvpnclient; the M4 exit IT's mocked peer. The proton subtree moves as one train — PROTON_TRAIN in xtask/src/deps.rs
+proton-boringtun = { version = "=3.0.0", registry = "proton", features = ["std"] } # the v3 train's boringtun; in-graph via protun->pvpnclient 4.x; the M4 exit IT's mocked peer. The proton subtree moves as one train — PROTON_TRAIN in xtask/src/deps.rs
 
 rtnetlink = "0.23"
 tokio = { version = "1", features = ["rt", "macros"] }
