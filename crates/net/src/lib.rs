@@ -65,6 +65,10 @@ pub mod dns;
 /// IT-20 conflict events.
 pub mod adapters;
 
+/// The session orchestrator (M5 slice 8): the connect and disconnect
+/// sequences composing kill switch + routes + DNS.
+pub mod session;
+
 /// The nftables kill switch (FR-56..65): an atomically replaced inet
 /// table whose output chain defaults to DROP, ownership by marker
 /// chain + persisted generation, lookalike refusal, fail-closed
