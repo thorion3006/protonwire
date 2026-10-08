@@ -3915,3 +3915,35 @@ The stack's convergence pattern is clear: round 2 = 14, round 3 =
 architecture holds — every P1 is a narrowing fix, never a redesign.
 
 Gates green at every tip (netns-it 5/5 targets, 6 PASS lines).
+
+## 2026-10-08 — OWNER DECISIONS (all four recommendations approved)
+
+1. **M5 EXIT-LINE RESTATEMENT** (plan edit): the exit is now the
+   explicit list — IT-1..IT-6, IT-9, IT-10, IT-13, IT-14, IT-15,
+   IT-16, IT-17, IT-20, IT-25, IT-26, IT-27 — removing IT-7/8/11/12
+   (M7's split-tunneling tests) and adding IT-27 (permanent-mode
+   early boot, genuinely M5 work that the old line omitted). The
+   plan file carries the edit.
+
+2. **IT-13 DEFERRAL**: the full marks-before-route-commit
+   composition test lands with the M6 daemon-composition slice
+   (where engine.connect() and route commit actually meet). The
+   switch-layer proof — the behavioral IT's marked-socket probe
+   against kernel-live bypass rules — covers the RULES' correctness
+   now; the composition proof covers the SEQUENCING then.
+
+3. **IT-25 INTERFACE-LOOKALIKE DESCOPE**: TUN interfaces are
+   fd-owned (kernel-managed lifecycle; the holder closes the fd, the
+   interface vanishes). ProtonWire has no interface-cleanup pass to
+   enforce ownership on. If a future slice adds interface naming
+   beyond the TUN fd, the lookalike check returns. Cgroups stay M7.
+   Routes + nftables lookalike refusal are live and IT-pinned.
+
+4. **BYPASS-MARK COLLISION CONTRACT** (for M6's daemon wiring): the
+   bypass mark is chosen RANDOMLY at daemon startup, collision-
+   checked against live ip-rule fwmarks and nftables mark-matching
+   rules at survey time, and re-chosen on collision. The check is
+   part of the route-commit sequence (before the kill switch arms).
+   The crates/net API receives a u32; the collision policy lives in
+   the daemon. Recorded here as the contract; the PRD's M6 section
+   carries it when the daemon slice opens its PR.
