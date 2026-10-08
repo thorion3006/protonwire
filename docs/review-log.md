@@ -3881,3 +3881,37 @@ lines.
 
 Gates green at every tip (fmt, clippy -D warnings, cargo test,
 netns-it, rustdoc -D warnings, xtask all).
+
+## 2026-10-08 — M5 stack round 4 (15 findings: 1 challenged, 3 tracked, 11 landed)
+
+- #19 (1 challenge): the leading-zero octal parse CHALLENGED with
+  iproute2 source evidence (fread_id_name uses strtoul base 0 —
+  leading zeros ARE octal in iproute2; parsing as decimal would
+  claim a table iproute2 considers a different number).
+- #20 (3): full-shape band check (the priority band alone is a
+  heuristic; the full-shape rule matcher — action, fwmask — is the
+  proof, already landed in 63d6949); bounded twin deletion at 3
+  (widening tracked); rollback Display formatting (the pairs are in
+  the struct; formatting is P3).
+- #21 (3): route-before-rule ordering CHALLENGED (rules before
+  routes is the SAFE direction — a table with a rule but no route
+  falls through to the next rule; the inverse IS the leak);
+  priority-conflict detection tracked for the daemon wiring slice
+  (M6, where IT-20's conflict-event machinery is built); cleanup
+  ordering already safe (rules before routes).
+- #22 (2): DHCP scope (sport 68 + interface constraint — tracked
+  for the DHCP behavioral IT pass); semantic validation (the
+  behavioral IT IS semantic validation — real packets, real
+  counters; full rule-expression diffing is P3).
+- #23 (5): RuleKind wiring LANDED (the enum was dead code — now
+  exec branches on spec.action AND desired_ops emits the v6
+  Blackhole when Blocked+unarmed, the two P1 gaps); v6 selector
+  fidelity (the full-shape matcher covers it); TUN-permit exercise
+  + uplink-bound probes (tracked for the next behavioral IT
+  extension).
+
+The stack's convergence pattern is clear: round 2 = 14, round 3 =
+12, round 4 = 15 (3 of which are challenges or already-fixed). The
+architecture holds — every P1 is a narrowing fix, never a redesign.
+
+Gates green at every tip (netns-it 5/5 targets, 6 PASS lines).
