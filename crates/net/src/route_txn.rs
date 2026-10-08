@@ -227,15 +227,17 @@ impl RouteTransaction {
 
     /// Add one op, refusing lookalike tables at CONSTRUCTION — a
     /// transaction containing an op on a table the plan does not own
-    /// can never exist. ONE exemption: the mark-BYPASS rule into the
+    /// can never exist. TWO exemptions: the mark-BYPASS rule into the
     /// KERNEL MAIN table (a RULE with a fwmark, FR-61's outer-socket
-    /// route-out) — main is the kernel's, not a lookalike, and only
-    /// the marked-rule shape may touch it; a route into main, or an
-    /// unmarked rule, still refuses.
+    /// route-out), and the TABLELESS Blackhole rule (table 0 — a
+    /// block has no destination table; the priority alone identifies
+    /// it, FR-37's routing-layer v6 enforcement).
     pub fn op(mut self, op: NetOp) -> Result<Self, LookalikeTable> {
         let bypass_into_main = matches!(op, NetOp::AddRule(spec) | NetOp::DelRule(spec)
             if spec.table == KERNEL_MAIN && spec.fwmark.is_some());
-        if !bypass_into_main && !self.plan.owns(op.table()) {
+        let blackhole = matches!(op, NetOp::AddRule(spec) | NetOp::DelRule(spec)
+            if spec.action == RuleKind::Blackhole);
+        if !bypass_into_main && !blackhole && !self.plan.owns(op.table()) {
             return Err(LookalikeTable {
                 table: op.table(),
                 owned: self.plan.ids(),
@@ -404,10 +406,15 @@ impl RtnetlinkExecutor {
                 RuleAttribute::FwMark(mark) => Some(*mark),
                 _ => None,
             });
-        // The pre-fix writer armed the builder's default action
-        // (Unspec — "lookup none"): such surviving rules must NOT
-        // read as ours (the round-2 P1) — only ToTable matches.
-        if message.header.action != NetlinkRuleAction::ToTable {
+        // The ACTION must match the SPEC (the round-4 P1): ToTable
+        // specs match only ToTable rules; Blackhole specs match only
+        // Blackhole rules. A pre-fix Unspec rule ("lookup none") is
+        // nobody's match.
+        let expected_action = match spec.action {
+            RuleKind::ToTable => NetlinkRuleAction::ToTable,
+            RuleKind::Blackhole => NetlinkRuleAction::Blackhole,
+        };
+        if message.header.action != expected_action {
             return false;
         }
         // FWMASK: our adds never set one — the kernel default
