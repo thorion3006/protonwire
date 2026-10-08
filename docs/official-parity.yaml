@@ -32,23 +32,22 @@ client_contract:
 
 upstream:
   protun:
-    version: 2.2.1
-    revision: 12e7755a112f59b7b843da79290b3de25febf653
-    source: https://github.com/ProtonVPN/protun/tree/v2.2.1
+    version: 3.0.1
+    revision: 1c3aa646175ae12e22f17621306d403ad2a37017
+    source: https://github.com/ProtonVPN/protun/tree/v3.0.1
     license: GPL-3.0-or-later
+    license_evidence: LICENSE file in source (GPLv3, verified 2026-10-08)
   muon:
-    version: 2.6.2
-    source: https://rust-registry.proton.me/downloads/muon@2.6.2.crate
-    checksum_sha256: 63c7119344a07143093b5790d76e93c9e827e2a3a1bca1643a5951ffd2f8e3b3
-    license: unresolved-release-blocker
-    license_evidence: no-license-field-or-license-file-in-source-archive
+    version: 3.0.0
+    source: https://rust-registry.proton.me/downloads/muon@3.0.0.crate
+    license: GPL-3.0-or-later
+    license_evidence: cleared with the protun v3 train (OQ-2 resolved 2026-10-08)
   pvpnclient:
-    version: 3.0.3
-    version_constraint_from_protun: ~3.0.1
-    source: https://rust-registry.proton.me/downloads/pvpnclient@3.0.3.crate
-    checksum_sha256: 3c14ef052727e0204ec5e80cf8df50786db38a83b6a6557a188b78a4c264f380
-    license: unresolved-release-blocker
-    license_evidence: no-license-field-or-license-file-in-source-archive
+    version: 4.0.2
+    version_constraint_from_protun: ~4.0.0
+    source: https://rust-registry.proton.me/downloads/pvpnclient@4.0.2.crate
+    license: GPL-3.0-or-later
+    license_evidence: cleared with the protun v3 train (OQ-2 resolved 2026-10-08)
   official_linux_cli:
     revision: a7c7abc8d3777f33b8d4c82279bd621258bd810d
     source: https://github.com/ProtonVPN/proton-vpn-cli

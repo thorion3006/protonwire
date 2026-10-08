@@ -425,10 +425,14 @@ pub(crate) fn find_lock_files(dir: &Path) -> Vec<PathBuf> {
 /// tag that requires the newer set; every entry here changes in the
 /// same commit when that happens.
 pub(crate) const PROTON_TRAIN: &[(&str, &str)] = &[
-    ("muon", "2.6.2"),
+    ("muon", "3.0.0"),
     ("muon-rest", "0.1.0"),
     ("proton-boringtun", "3.0.0"),
+    // BOTH os-interface versions are the v3 train's expected split:
+    // boringtun 3.0.0 holds 0.2.x while pvpnclient 4.x holds 0.3.x.
+    // The gate accepts ANY version listed for a name.
     ("proton-os-interface", "0.2.7"),
+    ("proton-os-interface", "0.3.5"),
     ("proton-pfff", "0.13.0"),
     ("proton-pfff-config", "0.1.0"),
     ("proton-pfff-core", "0.1.1"),
@@ -442,7 +446,7 @@ pub(crate) const PROTON_TRAIN: &[(&str, &str)] = &[
     ("proton-vpn-toolkit", "0.1.0"),
     ("proton-vpn-utils", "0.2.2"),
     ("proton-vpn-yaourt", "0.2.2"),
-    ("pvpnclient", "3.0.3"),
+    ("pvpnclient", "4.0.2"),
 ];
 
 /// The sparse-index source prefix identifying a proton-registry
@@ -469,17 +473,32 @@ pub(crate) fn proton_train_violations(lock_text: &str) -> Vec<String> {
             let (Some(name), Some(version)) = (name.as_ref(), version.as_ref()) else {
                 continue; // malformed block; other rules own lockfile shape
             };
-            match PROTON_TRAIN
+            // The v3 train SPLITS os-interface (boringtun 3.0.0 holds
+            // 0.2.x, pvpnclient 4.x holds 0.3.x) — the gate accepts
+            // ANY version listed for the name in PROTON_TRAIN.
+            let known = PROTON_TRAIN
                 .iter()
-                .find(|(train_name, _)| train_name == name)
-            {
-                Some((_, recorded)) if recorded == version => {}
-                Some((_, recorded)) => violations.push(format!(
-                    "{name} v{version} drifts the proton train (recorded {recorded}); \
+                .any(|(train_name, train_version)| {
+                    train_name == name && train_version == version
+                });
+            let named = PROTON_TRAIN
+                .iter()
+                .any(|(train_name, _)| train_name == name);
+            if known {
+                // OK — this exact version is in the table
+            } else if named {
+                let recorded: Vec<&str> = PROTON_TRAIN
+                    .iter()
+                    .filter(|(train_name, _)| train_name == name)
+                    .map(|(_, v)| *v)
+                    .collect();
+                violations.push(format!(
+                    "{name} v{version} drifts the proton train (recorded {recorded:?}); \
                      the subtree moves as ONE unit behind a protun tag — see \
                      PROTON_TRAIN in xtask/src/deps.rs"
-                )),
-                None => violations.push(format!(
+                ));
+            } else {
+                violations.push(format!(
                     "{name} v{version} is a proton-registry package missing from \
                      PROTON_TRAIN — record it (or hold it) consciously; an update \
                      must not absorb new proton crates silently"

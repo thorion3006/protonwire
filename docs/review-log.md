@@ -3947,3 +3947,36 @@ Gates green at every tip (netns-it 5/5 targets, 6 PASS lines).
    The crates/net API receives a u32; the collision policy lives in
    the daemon. Recorded here as the contract; the PRD's M6 section
    carries it when the daemon slice opens its PR.
+
+## 2026-10-08 — The v3 dependency train + the license clearance (OQ-2 RESOLVED)
+
+The owner ordered a full dependency update: protun, muon, Rust, and
+all documentation. Proton released protun v3.0.1 with a GPLv3
+LICENSE — the OQ-2 distribution blocker is RESOLVED.
+
+The train moved:
+- protun: v2.2.1 (12e7755a) → v3.0.1 (1c3aa646)
+- muon: 2.6.2 → 3.0.0
+- pvpnclient: 3.0.3 → 4.0.2 (protun v3's ~4.0.0 constraint)
+- proton-boringtun: 3.0.0 (unchanged — still compatible)
+- proton-os-interface: the v3 train SPLITS (0.2.7 from boringtun,
+  0.3.5 from pvpnclient 4.x) — the PROTON_TRAIN gate now accepts
+  multiple versions per name
+- Rust: 1.98.1 → 1.99.0 (the latest stable)
+
+Documentation swept:
+- PRD: NFR-35 updated (license RESOLVED), OQ-2 struck through with
+  the resolution date, all version references updated (the pin
+  description, FR-7P's logging note, the Cargo.toml example, the
+  resolver target)
+- official-parity.yaml: all upstream versions + license fields
+  updated from "unresolved-release-blocker" to "GPL-3.0-or-later"
+- README: the "no distribution" notice replaced with the clearance
+  note
+- COPYING.md: the release blocker text replaced with the clearance
+- rust-toolchain.toml: 1.99.0
+
+NOTE: the API compatibility check (protun v3's changes to the
+engine surface) runs on CI — the local nix-shell is unavailable
+(the nix-daemon's DNS is stale while the user shell resolves
+fine). CI will surface any adapter changes needed.

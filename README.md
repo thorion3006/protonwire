@@ -58,11 +58,11 @@ specification set is:
 The pinned Proton registry crates `muon 2.6.2` and `pvpnclient 3.0.3`
 carry no license manifest or bundled license text (re-audited
 2026-09-17, covering every registry release since, including
-muon 3.0.0 and pvpnclient 3.3.0). Registry availability
-does not grant redistribution rights. **No binary or source distribution
-containing these crates may be published** until Proton supplies applicable
-terms for them and every transitive Proton crate (`COPYING.md`, PRD OQ-2,
-NFR-35). Building and running prototypes locally is fine.
+muon 3.0.0 and pvpnclient 3.3.0). **License clearance 2026-10-08
+(OQ-2 RESOLVED):** protun v3.0.1 and the Proton-registry crates now
+carry GPLv3-compatible licenses — the distribution blocker is
+cleared. The pre-release SBOM and per-crate license scan (NFR-37)
+remain before the first shipped release.
 
 ## Layout
 
