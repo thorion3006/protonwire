@@ -130,10 +130,7 @@ pub async fn connect<E: NetlinkExecutor>(
     for op in &desired {
         txn = txn.op(*op).map_err(|e| SessionError::Plan(e.to_string()))?;
     }
-    let installed = txn
-        .apply(executor)
-        .await
-        .map_err(SessionError::Routes)?;
+    let installed = txn.apply(executor).await.map_err(SessionError::Routes)?;
 
     // === PHASE 4: DNS APPLY ===
     let backend = dns::detect_backend();
@@ -195,9 +192,7 @@ pub async fn disconnect<E: NetlinkExecutor>(
     for op in cleanup {
         txn = txn.op(op).map_err(|e| SessionError::Plan(e.to_string()))?;
     }
-    txn.apply(executor)
-        .await
-        .map_err(SessionError::Routes)?;
+    txn.apply(executor).await.map_err(SessionError::Routes)?;
 
     // === PHASE 3: KILL SWITCH (remove or keep) ===
     if !permanent_kill_switch {

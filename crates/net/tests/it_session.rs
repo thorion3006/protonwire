@@ -9,7 +9,7 @@ use protonwire_net::dns::{DnsConfig, DnsMode, DnsRouting};
 use protonwire_net::kill_switch::GenerationId;
 use protonwire_net::netns;
 use protonwire_net::route_drift::Ipv6Desired;
-use protonwire_net::route_txn::NetlinkExecutor;
+use protonwire_net::route_txn::{NetlinkExecutor, RtnetlinkExecutor};
 use protonwire_net::session::{self, ConnectInputs};
 
 #[tokio::test]
