@@ -21,7 +21,7 @@
 use crate::dns::{self, DnsConfig, DnsError, ResolvConfEvidence};
 use crate::kill_switch::{self, GenerationId, KillSwitchError, KillSwitchPolicy};
 use crate::route_drift::{self, DesiredRoutes, Ipv6Desired};
-use crate::route_txn::{self, NetOp, NetlinkExecutor, RouteTransaction, RtnetlinkExecutor};
+use crate::route_txn::{self, NetOp, NetlinkExecutor, RouteTransaction};
 use crate::tables::{PersistedTables, TablePlan};
 
 /// The session's orchestration errors — every failure names the
@@ -133,7 +133,7 @@ pub async fn connect<E: NetlinkExecutor>(
     let installed = txn
         .apply(executor)
         .await
-        .map_err(|e| SessionError::Routes(e))?;
+        .map_err(SessionError::Routes)?;
 
     // === PHASE 4: DNS APPLY ===
     let backend = dns::detect_backend();
@@ -197,7 +197,7 @@ pub async fn disconnect<E: NetlinkExecutor>(
     }
     txn.apply(executor)
         .await
-        .map_err(|e| SessionError::Routes(e))?;
+        .map_err(SessionError::Routes)?;
 
     // === PHASE 3: KILL SWITCH (remove or keep) ===
     if !permanent_kill_switch {
