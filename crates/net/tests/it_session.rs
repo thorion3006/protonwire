@@ -88,11 +88,13 @@ async fn it_session_lifecycle() {
         uplink_ifname: "pw-uplink0".into(),
         bypass_mark: 0x21,
         ipv6: Ipv6Desired::Blocked,
+        // DnsMode::None: no DNS mutation — the session's DNS path
+        // would write to the HOST's /etc/resolv.conf (a network
+        // namespace does NOT isolate the filesystem; the round-5
+        // P1). The DNS lifecycle has its own isolated ITs.
         dns: DnsConfig {
-            mode: DnsMode::Proton,
-            servers: vec![protonwire_net::dns::DnsServer::new(
-                "10.2.0.1".parse().unwrap(),
-            )],
+            mode: DnsMode::None,
+            servers: vec![],
             routing: DnsRouting::ThroughVpn,
         },
         generation: GenerationId(1),

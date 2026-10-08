@@ -130,12 +130,23 @@ pub async fn connect<E: NetlinkExecutor>(
     for op in &desired {
         txn = txn.op(*op).map_err(|e| SessionError::Plan(e.to_string()))?;
     }
-    let installed = txn.apply(executor).await.map_err(SessionError::Routes)?;
+    let installed = match txn.apply(executor).await {
+        Ok(ops) => ops,
+        Err(route_error) => {
+            // ROLL BACK THE KILL SWITCH (the round-5 P1): the switch
+            // armed in phase 2; a route failure here leaves it
+            // armed with no routes — every packet dies. Remove it
+            // before returning the route error (the switch's own
+            // error, if any, is secondary to the route error).
+            let _ = kill_switch::remove(inputs.prior_generation);
+            return Err(SessionError::Routes(route_error));
+        }
+    };
 
     // === PHASE 4: DNS APPLY ===
     let backend = dns::detect_backend();
     let dns_evidence = match (&inputs.dns.mode, &backend) {
-        (dns::DnsMode::None, _) => None, // no mutation
+        (dns::DnsMode::None, _) => None, // no mutation, no revert
         (_, dns::DnsBackend::SystemdResolved) => {
             // resolvectl per-link; in a namespace (or when resolved
             // does not know the interface) this FAILS — fall back to
