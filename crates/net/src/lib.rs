@@ -55,6 +55,11 @@ pub mod route_txn;
 /// owned-state cleanup enumeration.
 pub mod route_drift;
 
+/// DNS management (FR-41..49B): mode detection, per-backend
+/// application (systemd-resolved or /etc/resolv.conf), strict
+/// leak-proof validation, revert on disconnect.
+pub mod dns;
+
 /// The nftables kill switch (FR-56..65): an atomically replaced inet
 /// table whose output chain defaults to DROP, ownership by marker
 /// chain + persisted generation, lookalike refusal, fail-closed
