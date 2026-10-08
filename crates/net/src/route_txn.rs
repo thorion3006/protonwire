@@ -539,15 +539,21 @@ impl NetlinkExecutor for RtnetlinkExecutor {
                 if self.find_rule(spec).await?.is_some() {
                     return Ok(false);
                 }
-                let mut request = self.handle.rule().add();
-                // ACTION TO TABLE explicitly — the builder's default
-                // (Unspec) installs an "action none" rule that makes
-                // every lookup through it EINVAL (caught live by the
-                // kill-switch IT's diagnostics: "lookup 51820 none").
-                request = request
-                    .action(NetlinkRuleAction::ToTable)
-                    .table_id(spec.table)
-                    .priority(spec.priority);
+                let request = self.handle.rule().add();
+                // The ACTION follows the SPEC (the round-4 P1): the
+                // enum existed but was dead code — every rule went
+                // out as ToTable regardless. ToTable is the tunnel/
+                // bypass shape; Blackhole is routing-level blocking
+                // (FR-37 when the kill switch is unarmed).
+                let mut request = match spec.action {
+                    RuleKind::ToTable => request
+                        .action(NetlinkRuleAction::ToTable)
+                        .table_id(spec.table)
+                        .priority(spec.priority),
+                    RuleKind::Blackhole => request
+                        .action(NetlinkRuleAction::Blackhole)
+                        .priority(spec.priority),
+                };
                 if let Some(mark) = spec.fwmark {
                     request = request.fw_mark(mark);
                 }

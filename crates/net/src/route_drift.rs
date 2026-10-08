@@ -59,6 +59,12 @@ pub struct DesiredRoutes {
     pub bypass_mark: u32,
     /// The session's IPv6 posture.
     pub ipv6: Ipv6Desired,
+    /// Whether the kill switch is (or will be) armed for this
+    /// session. When false AND Ipv6Desired::Blocked, desired_ops
+    /// emits a routing-level v6 BLACKHOLE rule — FR-37's enforcement
+    /// must not depend on the nftables chain being present (the
+    /// round-4 P1).
+    pub kill_switch_armed: bool,
 }
 
 /// Render the full-tunnel desired operations. Deterministic order:
@@ -115,6 +121,21 @@ pub fn desired_ops(state: &DesiredRoutes) -> Vec<NetOp> {
             dest: DestPrefix::V6_DEFAULT,
             oif: state.tun_oif,
         }));
+    } else if !state.kill_switch_armed {
+        // BLOCKED v6 without the kill switch (the round-4 P1): the
+        // inet-family default drop is NOT there to block v6 — the
+        // ROUTING layer must block it itself. A v6 BLACKHOLE rule at
+        // a priority below the bypass band: matched v6 traffic dies
+        // at the fib (no route to any destination), while the marked
+        // bypass rules (priority 31699, above this) still give the
+        // outer sockets their route out.
+        ops.push(NetOp::AddRule(RuleSpec {
+            table: 0,
+            priority: FULL_TUNNEL_RULE_PRIORITY + 1,
+            fwmark: None,
+            family: Family::V6,
+            action: RuleKind::Blackhole,
+        }));
     }
     ops
 }
@@ -145,6 +166,7 @@ mod tests {
             tun_oif: oif,
             bypass_mark: 0,
             ipv6: Ipv6Desired::Blocked,
+            kill_switch_armed: true,
         }
     }
 
@@ -154,6 +176,7 @@ mod tests {
             tun_oif: oif,
             bypass_mark: mark,
             ipv6: Ipv6Desired::Blocked,
+            kill_switch_armed: true,
         }
     }
 

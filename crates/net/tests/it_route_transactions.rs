@@ -151,6 +151,7 @@ async fn it_route_drift_and_cleanup() {
         tun_oif: lo,
         bypass_mark: 0,
         ipv6: Ipv6Desired::Blocked,
+        kill_switch_armed: true,
     });
     let NetOp::AddRoute(owned_route) = desired[1] else {
         panic!("desired[1] is the default route");
@@ -262,6 +263,7 @@ async fn it_tunnelled_v6_end_to_end() {
         tun_oif: lo,
         bypass_mark: 0,
         ipv6: Ipv6Desired::Tunnelled,
+        kill_switch_armed: true,
     });
     assert_eq!(desired.len(), 4, "v4 pair + v6 pair");
     let mut txn = RouteTransaction::new(plan.clone());
@@ -411,6 +413,7 @@ async fn it_crash_replan_owns_stale_state() {
         tun_oif: lo,
         bypass_mark: 0,
         ipv6: Ipv6Desired::Blocked,
+        kill_switch_armed: true,
     });
     let mut txn = RouteTransaction::new(plan1.clone());
     for op in &desired1 {
