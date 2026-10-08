@@ -236,7 +236,7 @@ impl RouteTransaction {
         let bypass_into_main = matches!(op, NetOp::AddRule(spec) | NetOp::DelRule(spec)
             if spec.table == KERNEL_MAIN && spec.fwmark.is_some());
         let blackhole = matches!(op, NetOp::AddRule(spec) | NetOp::DelRule(spec)
-            if spec.action == RuleKind::Blackhole);
+            if spec.action == RuleKind::Blackhole && spec.table == 0);
         if !bypass_into_main && !blackhole && !self.plan.owns(op.table()) {
             return Err(LookalikeTable {
                 table: op.table(),
