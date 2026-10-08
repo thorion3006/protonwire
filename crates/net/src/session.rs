@@ -135,10 +135,11 @@ pub async fn connect<E: NetlinkExecutor>(
         Err(route_error) => {
             // ROLL BACK THE KILL SWITCH (the round-5 P1): the switch
             // armed in phase 2; a route failure here leaves it
-            // armed with no routes — every packet dies. Remove it
-            // before returning the route error (the switch's own
-            // error, if any, is secondary to the route error).
-            let _ = kill_switch::remove(inputs.prior_generation);
+            // armed with no routes — every packet dies. Remove the
+            // NEWLY-INSTALLED generation (the round-6 P1: on a
+            // reconnect, prior_generation is the OLD generation;
+            // the live table carries inputs.generation).
+            let _ = kill_switch::remove(Some(inputs.generation));
             return Err(SessionError::Routes(route_error));
         }
     };
