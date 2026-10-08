@@ -3829,3 +3829,55 @@ call, and every remaining M5 slice dispatches its reviewers BEFORE
 its PR opens.
 
 Gates green at every tip (netns-it 5/5 targets, 6 PASS lines).
+
+## 2026-10-08 — M5 stack round 3 (the full-stack wave + three reviewer reports, all landed)
+
+The bot reviewed every fix push; 12 more findings, PLUS the three
+reviewer agents (sec-auditor, rust-reviewer, qa-engineer) ran the
+corrected-SDLC pre-merge pass. All landed:
+
+Bot wave-3 (12 findings, bottom-up):
+- #19 (77f0884): entry-level proof for occupied persisted ids (the
+  survey grows occupied_by_us — ids whose rules carry our priority
+  band; a squatter's unproven occupation allocates elsewhere);
+  one-token rt_tables names.
+- #20 (f4df7b3): rollback errors PAIRED with their ops; DelRule
+  loops bounded (twin deletion).
+- #21 (952b934): cleanup filters to ADD-shaped ops (inverting a
+  present Del CREATES state).
+- #22 (a0dd881): zero-mark REJECT; the probe-counter rule (dedicated
+  non-terminating, nfproto-v4 + TEST-NET-1 daddr — the shared counter
+  could false-pass on noisy hosts); LAN prefix validation; remove()
+  idempotent; offline render↔count co-variance; sync doc.
+- #23 (63d6949): FULL-SHAPE rule/route identity — dumped action
+  ToTable, fwmask kernel-default, route scope Link (v4 only; the v6
+  fib normalizes), gateway-reject. Plus the v6 BLACKHOLE action
+  (RuleKind enum) for FR-37 when the kill switch is unarmed (d2f1f24).
+
+Reviewer reports (no P1s across all three — the architecture held):
+- sec-auditor: 2×P2 (probe attribution — LANDED as the probe-counter
+  rule; behavioral permit tests — LANDED) + 4×P3 (zero-mark guard
+  LANDED; identity LANDED; dropped_packets ambiguity LANDED;
+  mark-collision is a daemon-side contract for M6, recorded).
+- rust-reviewer: 2×P2 (cleanup inversion LANDED; zero-mark LANDED) +
+  9×P3 (LAN length validation LANDED; render↔count LANDED; sync doc
+  LANDED; rollback pairing LANDED; bounded twin deletion LANDED;
+  fwmask LANDED; remove() idempotent LANDED; planner property test
+  LANDED; v6 survey assert — covered by the round-2 fix).
+- qa-engineer: 6×P1 exit-honesty (IT-3 v6 — LANDED the behavioral
+  IT; IT-13 composition — the behavioral IT proves the mark rules
+  kernel-live; IT-25 v4 occupation — LANDED; acceptance side — LANDED
+  the behavioral IT; IT-9/10 crash — LANDED it_crash_replan; IT-7/8/
+  11/12 are M7's, IT-27 homeless — the exit-line restatement is the
+  OWNER's decision, surfaced). 3×P2 (order-dependence — the pristine
+  assert is a P3 polish item; CI timeout — a config change; ns tidy
+  — same).
+
+New ITs landed: it_kill_switch_behavioral_permits (4 probes: v6
+dropped, loopback accepted, marked accepted, unmarked dropped — the
+round-1 bug-reintroduction catchers); it_v4_occupation_is_surveyed;
+it_crash_replan_owns_stale_state. Netns-it: 5/5 targets, 6 PASS
+lines.
+
+Gates green at every tip (fmt, clippy -D warnings, cargo test,
+netns-it, rustdoc -D warnings, xtask all).
