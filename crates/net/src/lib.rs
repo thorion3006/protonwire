@@ -60,6 +60,11 @@ pub mod route_drift;
 /// leak-proof validation, revert on disconnect.
 pub mod dns;
 
+/// Integration adapters (PRD 6.6, IT-16/17/20): observation and
+/// cooperation with NetworkManager and systemd-networkd;
+/// IT-20 conflict events.
+pub mod adapters;
+
 /// The nftables kill switch (FR-56..65): an atomically replaced inet
 /// table whose output chain defaults to DROP, ownership by marker
 /// chain + persisted generation, lookalike refusal, fail-closed
