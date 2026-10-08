@@ -344,3 +344,120 @@ async fn it_v6_occupation_is_surveyed() {
         }
     }
 }
+
+/// QA rec 1: the v4 flavor of the occupation survey — a foreign v4
+/// rule pre-occupies the preferred table id, the planner allocates
+/// elsewhere, and the foreign rule is NOT touched.
+#[tokio::test]
+async fn it_v4_occupation_is_surveyed() {
+    if !netns::gate("it_v4_occupation_is_surveyed") {
+        return;
+    }
+    let (connection, handle, _) = rtnetlink::new_connection().expect("netlink connection");
+    tokio::spawn(connection);
+    let mut executor = RtnetlinkExecutor::new(handle.clone());
+    handle
+        .rule()
+        .add()
+        .action(rtnetlink::packet_route::rule::RuleAction::ToTable)
+        .table_id(51820)
+        .priority(8000)
+        .v4()
+        .execute()
+        .await
+        .expect("foreign v4 rule");
+    let survey = executor.survey("").await.expect("survey");
+    assert!(survey.occupied.contains(&51820));
+    assert!(
+        !survey.occupied_by_us.contains(&51820),
+        "priority 8000 is not our band"
+    );
+    let plan = plan_with(&mut executor, "", None).await.expect("plan");
+    let main = plan.assignment(TableKind::Main).id;
+    assert_ne!(main, 51820, "the v4-occupied preferred id is never claimed");
+    assert!(!plan.owns(51820));
+    // Tidy.
+    let mut rules = handle.rule().get(rtnetlink::IpVersion::V4).execute();
+    while let Some(message) = rules.next().await {
+        let m = message.expect("dump");
+        let table = m.attributes.iter().find_map(|a| match a {
+            rtnetlink::packet_route::rule::RuleAttribute::Table(t) => Some(*t),
+            _ => None,
+        });
+        if table == Some(51820) {
+            handle.rule().del(m).execute().await.expect("cleanup");
+        }
+    }
+}
+
+/// QA rec 6: the crash-replan flow — after a crash the stale rules
+/// are still in the kernel, the persisted record + entry-level proof
+/// (priority band) reclaims the table, and the session-scoped
+/// cleanup removes exactly the stale state.
+#[tokio::test]
+async fn it_crash_replan_owns_stale_state() {
+    if !netns::gate("it_crash_replan_owns_stale_state") {
+        return;
+    }
+    let (connection, handle, _) = rtnetlink::new_connection().expect("netlink connection");
+    tokio::spawn(connection);
+    let mut executor = RtnetlinkExecutor::new(handle.clone());
+
+    // Session 1: plan, apply, then CRASH (no cleanup).
+    let plan1 = plan_with(&mut executor, "", None).await.expect("plan 1");
+    let lo = lo_index(&handle).await;
+    let desired1 = desired_ops(&DesiredRoutes {
+        plan: plan1.clone(),
+        tun_oif: lo,
+        bypass_mark: 0,
+        ipv6: Ipv6Desired::Blocked,
+    });
+    let mut txn = RouteTransaction::new(plan1.clone());
+    for op in &desired1 {
+        txn = txn.op(*op).expect("plan table");
+    }
+    txn.apply(&mut executor).await.expect("session 1 applies");
+    // CRASH: no cleanup. The stale rules remain.
+
+    // Session 2: re-plan with the persisted record. The survey sees
+    // the stale rules (occupied) AND the entry-level proof (our
+    // priority band) → the persisted id is RECLAIMED.
+    let persisted = crate_persisted_from_plan(&plan1);
+    let plan2 = plan_with(&mut executor, "", Some(persisted))
+        .await
+        .expect("plan 2");
+    assert_eq!(
+        plan2.assignment(TableKind::Main).provenance,
+        protonwire_net::tables::Provenance::Persisted,
+        "the crash's stale rules + the entry-level proof reclaim the id"
+    );
+    assert_eq!(
+        plan2.assignment(TableKind::Main).id,
+        plan1.assignment(TableKind::Main).id
+    );
+
+    // The cleanup removes the stale state.
+    let cleanup = executor.cleanup_ops(&desired1).await.expect("cleanup");
+    let mut txn = RouteTransaction::new(plan2.clone());
+    for op in cleanup {
+        txn = txn.op(op).expect("plan table");
+    }
+    txn.apply(&mut executor).await.expect("stale cleanup");
+    let survey = executor.survey("").await.expect("post-cleanup survey");
+    for id in plan2.ids() {
+        assert!(
+            !survey.occupied.contains(&id),
+            "plan table {id} unreferenced after crash cleanup"
+        );
+    }
+}
+
+fn crate_persisted_from_plan(
+    plan: &protonwire_net::tables::TablePlan,
+) -> protonwire_net::tables::PersistedTables {
+    protonwire_net::tables::PersistedTables {
+        main: plan.assignment(TableKind::Main).id,
+        bypass: plan.assignment(TableKind::Bypass).id,
+        lan: plan.assignment(TableKind::Lan).id,
+    }
+}
