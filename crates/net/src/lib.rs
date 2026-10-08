@@ -69,6 +69,10 @@ pub mod adapters;
 /// sequences composing kill switch + routes + DNS.
 pub mod session;
 
+/// Permanent mode + early boot (FR-63A, IT-27): the early-boot
+/// firewall unit and the permanent kill-switch policy.
+pub mod permanent;
+
 /// The nftables kill switch (FR-56..65): an atomically replaced inet
 /// table whose output chain defaults to DROP, ownership by marker
 /// chain + persisted generation, lookalike refusal, fail-closed
