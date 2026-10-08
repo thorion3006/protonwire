@@ -118,6 +118,7 @@ fn it_kill_switch() {
                 tun_oif,
                 bypass_mark: 0,
                 ipv6: protonwire_net::route_drift::Ipv6Desired::Blocked,
+                kill_switch_armed: true,
             });
         let mut txn = protonwire_net::route_txn::RouteTransaction::new(plan);
         for op in desired {
@@ -406,6 +407,7 @@ fn it_kill_switch_behavioral_permits() {
                 tun_oif,
                 bypass_mark: 0x21,
                 ipv6: protonwire_net::route_drift::Ipv6Desired::Blocked,
+                kill_switch_armed: true,
             });
         let mut txn = protonwire_net::route_txn::RouteTransaction::new(plan);
         for op in desired {
