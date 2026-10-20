@@ -428,24 +428,21 @@ pub(crate) const PROTON_TRAIN: &[(&str, &str)] = &[
     ("muon", "3.0.0"),
     ("muon-rest", "0.1.0"),
     ("proton-boringtun", "3.0.0"),
-    // BOTH os-interface versions are the v3 train's expected split:
-    // boringtun 3.0.0 holds 0.2.x while pvpnclient 4.x holds 0.3.x.
-    // The gate accepts ANY version listed for a name.
     ("proton-os-interface", "0.2.7"),
     ("proton-os-interface", "0.3.5"),
-    ("proton-pfff", "0.13.0"),
+    ("proton-pfff", "0.13.2"),
     ("proton-pfff-config", "0.1.0"),
-    ("proton-pfff-core", "0.1.1"),
-    ("proton-pfff-module", "0.8.5"),
-    ("proton-srp", "0.8.3"),
+    ("proton-pfff-core", "0.1.4"),
+    ("proton-pfff-module", "0.8.9"),
+    ("proton-srp", "0.8.4"),
     ("proton-tls-parser", "0.4.0"),
     ("proton-vpn-haproxyv2", "0.1.0"),
-    ("proton-vpn-local-agent", "0.12.3"),
-    ("proton-vpn-netstack", "0.6.5"),
-    ("proton-vpn-rcrl", "0.2.2"),
+    ("proton-vpn-local-agent", "0.12.7"),
+    ("proton-vpn-netstack", "0.8.1"),
+    ("proton-vpn-rcrl", "2.0.0"),
     ("proton-vpn-toolkit", "0.1.0"),
-    ("proton-vpn-utils", "0.2.2"),
-    ("proton-vpn-yaourt", "0.2.2"),
+    ("proton-vpn-utils", "0.2.4"),
+    ("proton-vpn-yaourt", "0.2.4"),
     ("pvpnclient", "4.0.2"),
 ];
 
