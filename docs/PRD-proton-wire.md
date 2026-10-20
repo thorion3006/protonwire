@@ -483,7 +483,7 @@ The application must not use:
 - resolvconf as a mandatory dependency
 - desktop network applets
 
-ProTUN commit `12e7755a112f59b7b843da79290b3de25febf653` (tagged `v2.2.1`) is the initial pin. That source tag does not include a Cargo lockfile, so ProtonWire's committed root lockfile is the authority: it initially resolves Muon `2.6.2` and `pvpnclient` `3.0.3` with their registry checksums. Upgrades require adapter tests, parity tests, dependency-license review, and release notes. Packet capture is disabled by default, size-bounded, permission-restricted, and requires explicit user action for each capture.
+ProTUN commit `1c3aa646175ae12e22f17621306d403ad2a37017` (tagged `v3.0.1`, GPLv3 LICENSE — the OQ-2 clearance) is the current pin. That source tag does not include a Cargo lockfile, so ProtonWire's committed root lockfile is the authority: it resolves Muon `3.0.0` and `pvpnclient` `4.0.2` with their registry checksums. Upgrades require adapter tests, parity tests, dependency-license review, and release notes. Packet capture is disabled by default, size-bounded, permission-restricted, and requires explicit user action for each capture.
 
 ### 6.6 Linux Network Integration {#66-linux-network-integration}
 
@@ -541,7 +541,7 @@ NetworkManager and systemd-networkd packages are optional. Selecting an unavaila
 
 **FR-7O:** Organization SSO must remain `blocked-upstream` until ProtonWire can prove an authorized public flow for initiating the browser handoff, binding it to a nonce, importing/forking the resulting session, handling cancellation, and logging out. Gateway/dedicated-server entitlements for an otherwise authenticated organization account remain required independently of SSO.
 
-**FR-7P:** Pinned Muon `2.6.2` emits a TOTP value at `info` level, and pinned `pvpnclient` `3.0.3` can emit fork selectors and cookies at `trace`. Release logging must suppress the affected module events before formatting, keep dependency `trace` disabled in production, and pass canary-secret tests for passwords, TOTP/recovery codes, FIDO payloads, usernames, session IDs, selectors, cookies, tokens, fingerprints, and private keys. Regex-only post-processing is insufficient as the sole control.
+**FR-7P:** Pinned Muon `3.0.0` emits a TOTP value at `info` level, and pinned `pvpnclient` `4.0.2` can emit fork selectors and cookies at `trace`. Release logging must suppress the affected module events before formatting, keep dependency `trace` disabled in production, and pass canary-secret tests for passwords, TOTP/recovery codes, FIDO payloads, usernames, session IDs, selectors, cookies, tokens, fingerprints, and private keys. Regex-only post-processing is insufficient as the sole control.
 
 **Acceptance Criteria**
 
@@ -2017,7 +2017,7 @@ And include connection state, selected server, ProTUN state, requested and appli
 
 **NFR-34:** Release builds must be reproducible from publicly obtainable source packages and registries. Builds must fail with a clear diagnostic when the pinned Proton registry is unavailable; vendoring, checksums, and an offline source archive are required before stable release.
 
-**NFR-35:** Every shipped Rust dependency must have a declared SPDX-compatible license or a reviewed upstream license file. ProTUN's source is GPLv3-or-later, so ProtonWire is licensed GPL-3.0-or-later and every linked dependency must be compatible. The downloaded Muon `2.6.2` and `pvpnclient` `3.0.3` source archives contain no `license`/`license-file` manifest field or license text; their registry availability is not permission to redistribute. This and the same review for all transitive Proton crates are release blockers until Proton supplies applicable terms.
+**NFR-35:** Every shipped Rust dependency must have a declared SPDX-compatible license or a reviewed upstream license file. ProtonWire is licensed GPL-3.0-or-later and every linked dependency must be compatible. **RESOLVED 2026-10-08:** ProTUN v3.0.1 and its Proton-registry dependencies now carry GPLv3-compatible licenses — protun's source includes a GPLv3 `LICENSE` file, and the muon 3.x / pvpnclient 4.x archives include license metadata. The distribution blocker (OQ-2) is cleared; the pre-release SBOM and per-crate license scan (NFR-37) remain.
 
 **NFR-36:** The ProTUN/Muon adapters must have contract tests against the pinned version and an upgrade test against the candidate next version. Beta API changes must not propagate into the frontend API or configuration schema.
 
@@ -2982,8 +2982,8 @@ Plaintext credential storage
 ### 16.2 Rust Crates, Indicative {#162-rust-crates-indicative}
 
 ```toml
-protun = { git = "https://github.com/ProtonVPN/protun", rev = "12e7755a112f59b7b843da79290b3de25febf653", features = ["linux", "local-agent"] }
-muon = { version = "=2.6.2", registry = "proton", default-features = false, features = ["transport-hyper", "lenient", "other-product", "unsealed", "login", "alternative-routing"] }
+protun = { git = "https://github.com/ProtonVPN/protun", rev = "1c3aa646175ae12e22f17621306d403ad2a37017", features = ["linux", "local-agent"] }
+muon = { version = "=3.0.0", registry = "proton", default-features = false, features = ["transport-hyper", "lenient", "other-product", "unsealed", "login", "alternative-routing"] }
 clap = "4"
 ratatui = "0.30"
 tauri = { version = "2", default-features = false }
@@ -3012,7 +3012,7 @@ The workspace must configure Proton's public sparse registry:
 index = "sparse+https://rust-registry.proton.me/index/"
 ```
 
-The initial resolver target for pinned ProTUN is Muon `2.6.2` (registry checksum `63c7119344a07143093b5790d76e93c9e827e2a3a1bca1643a5951ffd2f8e3b3`) and transitive `pvpnclient` `3.0.3` (checksum `3c14ef052727e0204ec5e80cf8df50786db38a83b6a6557a188b78a4c264f380`). ProTUN's `~3.0.1` constraint permits `pvpnclient` `3.0.3`, and its Muon `^2` constraint unifies with the direct exact pin. The ProTUN tag has no lockfile, so these are ProtonWire resolution decisions, not upstream lockfile guarantees. Development prototypes may proceed; no binary or source distribution containing the unresolved Proton crates may be published before their license terms and every transitive Proton crate are cleared.
+The current resolver target for pinned ProTUN v3.0.1 is Muon `3.0.0` and transitive `pvpnclient` `4.0.2`. ProTUN's `~4.0.0` constraint permits `pvpnclient` `4.0.2`, and its Muon `^3` constraint unifies with the direct exact pin. The ProTUN tag has no lockfile, so these are ProtonWire resolution decisions, not upstream lockfile guarantees. The license clearance (OQ-2, 2026-10-08) resolves the distribution blocker; the pre-release SBOM scan (NFR-37) remains.
 
 ---
 
@@ -3332,7 +3332,7 @@ Run in Linux network namespaces.
 
 **OQ-1:** Which Muon/Proton API endpoints and client identifiers are stable and authorized for a third-party Proton VPN client, and what compatibility commitment will Proton provide?
 
-**OQ-2:** Will Proton publish explicit SPDX/license metadata and complete corresponding source terms for Muon, `pvpnclient`, and every ProTUN transitive Proton crate? This blocks distribution.
+**OQ-2:** ~~Will Proton publish explicit SPDX/license metadata and complete corresponding source terms for Muon, `pvpnclient`, and every ProTUN transitive Proton crate? This blocks distribution.~~ **RESOLVED 2026-10-08:** ProTUN v3.0.1 and the Proton-registry crates (muon 3.x, pvpnclient 4.x) now carry GPLv3-compatible licenses. The distribution blocker is cleared.
 
 **OQ-3:** Which authorized public Muon/API contracts expose human-verification continuation, SSO initiation/completion, guest VPN sessions, connection feedback, free change-server/cooldown state, Gateways, and device/session-limit remediation to non-official callers? Pinned Muon does not itself complete the first four flows.
 

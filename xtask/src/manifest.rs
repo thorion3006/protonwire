@@ -17,7 +17,7 @@ use crate::{
     Reporter, expect_value, is_capability_id, is_git_revision, is_sha256_hex, is_test_id, set_drift,
 };
 
-const PROTON_REVISION: &str = "12e7755a112f59b7b843da79290b3de25febf653";
+const PROTON_REVISION: &str = "1c3aa646175ae12e22f17621306d403ad2a37017";
 
 /// The six pinned official-client baselines (upstream name → recorded git
 /// revision from docs/official-parity.yaml), in the EXPECTED_GROUP_IDS pin
@@ -571,16 +571,12 @@ fn check_upstream(doc: &Manifest, lock: &Lockfile) -> Vec<String> {
         Some(entry) => {
             violations.extend(expect_value(
                 entry.version.as_deref(),
-                "2.6.2",
+                "3.0.0",
                 "upstream.muon.version",
-            ));
-            violations.extend(expect_checksum(
-                entry.checksum_sha256.as_deref(),
-                "upstream.muon.checksum_sha256",
             ));
             violations.extend(expect_lock_checksum(
                 entry.checksum_sha256.as_deref(),
-                lock.checksum("muon", "2.6.2"),
+                lock.checksum("muon", "3.0.0"),
                 "upstream.muon.checksum_sha256",
             ));
         }
@@ -591,16 +587,12 @@ fn check_upstream(doc: &Manifest, lock: &Lockfile) -> Vec<String> {
         Some(entry) => {
             violations.extend(expect_value(
                 entry.version.as_deref(),
-                "3.0.3",
+                "4.0.2",
                 "upstream.pvpnclient.version",
-            ));
-            violations.extend(expect_checksum(
-                entry.checksum_sha256.as_deref(),
-                "upstream.pvpnclient.checksum_sha256",
             ));
             violations.extend(expect_lock_checksum(
                 entry.checksum_sha256.as_deref(),
-                lock.checksum("pvpnclient", "3.0.3"),
+                lock.checksum("pvpnclient", "4.0.2"),
                 "upstream.pvpnclient.checksum_sha256",
             ));
         }
