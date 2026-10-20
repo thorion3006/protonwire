@@ -427,9 +427,8 @@ pub(crate) fn find_lock_files(dir: &Path) -> Vec<PathBuf> {
 pub(crate) const PROTON_TRAIN: &[(&str, &str)] = &[
     ("muon", "3.0.0"),
     ("muon-rest", "0.1.0"),
-    ("proton-boringtun", "3.0.0"),
-    ("proton-os-interface", "0.2.7"),
-    ("proton-os-interface", "0.3.3"),
+    ("proton-boringtun", "3.0.1"),
+    ("proton-os-interface", "0.3.5"),
     ("proton-pfff", "0.13.2"),
     ("proton-pfff-config", "0.1.0"),
     ("proton-pfff-core", "0.1.4"),

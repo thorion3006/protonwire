@@ -141,7 +141,7 @@ protonwire-net = { path = "crates/net", version = "0.1.0" }
 protonwire-policy = { path = "crates/policy", version = "0.1.0" }
 protonwire-pf = { path = "crates/port-forwarding", version = "0.1.0" }
 protonwire-store = { path = "crates/store", version = "0.1.0" }
-proton-boringtun = { version = "=3.0.0", registry = "proton", features = ["std"] } # the v3 train's boringtun; in-graph via protun->pvpnclient 4.x; the M4 exit IT's mocked peer. The proton subtree moves as one train — PROTON_TRAIN in xtask/src/deps.rs
+proton-boringtun = { version = "=3.0.1", registry = "proton", features = ["std"] } # 3.0.1 unified to os-interface ^0.3 (3.0.0 held ^0.2, splitting the graph and breaking muon 3.0.0's trait impls); the M4 exit IT's mocked peer. PROTON_TRAIN in xtask/src/deps.rs
 
 rtnetlink = "0.23"
 tokio = { version = "1", features = ["rt", "macros"] }
