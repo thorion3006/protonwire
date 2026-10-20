@@ -3770,7 +3770,7 @@ dependencies = [
  "itertools 0.14.0",
  "muon-rest",
  "pin-project",
- "proton-os-interface 0.3.3",
+ "proton-os-interface",
  "proton-srp",
  "psl",
  "rand_chacha 0.10.0",
@@ -5032,9 +5032,9 @@ dependencies = [
 
 [[package]]
 name = "proton-boringtun"
-version = "3.0.0"
+version = "3.0.1"
 source = "sparse+https://rust-registry.proton.me/index/"
-checksum = "d6cbef9a3ddc5f97501607f1a689c459a1894069745b4cede7c519b71bb64434"
+checksum = "098fcf977278ed11968e11340443c916e6ba9b2eb0d55056c9c82a7c757557b2"
 dependencies = [
  "aead",
  "base64 0.13.1",
@@ -5044,7 +5044,7 @@ dependencies = [
  "hmac 0.12.1",
  "nix 0.25.1",
  "parking_lot",
- "proton-os-interface 0.2.7",
+ "proton-os-interface",
  "rand_core 0.6.4",
  "ring",
  "tracing",
@@ -5053,23 +5053,9 @@ dependencies = [
 
 [[package]]
 name = "proton-os-interface"
-version = "0.2.7"
+version = "0.3.5"
 source = "sparse+https://rust-registry.proton.me/index/"
-checksum = "213218ea05202f02a22a5e41fb5bca48b6966c76f6118a7b00c3a936ac07b92c"
-dependencies = [
- "derive_more 1.0.0",
- "futures",
- "rand 0.9.5",
- "rand_core 0.6.4",
- "serde",
- "thiserror 2.0.21",
-]
-
-[[package]]
-name = "proton-os-interface"
-version = "0.3.3"
-source = "sparse+https://rust-registry.proton.me/index/"
-checksum = "255a294a047ca5d8660b73c22a9b4daf6045774947dc1c6445ab2c0a4a74e14f"
+checksum = "2d072e412deeb21cb2d6f98a497989227b34fd8ac7900de85522d3cf933b16ed"
 dependencies = [
  "derive_more 1.0.0",
  "futures",
@@ -5114,7 +5100,7 @@ dependencies = [
  "futures",
  "paste",
  "pin-project",
- "proton-os-interface 0.3.3",
+ "proton-os-interface",
  "serde",
  "simple-mermaid",
  "thiserror 2.0.21",
@@ -5195,7 +5181,7 @@ dependencies = [
  "futures-rustls",
  "futures-util",
  "futures_codec",
- "proton-os-interface 0.3.3",
+ "proton-os-interface",
  "redis-protocol",
  "rustls-pki-types",
  "thiserror 2.0.21",
@@ -5210,7 +5196,7 @@ checksum = "0389ec13eb10e822b5fea5533382d9ba327940005ffad62a4c04b9f81d6ed394"
 dependencies = [
  "derive_more 2.1.1",
  "futures",
- "proton-os-interface 0.3.3",
+ "proton-os-interface",
  "rand_xoshiro",
  "smoltcp",
  "thiserror 2.0.21",
@@ -5267,7 +5253,7 @@ dependencies = [
  "hex",
  "hex-literal",
  "hmac 0.12.1",
- "proton-os-interface 0.3.3",
+ "proton-os-interface",
  "proton-tls-parser",
  "rand 0.10.3",
  "serde",
@@ -5534,7 +5520,7 @@ dependencies = [
  "muon",
  "pin-project",
  "proton-boringtun",
- "proton-os-interface 0.3.3",
+ "proton-os-interface",
  "proton-pfff",
  "proton-vpn-local-agent",
  "proton-vpn-netstack",
