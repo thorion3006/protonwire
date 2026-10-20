@@ -59,6 +59,9 @@ unsafe_code = "deny"
 # ProTUN pin (tag v3.0.1 — GPLv3 LICENSE, the OQ-2 clearance). The tag carries
 # no upstream lockfile; the committed root Cargo.lock of this repository is
 # the resolution authority (PRD 6.5). The v3 train: muon 3, pvpnclient 4.
+# proton-os-interface held at 0.3.3 in the LOCKFILE (muon 3.0.0's ClockManager
+# trait impls break against 0.3.5's changed traits — the upstream version
+# incompatibility; the lockfile --precise is the authority).
 protun = { git = "https://github.com/ProtonVPN/protun", rev = "1c3aa646175ae12e22f17621306d403ad2a37017", features = [
     "linux",
     "local-agent",
