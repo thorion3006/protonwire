@@ -498,7 +498,7 @@ pub(crate) fn proton_train_violations(lock_text: &str) -> Vec<String> {
                     "{name} v{version} is a proton-registry package missing from \
                      PROTON_TRAIN — record it (or hold it) consciously; an update \
                      must not absorb new proton crates silently"
-                )),
+                ));
             }
         }
     }
