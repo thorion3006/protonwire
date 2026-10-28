@@ -414,15 +414,6 @@ fn expect_lock_revision(recorded: Option<&str>, locked: Option<&str>, what: &str
     }
 }
 
-fn expect_checksum(actual: Option<&str>, what: &str) -> Option<String> {
-    match actual {
-        Some(value) if is_sha256_hex(value) => None,
-        Some(value) => Some(format!(
-            "{what} must be 64 lowercase hex characters, got `{value}`"
-        )),
-        None => Some(format!("{what} is missing")),
-    }
-}
 
 fn expect_revision(actual: Option<&str>, what: &str) -> Option<String> {
     match actual {
@@ -548,7 +539,7 @@ fn check_upstream(doc: &Manifest, lock: &Lockfile) -> Vec<String> {
         Some(entry) => {
             violations.extend(expect_value(
                 entry.version.as_deref(),
-                "2.2.1",
+                "3.0.1",
                 "upstream.protun.version",
             ));
             violations.extend(expect_value(
