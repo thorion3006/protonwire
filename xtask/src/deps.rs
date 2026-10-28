@@ -432,7 +432,7 @@ pub(crate) const PROTON_TRAIN: &[(&str, &str)] = &[
     ("proton-pfff", "0.13.2"),
     ("proton-pfff-config", "0.1.0"),
     ("proton-pfff-core", "0.1.4"),
-    ("proton-pfff-module", "0.8.9"),
+    ("proton-pfff-module", "0.8.11"),
     ("proton-srp", "0.8.4"),
     ("proton-tls-parser", "0.4.0"),
     ("proton-vpn-haproxyv2", "0.1.0"),
