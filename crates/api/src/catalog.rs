@@ -560,14 +560,12 @@ mod wire_tests {
 
     /// Deterministic test RNG: muon only derives transport jitter from
     /// it; a xorshift stream is plenty and keeps the crate free of a
-    /// direct rand dependency.
+    /// direct rand dependency. Implements TryRng (rand_core 0.10's
+    /// base — Rng and CryptoRng are blanket impls over it).
     struct TestRng(u64);
 
-    impl muon::rand::RngCore for TestRng {
-        fn next_u32(&mut self) -> u32 {
-            self.next_u64() as u32
-        }
-        fn next_u64(&mut self) -> u64 {
+    impl TestRng {
+        fn xorshift(&mut self) -> u64 {
             let mut x = self.0;
             x ^= x << 13;
             x ^= x >> 7;
@@ -575,15 +573,26 @@ mod wire_tests {
             self.0 = x;
             x
         }
-        fn fill_bytes(&mut self, dst: &mut [u8]) {
+    }
+
+    impl muon::rand::TryRng for TestRng {
+        type Error = std::convert::Infallible;
+        fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
+            Ok(self.xorshift() as u32)
+        }
+        fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
+            Ok(self.xorshift())
+        }
+        fn try_fill_bytes(&mut self, dst: &mut [u8]) -> Result<(), Self::Error> {
             for chunk in dst.chunks_mut(8) {
-                let bytes = self.next_u64().to_le_bytes();
+                let bytes = self.xorshift().to_le_bytes();
                 chunk.copy_from_slice(&bytes[..chunk.len()]);
             }
+            Ok(())
         }
     }
 
-    impl muon::rand::CryptoRng for TestRng {}
+    impl muon::rand::TryCryptoRng for TestRng {}
 
     /// Spawns muon's background tasks onto the ambient (dedicated
     /// runtime driven by the bridge).
