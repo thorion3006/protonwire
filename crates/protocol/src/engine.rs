@@ -502,7 +502,11 @@ pub fn muon_env_to_protun(env: EngineMuonEnv) -> MuonEnv {
     match env {
         EngineMuonEnv::Prod => MuonEnv::Prod,
         EngineMuonEnv::Atlas { scientist } => MuonEnv::Atlas { scientist },
-        EngineMuonEnv::CustomServers { servers } => MuonEnv::CustomServers { servers },
+        EngineMuonEnv::CustomServers { servers } => MuonEnv::CustomServers {
+            servers,
+            api_pins: None, // v3: TLS pin set (None = registry default pinning)
+            ar_pins: None,
+        },
     }
 }
 
@@ -698,7 +702,7 @@ pub fn translate_event(event: &Event) -> Vec<EngineEvent> {
             adult_content_blocked: *adult_content_blocked,
             data_saved: *data_saved,
         })],
-        Event::Error { error } => match error {
+        Event::LocalAgentError { error } => match error {
             ErrorEvent::ForkSelectorNeeded => vec![EngineEvent::ForkSelectorNeeded],
             ErrorEvent::CertificateRefreshFatalError => vec![EngineEvent::CertificateFatal],
             ErrorEvent::LocalAgentSettingPolicyRefused { setting } => {
@@ -762,6 +766,7 @@ fn local_agent_mode(mode: &EngineMode) -> Option<ConnectionMode> {
             app_version: app_version.clone(),
             settings: settings_to_protun(*settings),
             muon_env: muon_env_to_protun(muon_env.clone()),
+            certificate_duration: None, // v3: the default cert lifetime (the engine's certificate refresh owns the value; None = upstream default)
         }),
         EngineMode::NoLocalAgent => None,
     }
@@ -1564,7 +1569,7 @@ mod tests {
 
     #[test]
     fn translate_event_refusal_and_fatal_shapes() {
-        let refusal = Event::Error {
+        let refusal = Event::LocalAgentError {
             error: ErrorEvent::LocalAgentSettingPolicyRefused {
                 setting: LocalAgentSettingType::NetshieldLevel,
             },
@@ -1574,12 +1579,12 @@ mod tests {
             vec![EngineEvent::SettingRefused(EngineSettingType::Netshield, 0)]
         );
 
-        let fatal = Event::Error {
+        let fatal = Event::LocalAgentError {
             error: ErrorEvent::CertificateRefreshFatalError,
         };
         assert_eq!(translate_event(&fatal), vec![EngineEvent::CertificateFatal]);
 
-        let api_error = Event::Error {
+        let api_error = Event::LocalAgentError {
             error: ErrorEvent::ApiError {
                 endpoint: protun::api::events::ApiEndpoint::CertificateRefresh,
                 http_code: Some(422),
@@ -1806,7 +1811,7 @@ mod tests {
         // And the critical class: a CertificateFatal past the full
         // queue is RETAINED, taken ONCE (the control events have no
         // poll surface — the slot is their only delivery).
-        let fatal = Event::Error {
+        let fatal = Event::LocalAgentError {
             error: ErrorEvent::CertificateRefreshFatalError,
         };
         callbacks.on_event(fatal);
