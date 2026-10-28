@@ -26,7 +26,7 @@ use std::os::fd::RawFd;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use protun::api::connection_unix::OnSocketFdAvailableCallback;
+use protun::api::connection_unix::SocketProtector;
 
 /// Applies the bypass mark to one reported outer-socket descriptor.
 pub trait MarkApplier: Send + Sync {
@@ -238,8 +238,8 @@ impl MarkingFdCallback {
     }
 }
 
-impl OnSocketFdAvailableCallback for MarkingFdCallback {
-    fn on_socket_fd_available(&self, socket_fd: i32) {
+impl SocketProtector for MarkingFdCallback {
+    fn protect_socket(&self, socket_fd: i32) -> bool {
         // Synchronous: by the time this returns, the descriptor carries
         // the bypass mark (or the failure is recorded for the
         // fail-closed gate — the callback cannot refuse the socket).
@@ -255,6 +255,7 @@ impl OnSocketFdAvailableCallback for MarkingFdCallback {
         // P1 — healthy() refuses while any marking is in progress).
         self.health.note_in_flight();
         let outcome = self.applier.apply_mark(socket_fd);
+        let protected = outcome.is_ok();
         match outcome {
             Ok(()) => self.health.note_reported(),
             Err(ref error) => {
@@ -268,6 +269,10 @@ impl OnSocketFdAvailableCallback for MarkingFdCallback {
             }
         }
         self.health.note_done();
+        // Always true: the mark failure is recorded for the fail-closed
+        // gate (MarkHealth::healthy), not refused here — the callback
+        // cannot refuse the socket's creation.
+        protected
     }
 }
 #[cfg(test)]
