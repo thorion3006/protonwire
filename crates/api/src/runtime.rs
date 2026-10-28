@@ -299,13 +299,16 @@ impl muon::rt::Spawn for TokioSpawner {
 
 /// The transport PRNG seed source: the OS CSPRNG (`getrandom` — already
 /// a lockfile transitive and the plan's chosen promotion for M2 RNG
-/// needs), seeding muon's own `ChaCha20Rng` derivation.
+/// needs), seeding muon 3's rand (the proton-os-interface 0.3.5
+/// re-export of rand 0.10's core traits — the v3 train's adapter
+/// migration; the old rand_chacha 0.3's ChaCha20Rng implements the
+/// pre-0.10 traits and does not satisfy muon 3's CryptoRng bound).
 ///
 /// # Errors
 /// Propagates the OS entropy failure.
-pub fn os_prng() -> std::io::Result<rand_chacha::ChaCha20Rng> {
+pub fn os_prng() -> std::io::Result<rand::rngs::StdRng> {
     use muon::rand::SeedableRng;
-    let mut seed = <rand_chacha::ChaCha20Rng as SeedableRng>::Seed::default();
+    let mut seed = <rand::rngs::StdRng as SeedableRng>::Seed::default();
     getrandom::getrandom(&mut seed)?;
-    Ok(rand_chacha::ChaCha20Rng::from_seed(seed))
+    Ok(rand::rngs::StdRng::from_seed(seed))
 }
