@@ -22,10 +22,12 @@ thiserror = { workspace = true }
 # calls them directly"); already a lockfile transitive via the pinned
 # engines, so no new package enters the resolution.
 tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-thread", "net", "time"] }
-# Muon's own PRNG type, seeded from the OS CSPRNG (the plan's chosen
-# promotion for M2 randomness). Both already lockfile transitives.
-rand_chacha = "0.9"
-getrandom = "0.2"
+# Muon 3's rand (the os-interface 0.3.5 re-export of rand 0.10):
+# StdRng implements the v3 train's CryptoRng/SeedableRng bounds.
+# rand_chacha 0.3 implements the PRE-0.10 traits and does not
+# satisfy muon 3's bounds (the v3 adapter migration).
+rand = "0.10"
+getrandom = "0.3"
 # Fido2Payload zeroize-on-drop (S0 deferral landed with S4).
 zeroize = { workspace = true }
 
