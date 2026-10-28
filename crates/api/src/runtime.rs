@@ -309,6 +309,6 @@ impl muon::rt::Spawn for TokioSpawner {
 pub fn os_prng() -> std::io::Result<rand::rngs::StdRng> {
     use muon::rand::SeedableRng;
     let mut seed = <rand::rngs::StdRng as SeedableRng>::Seed::default();
-    getrandom::getrandom(&mut seed)?;
+    getrandom::fill(&mut seed)?;
     Ok(rand::rngs::StdRng::from_seed(seed))
 }
