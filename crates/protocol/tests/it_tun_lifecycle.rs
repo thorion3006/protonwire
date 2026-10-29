@@ -20,7 +20,7 @@ use protonwire_protocol::DEFAULT_IF_NAME;
 use protonwire_protocol::marks::{MarkHealth, MarkingFdCallback, SoMarkApplier};
 use protonwire_protocol::tun::TunHandle;
 use protun::api::connection::TunStreamInfo;
-use protun::api::connection_unix::OnSocketFdAvailableCallback;
+use protun::api::connection_unix::SocketProtector;
 
 fn interface_exists(name: &str) -> bool {
     if_nametoindex(name).is_ok()
@@ -120,7 +120,7 @@ fn it1_outer_socket_mark_seam_roundtrip() {
     .expect("create a UDP socket in the namespace");
     let health = Arc::new(MarkHealth::new());
     let callback = MarkingFdCallback::new(Arc::new(SoMarkApplier::new(0x51820)), health.clone());
-    callback.on_socket_fd_available(socket_fd.as_raw_fd());
+    callback.protect_socket(socket_fd.as_raw_fd());
 
     let mark = getsockopt(&socket_fd, sockopt::Mark).expect("SO_MARK is readable back");
     assert_eq!(mark, 0x51820, "the callback applied the stable mark");

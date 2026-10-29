@@ -1645,6 +1645,7 @@ mod tests {
                 app_version,
                 settings,
                 muon_env,
+                .. // v3: certificate_duration (the engine doesn't pin it)
             } => {
                 assert_eq!(user_agent, "ProtonWire/0.1");
                 assert_eq!(app_version, "0.1.0");
@@ -1724,7 +1725,7 @@ mod tests {
             reconciliation: Arc::clone(&reconciliation),
         };
         let stats = || Event::ConnectionStats {
-            timestamp_ms: 0,
+            mono_timestamp_ms: 0,
             received_bytes: 1,
             sent_bytes: 2,
             time_since_last_handshake: Duration::ZERO,
@@ -1776,7 +1777,7 @@ mod tests {
         // Fill the single slot with a stale stat, then overflow with
         // a FRESH one: the slot must hold the fresh counters.
         let stale = Event::ConnectionStats {
-            timestamp_ms: 1,
+            mono_timestamp_ms: 1,
             received_bytes: 100,
             sent_bytes: 200,
             time_since_last_handshake: Duration::ZERO,
@@ -1784,7 +1785,7 @@ mod tests {
             estimated_round_trip_time: Duration::ZERO,
         };
         let fresh = Event::ConnectionStats {
-            timestamp_ms: 2,
+            mono_timestamp_ms: 2,
             received_bytes: 300,
             sent_bytes: 400,
             time_since_last_handshake: Duration::from_secs(5),
