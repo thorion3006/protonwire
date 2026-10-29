@@ -53,16 +53,17 @@ specification set is:
 - `docs/m2-plan.md` — the M2 unit plan (completed; see its header note)
 - `docs/m3-plan.md` — the M3 unit plan (completed; see its header note)
 
-## ⚠ Development builds only — no distribution
+## Distribution license status — cleared (OQ-2)
 
-The pinned Proton registry crates `muon 2.6.2` and `pvpnclient 3.0.3`
-carry no license manifest or bundled license text (re-audited
-2026-09-17, covering every registry release since, including
-muon 3.0.0 and pvpnclient 3.3.0). **License clearance 2026-10-08
-(OQ-2 RESOLVED):** protun v3.0.1 and the Proton-registry crates now
-carry GPLv3-compatible licenses — the distribution blocker is
-cleared. The pre-release SBOM and per-crate license scan (NFR-37)
-remain before the first shipped release.
+**License clearance 2026-10-08 (OQ-2 RESOLVED):** protun v3.0.1 bundles a
+GPLv3 `LICENSE` file, and the Proton-registry dependency train is cleared
+with it (owner decision; `docs/LICENSE-CLEARANCE.md` is the release-guard
+marker). Those registry crates still publish no `license` manifest field
+or bundled license text, so `cargo xtask license-scan` keeps the 17-name
+unlicensed set recorded as a drift baseline (the set may not grow, and a
+crate that gains a manifest license must shrink it). The pre-release SBOM
+and per-crate license scan (NFR-37) remain before the first shipped
+release.
 
 ## Layout
 
