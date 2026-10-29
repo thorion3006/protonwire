@@ -14,7 +14,7 @@ use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
 
 use crate::{
-    Reporter, expect_value, is_capability_id, is_git_revision, is_sha256_hex, is_test_id, set_drift,
+    Reporter, expect_value, is_capability_id, is_git_revision, is_test_id, set_drift,
 };
 
 const PROTON_REVISION: &str = "1c3aa646175ae12e22f17621306d403ad2a37017";
