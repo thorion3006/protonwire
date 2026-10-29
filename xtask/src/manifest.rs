@@ -1027,8 +1027,8 @@ capabilities:
         // A well-formed but wrong muon digest is tampering the shape check
         // cannot see (last hex digit flipped).
         let yaml = good_manifest_yaml().replacen(
-            "63c7119344a07143093b5790d76e93c9e827e2a3a1bca1643a5951ffd2f8e3b3",
-            "63c7119344a07143093b5790d76e93c9e827e2a3a1bca1643a5951ffd2f8e3b2",
+            "d06175b95acecae21bfaf373f98520ffd6c5fc0627e58d70e6a4a5edc93dc24c",
+            "d06175b95acecae21bfaf373f98520ffd6c5fc0627e58d70e6a4a5edc93dc24d",
             1,
         );
         let path = temp_yaml("checksum", &yaml);
@@ -1041,8 +1041,8 @@ capabilities:
         // QA mutation gap (item G5): the symmetric tamper on the pvpnclient
         // digest — the muon case passing does not prove this branch.
         let yaml = good_manifest_yaml().replacen(
-            "3c14ef052727e0204ec5e80cf8df50786db38a83b6a6557a188b78a4c264f380",
-            "3c14ef052727e0204ec5e80cf8df50786db38a83b6a6557a188b78a4c264f381",
+            "91fa3157e1b9281006159a0e29c44c05aa0741c9426558fc0d83322d58c8b3ba",
+            "91fa3157e1b9281006159a0e29c44c05aa0741c9426558fc0d83322d58c8b3bb",
             1,
         );
         let path = temp_yaml("checksum-pvpn", &yaml);
@@ -1086,7 +1086,7 @@ capabilities:
         let tampered = good_lockfile_text().replacen(
             "1c3aa646175ae12e22f17621306d403ad2a37017",
             "1c3aa646175ae12e22f17621306d403ad2a37018",
-            1,
+            2,
         );
         let path = temp_yaml("protun-lock", &good_manifest_yaml());
         assert!(
