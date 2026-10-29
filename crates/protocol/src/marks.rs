@@ -306,8 +306,8 @@ mod tests {
         let health = Arc::new(MarkHealth::new());
         let callback = MarkingFdCallback::new(applier.clone(), health.clone());
 
-        callback.on_socket_fd_available(7);
-        callback.on_socket_fd_available(9);
+        callback.protect_socket(7);
+        callback.protect_socket(9);
 
         assert_eq!(*applier.marked.lock().unwrap(), vec![7, 9]);
         assert_eq!(health.reported(), 2, "every report is counted");
@@ -328,7 +328,7 @@ mod tests {
 
         // ProTUN's callback contract is infallible on our side: the
         // failure is recorded, the thread lives on.
-        callback.on_socket_fd_available(3);
+        callback.protect_socket(3);
 
         assert!(
             !health.all_marked(),
@@ -444,7 +444,7 @@ mod tests {
                     }),
                     Arc::clone(&health),
                 );
-                std::thread::spawn(move || callback.on_socket_fd_available(1))
+                std::thread::spawn(move || callback.protect_socket(1))
             })
             .collect();
         entered.wait();
