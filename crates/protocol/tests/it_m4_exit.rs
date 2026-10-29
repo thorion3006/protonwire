@@ -86,7 +86,7 @@ fn spawn_mocked_peer(stop: Arc<AtomicBool>) -> (String, SocketAddr) {
         use proton_boringtun::proton_os_interface::time::Instant as OsInstant;
         use proton_boringtun::proton_os_interface::time::SinceUnixEpoch as _;
         use proton_boringtun::proton_os_interface::time::SystemTime as OsSystemTime;
-        use proton_boringtun::rand::SeedableRng as _;
+        use proton_boringtun::rand::SeedableRng;
         use proton_boringtun::rand::rngs::StdRng;
 
         let epoch = Instant::now();
