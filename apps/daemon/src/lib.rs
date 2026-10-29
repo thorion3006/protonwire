@@ -16,6 +16,10 @@ use protonwire_ipc::{EventBus, RequestHandler, SessionContext};
 use std::path::{Path, PathBuf};
 
 pub mod connect;
+/// M6 slice 1b: the daemon's net context — the startup-allocated
+/// bypass mark, the uplink survey, the kill-switch generation
+/// counter.
+pub mod netctx;
 pub mod services;
 
 pub use services::DaemonServices;

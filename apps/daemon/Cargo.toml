@@ -34,6 +34,13 @@ protonwire-protocol = { workspace = true }
 protonwire-frontend-api = { workspace = true }
 protonwire-ipc = { workspace = true }
 protonwire-store = { workspace = true }
+# M6 slice 1b: the lane composition — the M5 session orchestrator,
+# the kill switch, and the mark allocator (all already in-graph via
+# the netns IT harness's dependency on protonwire-net).
+protonwire-net = { workspace = true }
+rtnetlink = { workspace = true }
+futures-util = { workspace = true }
+tokio = { workspace = true }
 clap = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
