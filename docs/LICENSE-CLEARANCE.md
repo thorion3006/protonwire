@@ -8,14 +8,16 @@
   revision `a498c38a`, on 2026-10-29).
 - **muon 3.0.0** and **pvpnclient 4.4.1** — cleared with the protun
   v3 train by owner decision (2026-10-08; the pvpnclient entry moved
-  4.0.2 → 4.4.1 with the 2026-10-29 protun v3.0.5 sweep — its archive
-  is licenseless on the same basis). Their published archives
-  carry no license field and no bundled license text (verified
-  2026-10-29 against the local Proton-registry cache: no `license`
-  in `Cargo.toml`, no LICENSE/COPYING file, no README grant); the
-  clearance rests on Proton's stated licensing of the v3 train and
-  its GPLv3 Linux-client practice, not on bundled text. The NFR-37
-  per-crate scan before the first shipped release re-verifies this.
+  4.0.2 → 4.4.1 with the 2026-10-29 protun v3.0.5 sweep). Their
+  published archives carry no license field and no bundled license
+  text (verified 2026-10-29 by downloading pvpnclient@4.4.1.crate and
+  inspecting the local Proton-registry cache for the rest: no
+  `license` in `Cargo.toml`, no LICENSE/COPYING file, no README
+  grant; the manifest-field half is additionally gate-verified by
+  CI's license-scan on live cargo metadata); the clearance rests on
+  Proton's stated licensing of the v3 train and its GPLv3
+  Linux-client practice, not on bundled text. The NFR-37 per-crate
+  scan before the first shipped release re-verifies this.
 - The remaining Proton-registry crates of the train are cleared on
   the same basis as muon/pvpnclient (also verified licenseless in
   their archives 2026-10-29).

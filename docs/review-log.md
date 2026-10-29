@@ -3980,3 +3980,41 @@ NOTE: the API compatibility check (protun v3's changes to the
 engine surface) runs on CI — the local nix-shell is unavailable
 (the nix-daemon's DNS is stale while the user shell resolves
 fine). CI will surface any adapter changes needed.
+
+## 2026-10-29 — The protun v3.0.5 sweep (PR #30; two gate reviews PASS, four P3 track items)
+
+The train moved behind the new tag: protun v3.0.1 → v3.0.5
+(caaf2620/a498c38a), pvpnclient 4.0.2 → 4.4.1, proton-boringtun
+3.0.1 → 4.9.0 (the PURE major: caller supplies clock/wall-clock/
+RNG/locks; the M4-exit mocked peer was ported to Tunn<StdRng,
+Loose> with the update_timers-before-decapsulate contract),
+local-agent 0.12.7 → 0.13.0, x25519-dalek 3.0.0 enters (boringtun
+4's dep), ctutils 0.4.7, Rust 1.99.0 → 1.99.1. muon STAYS 3.0.0
+(the registry's only 3.x; required ^3 by both protun v3.0.5 and
+pvpnclient 4.4.1). CI 9/9 at 6b6cc24 (three fix rounds: the new
+PeerInfo::server_name field, a by-name SeedableRng import, an
+unused FromDuration import).
+
+Gate reviews (rust-reviewer + sec-auditor) at 6b6cc24: PASS, no
+P1/P2. Track items recorded:
+
+- audit.toml revisit (this entry is the record): protun moved
+  3.0.1 → 3.0.5 and the three ignores were re-checked — rsa 0.9.10,
+  crypto-bigint 0.5.5, and proc-macro-error 1.0.4 still resolve in
+  the new lock, no fixed upgrades available; the ignores stand.
+- In-graph crypto duplication widened by the train: x25519-dalek
+  2.0.1 + 3.0.0 (curve25519-dalek 4.1.3 + 5.0.0) and rand
+  0.8.8/0.9.5/0.10.3 — forced by boringtun ^4 vs local-agent ^0.13;
+  collapse toward single copies when upstream constraints permit.
+- M6 GATE CONDITION: translate.rs sets PeerInfo::server_name: None
+  (our params carry only entry IPs). The local agent falls back to
+  its IP-derived name; the M6 connection-plan wiring MUST plumb the
+  catalog's server domains rather than accept the IP-verifying
+  fallback (a DNS-SAN-only agent certificate would otherwise fail
+  closed at connect time).
+- it_m4_exit.rs: a responder-thread panic surfaces only as the
+  30s-deadline "no Connected" failure (bounded, test-only; a
+  RESPONDER_DIED probe would localize it); StdRng via the
+  boringtun re-export rides rand feature unification anchored by
+  protun's default-features rand = "0.10" (breaks loudly at compile
+  time if that anchor ever moves).

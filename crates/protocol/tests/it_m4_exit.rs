@@ -86,6 +86,9 @@ fn spawn_mocked_peer(stop: Arc<AtomicBool>) -> (String, SocketAddr) {
         use proton_boringtun::proton_os_interface::time::SinceUnixEpoch as _;
         use proton_boringtun::proton_os_interface::time::SystemTime as OsSystemTime;
         use proton_boringtun::rand::SeedableRng;
+        // StdRng exists through this re-export only because protun's
+        // own rand = "0.10" (default features) unifies std_rng on —
+        // if that anchor ever moves, this fails loudly at compile time.
         use proton_boringtun::rand::rngs::StdRng;
 
         let epoch = Instant::now();
