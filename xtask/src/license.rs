@@ -1,10 +1,15 @@
 //! License inventory and the distribution release guard (compliance
-//! findings 2+3): the pinned Proton registry crates carry no license
-//! manifest, so redistribution is blocked (COPYING.md, PRD NFR-35/OQ-2).
+//! findings 2+3): the pinned Proton registry crates publish no `license`
+//! manifest field; distribution was blocked until the 2026-10-08
+//! clearance (docs/LICENSE-CLEARANCE.md, PRD NFR-35/OQ-2 RESOLVED —
+//! protun v3.0.1 bundles a GPLv3 LICENSE file and the train is cleared
+//! with it). The manifests still carry no field, so the unlicensed set
+//! stays recorded as a drift baseline: it may not grow, and a crate
+//! that gains a manifest license must shrink it.
 //!
 //! `license-scan` enumerates every resolved package with no license field
 //! and fails on drift against the recorded baseline, so an engine upgrade
-//! cannot silently grow the blocked set. It also classifies every declared
+//! cannot silently grow the unlicensed set. It also classifies every declared
 //! license against GPL-3.0-or-later compatibility (NFR-35: ProTUN is
 //! GPL-3.0-or-later, so every linked dependency must be too): legacy slash
 //! separators mean OR, OR needs any compatible branch, AND needs every
@@ -27,8 +32,11 @@ use crate::Reporter;
 
 /// The recorded baseline of packages with no license field in the current
 /// resolution (all Proton registry/git crates; see docs/review-log.md and
-/// COPYING.md). Distribution is blocked until Proton supplies terms for
-/// every entry (OQ-2).
+/// COPYING.md). Cleared 2026-10-08 (OQ-2 RESOLVED,
+/// docs/LICENSE-CLEARANCE.md): protun v3.0.1 bundles a GPLv3 LICENSE and
+/// the train is cleared with it, while still publishing no manifest
+/// field — so the set stays recorded: it may not grow, and a crate that
+/// gains a manifest license must shrink it.
 const KNOWN_UNLICENSED: &[&str] = &[
     "muon",
     "muon-rest",
@@ -294,8 +302,8 @@ pub fn run(root: &Path) -> Result<bool> {
             .map(|name| {
                 format!(
                     "`{name}` has no license field and is not in the baseline — \
-                     distribution blocker grew; record it and extend COPYINGS.md \
-                     outreach (OQ-2)"
+                     the unlicensed set grew; record it only with the same \
+                     clearance evidence as docs/LICENSE-CLEARANCE.md (OQ-2)"
                 )
             })
             .collect::<Vec<_>>(),
@@ -307,7 +315,9 @@ pub fn run(root: &Path) -> Result<bool> {
         ));
     }
     reporter.note(&format!(
-        "{} unlicensed package(s) on record; distribution blocked (COPYING.md)",
+        "{} package(s) without a manifest license field — cleared by \
+         evidence (docs/LICENSE-CLEARANCE.md); the release-guard marker, \
+         not this count, governs distribution",
         unlicensed.len()
     ));
 
@@ -483,8 +493,11 @@ mod tests {
 
     #[test]
     fn baseline_records_the_documented_blocked_set() {
-        // The compliance review enumerated 17 unlicensed packages; keep the
-        // baseline pinned to that count until clearance changes it.
+        // The compliance review enumerated 17 unlicensed packages and the
+        // 2026-10-08 clearance (OQ-2 RESOLVED) covered exactly that set;
+        // the manifests still publish no license field, so the pin stays.
+        // Any change here must move in lockstep with
+        // docs/LICENSE-CLEARANCE.md evidence.
         assert_eq!(KNOWN_UNLICENSED.len(), 17);
     }
 

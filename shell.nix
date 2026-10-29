@@ -10,12 +10,14 @@
 # catch up (tracked with the M8 packaging work).
 { gui ? false }:
 let
-  # nixos-unstable pinned 2026-09-12: rustc 1.98.1 / cargo 1.98.0 — the
-  # verified workspace toolchain (docs/spike-2026-08.md, 2026-09-17
-  # toolchain note). rustup users get the same compiler from the
-  # rust-toolchain.toml pin; inside this shell the rustup shims are
-  # bypassed and rust-toolchain.toml is inert. The workspace FLOOR
-  # stays 1.97 (rust-version, the CI msrv job).
+  # nixos-unstable pinned 2026-09-12: rustc 1.98.1 / cargo 1.98.0. The
+  # repo pin and CI moved to 1.99.0 (rust-toolchain.toml, 2026-10-28);
+  # this snapshot still supplies 1.98.1 — above the 1.97.1 workspace
+  # floor (rust-version, the CI msrv job) and sufficient to build the
+  # whole tree. Bumping the snapshot to a 1.99-carrying nixpkgs rev
+  # needs a verified fetchTarball pin and rides the flake/packaging
+  # work (M8); inside this shell the rustup shims are bypassed and
+  # rust-toolchain.toml is inert either way.
   nixpkgs = builtins.fetchTarball {
     url = "https://github.com/NixOS/nixpkgs/archive/218c873049f049abc1c09c6f14cd0ec2aa28fc4c.tar.gz";
     sha256 = "0xvg23mvy2krxjmfqzx5yr78vc0ch1jqx00qkcjmm1hi1alcjzpi";

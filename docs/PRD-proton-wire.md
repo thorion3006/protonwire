@@ -2017,7 +2017,7 @@ And include connection state, selected server, ProTUN state, requested and appli
 
 **NFR-34:** Release builds must be reproducible from publicly obtainable source packages and registries. Builds must fail with a clear diagnostic when the pinned Proton registry is unavailable; vendoring, checksums, and an offline source archive are required before stable release.
 
-**NFR-35:** Every shipped Rust dependency must have a declared SPDX-compatible license or a reviewed upstream license file. ProtonWire is licensed GPL-3.0-or-later and every linked dependency must be compatible. **RESOLVED 2026-10-08:** ProTUN v3.0.1 and its Proton-registry dependencies now carry GPLv3-compatible licenses — protun's source includes a GPLv3 `LICENSE` file, and the muon 3.x / pvpnclient 4.x archives include license metadata. The distribution blocker (OQ-2) is cleared; the pre-release SBOM and per-crate license scan (NFR-37) remain.
+**NFR-35:** Every shipped Rust dependency must have a declared SPDX-compatible license or a reviewed upstream license file. ProtonWire is licensed GPL-3.0-or-later and every linked dependency must be compatible. **RESOLVED 2026-10-08:** protun v3.0.1's source bundles a GPLv3 `LICENSE` file, and the Proton-registry train (muon 3.x, pvpnclient 4.x) is cleared with it by owner decision — their archives still publish no license manifest field or bundled text (verified 2026-10-29; evidence and scope in docs/LICENSE-CLEARANCE.md, and `license-scan` keeps all 17 names on the unlicensed drift baseline). The distribution blocker (OQ-2) is cleared; the pre-release SBOM and per-crate license scan (NFR-37) remain.
 
 **NFR-36:** The ProTUN/Muon adapters must have contract tests against the pinned version and an upgrade test against the candidate next version. Beta API changes must not propagate into the frontend API or configuration schema.
 
@@ -3332,7 +3332,7 @@ Run in Linux network namespaces.
 
 **OQ-1:** Which Muon/Proton API endpoints and client identifiers are stable and authorized for a third-party Proton VPN client, and what compatibility commitment will Proton provide?
 
-**OQ-2:** ~~Will Proton publish explicit SPDX/license metadata and complete corresponding source terms for Muon, `pvpnclient`, and every ProTUN transitive Proton crate? This blocks distribution.~~ **RESOLVED 2026-10-08:** ProTUN v3.0.1 and the Proton-registry crates (muon 3.x, pvpnclient 4.x) now carry GPLv3-compatible licenses. The distribution blocker is cleared.
+**OQ-2:** ~~Will Proton publish explicit SPDX/license metadata and complete corresponding source terms for Muon, `pvpnclient`, and every ProTUN transitive Proton crate? This blocks distribution.~~ **RESOLVED 2026-10-08:** protun v3.0.1 bundles a GPLv3 `LICENSE` file and the Proton-registry train is cleared with it by owner decision (docs/LICENSE-CLEARANCE.md records the evidence basis: the registry archives themselves still publish no license field or text). The distribution blocker is cleared.
 
 **OQ-3:** Which authorized public Muon/API contracts expose human-verification continuation, SSO initiation/completion, guest VPN sessions, connection feedback, free change-server/cooldown state, Gateways, and device/session-limit remediation to non-official callers? Pinned Muon does not itself complete the first four flows.
 

@@ -14,9 +14,12 @@ respective owners.
 ProTUN and other third-party dependencies retain their own copyright notices and
 license terms.
 
-**License clearance 2026-10-08 (OQ-2 RESOLVED):** ProTUN v3.0.1 and the
-Proton-registry dependency train (muon 3.0.0, pvpnclient 4.0.2) now carry
-GPLv3-compatible licenses. ProTUN's source includes a GPLv3 `LICENSE` file,
-and the muon/pvpnclient registry archives include license metadata. The
-distribution blocker is cleared; the pre-release SBOM and per-crate license
-scan (PRD NFR-37) remain before the first shipped release.
+**License clearance 2026-10-08 (OQ-2 RESOLVED):** protun v3.0.1 bundles a
+GPLv3 `LICENSE` file, and the Proton-registry dependency train (muon 3.0.0,
+pvpnclient 4.0.2) is cleared with it — owner decision, evidence and scope
+recorded in [docs/LICENSE-CLEARANCE.md](docs/LICENSE-CLEARANCE.md). Those
+registry crates still publish no `license` manifest field or bundled license
+text, so `cargo xtask license-scan` keeps all 17 names on the unlicensed
+drift baseline. The distribution blocker is cleared; the pre-release SBOM
+and per-crate license scan (PRD NFR-37) remain before the first shipped
+release.
