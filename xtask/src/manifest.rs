@@ -859,7 +859,7 @@ checksum = \"91fa3157e1b9281006159a0e29c44c05aa0741c9426558fc0d83322d58c8b3ba\"
 [[package]]
 name = \"protun\"
 version = \"3.0.1\"
-source = \"git+https://github.com/ProtonVPN/protun?rev=1c3aa646175ae12e22f17621306d403ad2a37017#836715cdb288f810cd6518e2f3d917fa456a8493\"
+source = \"git+https://github.com/ProtonVPN/protun?rev=1c3aa646175ae12e22f17621306d403ad2a37017#1c3aa646175ae12e22f17621306d403ad2a37017\"
 "
         .to_string()
     }
