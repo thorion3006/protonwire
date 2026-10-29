@@ -453,11 +453,19 @@ const PROTON_REGISTRY_SOURCE: &str = "sparse+https://rust-registry.proton.me";
 /// recorded [`PROTON_TRAIN`] version, plus any proton-registry package
 /// missing from the table — a NEW proton crate entering the graph is a
 /// train change too and must be recorded consciously, not absorbed by
-/// an update.
+/// an update. The reverse direction is enforced equally: a recorded
+/// tuple ABSENT from the lockfile is a violation, so a crate leaving
+/// the resolution (or one side of a version split disappearing) cannot
+/// pass silently either — the table is an exact pin, both ways.
 pub(crate) fn proton_train_violations(lock_text: &str) -> Vec<String> {
     let mut violations = Vec::new();
     let mut name: Option<String> = None;
     let mut version: Option<String> = None;
+    // The (name, version) tuples the lockfile actually resolves; the
+    // reverse check below pins the table as an EXACT set — a recorded
+    // tuple leaving the resolution is drift too, not just a new or
+    // drifted entry entering it.
+    let mut seen: Vec<(String, String)> = Vec::new();
     for line in lock_text.lines() {
         let line = line.trim();
         if let Some(value) = line.strip_prefix("name = ") {
@@ -469,6 +477,7 @@ pub(crate) fn proton_train_violations(lock_text: &str) -> Vec<String> {
             let (Some(name), Some(version)) = (name.as_ref(), version.as_ref()) else {
                 continue; // malformed block; other rules own lockfile shape
             };
+            seen.push((name.clone(), version.clone()));
             // The v3 train SPLITS os-interface (boringtun 3.0.0 holds
             // 0.2.x, pvpnclient 4.x holds 0.3.x) — the gate accepts
             // ANY version listed for the name in PROTON_TRAIN.
@@ -498,6 +507,18 @@ pub(crate) fn proton_train_violations(lock_text: &str) -> Vec<String> {
                      must not absorb new proton crates silently"
                 ));
             }
+        }
+    }
+    for (train_name, train_version) in PROTON_TRAIN {
+        if !seen
+            .iter()
+            .any(|(name, version)| name == train_name && version == train_version)
+        {
+            violations.push(format!(
+                "{train_name} v{train_version} is recorded in PROTON_TRAIN but absent \
+                 from the lockfile — the resolution dropped it; the train is an exact \
+                 pin, so update the table consciously (or restore the pin)"
+            ));
         }
     }
     violations
@@ -671,24 +692,62 @@ mod tests {
 
     #[test]
     fn proton_train_rejects_a_drifted_version() {
-        // The v3 train's shape: muon 3.0.0 and pvpnclient 4.0.2
-        // (recorded), but os-interface drifted to 0.3.4 (recorded
-        // 0.3.5) and muon drifted to 3.0.1 (recorded 3.0.0).
-        let lock = format!(
-            "{}{}{}",
-            proton_lock_entry("muon", "3.0.1"),
-            proton_lock_entry("proton-os-interface", "0.3.4"),
-            proton_lock_entry("pvpnclient", "4.0.2"),
-        );
+        // Full train lock, muon drifted to 3.0.1 (recorded 3.0.0): the
+        // drift fires AND the recorded 3.0.0 tuple left the resolution —
+        // two sides of the same conscious table update.
+        let mut lock = String::new();
+        for (name, version) in PROTON_TRAIN {
+            let version = if *name == "muon" { "3.0.1" } else { version };
+            lock.push_str(&proton_lock_entry(name, version));
+        }
         let violations = proton_train_violations(&lock);
         assert_eq!(violations.len(), 2, "{violations:?}");
-        assert!(violations[0].contains("muon v3.0.1"));
-        assert!(violations[1].contains("proton-os-interface v0.3.4"));
+        assert!(
+            violations.iter().any(|v| v.contains("muon v3.0.1 drifts")),
+            "{violations:?}"
+        );
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.contains("muon") && v.contains("recorded in PROTON_TRAIN")),
+            "{violations:?}"
+        );
+    }
+
+    /// Codex review (P2): the gate validated every LOCKFILE entry
+    /// against the table but never the reverse — a recorded tuple that
+    /// VANISHED from the lockfile (a resolution change dropping one
+    /// side of a split, or a crate leaving the graph) passed silently.
+    /// The train is an exact pin: table and lockfile must match both
+    /// ways, so a disappearance forces a conscious table update.
+    #[test]
+    fn proton_train_rejects_a_vanished_recorded_tuple() {
+        let mut lock = String::new();
+        for (name, version) in PROTON_TRAIN {
+            if *name == "proton-os-interface" {
+                continue;
+            }
+            lock.push_str(&proton_lock_entry(name, version));
+        }
+        let violations = proton_train_violations(&lock);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].contains("proton-os-interface"),
+            "{violations:?}"
+        );
+        assert!(
+            violations[0].contains("recorded in PROTON_TRAIN"),
+            "{violations:?}"
+        );
     }
 
     #[test]
     fn proton_train_rejects_an_unrecorded_proton_package() {
-        let lock = proton_lock_entry("proton-vpn-newthing", "0.1.0");
+        let mut lock = String::new();
+        for (name, version) in PROTON_TRAIN {
+            lock.push_str(&proton_lock_entry(name, version));
+        }
+        lock.push_str(&proton_lock_entry("proton-vpn-newthing", "0.1.0"));
         let violations = proton_train_violations(&lock);
         assert_eq!(violations.len(), 1, "{violations:?}");
         assert!(violations[0].contains("missing from PROTON_TRAIN"));
