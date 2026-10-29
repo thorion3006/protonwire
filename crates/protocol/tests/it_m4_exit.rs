@@ -14,7 +14,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
-use proton_boringtun::StdTunn;
 use proton_boringtun::x25519::{PublicKey, StaticSecret};
 use protonwire_net::netns;
 use protonwire_protocol::Protocol;
@@ -76,15 +75,36 @@ fn spawn_mocked_peer(stop: Arc<AtomicBool>) -> (String, SocketAddr) {
     let public_base64 = base64::engine::general_purpose::STANDARD.encode(server_public.as_bytes());
 
     std::thread::spawn(move || {
-        let mut env = proton_boringtun::StdEnv::default();
-        let mut tunnel = StdTunn::new(
+        // boringtun 4 is PURE: no StdTunn/StdEnv batteries — the caller
+        // supplies the clock (os-interface nanosecond instants anchored
+        // to this thread's std Instant), the wall clock, the OS-seeded
+        // RNG, and the lock factory. Loose panics on contention, which
+        // is exactly right for this single-threaded responder.
+        use proton_boringtun::noise::Tunn;
+        use proton_boringtun::proton_os_interface::lock::Loose;
+        use proton_boringtun::proton_os_interface::time::FromDuration as _;
+        use proton_boringtun::proton_os_interface::time::Instant as OsInstant;
+        use proton_boringtun::proton_os_interface::time::SinceUnixEpoch as _;
+        use proton_boringtun::proton_os_interface::time::SystemTime as OsSystemTime;
+        use proton_boringtun::rand::SeedableRng as _;
+        use proton_boringtun::rand::rngs::StdRng;
+
+        let epoch = Instant::now();
+        let unix = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .expect("wall clock after the epoch");
+        let mut rng_seed = <StdRng as SeedableRng>::Seed::default();
+        getrandom::fill(&mut rng_seed).expect("responder RNG entropy");
+        let mut tunnel: Tunn<StdRng, Loose> = Tunn::new(
             server_secret,
             client_public,
             None,
             None,
             0x5151_0002,
             None,
-            &mut env,
+            OsInstant::from_duration(epoch.elapsed()),
+            OsSystemTime::since_unix_epoch(unix),
+            StdRng::from_seed(rng_seed),
         );
         let mut buf = [0u8; 1500];
         let mut out = [0u8; 2048];
@@ -97,6 +117,15 @@ fn spawn_mocked_peer(stop: Arc<AtomicBool>) -> (String, SocketAddr) {
             };
             eprintln!("[m4-peer] received {len} bytes from {peer}");
             RESPONDER_RECEIVED.store(true, Ordering::Relaxed);
+            // The pure-Tunn contract: advance the timers at the start of
+            // every wake-up, BEFORE decapsulate — events are stamped
+            // with that time, and a timer-fired network write goes back
+            // to the peer we just heard from.
+            if let proton_boringtun::noise::TunnResult::WriteToNetwork(bytes) =
+                tunnel.update_timers(&mut out, OsInstant::from_duration(epoch.elapsed()))
+            {
+                let _ = socket.send_to(bytes, peer);
+            }
             // decapsulate answers handshakes/messages; per its
             // contract a WriteToNetwork is followed by
             // empty-datagram calls until Done (queued packets drain).

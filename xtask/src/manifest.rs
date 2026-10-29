@@ -15,7 +15,7 @@ use serde::Deserialize;
 
 use crate::{Reporter, expect_value, is_capability_id, is_git_revision, is_test_id, set_drift};
 
-const PROTON_REVISION: &str = "836715cdb288f810cd6518e2f3d917fa456a8493";
+const PROTON_REVISION: &str = "a498c38ae6ffb0e68e7190b2831ef985d73fa6da";
 
 /// The six pinned official-client baselines (upstream name → recorded git
 /// revision from docs/official-parity.yaml), in the EXPECTED_GROUP_IDS pin
@@ -536,7 +536,7 @@ fn check_upstream(doc: &Manifest, lock: &Lockfile) -> Vec<String> {
         Some(entry) => {
             violations.extend(expect_value(
                 entry.version.as_deref(),
-                "3.0.1",
+                "3.0.5",
                 "upstream.protun.version",
             ));
             violations.extend(expect_value(
@@ -548,7 +548,7 @@ fn check_upstream(doc: &Manifest, lock: &Lockfile) -> Vec<String> {
             // drifting from what Cargo actually resolved.
             violations.extend(expect_lock_revision(
                 entry.revision.as_deref(),
-                lock.git_rev("protun", "3.0.1"),
+                lock.git_rev("protun", "3.0.5"),
                 "upstream.protun.revision",
             ));
         }
@@ -575,12 +575,12 @@ fn check_upstream(doc: &Manifest, lock: &Lockfile) -> Vec<String> {
         Some(entry) => {
             violations.extend(expect_value(
                 entry.version.as_deref(),
-                "4.0.2",
+                "4.4.1",
                 "upstream.pvpnclient.version",
             ));
             violations.extend(expect_lock_checksum(
                 entry.checksum_sha256.as_deref(),
-                lock.checksum("pvpnclient", "4.0.2"),
+                lock.checksum("pvpnclient", "4.4.1"),
                 "upstream.pvpnclient.checksum_sha256",
             ));
         }
@@ -837,8 +837,8 @@ mod tests {
     use super::*;
     /// A minimal lockfile fixture matching the good manifest's pins — the
     /// real Cargo.lock carries the same two checksums for muon 3.0.0 and
-    /// pvpnclient 4.0.2 (Proton sparse-registry entries) and the same git
-    /// source for protun 3.0.1 (`git+…?rev=…#…`, the fragment being the
+    /// pvpnclient 4.4.1 (Proton sparse-registry entries) and the same git
+    /// source for protun 3.0.5 (`git+…?rev=…#…`, the fragment being the
     /// commit Cargo actually resolved).
     fn good_lockfile_text() -> String {
         "\
@@ -852,14 +852,14 @@ checksum = \"d06175b95acecae21bfaf373f98520ffd6c5fc0627e58d70e6a4a5edc93dc24c\"
 
 [[package]]
 name = \"pvpnclient\"
-version = \"4.0.2\"
+version = \"4.4.1\"
 source = \"sparse+https://rust-registry.proton.me/index/\"
-checksum = \"91fa3157e1b9281006159a0e29c44c05aa0741c9426558fc0d83322d58c8b3ba\"
+checksum = \"c4ef1cf71afb4aa861dddf4092784bdf8deea277b5ba2e27536555e059d50941\"
 
 [[package]]
 name = \"protun\"
-version = \"3.0.1\"
-source = \"git+https://github.com/ProtonVPN/protun?rev=1c3aa646175ae12e22f17621306d403ad2a37017#836715cdb288f810cd6518e2f3d917fa456a8493\"
+version = \"3.0.5\"
+source = \"git+https://github.com/ProtonVPN/protun?rev=caaf2620d9f93fe0fd1a9c5c836fe5627a0a2bd9#a498c38ae6ffb0e68e7190b2831ef985d73fa6da\"
 "
         .to_string()
     }
@@ -882,14 +882,14 @@ client_contract:
   required_v1_clients: [cli, tui, gui]
 upstream:
   protun:
-    version: 3.0.1
-    revision: 836715cdb288f810cd6518e2f3d917fa456a8493
+    version: 3.0.5
+    revision: a498c38ae6ffb0e68e7190b2831ef985d73fa6da
   muon:
     version: 3.0.0
     checksum_sha256: d06175b95acecae21bfaf373f98520ffd6c5fc0627e58d70e6a4a5edc93dc24c
   pvpnclient:
-    version: 4.0.2
-    checksum_sha256: 91fa3157e1b9281006159a0e29c44c05aa0741c9426558fc0d83322d58c8b3ba
+    version: 4.4.1
+    checksum_sha256: c4ef1cf71afb4aa861dddf4092784bdf8deea277b5ba2e27536555e059d50941
   official_linux_cli:
     revision: a7c7abc8d3777f33b8d4c82279bd621258bd810d
   official_linux_gui:
@@ -1041,8 +1041,8 @@ capabilities:
         // QA mutation gap (item G5): the symmetric tamper on the pvpnclient
         // digest — the muon case passing does not prove this branch.
         let yaml = good_manifest_yaml().replacen(
-            "91fa3157e1b9281006159a0e29c44c05aa0741c9426558fc0d83322d58c8b3ba",
-            "91fa3157e1b9281006159a0e29c44c05aa0741c9426558fc0d83322d58c8b3bb",
+            "c4ef1cf71afb4aa861dddf4092784bdf8deea277b5ba2e27536555e059d50941",
+            "c4ef1cf71afb4aa861dddf4092784bdf8deea277b5ba2e27536555e059d50942",
             1,
         );
         let path = temp_yaml("checksum-pvpn", &yaml);
@@ -1084,8 +1084,8 @@ capabilities:
         // (both well-formed, the manifest still equal to the constant
         // pin): only the lockfile cross-check can see the disagreement.
         let tampered = good_lockfile_text().replacen(
-            "836715cdb288f810cd6518e2f3d917fa456a8493",
-            "836715cdb288f810cd6518e2f3d917fa456a8494",
+            "a498c38ae6ffb0e68e7190b2831ef985d73fa6da",
+            "a498c38ae6ffb0e68e7190b2831ef985d73fa6db",
             1,
         );
         let path = temp_yaml("protun-lock", &good_manifest_yaml());
@@ -1122,8 +1122,8 @@ capabilities:
         assert!(
             check_upstream(&doc, &Lockfile::parse(&tampered).unwrap())
                 .iter()
-                .any(|v| v.contains("836715cdb288f810cd6518e2f3d917fa456a8493")
-                    && v.contains("836715cdb288f810cd6518e2f3d917fa456a8494")),
+                .any(|v| v.contains("a498c38ae6ffb0e68e7190b2831ef985d73fa6da")
+                    && v.contains("a498c38ae6ffb0e68e7190b2831ef985d73fa6db")),
             "the violation must name the recorded pin and the resolved revision"
         );
     }
@@ -1521,7 +1521,7 @@ capabilities:
 
     #[test]
     fn tampered_proton_pin_fails() {
-        let yaml = good_manifest_yaml().replacen("revision: 836715cd", "revision: not-th", 1);
+        let yaml = good_manifest_yaml().replacen("revision: a498c38a", "revision: not-th", 1);
         let path = temp_yaml("pin", &yaml);
         assert!(!validate(&path, &repo_root(), &good_lock()).unwrap());
         fs::remove_file(&path).ok();
@@ -1696,7 +1696,7 @@ capabilities:
         upstream.insert(
             "protun".to_string(),
             UpstreamEntry {
-                version: Some("3.0.1".to_string()),
+                version: Some("3.0.5".to_string()),
                 revision: Some(PROTON_REVISION.to_string()),
                 checksum_sha256: None,
             },
@@ -1714,10 +1714,10 @@ capabilities:
         upstream.insert(
             "pvpnclient".to_string(),
             UpstreamEntry {
-                version: Some("4.0.2".to_string()),
+                version: Some("4.4.1".to_string()),
                 revision: None,
                 checksum_sha256: Some(
-                    "91fa3157e1b9281006159a0e29c44c05aa0741c9426558fc0d83322d58c8b3ba".to_string(),
+                    "c4ef1cf71afb4aa861dddf4092784bdf8deea277b5ba2e27536555e059d50941".to_string(),
                 ),
             },
         );

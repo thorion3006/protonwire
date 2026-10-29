@@ -11,7 +11,7 @@
 { gui ? false }:
 let
   # nixos-unstable pinned 2026-09-12: rustc 1.98.1 / cargo 1.98.0. The
-  # repo pin and CI moved to 1.99.0 (rust-toolchain.toml, 2026-10-28);
+  # repo pin and CI moved to 1.99.1 (rust-toolchain.toml, 2026-10-29);
   # this snapshot still supplies 1.98.1 — above the 1.97.1 workspace
   # floor (rust-version, the CI msrv job) and sufficient to build the
   # whole tree. Bumping the snapshot to a 1.99-carrying nixpkgs rev

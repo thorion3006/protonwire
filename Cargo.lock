@@ -1413,9 +1413,9 @@ dependencies = [
 
 [[package]]
 name = "ctutils"
-version = "0.4.6"
+version = "0.4.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fe3e9d21d39e6f39ff46e03d5b621424f88ee23d8a1672c6bfc9ccc7f2da4f6a"
+checksum = "a2376ffd6f96d8a9db59875b4b6b0237d6900b5baf64279714e05493ce64828a"
 dependencies = [
  "cmov",
 ]
@@ -3885,18 +3885,6 @@ checksum = "650eef8c711430f1a879fdd01d4745a7deea475becfb90269c06775983bbf086"
 
 [[package]]
 name = "nix"
-version = "0.25.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f346ff70e7dbfd675fe90590b92d59ef2de15a8779ae305ebcbfd3f0caf59be4"
-dependencies = [
- "autocfg",
- "bitflags 1.3.2",
- "cfg-if",
- "libc",
-]
-
-[[package]]
-name = "nix"
 version = "0.29.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "71e2746dc3a24dd78b3cfcb7be93368c6de9963d30f43a6a73998a9cf4b17b46"
@@ -4647,7 +4635,7 @@ dependencies = [
  "snafu",
  "subtle",
  "twofish",
- "x25519-dalek",
+ "x25519-dalek 2.0.1",
  "zeroize",
 ]
 
@@ -5028,23 +5016,19 @@ dependencies = [
 
 [[package]]
 name = "proton-boringtun"
-version = "3.0.1"
+version = "4.9.0"
 source = "sparse+https://rust-registry.proton.me/index/"
-checksum = "098fcf977278ed11968e11340443c916e6ba9b2eb0d55056c9c82a7c757557b2"
+checksum = "0c10f0be52e40d51a36de1aa072bbd417b59042432c852fc3657a8772d678b34"
 dependencies = [
  "aead",
- "base64 0.13.1",
  "blake2",
  "chacha20poly1305",
- "hex",
  "hmac 0.12.1",
- "nix 0.25.1",
- "parking_lot",
  "proton-os-interface",
- "rand_core 0.6.4",
+ "rand 0.10.3",
  "ring",
  "tracing",
- "x25519-dalek",
+ "x25519-dalek 3.0.0",
 ]
 
 [[package]]
@@ -5169,9 +5153,9 @@ dependencies = [
 
 [[package]]
 name = "proton-vpn-local-agent"
-version = "0.12.7"
+version = "0.13.0"
 source = "sparse+https://rust-registry.proton.me/index/"
-checksum = "50ef7568274d2788eebefc811a7f887e7c423e3fbf9994cfc8aa0d179a260c4e"
+checksum = "19139ea3336efc154233c058c3b0cf81b34ad49b559aae44701f9b37b329e517"
 dependencies = [
  "futures",
  "futures-rustls",
@@ -5255,7 +5239,7 @@ dependencies = [
  "serde",
  "sha2 0.10.9",
  "thiserror 2.0.21",
- "x25519-dalek",
+ "x25519-dalek 2.0.1",
 ]
 
 [[package]]
@@ -5448,8 +5432,8 @@ dependencies = [
 
 [[package]]
 name = "protun"
-version = "3.0.1"
-source = "git+https://github.com/ProtonVPN/protun?rev=1c3aa646175ae12e22f17621306d403ad2a37017#836715cdb288f810cd6518e2f3d917fa456a8493"
+version = "3.0.5"
+source = "git+https://github.com/ProtonVPN/protun?rev=caaf2620d9f93fe0fd1a9c5c836fe5627a0a2bd9#a498c38ae6ffb0e68e7190b2831ef985d73fa6da"
 dependencies = [
  "derive_more 2.1.1",
  "itertools 0.15.0",
@@ -5501,9 +5485,9 @@ dependencies = [
 
 [[package]]
 name = "pvpnclient"
-version = "4.0.2"
+version = "4.4.1"
 source = "sparse+https://rust-registry.proton.me/index/"
-checksum = "91fa3157e1b9281006159a0e29c44c05aa0741c9426558fc0d83322d58c8b3ba"
+checksum = "c4ef1cf71afb4aa861dddf4092784bdf8deea277b5ba2e27536555e059d50941"
 dependencies = [
  "base64 0.13.1",
  "cookie_store",
@@ -8732,6 +8716,17 @@ dependencies = [
  "curve25519-dalek 4.1.3",
  "rand_core 0.6.4",
  "serde",
+ "zeroize",
+]
+
+[[package]]
+name = "x25519-dalek"
+version = "3.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e7e8131a03190127fb2263afc72b322ecadae46b6ff8c6f399ff5d02f5559af6"
+dependencies = [
+ "curve25519-dalek 5.0.0",
+ "rand_core 0.10.1",
  "zeroize",
 ]
 
