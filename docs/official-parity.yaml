@@ -33,7 +33,7 @@ client_contract:
 upstream:
   protun:
     version: 3.0.1
-    revision: 1c3aa646175ae12e22f17621306d403ad2a37017
+    revision: 836715cdb288f810cd6518e2f3d917fa456a8493
     source: https://github.com/ProtonVPN/protun/tree/v3.0.1
     license: GPL-3.0-or-later
     license_evidence: LICENSE file in source (GPLv3, verified 2026-10-08)

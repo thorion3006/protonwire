@@ -15,7 +15,7 @@ use serde::Deserialize;
 
 use crate::{Reporter, expect_value, is_capability_id, is_git_revision, is_test_id, set_drift};
 
-const PROTON_REVISION: &str = "1c3aa646175ae12e22f17621306d403ad2a37017";
+const PROTON_REVISION: &str = "836715cdb288f810cd6518e2f3d917fa456a8493";
 
 /// The six pinned official-client baselines (upstream name → recorded git
 /// revision from docs/official-parity.yaml), in the EXPECTED_GROUP_IDS pin
@@ -859,7 +859,7 @@ checksum = \"91fa3157e1b9281006159a0e29c44c05aa0741c9426558fc0d83322d58c8b3ba\"
 [[package]]
 name = \"protun\"
 version = \"3.0.1\"
-source = \"git+https://github.com/ProtonVPN/protun?rev=1c3aa646175ae12e22f17621306d403ad2a37017#1c3aa646175ae12e22f17621306d403ad2a37017\"
+source = \"git+https://github.com/ProtonVPN/protun?rev=1c3aa646175ae12e22f17621306d403ad2a37017#836715cdb288f810cd6518e2f3d917fa456a8493\"
 "
         .to_string()
     }
@@ -883,7 +883,7 @@ client_contract:
 upstream:
   protun:
     version: 3.0.1
-    revision: 1c3aa646175ae12e22f17621306d403ad2a37017
+    revision: 836715cdb288f810cd6518e2f3d917fa456a8493
   muon:
     version: 3.0.0
     checksum_sha256: d06175b95acecae21bfaf373f98520ffd6c5fc0627e58d70e6a4a5edc93dc24c
@@ -1084,9 +1084,9 @@ capabilities:
         // (both well-formed, the manifest still equal to the constant
         // pin): only the lockfile cross-check can see the disagreement.
         let tampered = good_lockfile_text().replacen(
-            "1c3aa646175ae12e22f17621306d403ad2a37017",
-            "1c3aa646175ae12e22f17621306d403ad2a37018",
-            2,
+            "836715cdb288f810cd6518e2f3d917fa456a8493",
+            "836715cdb288f810cd6518e2f3d917fa456a8494",
+            1,
         );
         let path = temp_yaml("protun-lock", &good_manifest_yaml());
         assert!(
@@ -1122,8 +1122,8 @@ capabilities:
         assert!(
             check_upstream(&doc, &Lockfile::parse(&tampered).unwrap())
                 .iter()
-                .any(|v| v.contains("1c3aa646175ae12e22f17621306d403ad2a37017")
-                    && v.contains("1c3aa646175ae12e22f17621306d403ad2a37018")),
+                .any(|v| v.contains("836715cdb288f810cd6518e2f3d917fa456a8493")
+                    && v.contains("836715cdb288f810cd6518e2f3d917fa456a8494")),
             "the violation must name the recorded pin and the resolved revision"
         );
     }
@@ -1521,7 +1521,7 @@ capabilities:
 
     #[test]
     fn tampered_proton_pin_fails() {
-        let yaml = good_manifest_yaml().replacen("revision: 1c3aa646", "revision: not-th", 1);
+        let yaml = good_manifest_yaml().replacen("revision: 836715cd", "revision: not-th", 1);
         let path = temp_yaml("pin", &yaml);
         assert!(!validate(&path, &repo_root(), &good_lock()).unwrap());
         fs::remove_file(&path).ok();

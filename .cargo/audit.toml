@@ -13,6 +13,10 @@ ignore = [
     # No fixed upgrade exists until upstream drops thiserror 1.x.
     # Revisit on every protun upgrade.
     "RUSTSEC-2024-0370",
+    # crypto-bigint timing variability (medium). Transitive via the
+    # proton engine chain. No fixed upgrade available in the train.
+    # Revisit on every protun upgrade.
+    "RUSTSEC-2026-0387",
 ]
 # The quick-xml ignores (RUSTSEC-2026-0194/0195) were dropped in the
 # 2026-09-17 refresh: the lockfile now resolves quick-xml 0.42.0, past
