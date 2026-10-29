@@ -548,7 +548,7 @@ fn check_upstream(doc: &Manifest, lock: &Lockfile) -> Vec<String> {
             // drifting from what Cargo actually resolved.
             violations.extend(expect_lock_revision(
                 entry.revision.as_deref(),
-                lock.git_rev("protun", "2.2.1"),
+                lock.git_rev("protun", "3.0.1"),
                 "upstream.protun.revision",
             ));
         }
@@ -836,7 +836,7 @@ fn status_counts(doc: &Manifest) -> BTreeMap<String, usize> {
 mod tests {
     use super::*;
     /// A minimal lockfile fixture matching the good manifest's pins — the
-    /// real Cargo.lock carries the same two checksums for muon 2.6.2 and
+    /// real Cargo.lock carries the same two checksums for muon 3.0.0 and
     /// pvpnclient 4.0.2 (Proton sparse-registry entries) and the same git
     /// source for protun 3.0.1 (`git+…?rev=…#…`, the fragment being the
     /// commit Cargo actually resolved).
@@ -1084,9 +1084,9 @@ capabilities:
         // (both well-formed, the manifest still equal to the constant
         // pin): only the lockfile cross-check can see the disagreement.
         let tampered = good_lockfile_text().replacen(
-            "12e7755a112f59b7b843da79290b3de25febf653",
-            "12e7755a112f59b7b843da79290b3de25febf654",
-            2,
+            "1c3aa646175ae12e22f17621306d403ad2a37017",
+            "1c3aa646175ae12e22f17621306d403ad2a37018",
+            1,
         );
         let path = temp_yaml("protun-lock", &good_manifest_yaml());
         assert!(
@@ -1122,8 +1122,8 @@ capabilities:
         assert!(
             check_upstream(&doc, &Lockfile::parse(&tampered).unwrap())
                 .iter()
-                .any(|v| v.contains("12e7755a112f59b7b843da79290b3de25febf653")
-                    && v.contains("12e7755a112f59b7b843da79290b3de25febf654")),
+                .any(|v| v.contains("1c3aa646175ae12e22f17621306d403ad2a37017")
+                    && v.contains("1c3aa646175ae12e22f17621306d403ad2a37018")),
             "the violation must name the recorded pin and the resolved revision"
         );
     }
@@ -1198,7 +1198,7 @@ capabilities:
         // The same package+version twice (a second source, no checksum):
         // indistinguishable from the real entry by the map key alone.
         let duplicated = format!(
-            "{}\n[[package]]\nname = \"muon\"\nversion = \"2.6.2\"\nsource = \"git+https://example.com/muon?rev=deadbeef\"\n",
+            "{}\n[[package]]\nname = \"muon\"\nversion = \"3.0.0\"\nsource = \"git+https://example.com/muon?rev=deadbeef\"\n",
             good_lockfile_text()
         );
         let outcome = Lockfile::parse(&duplicated);
@@ -1521,7 +1521,7 @@ capabilities:
 
     #[test]
     fn tampered_proton_pin_fails() {
-        let yaml = good_manifest_yaml().replacen("revision: 12e7755a", "revision: not-th", 1);
+        let yaml = good_manifest_yaml().replacen("revision: 1c3aa646", "revision: not-th", 1);
         let path = temp_yaml("pin", &yaml);
         assert!(!validate(&path, &repo_root(), &good_lock()).unwrap());
         fs::remove_file(&path).ok();
@@ -1696,7 +1696,7 @@ capabilities:
         upstream.insert(
             "protun".to_string(),
             UpstreamEntry {
-                version: Some("2.2.1".to_string()),
+                version: Some("3.0.1".to_string()),
                 revision: Some(PROTON_REVISION.to_string()),
                 checksum_sha256: None,
             },
@@ -1704,20 +1704,20 @@ capabilities:
         upstream.insert(
             "muon".to_string(),
             UpstreamEntry {
-                version: Some("2.6.2".to_string()),
+                version: Some("3.0.0".to_string()),
                 revision: None,
                 checksum_sha256: Some(
-                    "63c7119344a07143093b5790d76e93c9e827e2a3a1bca1643a5951ffd2f8e3b3".to_string(),
+                    "d06175b95acecae21bfaf373f98520ffd6c5fc0627e58d70e6a4a5edc93dc24c".to_string(),
                 ),
             },
         );
         upstream.insert(
             "pvpnclient".to_string(),
             UpstreamEntry {
-                version: Some("3.0.3".to_string()),
+                version: Some("4.0.2".to_string()),
                 revision: None,
                 checksum_sha256: Some(
-                    "3c14ef052727e0204ec5e80cf8df50786db38a83b6a6557a188b78a4c264f380".to_string(),
+                    "91fa3157e1b9281006159a0e29c44c05aa0741c9426558fc0d83322d58c8b3ba".to_string(),
                 ),
             },
         );
