@@ -82,7 +82,6 @@ fn spawn_mocked_peer(stop: Arc<AtomicBool>) -> (String, SocketAddr) {
         // is exactly right for this single-threaded responder.
         use proton_boringtun::noise::Tunn;
         use proton_boringtun::proton_os_interface::lock::Loose;
-        use proton_boringtun::proton_os_interface::time::FromDuration as _;
         use proton_boringtun::proton_os_interface::time::Instant as OsInstant;
         use proton_boringtun::proton_os_interface::time::SinceUnixEpoch as _;
         use proton_boringtun::proton_os_interface::time::SystemTime as OsSystemTime;
