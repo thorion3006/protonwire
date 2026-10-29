@@ -16,9 +16,9 @@
 //! The mark space: the 32-bit space less the IANA-reserved
 //! `ip-rule` fwmark octets (0x00000000-0x0000FFFF and
 //! 0xFFFF0000-0xFFFFFFFF, RFC 3542's legacy user marks) and less the
-//! M4 constant band (0xCA6C00.. — the legacy `BYPASS_MARK`
-//! 0x51820 and the routing tables' 51820-51822 neighborhood, kept
-//! out to avoid confusing the two namespaces).
+//! M4 constant neighborhood (the legacy `BYPASS_MARK` 0x51820 and
+//! the routing tables' 51820-51822 ids, kept out to avoid confusing
+//! the two namespaces).
 
 use std::collections::BTreeSet;
 
@@ -27,7 +27,7 @@ use crate::route_drift::{BYPASS_RULE_PRIORITY, FULL_TUNNEL_RULE_PRIORITY};
 use crate::route_txn::{NetOpError, NetlinkExecutor};
 
 /// The allocator's refusal: the space is saturated (statistically
-/// unreachable — 2^30 candidates against a handful of live marks) or
+/// unreachable — ~49M candidates against a handful of live marks) or
 /// a survey failed.
 #[derive(Debug, thiserror::Error)]
 pub enum MarkError {
@@ -58,19 +58,26 @@ pub const MARK_MIN: u32 = 0x0010_0000;
 pub const MARK_MAX: u32 = 0x03FF_FFFF;
 
 /// Draws one uniformly random candidate inside
-/// ([`MARK_MIN`], [`MARK_MAX`]). `None` is impossible by
-/// construction — the range excludes zero — but the caller treats a
-/// degenerate 0 as a retry anyway (the kill switch refuses mark 0).
+/// ([`MARK_MIN`], [`MARK_MAX`]). Zero is impossible by construction —
+/// the range excludes it — but the chooser treats a degenerate 0 as a
+/// retry anyway (the kill switch refuses mark 0).
 fn random_candidate() -> u32 {
     let mut bytes = [0u8; 4];
-    // getrandom cannot fail on Linux after the boot entropy pool
-    // initializes; a failure here is unrecoverable for a SECURITY
-    // decision (a fallback to a deterministic mark would be a
-    // fingerprint) — panic loud, like the engine's own entropy uses.
+    // Deliberate panic (the rust gate's P3, dispositioned): the
+    // codebase's other entropy uses degrade (the scheduler's jitter
+    // falls back to 0) or propagate Err (the api runtime) — neither
+    // is right for a SECURITY mark: a deterministic fallback would
+    // fingerprint every install, and the caller has no safe default.
+    // Startup-only path: a panic here fails the daemon closed before
+    // anything arms.
     getrandom::fill(&mut bytes).expect("OS entropy for the bypass mark");
-    // 22 bits of entropy inside the space (0x00010000..=0x03FFFFFF):
-    // mask, then offset past the reserved low octet.
-    (u32::from_be_bytes(bytes) & 0x03FF_FFFF) | MARK_MIN
+    // Uniform over [0, RANGE): multiply-shift (Lemire) — a modulo
+    // would bias toward the low end of the space (2^32 mod RANGE is
+    // non-trivial), and a mask+OR would leave part of the space
+    // structurally unreachable (the rust gate's P2: the original
+    // mask-then-OR forced bit 20 set, killing the bit-20-clear half).
+    const RANGE: u32 = MARK_MAX - MARK_MIN + 1;
+    MARK_MIN + ((u64::from(u32::from_be_bytes(bytes)) * u64::from(RANGE)) >> 32) as u32
 }
 
 /// THE PURE CHOOSER: one random mark not in `taken` (attempts are
@@ -222,6 +229,28 @@ mod tests {
                 "candidate {candidate:#x} outside the space"
             );
         }
+    }
+
+    /// The rust gate's P2: the original mask-then-OR forced bit 20
+    /// (MARK_MIN's top bit) set in EVERY draw — the entire bit-20-
+    /// clear half of the space was structurally unreachable and the
+    /// draw non-uniform over the owner-decision interval. The
+    /// multiply-shift draw must reach both halves.
+    #[test]
+    fn random_candidates_reach_both_halves_of_the_space() {
+        let mut bit20_clear = 0usize;
+        let mut bit20_set = 0usize;
+        for _ in 0..10_000 {
+            if random_candidate() & MARK_MIN == 0 {
+                bit20_clear += 1;
+            } else {
+                bit20_set += 1;
+            }
+        }
+        assert!(
+            bit20_clear > 100 && bit20_set > 100,
+            "the draw must reach both halves: clear={bit20_clear} set={bit20_set}"
+        );
     }
 
     #[test]

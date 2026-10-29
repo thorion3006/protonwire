@@ -181,9 +181,13 @@ pub trait NetlinkExecutor {
         session: &[NetOp],
     ) -> impl Future<Output = Result<Vec<NetOp>, NetOpError>> + Send;
 
-    /// Every fwmark referenced by any LIVE policy rule (both
+    /// Every fwmark referenced by any LIVE FOREIGN policy rule (both
     /// families) — the mark-collision survey's netlink half (the
-    /// bypass-mark owner decision, 2026-10-08): a mark another
+    /// bypass-mark owner decision, 2026-10-08). CONTRACT: the set is
+    /// FOREIGN-ONLY — rules attributed to US (the canonical
+    /// 31699..=31700 priority band) are excluded, because our own
+    /// prior-session residue must not block re-choosing our own mark
+    /// (the allocator wedges if an impl counts them). A mark another
     /// subsystem routes by is TAKEN, whoever owns the rule.
     fn rule_marks(&mut self) -> impl Future<Output = Result<BTreeSet<u32>, NetOpError>> + Send;
 }
