@@ -18,6 +18,8 @@ rtnetlink = { workspace = true }
 futures-util = { workspace = true }
 rustables = { workspace = true }
 nix = { workspace = true }
+# the bypass-mark allocator's OS entropy (in-graph via the ring/muon paths)
+getrandom = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }
