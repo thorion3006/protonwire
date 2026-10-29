@@ -250,6 +250,13 @@ fn decode_peer(peer: &crate::params::PeerParams) -> Result<Vec<PeerInfo>, Protoc
                     tls_ports: Vec::new(),
                     priority: peer.priority,
                     exit_label: peer.exit_label.clone(),
+                    // protun v3.0.5: the local agent's DNS name for the
+                    // server. Our PeerParams carry only entry IPs — no
+                    // domain — so the agent falls back to its IP-derived
+                    // default (None skips the builder call entirely).
+                    // Plumb the catalog's server domains here when the
+                    // connection plan starts carrying them (M6).
+                    server_name: None,
                 };
                 install(&mut info);
                 candidates.push(info);
