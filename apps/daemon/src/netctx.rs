@@ -39,6 +39,12 @@ pub struct NetContext {
     /// The shared netlink handle (the rtnetlink connection is
     /// spawned on the daemon's runtime at startup).
     pub handle: rtnetlink::Handle,
+    /// The daemon's async runtime (the lane composes the async net
+    /// session from sync IPC-handler threads via `block_on`).
+    pub runtime: tokio::runtime::Handle,
+    /// The TUN interface's name (the engine's `if_name`; carried for
+    /// the session's DNS revert and teardown).
+    pub tun_ifname: String,
     /// `/etc/iproute2/rt_tables` as read at startup (empty when the
     /// file is absent — the planner treats named tables as absent).
     pub rt_tables: String,
@@ -58,6 +64,7 @@ impl NetContext {
     /// the mark against the live world, survey the uplink.
     pub fn startup(
         runtime: tokio::runtime::Handle,
+        tun_ifname: String,
         dns: DnsConfig,
         ipv6: Ipv6Desired,
     ) -> Result<Self, NetStartupError> {
@@ -77,6 +84,8 @@ impl NetContext {
         Ok(Self {
             mark,
             handle,
+            runtime,
+            tun_ifname,
             rt_tables,
             dns,
             ipv6,
@@ -92,6 +101,25 @@ impl NetContext {
     pub fn next_generation(&self) -> GenerationId {
         GenerationId(self.generation.fetch_add(1, Ordering::SeqCst).into())
     }
+}
+
+/// The interface index for `name`, via the link dump — the same
+/// netlink view the route transaction commits against (no C-ABI
+/// call: the workspace denies unsafe).
+pub async fn ifindex_by_name(handle: &rtnetlink::Handle, name: &str) -> Option<u32> {
+    use futures_util::StreamExt;
+    let mut links = handle.link().get().execute();
+    while let Some(message) = links.next().await {
+        let Ok(message) = message else { continue };
+        for attribute in &message.attributes {
+            if let rtnetlink::packet_route::link::LinkAttribute::IfName(if_name) = attribute
+                && if_name == name
+            {
+                return Some(message.header.index);
+            }
+        }
+    }
+    None
 }
 
 /// The v4 default route's interface name (the uplink the kill switch
@@ -150,16 +178,18 @@ mod tests {
     #[test]
     fn generations_advance_from_one() {
         // The rtnetlink handle needs a reactor even to CONSTRUCT —
-        // a throwaway current-thread runtime supplies one for the
-        // duration of the call; the handle is never used here.
-        let handle = tokio::runtime::Builder::new_current_thread()
+        // a throwaway current-thread runtime supplies one and stays
+        // alive for the context's lifetime (its handle is a field).
+        let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
-            .expect("test runtime")
-            .block_on(async { rtnetlink::new_connection().expect("netlink").1 });
+            .expect("test runtime");
+        let handle = runtime.block_on(async { rtnetlink::new_connection().expect("netlink").1 });
         let context = NetContext {
             mark: 0x0010_0001,
             handle,
+            runtime: runtime.handle().clone(),
+            tun_ifname: "pw-test0".to_owned(),
             rt_tables: String::new(),
             dns: DnsConfig {
                 mode: protonwire_net::dns::DnsMode::None,

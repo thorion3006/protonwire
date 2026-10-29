@@ -21,6 +21,8 @@ use std::time::Duration;
 
 use protonwire_core::state::DaemonCore as CoreState;
 use protonwire_frontend_api::VpnState;
+use protonwire_net::kill_switch::KillSwitchPolicy;
+use protonwire_net::session::{self, SessionError, SessionState};
 use protonwire_protocol::engine::{
     ActiveConnection, ConnectionEngine, EngineConfig, EngineConnectionState, EngineEvent,
     EngineMode, EngineMuonEnv, EngineVpnState,
@@ -28,9 +30,7 @@ use protonwire_protocol::engine::{
 use protonwire_protocol::params::TunnelParams;
 use protonwire_protocol::{EngineError, PersistenceFacade, SharedFacadeCache};
 
-/// The bypass mark (FR-32B): M5's policy routes match this value; the
-/// table IDs (51820-51822) live beside it in `protonwire_net`.
-pub const BYPASS_MARK: u32 = 0x51820;
+use crate::netctx::NetContext;
 
 /// Why a lane call refused.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -57,7 +57,9 @@ pub enum LaneRefusal {
     Disconnecting,
 }
 
-/// A failed connect: the typed refusal or the engine's own error.
+/// A failed connect: the typed refusal, the engine's own error, or
+/// the net session's phase-named failure (the session refuses typed
+/// per PHASE — the daemon surfaces the phase, not a generic error).
 #[derive(Debug, thiserror::Error)]
 pub enum LaneError {
     /// The owner gate refused.
@@ -66,6 +68,10 @@ pub enum LaneError {
     /// The engine could not compose/start the connection.
     #[error("{0}")]
     Engine(#[from] EngineError),
+    /// The net session (kill switch / routes / DNS) failed — the
+    /// variant's phase names where.
+    #[error("{0}")]
+    Net(#[from] SessionError),
 }
 
 /// The owner gate (pure, pinned): one connection, one owner.
@@ -94,13 +100,19 @@ type ConnectionSlot = Arc<Mutex<Option<ActiveConnection>>>;
 struct ActiveLane {
     connection: ConnectionSlot,
     pump: JoinHandle<()>,
+    /// The M6 1b net session state (what disconnect must undo). Set
+    /// only after the full composition succeeded; teardown runs it
+    /// BEFORE the engine teardown (DNS revert → routes → switch, the
+    /// M5 inverse).
+    session: Option<SessionState>,
 }
 
 impl ActiveLane {
     /// Takes the connection out (whoever gets it first) and waits for
     /// the pump to exit — teardown and pump-death race for the same
-    /// slot, exactly once either way.
-    fn teardown(self) {
+    /// slot, exactly once either way. The net session reverts FIRST.
+    fn teardown(self, net: &NetContext) {
+        revert_session(net, self.session.as_ref(), &net.tun_ifname);
         let taken = self.connection.lock().map(|mut slot| slot.take());
         if let Ok(Some(connection)) = taken {
             connection.disconnect();
@@ -113,20 +125,53 @@ impl ActiveLane {
     /// slot the moment the caller decides to tear down — a dequeued
     /// stale state can no longer observe the populated slot and
     /// publish through the transition. The caller then publishes the
-    /// transition and calls finish_tear to disconnect and join.
-    fn retire(self) -> (Option<ActiveConnection>, JoinHandle<()>) {
+    /// transition and calls finish_tear to revert the session,
+    /// disconnect and join.
+    fn retire(
+        self,
+    ) -> (
+        Option<ActiveConnection>,
+        Option<SessionState>,
+        JoinHandle<()>,
+    ) {
         let taken = self.connection.lock().map(|mut slot| slot.take());
-        (taken.ok().flatten(), self.pump)
+        (taken.ok().flatten(), self.session, self.pump)
     }
 }
 
-/// The second half of [`ActiveLane::retire`]: disconnect the retired
-/// connection and join the pump.
-fn finish_tear(retired: Option<ActiveConnection>, pump: JoinHandle<()>) {
+/// The second half of [`ActiveLane::retire`]: revert the net session
+/// (best-effort — teardown must proceed even when the revert fails;
+/// the failure is logged), disconnect the retired connection and
+/// join the pump.
+fn finish_tear(
+    net: &NetContext,
+    retired: Option<ActiveConnection>,
+    session: Option<SessionState>,
+    pump: JoinHandle<()>,
+) {
+    revert_session(net, session.as_ref(), &net.tun_ifname);
     if let Some(connection) = retired {
         connection.disconnect();
     }
     let _ = pump.join();
+}
+
+/// The M5 inverse, best-effort: DNS revert → route cleanup → kill
+/// switch remove. A failed revert is LOGGED, never blocking — the
+/// engine teardown must run either way, and the switch's own
+/// lookalike/live-marker discipline governs what remains.
+fn revert_session(net: &NetContext, state: Option<&SessionState>, if_name: &str) {
+    let Some(state) = state else { return };
+    let mut executor = protonwire_net::route_txn::RtnetlinkExecutor::new(net.handle.clone());
+    if let Err(error) = net.runtime.block_on(session::disconnect(
+        &mut executor,
+        state,
+        if_name,
+        false, // permanent mode is the config lane's, not the lane's
+        None,
+    )) {
+        tracing::error!(%error, if_name, "the net session revert failed (best-effort teardown)");
+    }
 }
 
 #[derive(Default)]
@@ -194,29 +239,35 @@ fn disconnect_refusal(lane: &LaneState, draining: bool) -> Option<LaneRefusal> {
 }
 
 /// The lane. Construct once at daemon startup with the production
-/// mode; the engine inside is stateless configuration.
+/// mode and the startup-allocated net context; the engine inside is
+/// stateless configuration.
 pub struct ConnectionLane {
     engine: ConnectionEngine,
     facade: Arc<PersistenceFacade>,
     core: Arc<CoreState>,
+    net: NetContext,
     state: SharedLane,
     draining: AtomicBool,
 }
 
 impl ConnectionLane {
     /// The production lane: LocalAgent mode over the encrypted cache
-    /// (FR-32A), interface name from the daemon config (FR-26).
+    /// (FR-32A), interface name from the daemon config (FR-26), the
+    /// STARTUP-ALLOCATED bypass mark (the 2026-10-08 owner decision)
+    /// reaching the engine, the switch, and the policy rules as ONE
+    /// value.
     pub fn new(
-        if_name: String,
+        net: NetContext,
         user_agent: String,
         app_version: String,
         facade: Arc<PersistenceFacade>,
         core: Arc<CoreState>,
     ) -> Self {
+        let if_name = net.tun_ifname.clone();
         Self {
             engine: ConnectionEngine::new(EngineConfig {
                 if_name,
-                bypass_mark: BYPASS_MARK,
+                bypass_mark: net.mark,
                 mode: EngineMode::LocalAgent {
                     user_agent,
                     app_version,
@@ -226,6 +277,7 @@ impl ConnectionLane {
             }),
             facade,
             core,
+            net,
             state: Arc::new(Mutex::new(LaneState::default())),
             draining: AtomicBool::new(false),
         }
@@ -286,9 +338,9 @@ impl ConnectionLane {
             // P2): the slot empties BEFORE the transition publishes —
             // a just-dequeued stale state meets an empty slot at the
             // retirement check and never reverts Disconnecting.
-            let (retired, pump) = active.retire();
+            let (retired, session, pump) = active.retire();
             self.core.set_vpn_state(VpnState::Disconnecting);
-            finish_tear(retired, pump);
+            finish_tear(&self.net, retired, session, pump);
         }
         let mut lane = self
             .state
@@ -334,6 +386,26 @@ impl ConnectionLane {
                 return Err(error.into());
             }
         };
+        // === THE NET COMPOSITION (M6 1b, IT-13) ===
+        // The engine owns the TUN and the marked outer sockets; the
+        // session owns the kill switch, the routes, and the DNS. The
+        // ORDER is the contract: the engine's marks are health-gated
+        // FIRST (no route commits before at least one outer socket
+        // carried the bypass mark — FR-32B's gate), then the session
+        // arms and routes. A composition failure tears the engine
+        // connection down — nothing half-armed survives.
+        let composed = match self.compose_net_session(&connection) {
+            Ok(session) => session,
+            Err(error) => {
+                connection.disconnect();
+                self.core.set_vpn_state(VpnState::Disconnected);
+                self.state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .reconnecting = false;
+                return Err(error);
+            }
+        };
         let mut lane = self
             .state
             .lock()
@@ -355,6 +427,7 @@ impl ConnectionLane {
         lane.active = Some(ActiveLane {
             connection: slot,
             pump,
+            session: Some(composed),
         });
         lane.owner = Some(uid);
         // The window closes HERE (the bot round-30 P2): the result is
@@ -363,6 +436,77 @@ impl ConnectionLane {
         // longer exists.
         lane.reconnecting = false;
         Ok(())
+    }
+
+    /// The M6 1b composition: gate the engine's marks (IT-13), then
+    /// run the M5 session sequence (mark re-check → kill switch →
+    /// routes → DNS) against the live host. Runs on the caller's
+    /// (IPC-handler) thread via the context's runtime `block_on` —
+    /// never inside a tokio worker (the kill-switch module's own
+    /// async-runtime contract).
+    fn compose_net_session(
+        &self,
+        connection: &ActiveConnection,
+    ) -> Result<SessionState, LaneError> {
+        // IT-13's gate: no route commits before the engine's outer
+        // sockets carry the bypass mark — `healthy()` is the
+        // all-marked + ≥1-reported + nothing-in-flight snapshot.
+        if !connection.mark_health().healthy() {
+            return Err(SessionError::Plan(
+                "the engine's outer sockets are not (all) bypass-marked — refusing to \
+                 commit routes (IT-13)"
+                    .to_owned(),
+            )
+            .into());
+        }
+        let net = &self.net;
+        // The TUN's kernel index (the engine created it by name) —
+        // via the link dump: no unsafe, and the answer is the same
+        // netlink view the route transaction commits against.
+        let tun_ifindex = net
+            .runtime
+            .block_on(crate::netctx::ifindex_by_name(&net.handle, &net.tun_ifname))
+            .ok_or_else(|| {
+                SessionError::Plan(format!(
+                    "the TUN interface {} has no kernel index (not created?)",
+                    net.tun_ifname
+                ))
+            })?;
+        // The uplink: re-detect per connect (a DHCP renew may have
+        // moved the default route since startup).
+        let uplink_ifname = net
+            .runtime
+            .block_on(crate::netctx::detect_uplink(&net.handle))
+            .or_else(|| net.uplink_ifname.clone())
+            .ok_or_else(|| {
+                SessionError::Plan("no default route — no uplink for the kill switch".to_owned())
+            })?;
+        let mut executor = protonwire_net::route_txn::RtnetlinkExecutor::new(net.handle.clone());
+        let inputs = session::ConnectInputs {
+            tun_ifindex,
+            tun_ifname: net.tun_ifname.clone(),
+            uplink_ifname,
+            bypass_mark: net.mark,
+            ipv6: net.ipv6,
+            dns: net.dns.clone(),
+            generation: net.next_generation(),
+            prior_generation: None, // the persisted-record lane's
+            persisted_tables: None, // (live-marker discipline governs)
+        };
+        let policy = KillSwitchPolicy {
+            tun_ifindex,
+            allow_dhcp_v4: true, // lease renewal while the tunnel establishes
+            lan_permits: Vec::new(),
+            bypass_mark: net.mark,
+        };
+        net.runtime
+            .block_on(session::connect(
+                &mut executor,
+                &net.rt_tables,
+                &inputs,
+                &policy,
+            ))
+            .map_err(Into::into)
     }
 
     /// Tears the active connection down. Only the owner (a disconnect
@@ -411,9 +555,9 @@ impl ConnectionLane {
         // after the join (round-26); idempotent when nothing was
         // taken (round-27).
         if let Some(active) = active {
-            let (retired, pump) = active.retire();
+            let (retired, session, pump) = active.retire();
             self.core.set_vpn_state(VpnState::Disconnecting);
-            finish_tear(retired, pump);
+            finish_tear(&self.net, retired, session, pump);
             self.core.set_vpn_state(VpnState::Disconnected);
         }
         // CLEAR ONLY THE WINDOW THIS CALL ARMED (the bot round-38 P2,
@@ -475,7 +619,7 @@ impl ConnectionLane {
             break lane.active.take();
         };
         if let Some(active) = active {
-            active.teardown();
+            active.teardown(&self.net);
         }
         if armed {
             // Released only by the caller that armed it; a waiter
