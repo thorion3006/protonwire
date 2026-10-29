@@ -391,7 +391,7 @@ mod tests {
         let health = Arc::new(MarkHealth::new());
         // A first SUCCESSFUL mark (the latch goes green, reported=1).
         let done = Arc::new(RecordingApplier::default());
-        MarkingFdCallback::new(done, health.clone()).on_socket_fd_available(1);
+        MarkingFdCallback::new(done, health.clone()).protect_socket(1);
         assert!(health.healthy(), "the first success opens the gate");
         // A second callback parks inside apply_mark.
         let entered = Arc::new(std::sync::Barrier::new(2));
@@ -403,7 +403,7 @@ mod tests {
             }),
             Arc::clone(&health),
         );
-        let handle = std::thread::spawn(move || parked.on_socket_fd_available(2));
+        let handle = std::thread::spawn(move || parked.protect_socket(2));
         entered.wait();
         assert!(
             !health.healthy(),
