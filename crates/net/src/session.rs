@@ -92,13 +92,22 @@ pub async fn connect<E: NetlinkExecutor>(
     inputs: &ConnectInputs,
     kill_policy_extras: &KillSwitchPolicy,
 ) -> Result<SessionState, SessionError> {
-    // === MARK COLLISION CHECK (the M6 contract, landed early) ===
-    // The bypass mark must not collide with any live fwmark or nft
-    // mark-matching rule (the sec-auditor's F6 finding). The check
-    // is here because the mark is about to be baked into rules.
-    // TODO: the live check (dump ip rules' fwmarks + nftables mark
-    // matches) lands with the daemon's survey; the structural
-    // check (mark != 0) is in the kill switch's apply.
+    // === MARK COLLISION RE-CHECK (the M6 contract) ===
+    // The owner decision 2026-10-08: the daemon chose its bypass
+    // mark randomly at STARTUP, but the world moved since — the
+    // check re-runs HERE, inside the route commit and BEFORE the
+    // kill switch arms (the mark is about to be baked into rules;
+    // arming on a colliding mark would punch another subsystem's
+    // traffic through our switch). A collision refuses typed — the
+    // daemon re-allocates and retries the whole sequence.
+    if crate::mark::session_collision(executor, inputs.bypass_mark)
+        .await
+        .map_err(|e| SessionError::Netlink(e.to_string()))?
+    {
+        return Err(SessionError::MarkCollision {
+            mark: inputs.bypass_mark,
+        });
+    }
 
     // === PHASE 1: PLAN ===
     let plan = route_txn::plan_with(executor, rt_tables_text, inputs.persisted_tables.clone())
@@ -236,5 +245,70 @@ mod tests {
             persisted_tables: None,
         };
         assert_eq!(inputs.tun_ifname, "pw-tun0");
+    }
+
+    /// The route-commit re-check: a bypass mark referenced by a
+    /// FOREIGN policy rule refuses the sequence BEFORE the kill
+    /// switch arms — the typed MarkCollision the daemon retries with
+    /// a fresh allocation. The netlink half decides this unit-level
+    /// (the netns IT proves both halves live).
+    #[tokio::test]
+    async fn a_colliding_bypass_mark_refuses_before_the_kill_switch_arms() {
+        use crate::route_txn::{NetOp, NetOpError};
+        use crate::tables::TableSurvey;
+        use std::collections::BTreeSet;
+
+        struct CollidingMark(u32);
+        impl crate::route_txn::NetlinkExecutor for CollidingMark {
+            async fn exec(&mut self, _op: NetOp) -> Result<bool, NetOpError> {
+                Ok(true)
+            }
+            async fn survey(&mut self, _text: &str) -> Result<TableSurvey, NetOpError> {
+                Ok(TableSurvey::default())
+            }
+            async fn present_ops(&mut self, _desired: &[NetOp]) -> Result<Vec<NetOp>, NetOpError> {
+                Ok(Vec::new())
+            }
+            async fn cleanup_ops(&mut self, _session: &[NetOp]) -> Result<Vec<NetOp>, NetOpError> {
+                Ok(Vec::new())
+            }
+            async fn rule_marks(&mut self) -> Result<BTreeSet<u32>, NetOpError> {
+                Ok([self.0].into_iter().collect())
+            }
+        }
+
+        let mut executor = CollidingMark(0x0020_2020);
+        let inputs = ConnectInputs {
+            tun_ifindex: 5,
+            tun_ifname: "pw-tun0".into(),
+            uplink_ifname: "eth0".into(),
+            bypass_mark: 0x0020_2020,
+            ipv6: Ipv6Desired::Blocked,
+            dns: DnsConfig {
+                mode: dns::DnsMode::None,
+                servers: vec![],
+                routing: dns::DnsRouting::ThroughVpn,
+            },
+            generation: GenerationId(1),
+            prior_generation: None,
+            persisted_tables: None,
+        };
+        let error = connect(
+            &mut executor,
+            "",
+            &inputs,
+            &KillSwitchPolicy {
+                tun_ifindex: 5,
+                allow_dhcp_v4: false,
+                lan_permits: Vec::new(),
+                bypass_mark: 0x0020_2020,
+            },
+        )
+        .await
+        .expect_err("the colliding mark must refuse");
+        assert!(
+            matches!(error, SessionError::MarkCollision { mark } if mark == 0x0020_2020),
+            "typed MarkCollision, got {error:?}"
+        );
     }
 }
