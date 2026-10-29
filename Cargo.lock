@@ -5360,6 +5360,7 @@ name = "protonwire-net"
 version = "0.1.0"
 dependencies = [
  "futures-util",
+ "getrandom 0.3.4",
  "nix 0.31.3",
  "protonwire-frontend-api",
  "rtnetlink",
@@ -5397,6 +5398,7 @@ dependencies = [
  "proton-boringtun",
  "protonwire-net",
  "protun",
+ "rustls-pki-types",
  "thiserror 2.0.21",
  "tracing",
  "zeroize",

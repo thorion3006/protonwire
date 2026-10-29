@@ -219,6 +219,23 @@ fn decode_peer(peer: &crate::params::PeerParams) -> Result<Vec<PeerInfo>, Protoc
     // The raw bytes are Copy — each expanded candidate gets its own.
     let server_public_key = server_public_key.0;
 
+    // The sec gate's P3: protun UNWRAPS pvpnclient's with_server_name,
+    // which refuses a Domain that does not parse as a TLS ServerName —
+    // validate HERE with upstream's own predicate so a malformed
+    // catalog Domain is a typed peer refusal, never a daemon panic
+    // at connect time.
+    if let Some(name) = peer.server_name.as_deref()
+        && rustls_pki_types::ServerName::try_from(name).is_err()
+    {
+        return Err(ProtocolError::InvalidPeer(
+            peer.id.clone(),
+            format!(
+                "server_name {name:?} does not parse as a TLS ServerName \
+                 (the catalog's Domain is malformed)"
+            ),
+        ));
+    }
+
     let mut candidates: Vec<PeerInfo> = Vec::new();
     for (transport, endpoint) in [
         (Transport::Udp, &peer.udp),
@@ -421,6 +438,30 @@ mod tests {
         // behavior for domain-less entries).
         let config = translate(&params(vec![peer("b", 0)])).unwrap();
         assert_eq!(config.peers[0].server_name, None);
+    }
+
+    /// The sec gate's P3: protun UNWRAPS with_server_name, and
+    /// pvpnclient refuses a Domain that does not parse as a TLS
+    /// ServerName — an unparseable catalog Domain must die as a
+    /// TYPED peer refusal here, never as a daemon panic at connect.
+    /// The predicate is upstream's own (rustls-pki-types), not a
+    /// local grammar that could drift from it.
+    #[test]
+    fn an_unparseable_server_name_refuses_the_peer_typed() {
+        for bad in ["not a name!", "", "ch-10..protonvpn.net", "brackets[1]"] {
+            let mut peer = peer("bad", 0);
+            peer.server_name = Some(bad.to_owned());
+            let error = translate(&params(vec![peer])).unwrap_err();
+            assert!(
+                matches!(&error, ProtocolError::InvalidPeer(id, _) if id == "bad"),
+                "typed InvalidPeer for {bad:?}, got {error}"
+            );
+        }
+        // A name upstream accepts still passes (the positive control:
+        // a real Domain shape).
+        let mut good = peer("good", 0);
+        good.server_name = Some("ch-10.protonvpn.net".to_owned());
+        assert!(translate(&params(vec![good])).is_ok());
     }
 
     #[test]
