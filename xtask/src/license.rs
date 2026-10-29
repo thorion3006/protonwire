@@ -2,7 +2,8 @@
 //! findings 2+3): the pinned Proton registry crates publish no `license`
 //! manifest field; distribution was blocked until the 2026-10-08
 //! clearance (docs/LICENSE-CLEARANCE.md, PRD NFR-35/OQ-2 RESOLVED —
-//! protun v3.0.1 bundles a GPLv3 LICENSE file and the train is cleared
+//! protun v3.0.5 bundles a GPLv3 LICENSE file (first verified at
+//! v3.0.1, re-verified per pin bump) and the train is cleared
 //! with it). The manifests still carry no field, so the unlicensed set
 //! stays recorded as a drift baseline: it may not grow, and a crate
 //! that gains a manifest license must shrink it.
@@ -33,7 +34,8 @@ use crate::Reporter;
 /// The recorded baseline of packages with no license field in the current
 /// resolution (all Proton registry/git crates; see docs/review-log.md and
 /// COPYING.md). Cleared 2026-10-08 (OQ-2 RESOLVED,
-/// docs/LICENSE-CLEARANCE.md): protun v3.0.1 bundles a GPLv3 LICENSE and
+/// docs/LICENSE-CLEARANCE.md): protun v3.0.5 bundles a GPLv3 LICENSE
+/// (first verified at v3.0.1) and the
 /// the train is cleared with it, while still publishing no manifest
 /// field — so the set stays recorded: it may not grow, and a crate that
 /// gains a manifest license must shrink it.

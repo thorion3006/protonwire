@@ -413,21 +413,19 @@ pub(crate) fn find_lock_files(dir: &Path) -> Vec<PathBuf> {
 }
 
 /// The proton-registry TRAIN: every package the Proton sparse registry
-/// contributes to the lockfile, at the versions the M4 verification ran
-/// against (the 2026-10-06 dependency sweep). The subtree is a
-/// COORDINATED train — muon 2.6.3+, proton-boringtun 3.0.1+, and the
-/// proton-pfff 0.13.2 family all moved to proton-os-interface 0.3,
-/// while the pinned protun v2.2.1 keeps pvpnclient at ~3.0.1
-/// (os-interface 0.2). Drifting ANY entry piecemeal (a bare `cargo
-/// update`) splits the graph into two proton-os-interface copies and
-/// pvpnclient stops compiling — its muon interop breaks across the
-/// two trait copies. The train moves as ONE unit, anchored by a protun
-/// tag that requires the newer set; every entry here changes in the
-/// same commit when that happens.
+/// contributes to the lockfile, at the versions the current protun tag
+/// resolves (the 2026-10-29 sweep; anchored by protun v3.0.5, which
+/// requires pvpnclient ~4.4.1, proton-boringtun ^4, and local-agent
+/// ^0.13, with muon ^3 — 3.0.0 is the only 3.x release). The subtree
+/// is a COORDINATED train: drifting ANY entry piecemeal (a bare
+/// `cargo update`) splits the graph across proton-os-interface copies
+/// and the trait impls stop compiling. The train moves as ONE unit,
+/// anchored by a protun tag that requires the newer set; every entry
+/// here changes in the same commit when that happens.
 pub(crate) const PROTON_TRAIN: &[(&str, &str)] = &[
     ("muon", "3.0.0"),
     ("muon-rest", "0.1.0"),
-    ("proton-boringtun", "3.0.1"),
+    ("proton-boringtun", "4.9.0"),
     ("proton-os-interface", "0.3.5"),
     ("proton-pfff", "0.13.2"),
     ("proton-pfff-config", "0.1.0"),
@@ -436,13 +434,13 @@ pub(crate) const PROTON_TRAIN: &[(&str, &str)] = &[
     ("proton-srp", "0.8.4"),
     ("proton-tls-parser", "0.4.0"),
     ("proton-vpn-haproxyv2", "0.1.0"),
-    ("proton-vpn-local-agent", "0.12.7"),
+    ("proton-vpn-local-agent", "0.13.0"),
     ("proton-vpn-netstack", "0.8.1"),
     ("proton-vpn-rcrl", "2.0.0"),
     ("proton-vpn-toolkit", "0.1.0"),
     ("proton-vpn-utils", "0.2.4"),
     ("proton-vpn-yaourt", "0.2.4"),
-    ("pvpnclient", "4.0.2"),
+    ("pvpnclient", "4.4.1"),
 ];
 
 /// The sparse-index source prefix identifying a proton-registry
@@ -478,9 +476,11 @@ pub(crate) fn proton_train_violations(lock_text: &str) -> Vec<String> {
                 continue; // malformed block; other rules own lockfile shape
             };
             seen.push((name.clone(), version.clone()));
-            // The v3 train SPLITS os-interface (boringtun 3.0.0 holds
-            // 0.2.x, pvpnclient 4.x holds 0.3.x) — the gate accepts
-            // ANY version listed for the name in PROTON_TRAIN.
+            // A name may legitimately hold SEVERAL recorded versions
+            // (the pre-3.0.5 train split os-interface across 0.2.x and
+            // 0.3.x); the gate accepts ANY version listed for the name
+            // in PROTON_TRAIN, while the reverse check below still
+            // requires every recorded tuple to resolve.
             let known = PROTON_TRAIN
                 .iter()
                 .any(|(train_name, train_version)| train_name == name && train_version == version);

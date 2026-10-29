@@ -55,7 +55,8 @@ specification set is:
 
 ## Distribution license status — cleared (OQ-2)
 
-**License clearance 2026-10-08 (OQ-2 RESOLVED):** protun v3.0.1 bundles a
+**License clearance 2026-10-08 (OQ-2 RESOLVED):** protun (first verified
+at v3.0.1, re-verified at the current v3.0.5 pin) bundles a
 GPLv3 `LICENSE` file, and the Proton-registry dependency train is cleared
 with it (owner decision; `docs/LICENSE-CLEARANCE.md` is the release-guard
 marker). Those registry crates still publish no `license` manifest field
