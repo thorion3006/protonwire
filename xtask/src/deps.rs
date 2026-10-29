@@ -671,18 +671,18 @@ mod tests {
 
     #[test]
     fn proton_train_rejects_a_drifted_version() {
-        // The live failure of the 2026-10-06 sweep: muon 2.6.3 and
-        // proton-boringtun 3.0.2 drag proton-os-interface 0.3 in
-        // alongside pvpnclient 3.0.3's 0.2 copy.
+        // The v3 train's shape: muon 3.0.0 and pvpnclient 4.0.2
+        // (recorded), but os-interface drifted to 0.3.4 (recorded
+        // 0.3.5) and muon drifted to 3.0.1 (recorded 3.0.0).
         let lock = format!(
             "{}{}{}",
-            proton_lock_entry("muon", "2.6.3"),
+            proton_lock_entry("muon", "3.0.1"),
             proton_lock_entry("proton-os-interface", "0.3.4"),
-            proton_lock_entry("pvpnclient", "3.0.3"),
+            proton_lock_entry("pvpnclient", "4.0.2"),
         );
         let violations = proton_train_violations(&lock);
         assert_eq!(violations.len(), 2, "{violations:?}");
-        assert!(violations[0].contains("muon v2.6.3"));
+        assert!(violations[0].contains("muon v3.0.1"));
         assert!(violations[1].contains("proton-os-interface v0.3.4"));
     }
 
