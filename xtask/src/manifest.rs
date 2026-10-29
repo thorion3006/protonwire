@@ -837,8 +837,8 @@ mod tests {
     use super::*;
     /// A minimal lockfile fixture matching the good manifest's pins — the
     /// real Cargo.lock carries the same two checksums for muon 2.6.2 and
-    /// pvpnclient 3.0.3 (Proton sparse-registry entries) and the same git
-    /// source for protun 2.2.1 (`git+…?rev=…#…`, the fragment being the
+    /// pvpnclient 4.0.2 (Proton sparse-registry entries) and the same git
+    /// source for protun 3.0.1 (`git+…?rev=…#…`, the fragment being the
     /// commit Cargo actually resolved).
     fn good_lockfile_text() -> String {
         "\
@@ -846,20 +846,20 @@ version = 4
 
 [[package]]
 name = \"muon\"
-version = \"2.6.2\"
+version = \"3.0.0\"
 source = \"sparse+https://rust-registry.proton.me/index/\"
-checksum = \"63c7119344a07143093b5790d76e93c9e827e2a3a1bca1643a5951ffd2f8e3b3\"
+checksum = \"d06175b95acecae21bfaf373f98520ffd6c5fc0627e58d70e6a4a5edc93dc24c\"
 
 [[package]]
 name = \"pvpnclient\"
-version = \"3.0.3\"
+version = \"4.0.2\"
 source = \"sparse+https://rust-registry.proton.me/index/\"
-checksum = \"3c14ef052727e0204ec5e80cf8df50786db38a83b6a6557a188b78a4c264f380\"
+checksum = \"91fa3157e1b9281006159a0e29c44c05aa0741c9426558fc0d83322d58c8b3ba\"
 
 [[package]]
 name = \"protun\"
-version = \"2.2.1\"
-source = \"git+https://github.com/ProtonVPN/protun?rev=12e7755a112f59b7b843da79290b3de25febf653#12e7755a112f59b7b843da79290b3de25febf653\"
+version = \"3.0.1\"
+source = \"git+https://github.com/ProtonVPN/protun?rev=1c3aa646175ae12e22f17621306d403ad2a37017#836715cdb288f810cd6518e2f3d917fa456a8493\"
 "
         .to_string()
     }
