@@ -13,9 +13,7 @@ use std::path::Path;
 use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
 
-use crate::{
-    Reporter, expect_value, is_capability_id, is_git_revision, is_test_id, set_drift,
-};
+use crate::{Reporter, expect_value, is_capability_id, is_git_revision, is_test_id, set_drift};
 
 const PROTON_REVISION: &str = "1c3aa646175ae12e22f17621306d403ad2a37017";
 
@@ -413,7 +411,6 @@ fn expect_lock_revision(recorded: Option<&str>, locked: Option<&str>, what: &str
         (None, _) => vec![format!("{what} is missing")],
     }
 }
-
 
 fn expect_revision(actual: Option<&str>, what: &str) -> Option<String> {
     match actual {

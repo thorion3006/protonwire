@@ -474,9 +474,7 @@ pub(crate) fn proton_train_violations(lock_text: &str) -> Vec<String> {
             // ANY version listed for the name in PROTON_TRAIN.
             let known = PROTON_TRAIN
                 .iter()
-                .any(|(train_name, train_version)| {
-                    train_name == name && train_version == version
-                });
+                .any(|(train_name, train_version)| train_name == name && train_version == version);
             let named = PROTON_TRAIN
                 .iter()
                 .any(|(train_name, _)| train_name == name);
