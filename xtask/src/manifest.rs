@@ -882,14 +882,14 @@ client_contract:
   required_v1_clients: [cli, tui, gui]
 upstream:
   protun:
-    version: 2.2.1
-    revision: 12e7755a112f59b7b843da79290b3de25febf653
+    version: 3.0.1
+    revision: 1c3aa646175ae12e22f17621306d403ad2a37017
   muon:
-    version: 2.6.2
-    checksum_sha256: 63c7119344a07143093b5790d76e93c9e827e2a3a1bca1643a5951ffd2f8e3b3
+    version: 3.0.0
+    checksum_sha256: d06175b95acecae21bfaf373f98520ffd6c5fc0627e58d70e6a4a5edc93dc24c
   pvpnclient:
-    version: 3.0.3
-    checksum_sha256: 3c14ef052727e0204ec5e80cf8df50786db38a83b6a6557a188b78a4c264f380
+    version: 4.0.2
+    checksum_sha256: 91fa3157e1b9281006159a0e29c44c05aa0741c9426558fc0d83322d58c8b3ba
   official_linux_cli:
     revision: a7c7abc8d3777f33b8d4c82279bd621258bd810d
   official_linux_gui:
