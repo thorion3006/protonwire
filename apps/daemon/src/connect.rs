@@ -541,6 +541,20 @@ impl ConnectionLane {
             ))
             .into());
         }
+        // The CONTRACT addresses (the bot round's P1): the engine
+        // creates the TUN; tun.rs leaves address application to the
+        // manager — without 10.2.0.2/32 the full-tunnel traffic
+        // sources from the uplink and the peer cannot return it.
+        net.runtime
+            .block_on(crate::netctx::assign_tun_addresses(
+                &net.handle,
+                tun_ifindex,
+                matches!(
+                    net.ipv6,
+                    protonwire_net::route_drift::Ipv6Desired::Tunnelled
+                ),
+            ))
+            .map_err(SessionError::Plan)?;
         // The uplink: re-detect per connect (a DHCP renew may have
         // moved the default route since startup).
         let uplink_ifname = net

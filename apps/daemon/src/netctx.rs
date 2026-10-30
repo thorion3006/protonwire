@@ -123,6 +123,46 @@ pub async fn ifindex_by_name(handle: &rtnetlink::Handle, name: &str) -> Option<u
     None
 }
 
+/// Assigns the TUN's contract addresses (the bot round's P1): the
+/// engine creates the device but tun.rs leaves address application
+/// to the MANAGER — without `10.2.0.2/32` (and the v6 address when
+/// tunnelled), traffic routed into the TUN sources from the uplink
+/// address and the peer cannot return it. Idempotent (a duplicate
+/// add is ENEXIST, swallowed — reconnect reuses the same TUN name).
+pub async fn assign_tun_addresses(
+    handle: &rtnetlink::Handle,
+    ifindex: u32,
+    ipv6_tunneled: bool,
+) -> Result<(), String> {
+    let plan = protonwire_protocol::tun::TunAddressPlan::contract();
+    let mut failures = Vec::new();
+    for address in [Some(plan.ipv4), ipv6_tunneled.then_some(plan.ipv6)]
+        .into_iter()
+        .flatten()
+    {
+        if let Err(error) = handle
+            .address()
+            .add(ifindex, address.address, address.prefix_len)
+            .execute()
+            .await
+        {
+            // EEXIST on reconnect: the address is already ours.
+            let text = error.to_string();
+            if !text.contains("File exists") {
+                failures.push(format!(
+                    "assign {} on {}: {}",
+                    address.address, ifindex, text
+                ));
+            }
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join("; "))
+    }
+}
+
 /// Brings the interface UP (RTM_NEWLINK flags+mask): protun's
 /// `InterfaceState::Up` only means the TUN STREAM registered — the
 /// kernel link itself stays administratively DOWN until the manager
