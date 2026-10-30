@@ -4060,3 +4060,15 @@ pinned (the recording-executor test proves the inverse is invoked
 and the original error surfaces); Custom-DNS entries parse STRICTLY
 at wiring (an unparseable list refuses startup, never a silent
 zero-server blackout).
+
+Slice-1 gate record, final: rust PASS (P1 class closed + conditions
+landed), sec PASS (2 P3s: the owner-UID leak fixed in the same
+commit as the QA pins; the root-disconnect override tracked for the
+M6 auth lane), qa's 2 P1s landed (the dispatch matrix + empty-cell
+refusals pinned; dns_posture/ipv6_posture extracted + pinned incl.
+the strict Custom refusal). QA's P2 tracks: factor+pin the
+mark-wait loop; a netns mini-IT for the TUN helpers + the two-route
+metric tie-break; strengthen dns_phase_cleanup's fake (real inverse
+ops through a recording exec); the runner's PARKED disclosure;
+IT-32's per-layer record line corrected (the wiring's unit surface
+IS now real — the posture functions).
