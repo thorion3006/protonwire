@@ -41,7 +41,7 @@ struct Args {
 
 fn main() {
     let args = Args::parse();
-    let code = run(args, &init_tracing_filtered, Some(Path::new("/")), None);
+    let code = run(args, &init_tracing_filtered, Some(Path::new("/")), None, true);
     if code != 0 {
         std::process::exit(code);
     }
@@ -156,8 +156,8 @@ fn run(
     init_tracing: &dyn Fn(&str),
     trust_root: Option<&Path>,
     cache_dir: Option<&Path>,
-) -> i32 {
-    // M2 S12: the terminating-signal handler goes in FIRST — a signal
+    install_lane: bool,
+) -> i32 {    // M2 S12: the terminating-signal handler goes in FIRST — a signal
     // arriving during config load or bind is recorded in the flag, and
     // the serve-loop watcher (spawned before serve) converts it into
     // the stop flag the moment the loop exists, so a stop request can
@@ -265,6 +265,25 @@ fn run(
             return 15;
         }
     };
+    // M6 1b: the production lane wiring — allocate the bypass mark
+    // against the LIVE host (a saturated or un-surveyable host fails
+    // startup: exit 15, never a daemon that cannot connect), open the
+    // encrypted cache, install the lane. Tests pass install_lane=false
+    // (no CAP_NET_ADMIN under the harness — the connect family then
+    // answers the typed no_lane_installed refusal). The runtime comes
+    // back and MUST OUTLIVE serve() — a tokio Handle does not keep a
+    // runtime alive, and the lane's netlink connection lives on it.
+    let _net_runtime = if install_lane {
+        match wire_production_lane(&services, &core, &config_for_services, &paths) {
+            Ok(runtime) => Some(runtime),
+            Err(e) => {
+                eprintln!("protonwire-daemon: connection lane wiring failed: {e}");
+                return 15;
+            }
+        }
+    } else {
+        None
+    };
     let server = match protonwire_ipc::server::IpcServer::bind_with_group(
         &socket_dir,
         &socket_name,
@@ -320,6 +339,101 @@ fn run(
     let _ = refresh_driver.join();
     info!("protonwire-daemon stopped");
     0
+}
+
+/// M6 1b: the production connection-lane wiring. Returns the runtime
+/// it built — the caller MUST hold it for the daemon's lifetime (a
+/// tokio Handle does not keep a runtime alive; the lane's netlink
+/// connection lives on it).
+fn wire_production_lane(
+    services: &protonwire_daemon::DaemonServices,
+    core: &Arc<protonwire_core::DaemonCore>,
+    config: &SystemConfig,
+    paths: &ConfigPaths,
+) -> Result<tokio::runtime::Runtime, String> {
+    use protonwire_daemon::connect::ConnectionLane;
+    use protonwire_daemon::netctx::NetContext;
+    use protonwire_net::dns::{DnsConfig, DnsMode, DnsRouting, DnsServer};
+    use protonwire_net::route_drift::Ipv6Desired;
+    use protonwire_protocol::{EncryptedCache, PersistenceFacade};
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("net runtime: {e}"))?;
+
+    // The DNS posture, from the config's section: Proton mode rides
+    // the tunnel's gateway resolver (10.2.0.1, the tun contract);
+    // Custom parses the user's list; System/None mutate nothing.
+    let dns = match config.dns.mode {
+        protonwire_store::config::DnsMode::Proton => DnsConfig {
+            mode: DnsMode::Proton,
+            servers: vec![DnsServer::new(
+                "10.2.0.1".parse().expect("the gateway resolver"),
+            )],
+            routing: DnsRouting::ThroughVpn,
+        },
+        protonwire_store::config::DnsMode::Custom => DnsConfig {
+            mode: DnsMode::Custom,
+            servers: config
+                .dns
+                .custom_servers
+                .iter()
+                .filter_map(|server| server.parse().ok().map(DnsServer::new))
+                .collect(),
+            routing: match config.dns.policy {
+                protonwire_store::config::DnsPolicy::BypassVpn => DnsRouting::BypassVpn,
+                protonwire_store::config::DnsPolicy::SystemDefault => DnsRouting::SystemDefault,
+                protonwire_store::config::DnsPolicy::ThroughVpn => DnsRouting::ThroughVpn,
+            },
+        },
+        protonwire_store::config::DnsMode::System => DnsConfig {
+            mode: DnsMode::System,
+            servers: vec![],
+            routing: DnsRouting::SystemDefault,
+        },
+        protonwire_store::config::DnsMode::None => DnsConfig {
+            mode: DnsMode::None,
+            servers: vec![],
+            routing: DnsRouting::ThroughVpn,
+        },
+    };
+    // FR-37's leak-block is the safe floor; `auto` negotiation of a
+    // tunnelled v6 rides the features slice (the server-support
+    // question needs the connected catalog).
+    let ipv6 = match config.connection.ipv6.mode {
+        protonwire_store::config::Ipv6Mode::Enabled => Ipv6Desired::Tunnelled,
+        protonwire_store::config::Ipv6Mode::Auto
+        | protonwire_store::config::Ipv6Mode::Disabled => Ipv6Desired::Blocked,
+    };
+
+    // The encrypted cache beside the state file (its own keyfile
+    // bootstrap; a wrong-size keyfile refuses, never re-keys).
+    let state_dir = paths
+        .state_file
+        .parent()
+        .ok_or("the state file has no parent directory")?
+        .to_path_buf();
+    let cache = EncryptedCache::open(&state_dir, &state_dir.join("cache.key"))
+        .map_err(|e| format!("encrypted cache: {e}"))?;
+    let facade = PersistenceFacade::start(Arc::new(cache));
+
+    let net = NetContext::startup(
+        runtime.handle().clone(),
+        config.daemon.interface_name.clone(),
+        dns,
+        ipv6,
+    )
+    .map_err(|e| format!("net context: {e}"))?;
+    let lane = ConnectionLane::new(
+        net,
+        "ProtonWire".to_owned(),
+        env!("CARGO_PKG_VERSION").to_owned(),
+        Arc::new(facade),
+        Arc::clone(core),
+    );
+    services.lane.install(Arc::new(lane));
+    Ok(runtime)
 }
 
 #[cfg(test)]
@@ -430,7 +544,7 @@ mod tests {
             }
         };
 
-        let code = run(args, &init, None, Some(&cache_dir));
+        let code = run(args, &init, None, Some(&cache_dir), false);
         assert_eq!(code, 1, "the blocked socket directory must fail the bind");
 
         let entries = log.snapshot();
@@ -502,7 +616,7 @@ mod tests {
             // No subscriber install (the FU-A test owns the process's
             // single global install); trust_root None keeps the loader
             // on its plain semantics for the scratch-tree path.
-            let _ = exit_tx.send(run(args, &|_level: &str| {}, None, Some(&cache_dir)));
+            let _ = exit_tx.send(run(args, &|_level: &str| {}, None, Some(&cache_dir), false));
         });
 
         // Wait for the socket, then handshake a live session through it.
@@ -609,7 +723,7 @@ mod tests {
             socket_dir: Some(blocker),
             log_level: None,
         };
-        let code = run(args, &|_level: &str| {}, None, Some(&cache_dir));
+        let code = run(args, &|_level: &str| {}, None, Some(&cache_dir), false);
         assert_eq!(
             code, 15,
             "a corrupted deadlines document must refuse startup with the \
@@ -643,7 +757,7 @@ mod tests {
             socket_dir: Some(blocker),
             log_level: None,
         };
-        let code = run(args, &|_level: &str| {}, None, Some(&cache_dir));
+        let code = run(args, &|_level: &str| {}, None, Some(&cache_dir), false);
         assert_eq!(
             code, 1,
             "first boot with no persisted deadlines must reach the bind \
@@ -683,7 +797,7 @@ mod tests {
             socket_dir: Some(blocker),
             log_level: None,
         };
-        let code = run(args, &|_level: &str| {}, None, Some(&dir.join("cache")));
+        let code = run(args, &|_level: &str| {}, None, Some(&dir.join("cache")), false);
         assert_eq!(
             code, 15,
             "a systemd source with no credentials directory must refuse startup \
@@ -730,7 +844,7 @@ mod tests {
         // single global install; this test pins only the exit code (the
         // defect naming is pinned by the store suite).
         let init = |_level: &str| {};
-        let code = run(args, &init, Some(Path::new("/")), None);
+        let code = run(args, &init, Some(Path::new("/")), None, false);
         assert_eq!(
             code, 15,
             "a group-writable system configuration must fail the strict load with \

@@ -357,6 +357,11 @@ fn lane_error_to_rpc(error: connect::LaneError) -> RpcError {
             let code = match &error {
                 connect::SessionError::KillSwitch(_) => RpcErrorCode::KillSwitchFailed,
                 connect::SessionError::Dns(_) => RpcErrorCode::DnsConfigFailed,
+                // A mark COLLISION is retryable — the daemon's next
+                // attempt draws a fresh mark (the 2026-10-08 owner
+                // decision's re-choose loop), so the client reads
+                // NetworkUnavailable, not a tunnel failure.
+                connect::SessionError::MarkCollision { .. } => RpcErrorCode::NetworkUnavailable,
                 _ => RpcErrorCode::TunnelFailed,
             };
             RpcError::new(code, error.to_string())

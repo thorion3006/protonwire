@@ -246,7 +246,10 @@ pub struct ConnectionLane {
     engine: ConnectionEngine,
     facade: Arc<PersistenceFacade>,
     core: Arc<CoreState>,
-    net: NetContext,
+    /// Shared with the pump thread: the engine-death claim arms must
+    /// revert the net session (the 1b rust gate's P1-1) — an Arc, not
+    /// an owned value, so the pump carries one too.
+    net: Arc<NetContext>,
     state: SharedLane,
     draining: AtomicBool,
 }
@@ -270,7 +273,7 @@ impl ConnectionLane {
             }),
             facade,
             core,
-            net,
+            net: Arc::new(net),
             state: Arc::new(Mutex::new(LaneState::default())),
             draining: AtomicBool::new(false),
         }
@@ -441,7 +444,13 @@ impl ConnectionLane {
         // the pump's retirement upgrades only while the lane lives
         // (a dropped lane needs no retirement — its drop IS one).
         let pump_lane = Arc::downgrade(&self.state);
-        let pump = std::thread::spawn(move || pump_events(&pump_slot, &pump_lane, &core));
+        // The pump carries the net context (the P1-1 fix): when the
+        // engine dies on its own, the pump's claim arms revert the
+        // net session BEFORE disconnecting the engine.
+        let pump_net = Arc::clone(&self.net);
+        let pump = std::thread::spawn(move || {
+            pump_events(&pump_slot, &pump_lane, &core, &pump_net)
+        });
         lane.active = Some(ActiveLane {
             connection: slot,
             pump,
@@ -707,14 +716,15 @@ fn terminate_on_fatal(
     slot: &ConnectionSlot,
     lane: &std::sync::Weak<Mutex<LaneState>>,
     core: &CoreState,
+    net: &NetContext,
 ) -> bool {
     // CLAIM-OR-YIELD (the bot round-35 P2): take the connection to
     // establish this pump owns the fatal cleanup; a teardown that
     // retired the slot first owns the terminal publish — publishing
     // here would overwrite its Disconnecting with a false terminal
     // mid-join. Returns whether the caller should continue its own
-    // teardown handling (the claimed arm disconnects, publishes the
-    // terminal, retires the lane).
+    // teardown handling (the claimed arm reverts the net session,
+    // disconnects, publishes the terminal, retires the lane).
     let Some(connection) = slot.lock().ok().and_then(|mut guard| guard.take()) else {
         tracing::warn!(
             "certificate refresh failed terminally — teardown already owns the slot; \
@@ -723,13 +733,43 @@ fn terminate_on_fatal(
         return true;
     };
     tracing::warn!("certificate refresh failed terminally — tearing the session down");
+    // THE NET SESSION REVERTS FIRST (the 1b rust gate's P1-1): the
+    // engine is about to die with the TUN — an unreverted session
+    // would leave the switch armed and routes committed with no
+    // tunnel, and the empty-lane disconnect could never clean it.
+    let session = claim_session(slot, lane);
+    revert_session(net, session.as_ref(), &net.tun_ifname);
     connection.disconnect();
     core.set_vpn_state(VpnState::Disconnected);
     retire_lane(slot, lane);
     true
 }
 
-fn pump_events(slot: &ConnectionSlot, lane: &std::sync::Weak<Mutex<LaneState>>, core: &CoreState) {
+/// Claims THIS pump's net session out of the lane entry — only the
+/// entry whose connection slot is OURS (a reconnect may already have
+/// replaced it, and the replacement's session is the replacement's).
+fn claim_session(
+    slot: &ConnectionSlot,
+    lane: &std::sync::Weak<Mutex<LaneState>>,
+) -> Option<SessionState> {
+    let shared = lane.upgrade()?;
+    let mut guard = shared
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let ours = guard
+        .active
+        .as_ref()
+        .is_some_and(|active| Arc::ptr_eq(&active.connection, slot));
+    ours.then(|| guard.active.as_mut().and_then(|active| active.session.take()))
+        .flatten()
+}
+
+fn pump_events(
+    slot: &ConnectionSlot,
+    lane: &std::sync::Weak<Mutex<LaneState>>,
+    core: &CoreState,
+    net: &NetContext,
+) {
     let mut last: Option<VpnState> = None;
     let mut dropped_watermark: u64 = 0;
     let mut backlog: bool = false;
@@ -757,7 +797,7 @@ fn pump_events(slot: &ConnectionSlot, lane: &std::sync::Weak<Mutex<LaneState>>, 
                 // transition is suppressed here (its sequence was
                 // never spent on a misleading state).
                 if reconcile_drops(slot, core, &mut last, &mut dropped_watermark, &mut backlog) {
-                    terminate_on_fatal(slot, lane, core);
+                    terminate_on_fatal(slot, lane, core, net);
                     break;
                 }
                 // A received event does NOT disarm the backlog (the
@@ -789,7 +829,7 @@ fn pump_events(slot: &ConnectionSlot, lane: &std::sync::Weak<Mutex<LaneState>>, 
                 // poll surface instead of leaving the frontend state
                 // stale until the next (possibly never) push.
                 if reconcile_drops(slot, core, &mut last, &mut dropped_watermark, &mut backlog) {
-                    terminate_on_fatal(slot, lane, core);
+                    terminate_on_fatal(slot, lane, core, net);
                     break;
                 }
                 // DISARM ON CURRENT EMPTINESS (the bot round-38 P2):
@@ -842,6 +882,14 @@ fn pump_events(slot: &ConnectionSlot, lane: &std::sync::Weak<Mutex<LaneState>>, 
                 // loser (a teardown emptied the slot) owns it.
                 let claimed = slot.lock().ok().and_then(|mut guard| guard.take());
                 if let Some(connection) = claimed {
+                    // THE NET SESSION REVERTS FIRST (the 1b rust
+                    // gate's P1-1, the engine-death twin of
+                    // terminate_on_fatal): the engine died on its
+                    // own — without this, the switch stays armed and
+                    // the routes committed over a dead TUN, and the
+                    // empty-lane disconnect could never clean it.
+                    let session = claim_session(slot, lane);
+                    revert_session(net, session.as_ref(), &net.tun_ifname);
                     connection.disconnect();
                     core.set_vpn_state(VpnState::Disconnected);
                     retire_lane(slot, lane);
@@ -906,7 +954,7 @@ fn pump_events(slot: &ConnectionSlot, lane: &std::sync::Weak<Mutex<LaneState>>, 
             // critical event recovered from a full queue — drain the
             // recovery slot on the quiet path too.
             EngineEvent::CertificateFatal => {
-                terminate_on_fatal(slot, lane, core);
+                terminate_on_fatal(slot, lane, core, net);
                 break;
             }
             // The DELIVERED credential-invalid signal (the bot
@@ -931,7 +979,7 @@ fn pump_events(slot: &ConnectionSlot, lane: &std::sync::Weak<Mutex<LaneState>>, 
             _ => {}
         }
         if reconcile_drops(slot, core, &mut last, &mut dropped_watermark, &mut backlog) {
-            terminate_on_fatal(slot, lane, core);
+            terminate_on_fatal(slot, lane, core, net);
             break;
         }
     }
@@ -1058,6 +1106,76 @@ fn retire_lane(slot: &ConnectionSlot, lane: &std::sync::Weak<Mutex<LaneState>>) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The P1-1 claim semantics: the pump's engine-death arms claim
+    /// the session ONLY from the lane entry whose connection slot is
+    /// theirs (a reconnect may have replaced the entry — the
+    /// replacement's session belongs to the replacement), and the
+    /// claim is single-shot (the second claim finds the field empty).
+    #[test]
+    fn claim_session_takes_only_this_pumps_entry_once() {
+        fn session_state(generation: u64) -> SessionState {
+            SessionState {
+                plan: protonwire_net::tables::plan_tables(&Default::default()),
+                installed_ops: Vec::new(),
+                dns_evidence: None,
+                dns_backend: protonwire_net::dns::DnsBackend::ResolvConf,
+                generation: protonwire_net::kill_switch::GenerationId(generation),
+            }
+        }
+        fn entry(session: Option<SessionState>) -> (ActiveLane, ConnectionSlot) {
+            let slot: ConnectionSlot = Arc::new(Mutex::new(None));
+            let pump = std::thread::spawn(|| ());
+            (
+                ActiveLane {
+                    connection: Arc::clone(&slot),
+                    pump,
+                    session,
+                },
+                slot,
+            )
+        }
+        let shared: SharedLane = Arc::new(Mutex::new(LaneState::default()));
+        // OUR entry, with a session (only its slot is needed for the
+        // ptr check against the replacement).
+        let (_ours, our_slot) = entry(Some(session_state(7)));
+        // A REPLACEMENT entry (different slot), with its own session.
+        let (replacement, replacement_slot) = entry(Some(session_state(9)));
+        shared
+            .lock()
+            .unwrap()
+            .active = Some(replacement);
+        let weak = Arc::downgrade(&shared);
+        // Our slot is no longer the lane's entry: the claim yields
+        // NOTHING (the replacement's session is not ours to take).
+        assert!(
+            claim_session(&our_slot, &weak).is_none(),
+            "a replaced entry's session is not claimable by the old pump"
+        );
+        // Swap ourselves back in: the claim takes the session and
+        // empties the field (single-shot).
+        {
+            let mut guard = shared.lock().unwrap();
+            let retired = guard.active.take();
+            if let Some(active) = retired {
+                let _ = active.pump.join();
+            }
+        }
+        drop(our_slot);
+        let (ours, our_slot) = entry(Some(session_state(7)));
+        shared.lock().unwrap().active = Some(ours);
+        let claimed = claim_session(&our_slot, &weak).expect("our entry's session");
+        assert_eq!(
+            claimed.generation,
+            protonwire_net::kill_switch::GenerationId(7)
+        );
+        assert!(
+            claim_session(&our_slot, &weak).is_none(),
+            "the claim is single-shot"
+        );
+        // The replacement's slot never claimed: cleanup its thread.
+        drop(replacement_slot);
+    }
 
     #[test]
     fn owner_gate_refuses_second_uid_and_allows_owner() {

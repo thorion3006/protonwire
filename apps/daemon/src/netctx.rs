@@ -193,7 +193,12 @@ pub async fn detect_uplink(handle: &rtnetlink::Handle) -> Option<String> {
             continue; // the v4 default is the kill switch's uplink
         }
         let mut oif = None;
-        let mut priority = u32::MAX;
+        // The metric defaults to ZERO, not u32::MAX (the rust gate's
+        // P2): the kernel emits RTA_PRIORITY only when non-zero, so a
+        // plain zero-metric default carries NO attribute — a u32::MAX
+        // default would rank it BELOW a metric-100 DHCP default and
+        // the switch would probe the wrong uplink.
+        let mut priority = 0u32;
         for attribute in &message.attributes {
             match attribute {
                 RouteAttribute::Oif(index) => oif = Some(*index),
