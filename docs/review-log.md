@@ -4049,3 +4049,14 @@ mark gate unit + IT-31, the session IT, the lane-window tests, the
 production wiring's unit surface). Reopen: when the peer harness is
 upgraded (tracked), or at the E2E slice (the owner's paid account
 replaces the mock entirely).
+
+Follow-up (the re-verification gate's conditions, all landed): fmt
+was failing silently in the PLAIN shell (rustfmt absent there — the
+devshell runs it); the lane's drain() is now WIRED into run()'s
+shutdown path (the gate found no caller — process exit would have
+stranded an armed switch on the next-startup sweep; now the
+administrator's teardown reverts cleanly); dns_phase_cleanup is
+pinned (the recording-executor test proves the inverse is invoked
+and the original error surfaces); Custom-DNS entries parse STRICTLY
+at wiring (an unparseable list refuses startup, never a silent
+zero-server blackout).

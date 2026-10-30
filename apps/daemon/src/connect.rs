@@ -448,9 +448,8 @@ impl ConnectionLane {
         // engine dies on its own, the pump's claim arms revert the
         // net session BEFORE disconnecting the engine.
         let pump_net = Arc::clone(&self.net);
-        let pump = std::thread::spawn(move || {
-            pump_events(&pump_slot, &pump_lane, &core, &pump_net)
-        });
+        let pump =
+            std::thread::spawn(move || pump_events(&pump_slot, &pump_lane, &core, &pump_net));
         lane.active = Some(ActiveLane {
             connection: slot,
             pump,
@@ -760,8 +759,13 @@ fn claim_session(
         .active
         .as_ref()
         .is_some_and(|active| Arc::ptr_eq(&active.connection, slot));
-    ours.then(|| guard.active.as_mut().and_then(|active| active.session.take()))
-        .flatten()
+    ours.then(|| {
+        guard
+            .active
+            .as_mut()
+            .and_then(|active| active.session.take())
+    })
+    .flatten()
 }
 
 fn pump_events(
@@ -1141,10 +1145,7 @@ mod tests {
         let (_ours, our_slot) = entry(Some(session_state(7)));
         // A REPLACEMENT entry (different slot), with its own session.
         let (replacement, replacement_slot) = entry(Some(session_state(9)));
-        shared
-            .lock()
-            .unwrap()
-            .active = Some(replacement);
+        shared.lock().unwrap().active = Some(replacement);
         let weak = Arc::downgrade(&shared);
         // Our slot is no longer the lane's entry: the claim yields
         // NOTHING (the replacement's session is not ours to take).

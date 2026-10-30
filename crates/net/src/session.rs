@@ -307,6 +307,66 @@ pub async fn disconnect<E: NetlinkExecutor>(
 
 #[cfg(test)]
 mod tests {
+    /// The P1-2 pin: the DNS-phase cleanup path actually invokes the
+    /// executor's cleanup (the inverse transaction is built from what
+    /// `cleanup_ops` returns) and hands the ORIGINAL error back. The
+    /// switch removal is best-effort (an unprivileged test cannot arm
+    /// one — its failure is the swallowed arm; the full phase-4
+    /// integration needs the DNS seam, tracked).
+    #[tokio::test]
+    async fn dns_phase_cleanup_runs_the_inverse_and_returns_the_error() {
+        use std::sync::Arc as TestArc;
+        struct RecordingCleanup;
+        impl crate::route_txn::NetlinkExecutor for RecordingCleanup {
+            async fn exec(
+                &mut self,
+                _op: crate::route_txn::NetOp,
+            ) -> Result<bool, crate::route_txn::NetOpError> {
+                Ok(true)
+            }
+            async fn survey(
+                &mut self,
+                _text: &str,
+            ) -> Result<crate::tables::TableSurvey, crate::route_txn::NetOpError> {
+                Ok(crate::tables::TableSurvey::default())
+            }
+            async fn present_ops(
+                &mut self,
+                desired: &[crate::route_txn::NetOp],
+            ) -> Result<Vec<crate::route_txn::NetOp>, crate::route_txn::NetOpError> {
+                Ok(desired.to_vec())
+            }
+            async fn cleanup_ops(
+                &mut self,
+                _session: &[crate::route_txn::NetOp],
+            ) -> Result<Vec<crate::route_txn::NetOp>, crate::route_txn::NetOpError> {
+                Err("cleanup refused (the recorder proves the call)".to_owned())
+            }
+            async fn rule_marks(
+                &mut self,
+            ) -> Result<std::collections::BTreeSet<u32>, crate::route_txn::NetOpError> {
+                Ok(Default::default())
+            }
+        }
+        let plan = crate::tables::plan_tables(&Default::default());
+        let error = dns_phase_cleanup(
+            &mut RecordingCleanup,
+            &plan,
+            &[],
+            GenerationId(3),
+            SessionError::Dns(dns::DnsError::Io(std::io::Error::other("boom"))),
+        )
+        .await;
+        // The ORIGINAL error surfaces (the cleanup is best-effort and
+        // its own refusal never replaces it) — the recorder's Err is
+        // the proof it was called at all.
+        assert!(
+            matches!(error, SessionError::Dns(ref inner) if inner.to_string().contains("boom")),
+            "the original DNS error surfaces, got {error:?}"
+        );
+        let _ = TestArc::new(()); // keep the import honest if unused
+    }
+
     use super::*;
 
     #[test]

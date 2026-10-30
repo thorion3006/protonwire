@@ -41,7 +41,13 @@ struct Args {
 
 fn main() {
     let args = Args::parse();
-    let code = run(args, &init_tracing_filtered, Some(Path::new("/")), None, true);
+    let code = run(
+        args,
+        &init_tracing_filtered,
+        Some(Path::new("/")),
+        None,
+        true,
+    );
     if code != 0 {
         std::process::exit(code);
     }
@@ -157,7 +163,8 @@ fn run(
     trust_root: Option<&Path>,
     cache_dir: Option<&Path>,
     install_lane: bool,
-) -> i32 {    // M2 S12: the terminating-signal handler goes in FIRST — a signal
+) -> i32 {
+    // M2 S12: the terminating-signal handler goes in FIRST — a signal
     // arriving during config load or bind is recorded in the flag, and
     // the serve-loop watcher (spawned before serve) converts it into
     // the stop flag the moment the loop exists, so a stop request can
@@ -304,6 +311,7 @@ fn run(
     );
 
     let stop = Arc::new(AtomicBool::new(false));
+    let services_for_drain = Arc::clone(&services);
     let handler = Arc::new(DaemonHandler {
         core: Arc::clone(&core),
         stop: Arc::clone(&stop),
@@ -337,6 +345,14 @@ fn run(
     server.serve(handler, stop);
     let _ = terminate_watcher.join();
     let _ = refresh_driver.join();
+    // M6 1b: the lane's DRAIN on shutdown (the re-verification gate's
+    // finding — nothing else called it, so process exit would strand
+    // an armed switch on the next-startup sweep instead of reverting
+    // cleanly): the administrator's unconditional teardown, blocking
+    // until the pump exits.
+    if let Some(lane) = services_for_drain.lane.current() {
+        lane.drain();
+    }
     info!("protonwire-daemon stopped");
     0
 }
@@ -373,20 +389,28 @@ fn wire_production_lane(
             )],
             routing: DnsRouting::ThroughVpn,
         },
-        protonwire_store::config::DnsMode::Custom => DnsConfig {
-            mode: DnsMode::Custom,
-            servers: config
-                .dns
-                .custom_servers
-                .iter()
-                .filter_map(|server| server.parse().ok().map(DnsServer::new))
-                .collect(),
-            routing: match config.dns.policy {
-                protonwire_store::config::DnsPolicy::BypassVpn => DnsRouting::BypassVpn,
-                protonwire_store::config::DnsPolicy::SystemDefault => DnsRouting::SystemDefault,
-                protonwire_store::config::DnsPolicy::ThroughVpn => DnsRouting::ThroughVpn,
-            },
-        },
+        protonwire_store::config::DnsMode::Custom => {
+            // STRICT (the re-verification gate's Medium): config
+            // validation only checks non-emptiness, so an all-invalid
+            // list would silently yield Custom mode with ZERO servers
+            // — a DNS blackout under the tunnel. Refuse at wiring.
+            let mut servers = Vec::new();
+            for server in &config.dns.custom_servers {
+                let parsed: std::net::IpAddr = server.parse().map_err(|e| {
+                    format!("dns.custom_servers entry {server:?} is not an address: {e}")
+                })?;
+                servers.push(DnsServer::new(parsed));
+            }
+            DnsConfig {
+                mode: DnsMode::Custom,
+                servers,
+                routing: match config.dns.policy {
+                    protonwire_store::config::DnsPolicy::BypassVpn => DnsRouting::BypassVpn,
+                    protonwire_store::config::DnsPolicy::SystemDefault => DnsRouting::SystemDefault,
+                    protonwire_store::config::DnsPolicy::ThroughVpn => DnsRouting::ThroughVpn,
+                },
+            }
+        }
         protonwire_store::config::DnsMode::System => DnsConfig {
             mode: DnsMode::System,
             servers: vec![],
@@ -403,8 +427,9 @@ fn wire_production_lane(
     // question needs the connected catalog).
     let ipv6 = match config.connection.ipv6.mode {
         protonwire_store::config::Ipv6Mode::Enabled => Ipv6Desired::Tunnelled,
-        protonwire_store::config::Ipv6Mode::Auto
-        | protonwire_store::config::Ipv6Mode::Disabled => Ipv6Desired::Blocked,
+        protonwire_store::config::Ipv6Mode::Auto | protonwire_store::config::Ipv6Mode::Disabled => {
+            Ipv6Desired::Blocked
+        }
     };
 
     // The encrypted cache beside the state file (its own keyfile
@@ -797,7 +822,13 @@ mod tests {
             socket_dir: Some(blocker),
             log_level: None,
         };
-        let code = run(args, &|_level: &str| {}, None, Some(&dir.join("cache")), false);
+        let code = run(
+            args,
+            &|_level: &str| {},
+            None,
+            Some(&dir.join("cache")),
+            false,
+        );
         assert_eq!(
             code, 15,
             "a systemd source with no credentials directory must refuse startup \
