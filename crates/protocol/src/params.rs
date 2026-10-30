@@ -72,6 +72,14 @@ pub struct PeerParams {
     /// The exit location label (status rendering; the catalog's
     /// `Domain` or the logical's country, per the caller).
     pub exit_label: Option<String>,
+    /// The server's DNS name (the catalog physical's `Domain` — its
+    /// TLS identity). Reaches protun's `PeerInfo::server_name`, which
+    /// the local agent uses for certificate name verification: an
+    /// IP-derived fallback FAILS CLOSED on DNS-SAN-only certificates,
+    /// so the daemon MUST pass the domain whenever the catalog entry
+    /// carries one (T-38, the M6 gate condition — review-log
+    /// 2026-10-29). `None` only for a genuinely domain-less entry.
+    pub server_name: Option<String>,
 }
 
 /// SEC-5/FR-121: full entry addresses never render (the manual
@@ -89,6 +97,7 @@ impl std::fmt::Debug for PeerParams {
             .field("tls", &self.tls)
             .field("priority", &self.priority)
             .field("exit_label", &self.exit_label)
+            .field("server_name", &self.server_name)
             .finish()
     }
 }

@@ -41,7 +41,13 @@ struct Args {
 
 fn main() {
     let args = Args::parse();
-    let code = run(args, &init_tracing_filtered, Some(Path::new("/")), None);
+    let code = run(
+        args,
+        &init_tracing_filtered,
+        Some(Path::new("/")),
+        None,
+        true,
+    );
     if code != 0 {
         std::process::exit(code);
     }
@@ -156,6 +162,7 @@ fn run(
     init_tracing: &dyn Fn(&str),
     trust_root: Option<&Path>,
     cache_dir: Option<&Path>,
+    install_lane: bool,
 ) -> i32 {
     // M2 S12: the terminating-signal handler goes in FIRST — a signal
     // arriving during config load or bind is recorded in the flag, and
@@ -265,6 +272,25 @@ fn run(
             return 15;
         }
     };
+    // M6 1b: the production lane wiring — allocate the bypass mark
+    // against the LIVE host (a saturated or un-surveyable host fails
+    // startup: exit 15, never a daemon that cannot connect), open the
+    // encrypted cache, install the lane. Tests pass install_lane=false
+    // (no CAP_NET_ADMIN under the harness — the connect family then
+    // answers the typed no_lane_installed refusal). The runtime comes
+    // back and MUST OUTLIVE serve() — a tokio Handle does not keep a
+    // runtime alive, and the lane's netlink connection lives on it.
+    let _net_runtime = if install_lane {
+        match wire_production_lane(&services, &core, &config_for_services, &paths) {
+            Ok(runtime) => Some(runtime),
+            Err(e) => {
+                eprintln!("protonwire-daemon: connection lane wiring failed: {e}");
+                return 15;
+            }
+        }
+    } else {
+        None
+    };
     let server = match protonwire_ipc::server::IpcServer::bind_with_group(
         &socket_dir,
         &socket_name,
@@ -285,6 +311,7 @@ fn run(
     );
 
     let stop = Arc::new(AtomicBool::new(false));
+    let services_for_drain = Arc::clone(&services);
     let handler = Arc::new(DaemonHandler {
         core: Arc::clone(&core),
         stop: Arc::clone(&stop),
@@ -318,8 +345,132 @@ fn run(
     server.serve(handler, stop);
     let _ = terminate_watcher.join();
     let _ = refresh_driver.join();
+    // M6 1b: the lane's DRAIN on shutdown (the re-verification gate's
+    // finding — nothing else called it, so process exit would strand
+    // an armed switch on the next-startup sweep instead of reverting
+    // cleanly): the administrator's unconditional teardown, blocking
+    // until the pump exits.
+    if let Some(lane) = services_for_drain.lane.current() {
+        lane.drain();
+    }
     info!("protonwire-daemon stopped");
     0
+}
+
+/// M6 1b: the production connection-lane wiring. Returns the runtime
+/// it built — the caller MUST hold it for the daemon's lifetime (a
+/// tokio Handle does not keep a runtime alive; the lane's netlink
+/// connection lives on it).
+fn wire_production_lane(
+    services: &protonwire_daemon::DaemonServices,
+    core: &Arc<protonwire_core::DaemonCore>,
+    config: &SystemConfig,
+    paths: &ConfigPaths,
+) -> Result<tokio::runtime::Runtime, String> {
+    use protonwire_daemon::connect::ConnectionLane;
+    use protonwire_daemon::netctx::NetContext;
+    use protonwire_protocol::{EncryptedCache, PersistenceFacade};
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("net runtime: {e}"))?;
+
+    // The DNS/IPv6 postures from the config's sections (the qa
+    // gate's P1-2: extracted, testable, pinned in the tests below).
+    let dns = dns_posture(config)?;
+    let ipv6 = ipv6_posture(config);
+
+    // The encrypted cache beside the state file (its own keyfile
+    // bootstrap; a wrong-size keyfile refuses, never re-keys).
+    let state_dir = paths
+        .state_file
+        .parent()
+        .ok_or("the state file has no parent directory")?
+        .to_path_buf();
+    let cache = EncryptedCache::open(&state_dir, &state_dir.join("cache.key"))
+        .map_err(|e| format!("encrypted cache: {e}"))?;
+    let facade = PersistenceFacade::start(Arc::new(cache));
+
+    let net = NetContext::startup(
+        runtime.handle().clone(),
+        config.daemon.interface_name.clone(),
+        dns,
+        ipv6,
+    )
+    .map_err(|e| format!("net context: {e}"))?;
+    let lane = ConnectionLane::new(
+        net,
+        "ProtonWire".to_owned(),
+        env!("CARGO_PKG_VERSION").to_owned(),
+        Arc::new(facade),
+        Arc::clone(core),
+    );
+    services.lane.install(Arc::new(lane));
+    Ok(runtime)
+}
+
+/// The DNS posture from the config's section (the qa gate's P1-2 —
+/// extracted so the mapping and its STRICT refusal are testable):
+/// Proton mode rides the tunnel's gateway resolver (10.2.0.1, the
+/// tun contract); Custom parses the user's list, refusing on any
+/// unparseable entry (config validation only checks non-emptiness —
+/// an all-invalid list must be a startup refusal, never a silent
+/// zero-server blackout under the tunnel); System/None mutate
+/// nothing.
+fn dns_posture(config: &SystemConfig) -> Result<protonwire_net::dns::DnsConfig, String> {
+    use protonwire_net::dns::{DnsConfig, DnsMode, DnsRouting, DnsServer};
+    match config.dns.mode {
+        protonwire_store::config::DnsMode::Proton => Ok(DnsConfig {
+            mode: DnsMode::Proton,
+            servers: vec![DnsServer::new(
+                "10.2.0.1".parse().expect("the gateway resolver"),
+            )],
+            routing: DnsRouting::ThroughVpn,
+        }),
+        protonwire_store::config::DnsMode::Custom => {
+            let mut servers = Vec::new();
+            for server in &config.dns.custom_servers {
+                let parsed: std::net::IpAddr = server.parse().map_err(|e| {
+                    format!("dns.custom_servers entry {server:?} is not an address: {e}")
+                })?;
+                servers.push(DnsServer::new(parsed));
+            }
+            Ok(DnsConfig {
+                mode: DnsMode::Custom,
+                servers,
+                routing: match config.dns.policy {
+                    protonwire_store::config::DnsPolicy::BypassVpn => DnsRouting::BypassVpn,
+                    protonwire_store::config::DnsPolicy::SystemDefault => DnsRouting::SystemDefault,
+                    protonwire_store::config::DnsPolicy::ThroughVpn => DnsRouting::ThroughVpn,
+                },
+            })
+        }
+        protonwire_store::config::DnsMode::System => Ok(DnsConfig {
+            mode: DnsMode::System,
+            servers: vec![],
+            routing: DnsRouting::SystemDefault,
+        }),
+        protonwire_store::config::DnsMode::None => Ok(DnsConfig {
+            mode: DnsMode::None,
+            servers: vec![],
+            routing: DnsRouting::ThroughVpn,
+        }),
+    }
+}
+
+/// FR-37's leak-block is the safe floor; `auto` negotiation of a
+/// tunnelled v6 rides the features slice (the server-support question
+/// needs the connected catalog).
+fn ipv6_posture(config: &SystemConfig) -> protonwire_net::route_drift::Ipv6Desired {
+    match config.connection.ipv6.mode {
+        protonwire_store::config::Ipv6Mode::Enabled => {
+            protonwire_net::route_drift::Ipv6Desired::Tunnelled
+        }
+        protonwire_store::config::Ipv6Mode::Auto | protonwire_store::config::Ipv6Mode::Disabled => {
+            protonwire_net::route_drift::Ipv6Desired::Blocked
+        }
+    }
 }
 
 #[cfg(test)]
@@ -327,6 +478,54 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// M6 1b (the qa gate's P1-2): the DNS/IPv6 posture mapping and
+    /// its STRICT Custom refusal, pinned on the pure functions.
+    #[test]
+    fn m6_dns_posture_maps_every_mode_and_refuses_invalid_custom_entries() {
+        let mut config = SystemConfig::default();
+        // Proton: the tunnel's gateway resolver, through the VPN.
+        let dns = dns_posture(&config).expect("proton posture");
+        assert_eq!(dns.mode, protonwire_net::dns::DnsMode::Proton);
+        assert_eq!(dns.servers.len(), 1);
+        // Custom: valid entries parse; an unparseable entry REFUSES
+        // naming the offender (never a silent zero-server blackout).
+        config.dns.mode = protonwire_store::config::DnsMode::Custom;
+        config.dns.custom_servers = vec!["10.0.0.1".to_owned(), "192.168.1.1".to_owned()];
+        let dns = dns_posture(&config).expect("custom posture");
+        assert_eq!(dns.mode, protonwire_net::dns::DnsMode::Custom);
+        assert_eq!(dns.servers.len(), 2);
+        config.dns.custom_servers = vec!["10.0.0.1".to_owned(), "not-an-address".to_owned()];
+        let error = dns_posture(&config).expect_err("the invalid entry refuses");
+        assert!(
+            error.contains("not-an-address"),
+            "the refusal names the offender: {error}"
+        );
+        // System/None: no mutation, no servers.
+        config.dns.mode = protonwire_store::config::DnsMode::System;
+        assert!(dns_posture(&config).unwrap().servers.is_empty());
+        config.dns.mode = protonwire_store::config::DnsMode::None;
+        assert!(dns_posture(&config).unwrap().servers.is_empty());
+    }
+
+    #[test]
+    fn m6_ipv6_posture_blocks_unless_enabled() {
+        type Ipv6DesiredPosture = protonwire_net::route_drift::Ipv6Desired;
+        let mut config = SystemConfig::default();
+        config.connection.ipv6.mode = protonwire_store::config::Ipv6Mode::Enabled;
+        assert_eq!(ipv6_posture(&config), Ipv6DesiredPosture::Tunnelled);
+        for mode in [
+            protonwire_store::config::Ipv6Mode::Auto,
+            protonwire_store::config::Ipv6Mode::Disabled,
+        ] {
+            config.connection.ipv6.mode = mode;
+            assert_eq!(
+                ipv6_posture(&config),
+                Ipv6DesiredPosture::Blocked,
+                "{mode:?} blocks (FR-37's leak floor)"
+            );
+        }
+    }
 
     /// In-order log capture: the marker the injected factory pushes plus
     /// every tracing event recorded after it installs its subscriber.
@@ -430,7 +629,7 @@ mod tests {
             }
         };
 
-        let code = run(args, &init, None, Some(&cache_dir));
+        let code = run(args, &init, None, Some(&cache_dir), false);
         assert_eq!(code, 1, "the blocked socket directory must fail the bind");
 
         let entries = log.snapshot();
@@ -502,7 +701,7 @@ mod tests {
             // No subscriber install (the FU-A test owns the process's
             // single global install); trust_root None keeps the loader
             // on its plain semantics for the scratch-tree path.
-            let _ = exit_tx.send(run(args, &|_level: &str| {}, None, Some(&cache_dir)));
+            let _ = exit_tx.send(run(args, &|_level: &str| {}, None, Some(&cache_dir), false));
         });
 
         // Wait for the socket, then handshake a live session through it.
@@ -609,7 +808,7 @@ mod tests {
             socket_dir: Some(blocker),
             log_level: None,
         };
-        let code = run(args, &|_level: &str| {}, None, Some(&cache_dir));
+        let code = run(args, &|_level: &str| {}, None, Some(&cache_dir), false);
         assert_eq!(
             code, 15,
             "a corrupted deadlines document must refuse startup with the \
@@ -643,7 +842,7 @@ mod tests {
             socket_dir: Some(blocker),
             log_level: None,
         };
-        let code = run(args, &|_level: &str| {}, None, Some(&cache_dir));
+        let code = run(args, &|_level: &str| {}, None, Some(&cache_dir), false);
         assert_eq!(
             code, 1,
             "first boot with no persisted deadlines must reach the bind \
@@ -683,7 +882,13 @@ mod tests {
             socket_dir: Some(blocker),
             log_level: None,
         };
-        let code = run(args, &|_level: &str| {}, None, Some(&dir.join("cache")));
+        let code = run(
+            args,
+            &|_level: &str| {},
+            None,
+            Some(&dir.join("cache")),
+            false,
+        );
         assert_eq!(
             code, 15,
             "a systemd source with no credentials directory must refuse startup \
@@ -730,7 +935,7 @@ mod tests {
         // single global install; this test pins only the exit code (the
         // defect naming is pinned by the store suite).
         let init = |_level: &str| {};
-        let code = run(args, &init, Some(Path::new("/")), None);
+        let code = run(args, &init, Some(Path::new("/")), None, false);
         assert_eq!(
             code, 15,
             "a group-writable system configuration must fail the strict load with \

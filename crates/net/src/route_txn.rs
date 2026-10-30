@@ -180,6 +180,16 @@ pub trait NetlinkExecutor {
         &mut self,
         session: &[NetOp],
     ) -> impl Future<Output = Result<Vec<NetOp>, NetOpError>> + Send;
+
+    /// Every fwmark referenced by any LIVE FOREIGN policy rule (both
+    /// families) — the mark-collision survey's netlink half (the
+    /// bypass-mark owner decision, 2026-10-08). CONTRACT: the set is
+    /// FOREIGN-ONLY — rules attributed to US (the canonical
+    /// 31699..=31700 priority band) are excluded, because our own
+    /// prior-session residue must not block re-choosing our own mark
+    /// (the allocator wedges if an impl counts them). A mark another
+    /// subsystem routes by is TAKEN, whoever owns the rule.
+    fn rule_marks(&mut self) -> impl Future<Output = Result<BTreeSet<u32>, NetOpError>> + Send;
 }
 
 /// A transaction refused before it started — the op's table is a
@@ -707,6 +717,45 @@ impl NetlinkExecutor for RtnetlinkExecutor {
         let present = self.present_ops(&adds).await?;
         Ok(present.iter().map(|op| inverse(*op)).collect())
     }
+
+    async fn rule_marks(&mut self) -> Result<BTreeSet<u32>, NetOpError> {
+        // Both rule families (the survey's own discipline: a mark
+        // routed only by an IPv6 rule is as taken as a v4 one).
+        // Attribution: rules in OUR canonical priority band are ours
+        // (prior-session/crash-residue rules may reference the old
+        // mark and must not block re-choosing it) — only FOREIGN
+        // rules' marks are reported taken.
+        let mut marks = BTreeSet::new();
+        for family in [rtnetlink::IpVersion::V4, rtnetlink::IpVersion::V6] {
+            let mut rules = self.handle.rule().get(family).execute();
+            while let Some(message) = rules.next().await {
+                let message = message.map_err(|error| format!("rule dump: {error}"))?;
+                let ours = message.attributes.iter().any(|attribute| {
+                    matches!(attribute, RuleAttribute::Priority(priority)
+                            if crate::mark::is_ours_priority(*priority))
+                });
+                if ours {
+                    continue;
+                }
+                for mark in message
+                    .attributes
+                    .iter()
+                    .filter_map(|attribute| match attribute {
+                        RuleAttribute::FwMark(mark) => Some(*mark),
+                        _ => None,
+                    })
+                {
+                    // FwMark 0 is the attribute-less default — not a
+                    // reservation of the zero mark (which the chooser
+                    // refuses on its own anyway).
+                    if mark != 0 {
+                        marks.insert(mark);
+                    }
+                }
+            }
+        }
+        Ok(marks)
+    }
 }
 
 #[cfg(test)]
@@ -742,6 +791,9 @@ mod tests {
         }
         async fn cleanup_ops(&mut self, _session: &[NetOp]) -> Result<Vec<NetOp>, NetOpError> {
             Ok(Vec::new())
+        }
+        async fn rule_marks(&mut self) -> Result<BTreeSet<u32>, NetOpError> {
+            Ok(BTreeSet::new())
         }
     }
 
@@ -870,6 +922,9 @@ mod tests {
             async fn cleanup_ops(&mut self, _session: &[NetOp]) -> Result<Vec<NetOp>, NetOpError> {
                 Ok(Vec::new())
             }
+            async fn rule_marks(&mut self) -> Result<BTreeSet<u32>, NetOpError> {
+                Ok(BTreeSet::new())
+            }
         }
         let failing_op = NetOp::DelRule(RuleSpec {
             table: 51821,
@@ -931,6 +986,9 @@ mod tests {
             async fn cleanup_ops(&mut self, _session: &[NetOp]) -> Result<Vec<NetOp>, NetOpError> {
                 Ok(Vec::new())
             }
+            async fn rule_marks(&mut self) -> Result<BTreeSet<u32>, NetOpError> {
+                Ok(BTreeSet::new())
+            }
         }
         let failing = NetOp::AddRoute(route(51820));
         let txn = RouteTransaction::new(plan())
@@ -986,6 +1044,9 @@ mod tests {
                 let present = self.present_ops(&adds).await?;
                 Ok(present.iter().map(|op| inverse(*op)).collect())
             }
+            async fn rule_marks(&mut self) -> Result<BTreeSet<u32>, NetOpError> {
+                Ok(BTreeSet::new())
+            }
         }
         let mut executor = DelShapedPresent {
             calls: std::cell::RefCell::new(Vec::new()),
@@ -1034,6 +1095,9 @@ mod tests {
             }
             async fn cleanup_ops(&mut self, _session: &[NetOp]) -> Result<Vec<NetOp>, NetOpError> {
                 Ok(Vec::new())
+            }
+            async fn rule_marks(&mut self) -> Result<BTreeSet<u32>, NetOpError> {
+                Ok(BTreeSet::new())
             }
         }
         let txn = RouteTransaction::new(plan())

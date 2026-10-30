@@ -5306,17 +5306,24 @@ dependencies = [
 name = "protonwire-daemon"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "clap",
- "getrandom 0.2.17",
+ "futures-util",
+ "getrandom 0.3.4",
+ "log",
  "nix 0.31.3",
+ "proton-boringtun",
  "protonwire-api",
  "protonwire-core",
  "protonwire-frontend-api",
  "protonwire-ipc",
+ "protonwire-net",
  "protonwire-protocol",
  "protonwire-store",
+ "rtnetlink",
  "serde_json",
  "thiserror 2.0.21",
+ "tokio",
  "tracing",
 ]
 
@@ -5360,6 +5367,7 @@ name = "protonwire-net"
 version = "0.1.0"
 dependencies = [
  "futures-util",
+ "getrandom 0.3.4",
  "nix 0.31.3",
  "protonwire-frontend-api",
  "rtnetlink",
@@ -5397,6 +5405,7 @@ dependencies = [
  "proton-boringtun",
  "protonwire-net",
  "protun",
+ "rustls-pki-types",
  "thiserror 2.0.21",
  "tracing",
  "zeroize",

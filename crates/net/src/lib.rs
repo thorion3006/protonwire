@@ -79,6 +79,12 @@ pub mod permanent;
 /// validation.
 pub mod kill_switch;
 
+/// The bypass-mark allocator (the 2026-10-08 owner decision): random
+/// choice at startup, collision-checked against live ip-rule fwmarks
+/// and nftables mark matches outside our table, re-chosen on
+/// collision; the session re-check runs before the kill switch arms.
+pub mod mark;
+
 /// The network-namespace integration-test harness (NFR-31). Shared by
 /// every netns-gated integration test in the workspace (`protocol`'s
 /// IT-1 today, this crate's M5 suite next); the runner is

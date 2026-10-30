@@ -52,6 +52,7 @@ fn deterministic_peer(id: &str) -> PeerParams {
         }),
         priority: 1,
         exit_label: Some("test-exit".to_owned()),
+        server_name: None,
     }
 }
 

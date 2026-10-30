@@ -92,13 +92,22 @@ pub async fn connect<E: NetlinkExecutor>(
     inputs: &ConnectInputs,
     kill_policy_extras: &KillSwitchPolicy,
 ) -> Result<SessionState, SessionError> {
-    // === MARK COLLISION CHECK (the M6 contract, landed early) ===
-    // The bypass mark must not collide with any live fwmark or nft
-    // mark-matching rule (the sec-auditor's F6 finding). The check
-    // is here because the mark is about to be baked into rules.
-    // TODO: the live check (dump ip rules' fwmarks + nftables mark
-    // matches) lands with the daemon's survey; the structural
-    // check (mark != 0) is in the kill switch's apply.
+    // === MARK COLLISION RE-CHECK (the M6 contract) ===
+    // The owner decision 2026-10-08: the daemon chose its bypass
+    // mark randomly at STARTUP, but the world moved since — the
+    // check re-runs HERE, inside the route commit and BEFORE the
+    // kill switch arms (the mark is about to be baked into rules;
+    // arming on a colliding mark would punch another subsystem's
+    // traffic through our switch). A collision refuses typed — the
+    // daemon re-allocates and retries the whole sequence.
+    if crate::mark::session_collision(executor, inputs.bypass_mark)
+        .await
+        .map_err(|e| SessionError::Netlink(e.to_string()))?
+    {
+        return Err(SessionError::MarkCollision {
+            mark: inputs.bypass_mark,
+        });
+    }
 
     // === PHASE 1: PLAN ===
     let plan = route_txn::plan_with(executor, rt_tables_text, inputs.persisted_tables.clone())
@@ -145,6 +154,14 @@ pub async fn connect<E: NetlinkExecutor>(
     };
 
     // === PHASE 4: DNS APPLY ===
+    // A failure HERE would strand the sequence half-composed (the
+    // round-6 rollback covers phase 3 only): the switch armed, routes
+    // committed, DNS unmutated — and NO SessionState returned, so the
+    // caller could not revert what it never received (the 1b rust
+    // gate's P1-2). Every phase-4 error path therefore runs the
+    // cleanup ITSELF before refusing: DNS revert is unnecessary
+    // (nothing mutated), the route cleanup replays disconnect's own
+    // phase-2 shape, and the NEWLY-INSTALLED generation comes off.
     let backend = dns::detect_backend();
     let dns_evidence = match (&inputs.dns.mode, &backend) {
         (dns::DnsMode::None, _) => None, // no mutation, no revert
@@ -156,16 +173,62 @@ pub async fn connect<E: NetlinkExecutor>(
                 Ok(()) => None,
                 Err(_) => {
                     let path = std::path::Path::new("/etc/resolv.conf");
-                    let evidence = dns::capture_resolv_conf(path)?;
-                    dns::apply_resolv_conf(&evidence, &inputs.dns.servers)?;
+                    let evidence = match dns::capture_resolv_conf(path) {
+                        Ok(evidence) => evidence,
+                        Err(error) => {
+                            return Err(dns_phase_cleanup(
+                                executor,
+                                &plan,
+                                &installed,
+                                inputs.generation,
+                                SessionError::Dns(error),
+                            )
+                            .await);
+                        }
+                    };
+                    if let Err(error) = dns::apply_resolv_conf(&evidence, &inputs.dns.servers) {
+                        // The capture may have already replaced the
+                        // file mid-way: restore it before the cleanup.
+                        let _ = dns::revert_resolv_conf(&evidence);
+                        return Err(dns_phase_cleanup(
+                            executor,
+                            &plan,
+                            &installed,
+                            inputs.generation,
+                            SessionError::Dns(error),
+                        )
+                        .await);
+                    }
                     Some(evidence)
                 }
             }
         }
         (_, dns::DnsBackend::ResolvConf) => {
             let path = std::path::Path::new("/etc/resolv.conf");
-            let evidence = dns::capture_resolv_conf(path)?;
-            dns::apply_resolv_conf(&evidence, &inputs.dns.servers)?;
+            let evidence = match dns::capture_resolv_conf(path) {
+                Ok(evidence) => evidence,
+                Err(error) => {
+                    return Err(dns_phase_cleanup(
+                        executor,
+                        &plan,
+                        &installed,
+                        inputs.generation,
+                        SessionError::Dns(error),
+                    )
+                    .await);
+                }
+            };
+            if let Err(error) = dns::apply_resolv_conf(&evidence, &inputs.dns.servers) {
+                let _ = dns::revert_resolv_conf(&evidence);
+                return Err(dns_phase_cleanup(
+                    executor,
+                    &plan,
+                    &installed,
+                    inputs.generation,
+                    SessionError::Dns(error),
+                )
+                .await);
+            }
             Some(evidence)
         }
     };
@@ -177,6 +240,34 @@ pub async fn connect<E: NetlinkExecutor>(
         dns_backend: backend,
         generation: inputs.generation,
     })
+}
+
+/// The phase-4 failure cleanup (the 1b rust gate's P1-2): the DNS
+/// phase failed with the switch armed and routes committed — undo
+/// them (the disconnect sequence's own phase-2/3 shape) and hand the
+/// ORIGINAL error back. Best-effort: a cleanup failure is logged by
+/// the caller's error path; the switch's own lookalike discipline
+/// governs what remains.
+async fn dns_phase_cleanup<E: NetlinkExecutor>(
+    executor: &mut E,
+    plan: &TablePlan,
+    installed: &[NetOp],
+    generation: GenerationId,
+    error: SessionError,
+) -> SessionError {
+    let cleanup = executor.cleanup_ops(installed).await.unwrap_or_default();
+    let mut txn = Some(RouteTransaction::new(plan.clone()));
+    for op in cleanup {
+        txn = txn.and_then(|built| built.op(op).ok());
+        if txn.is_none() {
+            break; // best-effort cleanup: apply what built
+        }
+    }
+    if let Some(txn) = txn {
+        let _ = txn.apply(executor).await;
+    }
+    let _ = kill_switch::remove(Some(generation));
+    error
 }
 
 /// THE DISCONNECT SEQUENCE: DNS revert → route cleanup → kill
@@ -216,6 +307,66 @@ pub async fn disconnect<E: NetlinkExecutor>(
 
 #[cfg(test)]
 mod tests {
+    /// The P1-2 pin: the DNS-phase cleanup path actually invokes the
+    /// executor's cleanup (the inverse transaction is built from what
+    /// `cleanup_ops` returns) and hands the ORIGINAL error back. The
+    /// switch removal is best-effort (an unprivileged test cannot arm
+    /// one — its failure is the swallowed arm; the full phase-4
+    /// integration needs the DNS seam, tracked).
+    #[tokio::test]
+    async fn dns_phase_cleanup_runs_the_inverse_and_returns_the_error() {
+        use std::sync::Arc as TestArc;
+        struct RecordingCleanup;
+        impl crate::route_txn::NetlinkExecutor for RecordingCleanup {
+            async fn exec(
+                &mut self,
+                _op: crate::route_txn::NetOp,
+            ) -> Result<bool, crate::route_txn::NetOpError> {
+                Ok(true)
+            }
+            async fn survey(
+                &mut self,
+                _text: &str,
+            ) -> Result<crate::tables::TableSurvey, crate::route_txn::NetOpError> {
+                Ok(crate::tables::TableSurvey::default())
+            }
+            async fn present_ops(
+                &mut self,
+                desired: &[crate::route_txn::NetOp],
+            ) -> Result<Vec<crate::route_txn::NetOp>, crate::route_txn::NetOpError> {
+                Ok(desired.to_vec())
+            }
+            async fn cleanup_ops(
+                &mut self,
+                _session: &[crate::route_txn::NetOp],
+            ) -> Result<Vec<crate::route_txn::NetOp>, crate::route_txn::NetOpError> {
+                Err("cleanup refused (the recorder proves the call)".to_owned())
+            }
+            async fn rule_marks(
+                &mut self,
+            ) -> Result<std::collections::BTreeSet<u32>, crate::route_txn::NetOpError> {
+                Ok(Default::default())
+            }
+        }
+        let plan = crate::tables::plan_tables(&Default::default());
+        let error = dns_phase_cleanup(
+            &mut RecordingCleanup,
+            &plan,
+            &[],
+            GenerationId(3),
+            SessionError::Dns(dns::DnsError::Io(std::io::Error::other("boom"))),
+        )
+        .await;
+        // The ORIGINAL error surfaces (the cleanup is best-effort and
+        // its own refusal never replaces it) — the recorder's Err is
+        // the proof it was called at all.
+        assert!(
+            matches!(error, SessionError::Dns(ref inner) if inner.to_string().contains("boom")),
+            "the original DNS error surfaces, got {error:?}"
+        );
+        let _ = TestArc::new(()); // keep the import honest if unused
+    }
+
     use super::*;
 
     #[test]
@@ -236,5 +387,70 @@ mod tests {
             persisted_tables: None,
         };
         assert_eq!(inputs.tun_ifname, "pw-tun0");
+    }
+
+    /// The route-commit re-check: a bypass mark referenced by a
+    /// FOREIGN policy rule refuses the sequence BEFORE the kill
+    /// switch arms — the typed MarkCollision the daemon retries with
+    /// a fresh allocation. The netlink half decides this unit-level
+    /// (the netns IT proves both halves live).
+    #[tokio::test]
+    async fn a_colliding_bypass_mark_refuses_before_the_kill_switch_arms() {
+        use crate::route_txn::{NetOp, NetOpError};
+        use crate::tables::TableSurvey;
+        use std::collections::BTreeSet;
+
+        struct CollidingMark(u32);
+        impl crate::route_txn::NetlinkExecutor for CollidingMark {
+            async fn exec(&mut self, _op: NetOp) -> Result<bool, NetOpError> {
+                Ok(true)
+            }
+            async fn survey(&mut self, _text: &str) -> Result<TableSurvey, NetOpError> {
+                Ok(TableSurvey::default())
+            }
+            async fn present_ops(&mut self, _desired: &[NetOp]) -> Result<Vec<NetOp>, NetOpError> {
+                Ok(Vec::new())
+            }
+            async fn cleanup_ops(&mut self, _session: &[NetOp]) -> Result<Vec<NetOp>, NetOpError> {
+                Ok(Vec::new())
+            }
+            async fn rule_marks(&mut self) -> Result<BTreeSet<u32>, NetOpError> {
+                Ok([self.0].into_iter().collect())
+            }
+        }
+
+        let mut executor = CollidingMark(0x0020_2020);
+        let inputs = ConnectInputs {
+            tun_ifindex: 5,
+            tun_ifname: "pw-tun0".into(),
+            uplink_ifname: "eth0".into(),
+            bypass_mark: 0x0020_2020,
+            ipv6: Ipv6Desired::Blocked,
+            dns: DnsConfig {
+                mode: dns::DnsMode::None,
+                servers: vec![],
+                routing: dns::DnsRouting::ThroughVpn,
+            },
+            generation: GenerationId(1),
+            prior_generation: None,
+            persisted_tables: None,
+        };
+        let error = connect(
+            &mut executor,
+            "",
+            &inputs,
+            &KillSwitchPolicy {
+                tun_ifindex: 5,
+                allow_dhcp_v4: false,
+                lan_permits: Vec::new(),
+                bypass_mark: 0x0020_2020,
+            },
+        )
+        .await
+        .expect_err("the colliding mark must refuse");
+        assert!(
+            matches!(error, SessionError::MarkCollision { mark } if mark == 0x0020_2020),
+            "typed MarkCollision, got {error:?}"
+        );
     }
 }

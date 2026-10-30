@@ -16,6 +16,10 @@ use protonwire_ipc::{EventBus, RequestHandler, SessionContext};
 use std::path::{Path, PathBuf};
 
 pub mod connect;
+/// M6 slice 1b: the daemon's net context — the startup-allocated
+/// bypass mark, the uplink survey, the kill-switch generation
+/// counter.
+pub mod netctx;
 pub mod services;
 
 pub use services::DaemonServices;
@@ -132,6 +136,32 @@ impl RequestHandler for DaemonHandler {
                 .selection
                 .resolve(&target, &modifiers)
                 .map(|result| RequestResult::Selected { result }),
+            // M6 1b: THE CONNECT COMPOSITION — selection resolves the
+            // target, the catalog join builds the tunnel params (the
+            // winner's online keyed physicals, Domains riding as
+            // server_name), and the lane composes engine ∘ net session
+            // (marks health-gated before the kill switch arms, IT-13).
+            // The IPC-authenticated UID is the lane's owner identity.
+            Request::Connect { target } => {
+                let lane = self.services.lane.current().ok_or_else(no_lane_installed)?;
+                let winner = self.services.selection.resolve(
+                    &target,
+                    &protonwire_frontend_api::SelectionModifiers::default(),
+                )?;
+                let params = self.services.selection.tunnel_params(&winner.winner.id)?;
+                lane.connect(ctx.peer.uid, &params)
+                    .map_err(lane_error_to_rpc)?;
+                Ok(RequestResult::Acknowledged)
+            }
+            // M6 1b: disconnect — the owner gate and the teardown
+            // windows are the lane's; a no-active-connection
+            // disconnect is its idempotent success.
+            Request::Disconnect => {
+                let lane = self.services.lane.current().ok_or_else(no_lane_installed)?;
+                lane.disconnect(ctx.peer.uid)
+                    .map_err(|refusal| lane_error_to_rpc(connect::LaneError::Refused(refusal)))?;
+                Ok(RequestResult::Acknowledged)
+            }
             // M3 U6 (FR-23I/U): the registry-served group catalog with
             // FR-23S availability — no network, no client-side preset
             // lists.
@@ -286,6 +316,60 @@ fn no_engine_installed() -> RpcError {
         "the account session engine is not wired yet (the session lane \
          installs it into the daemon's auth provider)",
     )
+}
+
+/// The connect family's empty-cell refusal: the lane installs at
+/// startup, after the NetContext's mark allocation — before that the
+/// family answers typed, never guessing.
+fn no_lane_installed() -> RpcError {
+    RpcError::new(
+        RpcErrorCode::NotImplemented,
+        "the connection lane is not installed yet (daemon startup wires it \
+         after allocating the bypass mark)",
+    )
+}
+
+/// Maps the lane's refusals and failures onto the wire's error
+/// vocabulary: the owner gate is PERMISSION, the teardown windows are
+/// TEMPORARY (the client retries), and the engine/session failures
+/// name their own layer (TunnelFailed / KillSwitchFailed /
+/// DnsConfigFailed by the session's phase).
+fn lane_error_to_rpc(error: connect::LaneError) -> RpcError {
+    match error {
+        connect::LaneError::Refused(connect::LaneRefusal::NotOwner { .. }) => RpcError::new(
+            RpcErrorCode::PermissionDenied,
+            // Least disclosure (the sec gate's P3): GetState already
+            // redacts the owner's UID from non-owners — the refusal
+            // matches it; only the FACT of another owner surfaces.
+            "another user owns the active connection",
+        ),
+        connect::LaneError::Refused(
+            refusal @ (connect::LaneRefusal::Draining
+            | connect::LaneRefusal::Reconnecting
+            | connect::LaneRefusal::Disconnecting),
+        ) => RpcError::new(RpcErrorCode::NetworkUnavailable, refusal.to_string()),
+        // The idempotent no-active-connection disconnect is an Ok at
+        // the lane; reaching here with it is a logic error upstream.
+        connect::LaneError::Refused(connect::LaneRefusal::NoActiveConnection) => {
+            RpcError::new(RpcErrorCode::InvalidParams, "no active connection")
+        }
+        connect::LaneError::Engine(error) => {
+            RpcError::new(RpcErrorCode::TunnelFailed, error.to_string())
+        }
+        connect::LaneError::Net(error) => {
+            let code = match &error {
+                connect::SessionError::KillSwitch(_) => RpcErrorCode::KillSwitchFailed,
+                connect::SessionError::Dns(_) => RpcErrorCode::DnsConfigFailed,
+                // A mark COLLISION is retryable — the daemon's next
+                // attempt draws a fresh mark (the 2026-10-08 owner
+                // decision's re-choose loop), so the client reads
+                // NetworkUnavailable, not a tunnel failure.
+                connect::SessionError::MarkCollision { .. } => RpcErrorCode::NetworkUnavailable,
+                _ => RpcErrorCode::TunnelFailed,
+            };
+            RpcError::new(code, error.to_string())
+        }
+    }
 }
 
 /// S2's GetState redaction decision (PRD 6.3, the round-1 finding-9
@@ -553,11 +637,84 @@ mod tests {
             RequestResult::Pong { nonce } => assert_eq!(nonce, "n"),
             other => panic!("unexpected result: {other:?}"),
         }
-        // Disconnect is refused by core until Milestone 4.
+        // Disconnect without an installed lane (the test handler never
+        // wires one) is the connect family's typed empty-cell refusal
+        // (M6 1b) — core's arm is the defensive backstop only.
         let err = handler
             .handle(&admin_ctx(), Request::Disconnect)
             .unwrap_err();
         assert_eq!(err.code, RpcErrorCode::NotImplemented);
+        assert!(err.message.contains("connection lane is not installed"));
+    }
+
+    /// M6 1b (the qa gate's P1-1): the Connect arm's empty-cell
+    /// refusal, and the full lane_error_to_rpc matrix — the pure
+    /// mapping from the lane's vocabulary onto the wire's codes.
+    #[test]
+    fn m6_connect_without_a_lane_refuses_typed() {
+        let (handler, _) = handler();
+        let err = handler
+            .handle(
+                &admin_ctx(),
+                Request::Connect {
+                    target: protonwire_frontend_api::ConnectTarget::Fastest,
+                },
+            )
+            .unwrap_err();
+        assert_eq!(err.code, RpcErrorCode::NotImplemented);
+        assert!(err.message.contains("connection lane is not installed"));
+    }
+
+    #[test]
+    fn m6_lane_errors_map_onto_the_wire_vocabulary() {
+        use connect::LaneError::Refused;
+        // The owner gate is PERMISSION — and the owner's UID does NOT
+        // leak (the sec gate's P3: GetState redacts it; the refusal
+        // matches that least-disclosure decision).
+        let error = lane_error_to_rpc(Refused(connect::LaneRefusal::NotOwner { owner: 4242 }));
+        assert_eq!(error.code, RpcErrorCode::PermissionDenied);
+        assert!(
+            !error.message.contains("4242"),
+            "the owner UID must not leak: {}",
+            error.message
+        );
+        // The teardown windows are TEMPORARY (the client retries).
+        for refusal in [
+            connect::LaneRefusal::Draining,
+            connect::LaneRefusal::Reconnecting,
+            connect::LaneRefusal::Disconnecting,
+        ] {
+            let code = lane_error_to_rpc(Refused(refusal)).code;
+            assert_eq!(code, RpcErrorCode::NetworkUnavailable);
+        }
+        assert_eq!(
+            lane_error_to_rpc(Refused(connect::LaneRefusal::NoActiveConnection)).code,
+            RpcErrorCode::InvalidParams
+        );
+        // The session's phases name their own layer; a mark COLLISION
+        // is retryable (the daemon re-draws), not a tunnel failure.
+        let phase =
+            |error: connect::SessionError| lane_error_to_rpc(connect::LaneError::Net(error)).code;
+        assert_eq!(
+            phase(connect::SessionError::KillSwitch(
+                protonwire_net::kill_switch::KillSwitchError::Lookalike
+            )),
+            RpcErrorCode::KillSwitchFailed
+        );
+        assert_eq!(
+            phase(connect::SessionError::Dns(
+                protonwire_net::dns::DnsError::Resolvectl("x".to_owned())
+            )),
+            RpcErrorCode::DnsConfigFailed
+        );
+        assert_eq!(
+            phase(connect::SessionError::MarkCollision { mark: 7 }),
+            RpcErrorCode::NetworkUnavailable
+        );
+        assert_eq!(
+            phase(connect::SessionError::Plan("x".to_owned())),
+            RpcErrorCode::TunnelFailed
+        );
     }
 
     /// M3 U6: the selection surface dispatches through the handler

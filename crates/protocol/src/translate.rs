@@ -219,6 +219,23 @@ fn decode_peer(peer: &crate::params::PeerParams) -> Result<Vec<PeerInfo>, Protoc
     // The raw bytes are Copy — each expanded candidate gets its own.
     let server_public_key = server_public_key.0;
 
+    // The sec gate's P3: protun UNWRAPS pvpnclient's with_server_name,
+    // which refuses a Domain that does not parse as a TLS ServerName —
+    // validate HERE with upstream's own predicate so a malformed
+    // catalog Domain is a typed peer refusal, never a daemon panic
+    // at connect time.
+    if let Some(name) = peer.server_name.as_deref()
+        && rustls_pki_types::ServerName::try_from(name).is_err()
+    {
+        return Err(ProtocolError::InvalidPeer(
+            peer.id.clone(),
+            format!(
+                "server_name {name:?} does not parse as a TLS ServerName \
+                 (the catalog's Domain is malformed)"
+            ),
+        ));
+    }
+
     let mut candidates: Vec<PeerInfo> = Vec::new();
     for (transport, endpoint) in [
         (Transport::Udp, &peer.udp),
@@ -250,13 +267,12 @@ fn decode_peer(peer: &crate::params::PeerParams) -> Result<Vec<PeerInfo>, Protoc
                     tls_ports: Vec::new(),
                     priority: peer.priority,
                     exit_label: peer.exit_label.clone(),
-                    // protun v3.0.5: the local agent's DNS name for the
-                    // server. Our PeerParams carry only entry IPs — no
-                    // domain — so the agent falls back to its IP-derived
-                    // default (None skips the builder call entirely).
-                    // Plumb the catalog's server domains here when the
-                    // connection plan starts carrying them (M6).
-                    server_name: None,
+                    // T-38: the catalog domain rides into EVERY
+                    // expanded candidate — the local agent verifies
+                    // this name against the server certificate, and
+                    // dropping it silently fails closed on
+                    // DNS-SAN-only certs at connect time.
+                    server_name: peer.server_name.clone(),
                 };
                 install(&mut info);
                 candidates.push(info);
@@ -350,6 +366,7 @@ mod tests {
             }),
             priority,
             exit_label: Some("CH#10".to_owned()),
+            server_name: None,
         }
     }
 
@@ -372,6 +389,79 @@ mod tests {
         assert_eq!(config.peers[0].udp_ports, vec![443, 1194]);
         assert_eq!(config.peers[0].exit_label.as_deref(), Some("CH#10"));
         assert!(config.network_available);
+    }
+
+    /// T-38 (the M6 gate condition, review-log 2026-10-29): the
+    /// catalog's server domain MUST reach `PeerInfo::server_name` —
+    /// the local agent verifies that name against the server
+    /// certificate, and an IP-derived fallback FAILS CLOSED on
+    /// DNS-SAN-only certs. A domain present in the params but dropped
+    /// at translation is exactly the silent failure this pins; the
+    /// None case (a catalog entry with no domain) stays None.
+    #[test]
+    fn t38_the_catalog_domain_reaches_peerinfo_server_name() {
+        let mut with_domain = peer("a", 0);
+        with_domain.server_name = Some("ch-10.protonvpn.net".to_owned());
+        let config = translate(&params(vec![with_domain])).unwrap();
+        assert_eq!(
+            config.peers[0].server_name.as_deref(),
+            Some("ch-10.protonvpn.net"),
+            "the domain must ride into every expanded candidate"
+        );
+
+        // The per-address EXPANSION carries it too: a peer with
+        // different addresses per transport splits into several
+        // candidates and EACH needs the name (any of them may win).
+        // Protocol::Smart — a fixed protocol's constrain_transports
+        // would drop the other-transport candidates before the
+        // expansion can matter.
+        let mut split = peer("split", 0);
+        split.server_name = Some("split.example.net".to_owned());
+        split.tcp = Some(crate::params::TransportEndpoint {
+            entry_ip: IpAddr::from_str("198.51.100.99").unwrap(),
+            ports: vec![443],
+        });
+        let mut smart = params(vec![split]);
+        smart.protocol = crate::Protocol::Smart;
+        let config = translate(&smart).unwrap();
+        assert!(config.peers.len() > 1, "the fixture must actually split");
+        assert!(
+            config
+                .peers
+                .iter()
+                .all(|candidate| candidate.server_name.as_deref() == Some("split.example.net")),
+            "every expanded candidate carries the domain"
+        );
+
+        // No domain in the catalog entry: None stays None (protun
+        // skips its with_server_name builder call — the pre-M6
+        // behavior for domain-less entries).
+        let config = translate(&params(vec![peer("b", 0)])).unwrap();
+        assert_eq!(config.peers[0].server_name, None);
+    }
+
+    /// The sec gate's P3: protun UNWRAPS with_server_name, and
+    /// pvpnclient refuses a Domain that does not parse as a TLS
+    /// ServerName — an unparseable catalog Domain must die as a
+    /// TYPED peer refusal here, never as a daemon panic at connect.
+    /// The predicate is upstream's own (rustls-pki-types), not a
+    /// local grammar that could drift from it.
+    #[test]
+    fn an_unparseable_server_name_refuses_the_peer_typed() {
+        for bad in ["not a name!", "", "ch-10..protonvpn.net", "brackets[1]"] {
+            let mut peer = peer("bad", 0);
+            peer.server_name = Some(bad.to_owned());
+            let error = translate(&params(vec![peer])).unwrap_err();
+            assert!(
+                matches!(&error, ProtocolError::InvalidPeer(id, _) if id == "bad"),
+                "typed InvalidPeer for {bad:?}, got {error}"
+            );
+        }
+        // A name upstream accepts still passes (the positive control:
+        // a real Domain shape).
+        let mut good = peer("good", 0);
+        good.server_name = Some("ch-10.protonvpn.net".to_owned());
+        assert!(translate(&params(vec![good])).is_ok());
     }
 
     #[test]

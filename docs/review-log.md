@@ -4018,3 +4018,57 @@ P1/P2. Track items recorded:
   boringtun re-export rides rand feature unification anchored by
   protun's default-features rand = "0.10" (breaks loudly at compile
   time if that anchor ever moves).
+
+## 2026-10-30 — M6 slice 1: the 1b rust gate (FAIL → fixed) and IT-32's owner repark
+
+The 1b rust gate (agent_dfc51433) FAILED with 3 P1s; all landed:
+P1-1 the pump-death claim arms now revert the net session before the
+engine disconnect (claim_session: ptr_eq, single-shot; unit-pinned);
+P1-2 the DNS phase cleans up what phases 2-3 armed (dns_phase_cleanup);
+P1-3 dispositioned below. P2s also landed: detect_uplink's zero-metric
+default, the production lane wiring (wire_production_lane at startup —
+install_lane=false under the test harness), MarkCollision→
+NetworkUnavailable.
+
+**IT-32 OWNER REPARK (P1-3, the gate's recorded alternative).** The
+lane IT is written end-to-end but stays off GATED_TARGETS: the mocked
+peer cannot satisfy protun v3.0.5's CONNECTED bar, which requires the
+connection probe (ICMP echo through the tunnel) — and the diagnostic
+trail bottoms out at boringtun 4.9 peer-fidelity semantics a raw
+`noise::Tunn` responder does not model: the responder ACCEPTS the
+engine's first handshake initiation (session establishes), then
+REJECTS its retransmissions with WrongTai64nTimestamp (correct
+replay-window behavior — the retransmission carries the identical
+timestamp), while the engine's probe exchanges never converge to
+Connected. The M4-exit IT (the same responder shape) is FLAKY the
+same way locally yet passed every CI run of the v3.0.5 sweep — the
+harness needs a supervisor-level peer (pvpnclient's own test peer or
+a boringtun device-loopback), not a bare Tunn. PARKED with owner
+knowledge; every composition layer carries its own green proof (the
+mark gate unit + IT-31, the session IT, the lane-window tests, the
+production wiring's unit surface). Reopen: when the peer harness is
+upgraded (tracked), or at the E2E slice (the owner's paid account
+replaces the mock entirely).
+
+Follow-up (the re-verification gate's conditions, all landed): fmt
+was failing silently in the PLAIN shell (rustfmt absent there — the
+devshell runs it); the lane's drain() is now WIRED into run()'s
+shutdown path (the gate found no caller — process exit would have
+stranded an armed switch on the next-startup sweep; now the
+administrator's teardown reverts cleanly); dns_phase_cleanup is
+pinned (the recording-executor test proves the inverse is invoked
+and the original error surfaces); Custom-DNS entries parse STRICTLY
+at wiring (an unparseable list refuses startup, never a silent
+zero-server blackout).
+
+Slice-1 gate record, final: rust PASS (P1 class closed + conditions
+landed), sec PASS (2 P3s: the owner-UID leak fixed in the same
+commit as the QA pins; the root-disconnect override tracked for the
+M6 auth lane), qa's 2 P1s landed (the dispatch matrix + empty-cell
+refusals pinned; dns_posture/ipv6_posture extracted + pinned incl.
+the strict Custom refusal). QA's P2 tracks: factor+pin the
+mark-wait loop; a netns mini-IT for the TUN helpers + the two-route
+metric tie-break; strengthen dns_phase_cleanup's fake (real inverse
+ops through a recording exec); the runner's PARKED disclosure;
+IT-32's per-layer record line corrected (the wiring's unit surface
+IS now real — the posture functions).

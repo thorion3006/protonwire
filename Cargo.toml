@@ -100,6 +100,11 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 libc = "0.2" # in-graph via nix (its own dep); O_NOFOLLOW/ELOOP only
 chacha20poly1305 = "0.10"
 getrandom = "0.3" # already in-graph (ring/muon paths); OS randomness
+# The EXACT predicate protun applies to server_name (rustls-pki-types
+# 1.15, in-graph via rustls — zero new copies): validating here keeps
+# an unparseable catalog Domain a typed refusal instead of protun's
+# with_server_name unwrap panic (sec-gate P3).
+rustls-pki-types = "1"
 
 # --- System ---------------------------------------------------------------
 # `poll` backs the ipc tests' deterministic readability checks (WO-R4).
