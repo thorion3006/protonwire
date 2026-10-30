@@ -296,6 +296,7 @@ impl ConnectionLane {
         net: NetContext,
         user_agent: String,
         app_version: String,
+        settings: protonwire_protocol::engine::EngineAgentSettings,
         facade: Arc<PersistenceFacade>,
         core: Arc<CoreState>,
     ) -> Self {
@@ -305,7 +306,7 @@ impl ConnectionLane {
                 user_agent,
                 app_version,
                 muon_env: EngineMuonEnv::Prod,
-                settings: Default::default(),
+                settings,
             },
             facade,
             core,
