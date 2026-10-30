@@ -369,8 +369,6 @@ fn wire_production_lane(
 ) -> Result<tokio::runtime::Runtime, String> {
     use protonwire_daemon::connect::ConnectionLane;
     use protonwire_daemon::netctx::NetContext;
-    use protonwire_net::dns::{DnsConfig, DnsMode, DnsRouting, DnsServer};
-    use protonwire_net::route_drift::Ipv6Desired;
     use protonwire_protocol::{EncryptedCache, PersistenceFacade};
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -378,59 +376,10 @@ fn wire_production_lane(
         .build()
         .map_err(|e| format!("net runtime: {e}"))?;
 
-    // The DNS posture, from the config's section: Proton mode rides
-    // the tunnel's gateway resolver (10.2.0.1, the tun contract);
-    // Custom parses the user's list; System/None mutate nothing.
-    let dns = match config.dns.mode {
-        protonwire_store::config::DnsMode::Proton => DnsConfig {
-            mode: DnsMode::Proton,
-            servers: vec![DnsServer::new(
-                "10.2.0.1".parse().expect("the gateway resolver"),
-            )],
-            routing: DnsRouting::ThroughVpn,
-        },
-        protonwire_store::config::DnsMode::Custom => {
-            // STRICT (the re-verification gate's Medium): config
-            // validation only checks non-emptiness, so an all-invalid
-            // list would silently yield Custom mode with ZERO servers
-            // — a DNS blackout under the tunnel. Refuse at wiring.
-            let mut servers = Vec::new();
-            for server in &config.dns.custom_servers {
-                let parsed: std::net::IpAddr = server.parse().map_err(|e| {
-                    format!("dns.custom_servers entry {server:?} is not an address: {e}")
-                })?;
-                servers.push(DnsServer::new(parsed));
-            }
-            DnsConfig {
-                mode: DnsMode::Custom,
-                servers,
-                routing: match config.dns.policy {
-                    protonwire_store::config::DnsPolicy::BypassVpn => DnsRouting::BypassVpn,
-                    protonwire_store::config::DnsPolicy::SystemDefault => DnsRouting::SystemDefault,
-                    protonwire_store::config::DnsPolicy::ThroughVpn => DnsRouting::ThroughVpn,
-                },
-            }
-        }
-        protonwire_store::config::DnsMode::System => DnsConfig {
-            mode: DnsMode::System,
-            servers: vec![],
-            routing: DnsRouting::SystemDefault,
-        },
-        protonwire_store::config::DnsMode::None => DnsConfig {
-            mode: DnsMode::None,
-            servers: vec![],
-            routing: DnsRouting::ThroughVpn,
-        },
-    };
-    // FR-37's leak-block is the safe floor; `auto` negotiation of a
-    // tunnelled v6 rides the features slice (the server-support
-    // question needs the connected catalog).
-    let ipv6 = match config.connection.ipv6.mode {
-        protonwire_store::config::Ipv6Mode::Enabled => Ipv6Desired::Tunnelled,
-        protonwire_store::config::Ipv6Mode::Auto | protonwire_store::config::Ipv6Mode::Disabled => {
-            Ipv6Desired::Blocked
-        }
-    };
+    // The DNS/IPv6 postures from the config's sections (the qa
+    // gate's P1-2: extracted, testable, pinned in the tests below).
+    let dns = dns_posture(config)?;
+    let ipv6 = ipv6_posture(config);
 
     // The encrypted cache beside the state file (its own keyfile
     // bootstrap; a wrong-size keyfile refuses, never re-keys).
@@ -461,11 +410,122 @@ fn wire_production_lane(
     Ok(runtime)
 }
 
+/// The DNS posture from the config's section (the qa gate's P1-2 —
+/// extracted so the mapping and its STRICT refusal are testable):
+/// Proton mode rides the tunnel's gateway resolver (10.2.0.1, the
+/// tun contract); Custom parses the user's list, refusing on any
+/// unparseable entry (config validation only checks non-emptiness —
+/// an all-invalid list must be a startup refusal, never a silent
+/// zero-server blackout under the tunnel); System/None mutate
+/// nothing.
+fn dns_posture(config: &SystemConfig) -> Result<protonwire_net::dns::DnsConfig, String> {
+    use protonwire_net::dns::{DnsConfig, DnsMode, DnsRouting, DnsServer};
+    match config.dns.mode {
+        protonwire_store::config::DnsMode::Proton => Ok(DnsConfig {
+            mode: DnsMode::Proton,
+            servers: vec![DnsServer::new(
+                "10.2.0.1".parse().expect("the gateway resolver"),
+            )],
+            routing: DnsRouting::ThroughVpn,
+        }),
+        protonwire_store::config::DnsMode::Custom => {
+            let mut servers = Vec::new();
+            for server in &config.dns.custom_servers {
+                let parsed: std::net::IpAddr = server.parse().map_err(|e| {
+                    format!("dns.custom_servers entry {server:?} is not an address: {e}")
+                })?;
+                servers.push(DnsServer::new(parsed));
+            }
+            Ok(DnsConfig {
+                mode: DnsMode::Custom,
+                servers,
+                routing: match config.dns.policy {
+                    protonwire_store::config::DnsPolicy::BypassVpn => DnsRouting::BypassVpn,
+                    protonwire_store::config::DnsPolicy::SystemDefault => DnsRouting::SystemDefault,
+                    protonwire_store::config::DnsPolicy::ThroughVpn => DnsRouting::ThroughVpn,
+                },
+            })
+        }
+        protonwire_store::config::DnsMode::System => Ok(DnsConfig {
+            mode: DnsMode::System,
+            servers: vec![],
+            routing: DnsRouting::SystemDefault,
+        }),
+        protonwire_store::config::DnsMode::None => Ok(DnsConfig {
+            mode: DnsMode::None,
+            servers: vec![],
+            routing: DnsRouting::ThroughVpn,
+        }),
+    }
+}
+
+/// FR-37's leak-block is the safe floor; `auto` negotiation of a
+/// tunnelled v6 rides the features slice (the server-support question
+/// needs the connected catalog).
+fn ipv6_posture(config: &SystemConfig) -> protonwire_net::route_drift::Ipv6Desired {
+    match config.connection.ipv6.mode {
+        protonwire_store::config::Ipv6Mode::Enabled => {
+            protonwire_net::route_drift::Ipv6Desired::Tunnelled
+        }
+        protonwire_store::config::Ipv6Mode::Auto | protonwire_store::config::Ipv6Mode::Disabled => {
+            protonwire_net::route_drift::Ipv6Desired::Blocked
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// M6 1b (the qa gate's P1-2): the DNS/IPv6 posture mapping and
+    /// its STRICT Custom refusal, pinned on the pure functions.
+    #[test]
+    fn m6_dns_posture_maps_every_mode_and_refuses_invalid_custom_entries() {
+        let mut config = SystemConfig::default();
+        // Proton: the tunnel's gateway resolver, through the VPN.
+        let dns = dns_posture(&config).expect("proton posture");
+        assert_eq!(dns.mode, protonwire_net::dns::DnsMode::Proton);
+        assert_eq!(dns.servers.len(), 1);
+        // Custom: valid entries parse; an unparseable entry REFUSES
+        // naming the offender (never a silent zero-server blackout).
+        config.dns.mode = protonwire_store::config::DnsMode::Custom;
+        config.dns.custom_servers = vec!["10.0.0.1".to_owned(), "192.168.1.1".to_owned()];
+        let dns = dns_posture(&config).expect("custom posture");
+        assert_eq!(dns.mode, protonwire_net::dns::DnsMode::Custom);
+        assert_eq!(dns.servers.len(), 2);
+        config.dns.custom_servers = vec!["10.0.0.1".to_owned(), "not-an-address".to_owned()];
+        let error = dns_posture(&config).expect_err("the invalid entry refuses");
+        assert!(
+            error.contains("not-an-address"),
+            "the refusal names the offender: {error}"
+        );
+        // System/None: no mutation, no servers.
+        config.dns.mode = protonwire_store::config::DnsMode::System;
+        assert!(dns_posture(&config).unwrap().servers.is_empty());
+        config.dns.mode = protonwire_store::config::DnsMode::None;
+        assert!(dns_posture(&config).unwrap().servers.is_empty());
+    }
+
+    #[test]
+    fn m6_ipv6_posture_blocks_unless_enabled() {
+        type Ipv6DesiredPosture = protonwire_net::route_drift::Ipv6Desired;
+        let mut config = SystemConfig::default();
+        config.connection.ipv6.mode = protonwire_store::config::Ipv6Mode::Enabled;
+        assert_eq!(ipv6_posture(&config), Ipv6DesiredPosture::Tunnelled);
+        for mode in [
+            protonwire_store::config::Ipv6Mode::Auto,
+            protonwire_store::config::Ipv6Mode::Disabled,
+        ] {
+            config.connection.ipv6.mode = mode;
+            assert_eq!(
+                ipv6_posture(&config),
+                Ipv6DesiredPosture::Blocked,
+                "{mode:?} blocks (FR-37's leak floor)"
+            );
+        }
+    }
 
     /// In-order log capture: the marker the injected factory pushes plus
     /// every tracing event recorded after it installs its subscriber.
