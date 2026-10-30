@@ -169,7 +169,12 @@ fn revert_session(net: &NetContext, state: Option<&SessionState>, if_name: &str)
         state,
         if_name,
         false, // permanent mode is the config lane's, not the lane's
-        None,
+        // THE INSTALLED GENERATION (the bot round's P1): the live
+        // table's marker equals the session's own generation — with
+        // None, decide_live reads a marker-without-prior as a
+        // LOOKALIKE and REFUSES, leaving the switch armed on every
+        // normal disconnect.
+        Some(state.generation),
     )) {
         tracing::error!(%error, if_name, "the net session revert failed (best-effort teardown)");
     }
