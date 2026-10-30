@@ -118,17 +118,24 @@ impl DaemonCore {
                 state: self.state(),
             }),
             Request::Connect { .. } => {
-                // No state is committed on a failing path: an unprivileged
-                // peer must not be able to claim the host-global owner slot
-                // with a request that cannot succeed (security review
-                // finding: owner squatting). Owner recording activates with
-                // the Milestone 4 engine, which sets it only after the
-                // transition to Connecting is confirmed; cross-UID refusal
-                // then keys off that real owner.
-                Err(CoreError::NotImplemented("tunnel connect lands in milestone 4").into_rpc())
+                // M6: the DAEMON intercepts Connect before delegation
+                // (selection → catalog join → the connection lane,
+                // which composes engine ∘ net session and records the
+                // owner only after a confirmed start). This arm is the
+                // DEFENSIVE refusal for a future dispatch path that
+                // bypasses the handler — core never guesses a tunnel.
+                Err(CoreError::Internal(
+                    "connect must be handled by the daemon's connection lane".into(),
+                )
+                .into_rpc())
             }
             Request::Disconnect => {
-                Err(CoreError::NotImplemented("tunnel disconnect lands in milestone 4").into_rpc())
+                // Same shape: the lane's teardown owns it; core never
+                // fabricates a disconnect over a lane it cannot see.
+                Err(CoreError::Internal(
+                    "disconnect must be handled by the daemon's connection lane".into(),
+                )
+                .into_rpc())
             }
             Request::Shutdown => {
                 // Intercepted by the daemon (admin-gated) before reaching core.
@@ -365,10 +372,10 @@ mod tests {
                 },
             )
             .unwrap_err();
-        assert_eq!(
-            err.code,
-            protonwire_frontend_api::RpcErrorCode::NotImplemented
-        );
+        // M6: core's arm is the defensive Internal refusal (the
+        // daemon's lane owns Connect); the CONTRACT under test — no
+        // owner state committed on a refusal — is unchanged.
+        assert_eq!(err.code, protonwire_frontend_api::RpcErrorCode::Internal);
         // No owner was recorded: a failed request must not squat the
         // host-global owner slot (any subsequent user is equally free to
         // request, and status shows no owner).
@@ -381,10 +388,7 @@ mod tests {
                 },
             )
             .unwrap_err();
-        assert_eq!(
-            err.code,
-            protonwire_frontend_api::RpcErrorCode::NotImplemented
-        );
+        assert_eq!(err.code, protonwire_frontend_api::RpcErrorCode::Internal);
     }
 
     #[test]

@@ -22,7 +22,8 @@ use std::time::Duration;
 use protonwire_core::state::DaemonCore as CoreState;
 use protonwire_frontend_api::VpnState;
 use protonwire_net::kill_switch::KillSwitchPolicy;
-use protonwire_net::session::{self, SessionError, SessionState};
+pub use protonwire_net::session::SessionError;
+use protonwire_net::session::{self, SessionState};
 use protonwire_protocol::engine::{
     ActiveConnection, ConnectionEngine, EngineConfig, EngineConnectionState, EngineEvent,
     EngineMode, EngineMuonEnv, EngineVpnState,

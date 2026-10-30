@@ -133,6 +133,7 @@ use protonwire_frontend_api::SpecialClass;
 use protonwire_frontend_api::StageReport;
 use protonwire_frontend_api::WeightedBreakdownWire;
 use protonwire_frontend_api::WinnerSignals;
+use protonwire_protocol::params::TunnelParams;
 use protonwire_store::catalog::CachedCatalog;
 use protonwire_store::catalog::CatalogCache;
 use protonwire_store::catalog::CatalogCacheError;
@@ -1770,6 +1771,107 @@ impl SelectionEngine {
     /// when one exists and is unknown otherwise (the listing reports
     /// the honest unknown rather than initiating API traffic or
     /// blocking on a slow entitlement service).
+    /// M6 1b: the connect composition's catalog half — the selection
+    /// winner's ONLINE physicals as [`TunnelParams`]. The physical's
+    /// DOMAIN rides as `server_name` (T-38: the local agent's TLS
+    /// verification name — dropping it fails closed on DNS-SAN-only
+    /// certificates); per-protocol endpoints come from
+    /// `EntryPerProtocol` (a missing/empty Ports list defaults to the
+    /// WireGuard port 51820), a legacy `EntryIP` maps to a UDP-only
+    /// endpoint on the same port. Physicals without an X25519 key are
+    /// skipped (not WireGuard-capable). Keyless params: LocalAgent
+    /// production holds the client key in the encrypted cache
+    /// (FR-32A), the engine's own key policy decides.
+    pub fn tunnel_params(&self, winner_id: &str) -> Result<TunnelParams, RpcError> {
+        let Some((_, _, catalog)) = self.cached_catalog()? else {
+            return Err(RpcError::new(
+                RpcErrorCode::NoEligibleServer,
+                "no server catalog is cached yet — run `protonwire servers refresh` first \
+                 (selection reads the cache; it never fetches)",
+            ));
+        };
+        let logical = catalog
+            .logical_servers
+            .iter()
+            .find(|server| server.id == winner_id)
+            .ok_or_else(|| {
+                RpcError::new(
+                    RpcErrorCode::NoEligibleServer,
+                    format!(
+                        "the selected server {winner_id} is not in the cached catalog \
+                         (it changed under us — re-select)"
+                    ),
+                )
+            })?;
+        const WG_DEFAULT_PORT: u16 = 51820;
+        let endpoint = |entry: &protonwire_store::catalog::ProtocolEndpoint| -> Option<
+            protonwire_protocol::params::TransportEndpoint,
+        > {
+            let entry_ip = entry.ipv4.parse().ok()?;
+            let mut ports = entry.ports.clone().unwrap_or_default();
+            if ports.is_empty() {
+                ports.push(WG_DEFAULT_PORT);
+            }
+            Some(protonwire_protocol::params::TransportEndpoint { entry_ip, ports })
+        };
+        let mut peers = Vec::new();
+        for (index, physical) in logical.servers.iter().filter(|p| p.is_online()).enumerate() {
+            let Some(public_key_base64) = physical.x25519_public_key.clone() else {
+                continue; // not WireGuard-capable
+            };
+            let (udp, tcp, tls) = match &physical.entry_per_protocol {
+                Some(per_protocol) => (
+                    per_protocol.wireguard_udp.as_ref().and_then(endpoint),
+                    per_protocol.wireguard_tcp.as_ref().and_then(endpoint),
+                    per_protocol.wireguard_tls.as_ref().and_then(endpoint),
+                ),
+                None => {
+                    let udp = physical.entry_ip.as_ref().and_then(|ip| {
+                        let entry_ip = ip.parse().ok()?;
+                        Some(protonwire_protocol::params::TransportEndpoint {
+                            entry_ip,
+                            ports: vec![WG_DEFAULT_PORT],
+                        })
+                    });
+                    (udp, None, None)
+                }
+            };
+            if udp.is_none() && tcp.is_none() && tls.is_none() {
+                continue; // serves no WireGuard transport
+            }
+            peers.push(protonwire_protocol::params::PeerParams {
+                id: format!(
+                    "{}/{}",
+                    logical.id,
+                    physical.id.as_deref().unwrap_or(index.to_string().as_str())
+                ),
+                public_key_base64,
+                udp,
+                tcp,
+                tls,
+                priority: index as i32,
+                exit_label: Some(logical.name.clone()),
+                server_name: (!physical.domain.is_empty()).then(|| physical.domain.clone()),
+            });
+        }
+        if peers.is_empty() {
+            return Err(RpcError::new(
+                RpcErrorCode::NoEligibleServer,
+                format!(
+                    "the selected server {} has no online WireGuard-capable physical",
+                    logical.id
+                ),
+            ));
+        }
+        Ok(TunnelParams {
+            peers,
+            protocol: protonwire_protocol::Protocol::WireGuardUdp,
+            network_available: true,
+            client_private_key: None, // FR-32A: the encrypted cache holds it
+            sni_strategy: Default::default(),
+        })
+    }
+
     pub fn groups_catalog(&self) -> Result<GroupsCatalog, RpcError> {
         let cached = self.cached_catalog()?;
         let weights = self.balanced_weights();
@@ -2694,6 +2796,82 @@ mod tests {
         let mut engine = engine_over(SystemConfig::default(), 1_000_000, never_answers);
         engine.catalog_read = Box::new(|| Ok(None));
         engine
+    }
+
+    /// M6 1b: the winner→physicals→TunnelParams join. One online
+    /// keyed physical (whose Ports list is null — the WG default
+    /// port applies), one OFFLINE, one KEYLESS: exactly the first
+    /// becomes a peer, its Domain riding as server_name (T-38), the
+    /// params keyless (FR-32A — the cache holds the client key).
+    #[test]
+    fn m6_tunnel_params_joins_the_winners_online_keyed_physicals() {
+        // A RAW literal (a json! nesting this deep hits the macro
+        // recursion limit): one online keyed physical (Ports null —
+        // the WG default applies), one offline, one keyless.
+        let body = r#"{"Code":1000,"Error":"","StatusID":"t","LogicalServers":[{"ID":"id-CH#10","Name":"CH#10","City":null,"State":null,"EntryCountry":"CH","ExitCountry":"CH","Domain":null,"Tier":2,"Features":0,"Status":1,"Load":10,"Score":1.0,"HostCountry":null,"GatewayName":null,"Translations":null,"Servers":[{"ID":"p-online","EntryIP":null,"ExitIP":null,"Domain":"ch-10.protonvpn.net","Status":1,"Label":"","X25519PublicKey":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=","Signature":null,"Generation":null,"ServicesDownReason":null,"EntryPerProtocol":{"WireGuardUDP":{"IPv4":"192.0.2.10","Ports":null},"WireGuardTCP":{"IPv4":"192.0.2.10","Ports":[443]},"WireGuardTLS":null,"OpenVPNUDP":null,"OpenVPNTCP":null}},{"ID":"p-offline","EntryIP":null,"ExitIP":null,"Domain":"off.protonvpn.net","Status":0,"Label":"","X25519PublicKey":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=","Signature":null,"Generation":null,"ServicesDownReason":null,"EntryPerProtocol":null},{"ID":"p-keyless","EntryIP":"198.51.100.7","ExitIP":null,"Domain":"keyless.protonvpn.net","Status":1,"Label":"","X25519PublicKey":null,"Signature":null,"Generation":null,"ServicesDownReason":null,"EntryPerProtocol":null}]}]}"#.to_string();
+        let mut engine = engine_over(SystemConfig::default(), 1_000_000, never_answers);
+        engine.catalog_read = Box::new(move || {
+            Ok(Some(CachedCatalog {
+                schema_version: 1,
+                etag: Some("\"t\"".to_owned()),
+                fetched_unix: 1_771_000_000,
+                body: body.clone(),
+            }))
+        });
+
+        let params = engine.tunnel_params("id-CH#10").expect("the join");
+        assert_eq!(params.peers.len(), 1, "offline and keyless physicals skip");
+        let peer = &params.peers[0];
+        assert_eq!(peer.id, "id-CH#10/p-online");
+        assert_eq!(
+            peer.server_name.as_deref(),
+            Some("ch-10.protonvpn.net"),
+            "T-38: the Domain rides as the agent's TLS name"
+        );
+        assert_eq!(
+            peer.udp.as_ref().expect("udp").ports,
+            vec![51820],
+            "a null Ports list defaults to the WireGuard port"
+        );
+        assert_eq!(peer.tcp.as_ref().expect("tcp").ports, vec![443]);
+        assert!(peer.tls.is_none());
+        assert_eq!(peer.exit_label.as_deref(), Some("CH#10"));
+        assert!(
+            params.client_private_key.is_none(),
+            "FR-32A: production LocalAgent is keyless"
+        );
+        assert!(matches!(
+            params.protocol,
+            protonwire_protocol::Protocol::WireGuardUdp
+        ));
+
+        // The refusals: no catalog, and a winner the cache no longer
+        // knows (it changed under us).
+        let error = engine_without_catalog()
+            .tunnel_params("id-CH#10")
+            .unwrap_err();
+        assert!(error.message.contains("no server catalog is cached"));
+        let error = engine.tunnel_params("id-MISSING").unwrap_err();
+        assert!(error.message.contains("changed under us"));
+
+        // A logical whose ONLY physical is offline-and-keyless refuses
+        // typed (no WireGuard-capable candidate at all).
+        let bare = r#"{"Code":1000,"Error":"","StatusID":"t","LogicalServers":[{"ID":"id-X#1","Name":"X#1","City":null,"State":null,"EntryCountry":"X","ExitCountry":"X","Domain":null,"Tier":0,"Features":0,"Status":1,"Load":1,"Score":1.0,"HostCountry":null,"GatewayName":null,"Translations":null,"Servers":[{"ID":"p","EntryIP":null,"ExitIP":null,"Domain":"x.example","Status":1,"Label":"","X25519PublicKey":null,"Signature":null,"Generation":null,"ServicesDownReason":null,"EntryPerProtocol":null}]}]}"#.to_string();
+        let mut engine = engine_over(SystemConfig::default(), 1_000_000, never_answers);
+        engine.catalog_read = Box::new(move || {
+            Ok(Some(CachedCatalog {
+                schema_version: 1,
+                etag: Some("\"t\"".to_owned()),
+                fetched_unix: 1_771_000_000,
+                body: bare.clone(),
+            }))
+        });
+        let error = engine.tunnel_params("id-X#1").unwrap_err();
+        assert!(
+            error
+                .message
+                .contains("no online WireGuard-capable physical")
+        );
     }
 
     fn default_engine() -> SelectionEngine {

@@ -136,6 +136,32 @@ impl RequestHandler for DaemonHandler {
                 .selection
                 .resolve(&target, &modifiers)
                 .map(|result| RequestResult::Selected { result }),
+            // M6 1b: THE CONNECT COMPOSITION — selection resolves the
+            // target, the catalog join builds the tunnel params (the
+            // winner's online keyed physicals, Domains riding as
+            // server_name), and the lane composes engine ∘ net session
+            // (marks health-gated before the kill switch arms, IT-13).
+            // The IPC-authenticated UID is the lane's owner identity.
+            Request::Connect { target } => {
+                let lane = self.services.lane.current().ok_or_else(no_lane_installed)?;
+                let winner = self.services.selection.resolve(
+                    &target,
+                    &protonwire_frontend_api::SelectionModifiers::default(),
+                )?;
+                let params = self.services.selection.tunnel_params(&winner.winner.id)?;
+                lane.connect(ctx.peer.uid, &params)
+                    .map_err(lane_error_to_rpc)?;
+                Ok(RequestResult::Acknowledged)
+            }
+            // M6 1b: disconnect — the owner gate and the teardown
+            // windows are the lane's; a no-active-connection
+            // disconnect is its idempotent success.
+            Request::Disconnect => {
+                let lane = self.services.lane.current().ok_or_else(no_lane_installed)?;
+                lane.disconnect(ctx.peer.uid)
+                    .map_err(|refusal| lane_error_to_rpc(connect::LaneError::Refused(refusal)))?;
+                Ok(RequestResult::Acknowledged)
+            }
             // M3 U6 (FR-23I/U): the registry-served group catalog with
             // FR-23S availability — no network, no client-side preset
             // lists.
@@ -290,6 +316,52 @@ fn no_engine_installed() -> RpcError {
         "the account session engine is not wired yet (the session lane \
          installs it into the daemon's auth provider)",
     )
+}
+
+/// The connect family's empty-cell refusal: the lane installs at
+/// startup, after the NetContext's mark allocation — before that the
+/// family answers typed, never guessing.
+fn no_lane_installed() -> RpcError {
+    RpcError::new(
+        RpcErrorCode::NotImplemented,
+        "the connection lane is not installed yet (daemon startup wires it \
+         after allocating the bypass mark)",
+    )
+}
+
+/// Maps the lane's refusals and failures onto the wire's error
+/// vocabulary: the owner gate is PERMISSION, the teardown windows are
+/// TEMPORARY (the client retries), and the engine/session failures
+/// name their own layer (TunnelFailed / KillSwitchFailed /
+/// DnsConfigFailed by the session's phase).
+fn lane_error_to_rpc(error: connect::LaneError) -> RpcError {
+    match error {
+        connect::LaneError::Refused(connect::LaneRefusal::NotOwner { owner }) => RpcError::new(
+            RpcErrorCode::PermissionDenied,
+            format!("uid {owner} owns the active connection"),
+        ),
+        connect::LaneError::Refused(
+            refusal @ (connect::LaneRefusal::Draining
+            | connect::LaneRefusal::Reconnecting
+            | connect::LaneRefusal::Disconnecting),
+        ) => RpcError::new(RpcErrorCode::NetworkUnavailable, refusal.to_string()),
+        // The idempotent no-active-connection disconnect is an Ok at
+        // the lane; reaching here with it is a logic error upstream.
+        connect::LaneError::Refused(connect::LaneRefusal::NoActiveConnection) => {
+            RpcError::new(RpcErrorCode::InvalidParams, "no active connection")
+        }
+        connect::LaneError::Engine(error) => {
+            RpcError::new(RpcErrorCode::TunnelFailed, error.to_string())
+        }
+        connect::LaneError::Net(error) => {
+            let code = match &error {
+                connect::SessionError::KillSwitch(_) => RpcErrorCode::KillSwitchFailed,
+                connect::SessionError::Dns(_) => RpcErrorCode::DnsConfigFailed,
+                _ => RpcErrorCode::TunnelFailed,
+            };
+            RpcError::new(code, error.to_string())
+        }
+    }
 }
 
 /// S2's GetState redaction decision (PRD 6.3, the round-1 finding-9
