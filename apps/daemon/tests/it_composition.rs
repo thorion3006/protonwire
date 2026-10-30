@@ -154,15 +154,26 @@ fn spawn_mocked_peer(stop: Arc<AtomicBool>) -> (String, std::net::SocketAddr) {
         socket
             .set_read_timeout(Some(Duration::from_millis(100)))
             .expect("peer read timeout");
+        // The last peer we answered — timer-fired writes (keepalives,
+        // retransmits) go there; before any packet arrives there is
+        // nowhere to send.
+        let mut last_peer: Option<std::net::SocketAddr> = None;
         while !stop.load(Ordering::Relaxed) {
-            let Ok((len, peer)) = socket.recv_from(&mut buf) else {
-                continue;
-            };
+            // TIMERS FIRST, ON EVERY WAKE-UP (packet OR timeout — the
+            // pure-Tunn contract): the private rate limiter resets ONLY
+            // here, and skipping the timeout iterations left it stale —
+            // the engine's retry bursts then read as under-load and the
+            // responder dropped them (the flake).
             if let proton_boringtun::noise::TunnResult::WriteToNetwork(bytes) =
                 tunnel.update_timers(&mut out, OsInstant::from_duration(epoch.elapsed()))
+                && let Some(peer) = last_peer
             {
                 let _ = socket.send_to(bytes, peer);
             }
+            let Ok((len, peer)) = socket.recv_from(&mut buf) else {
+                continue;
+            };
+            last_peer = Some(peer);
             // The connection probe: decapsulated IP packets that are
             // ICMP echo requests get their REPLY encapsulated back —
             // Connected waits for it (protun v3.0.5).
