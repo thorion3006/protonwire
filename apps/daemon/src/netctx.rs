@@ -68,17 +68,18 @@ impl NetContext {
         dns: DnsConfig,
         ipv6: Ipv6Desired,
     ) -> Result<Self, NetStartupError> {
-        let (connection, handle, _) =
-            rtnetlink::new_connection().map_err(|e| NetStartupError::Netlink(e.to_string()))?;
-        runtime.spawn(connection);
-        let mut executor = RtnetlinkExecutor::new(handle.clone());
-        // One block_on for BOTH surveys: the mark allocation and the
-        // uplink dump share the executor (the async runtime drives
-        // the rtnetlink connection; a plain futures block_on cannot).
-        let (mark, uplink_ifname) = runtime.block_on(async {
+        // Everything netlink runs INSIDE one block_on: the
+        // connection constructor itself needs an active reactor at
+        // call time (calling it on a plain thread panics in
+        // netlink-sys), and the surveys share the executor.
+        let (mark, uplink_ifname, handle) = runtime.block_on(async {
+            let (connection, handle, _) =
+                rtnetlink::new_connection().map_err(|e| NetStartupError::Netlink(e.to_string()))?;
+            tokio::spawn(connection);
+            let mut executor = RtnetlinkExecutor::new(handle.clone());
             let mark = protonwire_net::mark::allocate(&mut executor).await?;
             let uplink = detect_uplink(&handle).await;
-            Ok::<_, NetStartupError>((mark, uplink))
+            Ok::<_, NetStartupError>((mark, uplink, handle))
         })?;
         let rt_tables = std::fs::read_to_string("/etc/iproute2/rt_tables").unwrap_or_default();
         Ok(Self {
@@ -120,6 +121,58 @@ pub async fn ifindex_by_name(handle: &rtnetlink::Handle, name: &str) -> Option<u
         }
     }
     None
+}
+
+/// Brings the interface UP (RTM_NEWLINK flags+mask): protun's
+/// `InterfaceState::Up` only means the TUN STREAM registered — the
+/// kernel link itself stays administratively DOWN until the manager
+/// raises it (the wg-quick role; the route commit's ENETDOWN without
+/// it).
+pub async fn set_link_up(handle: &rtnetlink::Handle, ifindex: u32) -> Result<(), String> {
+    use rtnetlink::packet_route::link::{LinkFlags, LinkMessage};
+    let mut message = LinkMessage::default();
+    message.header.index = ifindex;
+    message.header.flags |= LinkFlags::Up;
+    message.header.change_mask |= LinkFlags::Up;
+    handle
+        .link()
+        .set(message)
+        .execute()
+        .await
+        .map_err(|e| format!("set link up: {e}"))
+}
+
+/// Waits (bounded) for the interface to report IFF_UP: the engine
+/// creates the TUN asynchronously and sets it up moments after its
+/// sockets open — a route commit against a DOWN device fails with
+/// ENETDOWN (the IT-32 race). `false` on the deadline: the caller
+/// refuses typed, never guessing.
+pub async fn wait_link_up(
+    handle: &rtnetlink::Handle,
+    ifindex: u32,
+    deadline: std::time::Instant,
+) -> bool {
+    use futures_util::StreamExt;
+    loop {
+        let mut links = handle.link().get().execute();
+        let mut up = false;
+        while let Some(message) = links.next().await {
+            let Ok(message) = message else { continue };
+            if message.header.index == ifindex {
+                up = message
+                    .header
+                    .flags
+                    .contains(rtnetlink::packet_route::link::LinkFlags::Up);
+            }
+        }
+        if up {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
 }
 
 /// The v4 default route's interface name (the uplink the kill switch

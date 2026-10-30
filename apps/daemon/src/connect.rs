@@ -252,6 +252,30 @@ pub struct ConnectionLane {
 }
 
 impl ConnectionLane {
+    /// The mode-parameterized construction (IT-32's agentless lane;
+    /// the production [`Self::new`] pins LocalAgent over the
+    /// encrypted cache).
+    pub fn new_with_mode(
+        net: NetContext,
+        mode: EngineMode,
+        facade: Arc<PersistenceFacade>,
+        core: Arc<CoreState>,
+    ) -> Self {
+        let if_name = net.tun_ifname.clone();
+        Self {
+            engine: ConnectionEngine::new(EngineConfig {
+                if_name,
+                bypass_mark: net.mark,
+                mode,
+            }),
+            facade,
+            core,
+            net,
+            state: Arc::new(Mutex::new(LaneState::default())),
+            draining: AtomicBool::new(false),
+        }
+    }
+
     /// The production lane: LocalAgent mode over the encrypted cache
     /// (FR-32A), interface name from the daemon config (FR-26), the
     /// STARTUP-ALLOCATED bypass mark (the 2026-10-08 owner decision)
@@ -264,24 +288,17 @@ impl ConnectionLane {
         facade: Arc<PersistenceFacade>,
         core: Arc<CoreState>,
     ) -> Self {
-        let if_name = net.tun_ifname.clone();
-        Self {
-            engine: ConnectionEngine::new(EngineConfig {
-                if_name,
-                bypass_mark: net.mark,
-                mode: EngineMode::LocalAgent {
-                    user_agent,
-                    app_version,
-                    muon_env: EngineMuonEnv::Prod,
-                    settings: Default::default(),
-                },
-            }),
+        Self::new_with_mode(
+            net,
+            EngineMode::LocalAgent {
+                user_agent,
+                app_version,
+                muon_env: EngineMuonEnv::Prod,
+                settings: Default::default(),
+            },
             facade,
             core,
-            net,
-            state: Arc::new(Mutex::new(LaneState::default())),
-            draining: AtomicBool::new(false),
-        }
+        )
     }
 
     /// The UID owning the active connection, if any (the status
@@ -450,15 +467,35 @@ impl ConnectionLane {
         connection: &ActiveConnection,
     ) -> Result<SessionState, LaneError> {
         // IT-13's gate: no route commits before the engine's outer
-        // sockets carry the bypass mark — `healthy()` is the
-        // all-marked + ≥1-reported + nothing-in-flight snapshot.
-        if !connection.mark_health().healthy() {
-            return Err(SessionError::Plan(
-                "the engine's outer sockets are not (all) bypass-marked — refusing to \
-                 commit routes (IT-13)"
-                    .to_owned(),
-            )
-            .into());
+        // sockets carry the bypass mark. The engine marks its sockets
+        // ASYNCHRONOUSLY as protun opens them — `healthy()` is a
+        // snapshot AT CALL TIME (the marks module's disclosed
+        // residual), so the gate WAITS, bounded, for the first
+        // successful report: a FAILED mark refuses immediately (it
+        // is permanent), a silent engine refuses at the deadline.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let health = connection.mark_health();
+            if health.healthy() {
+                break;
+            }
+            if !health.all_marked() {
+                return Err(SessionError::Plan(
+                    "an engine outer socket FAILED its bypass mark — refusing to commit \
+                     routes (IT-13)"
+                        .to_owned(),
+                )
+                .into());
+            }
+            if std::time::Instant::now() > deadline {
+                return Err(SessionError::Plan(
+                    "the engine reported no bypass-marked outer socket within 10s — \
+                     refusing to commit routes (IT-13)"
+                        .to_owned(),
+                )
+                .into());
+            }
+            std::thread::sleep(Duration::from_millis(25));
         }
         let net = &self.net;
         // The TUN's kernel index (the engine created it by name) —
@@ -473,6 +510,24 @@ impl ConnectionLane {
                     net.tun_ifname
                 ))
             })?;
+        // The TUN comes UP when the manager raises it — protun's
+        // InterfaceState::Up only means the stream registered, the
+        // kernel link stays DOWN (ENETDOWN on the route commit
+        // otherwise). Up, then bounded-wait for the flag to land.
+        net.runtime
+            .block_on(crate::netctx::set_link_up(&net.handle, tun_ifindex))
+            .map_err(SessionError::Plan)?;
+        if !net.runtime.block_on(crate::netctx::wait_link_up(
+            &net.handle,
+            tun_ifindex,
+            std::time::Instant::now() + Duration::from_secs(10),
+        )) {
+            return Err(SessionError::Plan(format!(
+                "the TUN interface {} never reported UP within 10s",
+                net.tun_ifname
+            ))
+            .into());
+        }
         // The uplink: re-detect per connect (a DHCP renew may have
         // moved the default route since startup).
         let uplink_ifname = net

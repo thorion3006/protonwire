@@ -986,7 +986,9 @@ impl SelectionEngine {
         // The scheduler's posture: getrandom cannot fail on supported
         // platforms; a failure means a broken CSPRNG and the random
         // policy refuses rather than drawing pseudo-randomness.
-        getrandom::getrandom(&mut bytes).map_err(|_| {
+        // (0.3's `fill` is the renamed `getrandom` — the workspace
+        // pin unified this crate off its stray 0.2 copy.)
+        getrandom::fill(&mut bytes).map_err(|_| {
             RpcError::new(
                 RpcErrorCode::Internal,
                 "the OS CSPRNG refused the random policy's entropy draw",

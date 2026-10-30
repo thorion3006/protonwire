@@ -37,6 +37,10 @@ const GATED_TARGETS: &[(&str, &str)] = &[
     ("protonwire-net", "it_dns_lifecycle"),
     ("protonwire-net", "it_session"),
     ("protonwire-net", "it_mark"),
+    // ("protonwire-daemon", "it_composition"), — M6 1b: WRITTEN but
+    // PARKED (the mocked peer vs protun v3.0.5's connection probe:
+    // ICMP echo implemented; the simultaneous-open retry exchange
+    // still flakes — harness fidelity, tracked in PR #32's body).
 ];
 
 /// `unshare` flags creating the isolated user + network namespace.
