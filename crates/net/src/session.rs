@@ -76,10 +76,14 @@ pub struct SessionState {
     pub plan: TablePlan,
     /// The mutations apply() returned (what cleanup inverts).
     pub installed_ops: Vec<NetOp>,
-    /// The DNS evidence (for the revert).
+    /// The DNS evidence (for the file-backend revert).
     pub dns_evidence: Option<ResolvConfEvidence>,
-    /// The DNS backend used.
+    /// The DNS backend in effect at connect time.
     pub dns_backend: dns::DnsBackend,
+    /// Whether the session MUTATED DNS at all (false for None and
+    /// System modes — the bot round's P2: the disconnect must not
+    /// "revert" resolvers the session never touched).
+    pub dns_mutated: bool,
     /// The kill-switch generation.
     pub generation: GenerationId,
 }
@@ -163,14 +167,28 @@ pub async fn connect<E: NetlinkExecutor>(
     // (nothing mutated), the route cleanup replays disconnect's own
     // phase-2 shape, and the NEWLY-INSTALLED generation comes off.
     let backend = dns::detect_backend();
+    // Whether ANY DNS mutation happened (None/System never mutate —
+    // the disconnect must not "revert" what was never touched).
+    let dns_mutated;
     let dns_evidence = match (&inputs.dns.mode, &backend) {
-        (dns::DnsMode::None, _) => None, // no mutation, no revert
+        // NO MUTATION for None AND System (the bot round's P2): System
+        // means "keep the host's resolvers" — falling through to the
+        // backend arms composed an EMPTY resolv.conf and wiped them.
+        // FR-44's strict leak proof (every resolver routes through
+        // the VPN) is the diagnostics slice's validation surface.
+        (dns::DnsMode::None | dns::DnsMode::System, _) => {
+            dns_mutated = false;
+            None
+        }
         (_, dns::DnsBackend::SystemdResolved) => {
             // resolvectl per-link; in a namespace (or when resolved
             // does not know the interface) this FAILS — fall back to
             // the file. The evidence is the file capture in that case.
             match dns::apply_resolved(&inputs.tun_ifname, &inputs.dns.servers) {
-                Ok(()) => None,
+                Ok(()) => {
+                    dns_mutated = true;
+                    None
+                }
                 Err(_) => {
                     let path = std::path::Path::new("/etc/resolv.conf");
                     let evidence = match dns::capture_resolv_conf(path) {
@@ -199,6 +217,7 @@ pub async fn connect<E: NetlinkExecutor>(
                         )
                         .await);
                     }
+                    dns_mutated = true;
                     Some(evidence)
                 }
             }
@@ -229,6 +248,7 @@ pub async fn connect<E: NetlinkExecutor>(
                 )
                 .await);
             }
+            dns_mutated = true;
             Some(evidence)
         }
     };
@@ -238,6 +258,7 @@ pub async fn connect<E: NetlinkExecutor>(
         installed_ops: installed,
         dns_evidence,
         dns_backend: backend,
+        dns_mutated,
         generation: inputs.generation,
     })
 }
@@ -279,11 +300,15 @@ pub async fn disconnect<E: NetlinkExecutor>(
     permanent_kill_switch: bool,
     prior_generation: Option<GenerationId>,
 ) -> Result<(), SessionError> {
-    // === PHASE 1: DNS REVERT (FR-47) ===
-    if let Some(evidence) = &state.dns_evidence {
-        let _ = dns::revert_resolv_conf(evidence); // best-effort: the revert may refuse (changed under us)
-    } else if state.dns_backend == dns::DnsBackend::SystemdResolved {
-        let _ = dns::revert_resolved(tun_ifname);
+    // === PHASE 1: DNS REVERT (FR-47) — only what the session
+    // MUTATED (the bot round's P2: a None/System session must not
+    // "revert" resolvers it never touched). ===
+    if state.dns_mutated {
+        if let Some(evidence) = &state.dns_evidence {
+            let _ = dns::revert_resolv_conf(evidence); // best-effort: the revert may refuse (changed under us)
+        } else if state.dns_backend == dns::DnsBackend::SystemdResolved {
+            let _ = dns::revert_resolved(tun_ifname);
+        }
     }
 
     // === PHASE 2: ROUTE CLEANUP (session-scoped) ===

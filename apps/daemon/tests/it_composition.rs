@@ -304,6 +304,7 @@ fn it32_the_lane_composes_engine_and_net_session() {
             routing: DnsRouting::ThroughVpn,
         },
         Ipv6Desired::Blocked,
+        false, // the IT tears down non-permanently
     )
     .expect("the net context starts (mark allocated)");
     assert_ne!(net.mark, 0);

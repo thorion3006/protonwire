@@ -397,6 +397,10 @@ fn wire_production_lane(
         config.daemon.interface_name.clone(),
         dns,
         ipv6,
+        // FR-63: `permanent` survives every teardown until an
+        // explicit authorized disable — the policy rides the context
+        // into every session::disconnect (the bot round's P1).
+        config.features.kill_switch == protonwire_store::config::KillSwitchMode::Permanent,
     )
     .map_err(|e| format!("net context: {e}"))?;
     let lane = ConnectionLane::new(

@@ -104,6 +104,13 @@ impl RequestHandler for DaemonHandler {
             // neither the owner nor root — null active_owner_uid.
             Request::GetState => {
                 let mut state = self.core.state();
+                // The CONNECTED lane's owner (the bot round's P2):
+                // ownership lives in the lane, not the core — overlay
+                // it BEFORE the per-peer redaction so the owner (and
+                // root) see it and everyone else sees null.
+                if let Some(lane) = self.services.lane.current() {
+                    state.active_owner_uid = lane.active_owner_uid();
+                }
                 redact_state_for_peer(&mut state, ctx.peer.uid);
                 Ok(RequestResult::State { state })
             }

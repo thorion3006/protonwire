@@ -56,6 +56,12 @@ pub struct NetContext {
     /// `None` (no default route at boot) REFUSES connects typed
     /// until a default route exists; the lane re-detects per connect.
     pub uplink_ifname: Option<String>,
+    /// The administrator's permanent-mode policy (FR-63): when set,
+    /// every teardown KEEPS the kill switch (session::disconnect's
+    /// permanent_kill_switch) — the switch survives disconnect,
+    /// reconnect teardown, engine-fatal cleanup, and daemon drain
+    /// until an explicit authorized disable (the bot round's P1).
+    pub permanent_kill_switch: bool,
     generation: AtomicU32,
 }
 
@@ -67,6 +73,7 @@ impl NetContext {
         tun_ifname: String,
         dns: DnsConfig,
         ipv6: Ipv6Desired,
+        permanent_kill_switch: bool,
     ) -> Result<Self, NetStartupError> {
         // Everything netlink runs INSIDE one block_on: the
         // connection constructor itself needs an active reactor at
@@ -91,6 +98,7 @@ impl NetContext {
             dns,
             ipv6,
             uplink_ifname,
+            permanent_kill_switch,
             generation: AtomicU32::new(1),
         })
     }
@@ -216,8 +224,11 @@ pub async fn wait_link_up(
 }
 
 /// The v4 default route's interface name (the uplink the kill switch
-/// probes): lowest-metric default wins, the kernel's own ordering
-/// among equals. `None` when no default route exists.
+/// probes): lowest-metric default in the MAIN TABLE wins — the bypass
+/// rules route through main, so a zero-metric default in an unrelated
+/// policy table must not beat the usable DHCP default (the bot
+/// round's P2: cross-table metric ranking probed the wrong uplink on
+/// multi-VPN hosts). `None` when no main-table default exists.
 pub async fn detect_uplink(handle: &rtnetlink::Handle) -> Option<String> {
     use futures_util::StreamExt;
     use rtnetlink::packet_route::route::{RouteAttribute, RouteMessage};
@@ -239,12 +250,20 @@ pub async fn detect_uplink(handle: &rtnetlink::Handle) -> Option<String> {
         // default would rank it BELOW a metric-100 DHCP default and
         // the switch would probe the wrong uplink.
         let mut priority = 0u32;
+        // MAIN TABLE only (table 254): the header's byte field is the
+        // compatibility marker when >255 ids ride the attribute —
+        // read the attribute when present, else the header byte.
+        let mut table = message.header.table as u32;
         for attribute in &message.attributes {
             match attribute {
                 RouteAttribute::Oif(index) => oif = Some(*index),
                 RouteAttribute::Priority(metric) => priority = *metric,
+                RouteAttribute::Table(id) => table = *id,
                 _ => {}
             }
+        }
+        if table != 254 {
+            continue; // another manager's policy table
         }
         if let Some(index) = oif
             && best.is_none_or(|(metric, _)| priority < metric)
@@ -296,6 +315,7 @@ mod tests {
             },
             ipv6: Ipv6Desired::Blocked,
             uplink_ifname: None,
+            permanent_kill_switch: false,
             generation: AtomicU32::new(1),
         };
         assert_eq!(context.next_generation(), GenerationId(1));

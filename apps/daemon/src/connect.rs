@@ -168,7 +168,10 @@ fn revert_session(net: &NetContext, state: Option<&SessionState>, if_name: &str)
         &mut executor,
         state,
         if_name,
-        false, // permanent mode is the config lane's, not the lane's
+        // The ADMINISTRATOR's permanent-mode policy rides the context
+        // (the bot round's P1): `permanent` KEEPS the switch through
+        // every teardown until an explicit authorized disable (FR-63).
+        net.permanent_kill_switch,
         // THE INSTALLED GENERATION (the bot round's P1): the live
         // table's marker equals the session's own generation — with
         // None, decide_live reads a marker-without-prior as a
@@ -1143,6 +1146,7 @@ mod tests {
                 installed_ops: Vec::new(),
                 dns_evidence: None,
                 dns_backend: protonwire_net::dns::DnsBackend::ResolvConf,
+                dns_mutated: false,
                 generation: protonwire_net::kill_switch::GenerationId(generation),
             }
         }
