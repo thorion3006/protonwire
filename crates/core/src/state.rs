@@ -99,6 +99,9 @@ impl DaemonCore {
             network_integration: self.config.daemon.network_integration.into(),
             active_owner_uid: inner.active_owner_uid,
             latest_event_seq: Some(latest_event_seq),
+            // The lane overlays this at the daemon boundary (core
+            // cannot see the connection's reconciliation ledger).
+            features: None,
         }
     }
 

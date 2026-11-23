@@ -728,6 +728,7 @@ mod tests {
                         network_integration: NetworkIntegration::Auto,
                         active_owner_uid: None,
                         latest_event_seq: Some(self.seq.load(Ordering::SeqCst)),
+                        features: None,
                     },
                 }),
                 // Connect bumps the sequence twice but publishes only the
@@ -1506,6 +1507,7 @@ mod tests {
                         network_integration: NetworkIntegration::Auto,
                         active_owner_uid: None,
                         latest_event_seq: Some(self.stamp()),
+                        features: None,
                     },
                 }),
                 other => Err(RpcError::new(
@@ -1719,6 +1721,7 @@ mod tests {
                                 network_integration: NetworkIntegration::Auto,
                                 active_owner_uid: None,
                                 latest_event_seq: Some(self.seq.load(Ordering::SeqCst)),
+                                features: None,
                             },
                         })
                     }
@@ -1824,6 +1827,7 @@ mod tests {
                             active_owner_uid: None,
                             // The legacy wire shape: no stamp on the wire.
                             latest_event_seq: None,
+                            features: None,
                         },
                     }),
                     other => Err(RpcError::new(
@@ -1938,6 +1942,7 @@ mod tests {
                                 network_integration: NetworkIntegration::Auto,
                                 active_owner_uid: None,
                                 latest_event_seq: Some(2),
+                                features: None,
                             },
                         })
                     }

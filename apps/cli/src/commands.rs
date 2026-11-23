@@ -1240,6 +1240,7 @@ mod tests {
             network_integration: protonwire_frontend_api::NetworkIntegration::Auto,
             active_owner_uid: None,
             latest_event_seq: None,
+            features: None,
         };
         let document: serde_json::Value = serde_json::from_str(&status_json(&state)).unwrap();
         assert_eq!(document["state"], "disconnected");

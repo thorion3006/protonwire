@@ -639,6 +639,7 @@ mod tests {
             network_integration: NetworkIntegration::Auto,
             active_owner_uid: None,
             latest_event_seq: None,
+            features: None,
         }
     }
 

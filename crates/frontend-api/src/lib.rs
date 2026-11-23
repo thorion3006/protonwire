@@ -35,4 +35,7 @@ pub use proto::{
     SelectionResult, ServerMessage, ServersRefreshOutcome, ServersRefreshReport, SessionStatus,
     SpecialClass, StageReport, WeightedBreakdownWire, WinnerSignals, WritableStoreStatus,
 };
-pub use state::{DaemonState, NetworkIntegration, VpnState};
+pub use state::{
+    AgentFeatures, DaemonState, FeatureSetting, FeaturesState, NetshieldLevel, NetworkIntegration,
+    VpnState,
+};

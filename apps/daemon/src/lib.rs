@@ -107,9 +107,14 @@ impl RequestHandler for DaemonHandler {
                 // The CONNECTED lane's owner (the bot round's P2):
                 // ownership lives in the lane, not the core — overlay
                 // it BEFORE the per-peer redaction so the owner (and
-                // root) see it and everyone else sees null.
+                // root) see it and everyone else sees null. The T-39
+                // features block rides the same overlay: the lane's
+                // reconciliation ledger, mapped onto the wire.
                 if let Some(lane) = self.services.lane.current() {
                     state.active_owner_uid = lane.active_owner_uid();
+                    state.features = lane
+                        .reconciliation_snapshot()
+                        .map(|ledger| features_state_to_wire(&ledger));
                 }
                 redact_state_for_peer(&mut state, ctx.peer.uid);
                 Ok(RequestResult::State { state })
@@ -376,6 +381,52 @@ fn lane_error_to_rpc(error: connect::LaneError) -> RpcError {
             };
             RpcError::new(code, error.to_string())
         }
+    }
+}
+
+/// T-39: the reconciliation ledger onto the wire — requested, what
+/// the server APPLIED (`None` = unconfirmed), and the explicit
+/// refusals. Pure so the mapping is unit-pinned without an engine.
+fn features_state_to_wire(
+    ledger: &protonwire_protocol::FeatureReconciliation,
+) -> protonwire_frontend_api::FeaturesState {
+    use protonwire_frontend_api::{AgentFeatures, FeatureSetting, NetshieldLevel};
+
+    let netshield = |level: protonwire_protocol::engine::EngineNetshield| match level {
+        protonwire_protocol::engine::EngineNetshield::None => NetshieldLevel::Off,
+        protonwire_protocol::engine::EngineNetshield::MalwareFilter => NetshieldLevel::Malware,
+        protonwire_protocol::engine::EngineNetshield::AdsAndMalwareFilter => {
+            NetshieldLevel::AdsTrackersMalware
+        }
+        protonwire_protocol::engine::EngineNetshield::AdultAndAdsAndMalwareFilter => {
+            NetshieldLevel::AdultAdsTrackersMalware
+        }
+    };
+    let features = |settings: protonwire_protocol::engine::EngineAgentSettings| AgentFeatures {
+        netshield_level: settings.netshield_level.map(netshield),
+        split_tcp: settings.split_tcp,
+        random_nat: settings.random_nat,
+        port_forwarding: settings.port_forwarding,
+        soft_jail: settings.soft_jail,
+        circumvention_routing: settings.circumvention_routing,
+    };
+    let setting = |ty: protonwire_protocol::engine::EngineSettingType| match ty {
+        protonwire_protocol::engine::EngineSettingType::Netshield => FeatureSetting::Netshield,
+        protonwire_protocol::engine::EngineSettingType::SplitTcp => FeatureSetting::SplitTcp,
+        protonwire_protocol::engine::EngineSettingType::RandomNat => FeatureSetting::RandomNat,
+        protonwire_protocol::engine::EngineSettingType::PortForwarding => {
+            FeatureSetting::PortForwarding
+        }
+        protonwire_protocol::engine::EngineSettingType::SafeMode => FeatureSetting::SafeMode,
+        protonwire_protocol::engine::EngineSettingType::CircumventionRouting => {
+            FeatureSetting::CircumventionRouting
+        }
+        protonwire_protocol::engine::EngineSettingType::Bouncing => FeatureSetting::Bouncing,
+    };
+    protonwire_frontend_api::FeaturesState {
+        requested: features(ledger.requested()),
+        applied: ledger.applied().map(features),
+        refused: ledger.refused().iter().copied().map(setting).collect(),
     }
 }
 
@@ -724,6 +775,107 @@ mod tests {
         );
     }
 
+    /// M6 slice 2 (T-39): the reconciliation ledger onto the wire —
+    /// requested, applied (None while unconfirmed), and the explicit
+    /// refusals, with every NetShield level mapped. Built through the
+    /// ledger's OWN transitions (note_requested/note_applied/
+    /// note_refused with the live epoch), so the pin exercises the
+    /// same state machine the engine drives.
+    #[test]
+    fn m6_features_state_maps_the_reconciliation_ledger() {
+        use protonwire_frontend_api::{FeatureSetting, NetshieldLevel};
+        use protonwire_protocol::FeatureReconciliation;
+        use protonwire_protocol::engine::{
+            EngineAgentSettings, EngineNetshield, EngineSettingType,
+        };
+
+        let request = EngineAgentSettings {
+            netshield_level: Some(EngineNetshield::AdsAndMalwareFilter),
+            split_tcp: Some(true),
+            random_nat: Some(false),
+            port_forwarding: Some(false),
+            ..Default::default()
+        };
+        let mut ledger = FeatureReconciliation::new(request);
+        // Unconfirmed: applied is None, nothing refused.
+        let wire = features_state_to_wire(&ledger);
+        assert_eq!(
+            wire.requested.netshield_level,
+            Some(NetshieldLevel::AdsTrackersMalware)
+        );
+        assert_eq!(wire.requested.split_tcp, Some(true));
+        assert_eq!(wire.requested.random_nat, Some(false));
+        assert!(wire.applied.is_none(), "unconfirmed reads as None");
+        assert!(wire.refused.is_empty());
+        // The server applies (same epoch) but refuses NAT-PMP.
+        let epoch = ledger
+            .epoch_handle()
+            .load(std::sync::atomic::Ordering::SeqCst);
+        ledger.note_applied(request, epoch);
+        ledger.note_refused(EngineSettingType::PortForwarding, epoch);
+        let wire = features_state_to_wire(&ledger);
+        let applied = wire.applied.expect("confirmed applied set");
+        assert_eq!(
+            applied.netshield_level,
+            Some(NetshieldLevel::AdsTrackersMalware)
+        );
+        assert_eq!(applied.split_tcp, Some(true));
+        assert_eq!(wire.refused, vec![FeatureSetting::PortForwarding]);
+        // A new request supersedes: applied back to unconfirmed,
+        // refusals cleared, the new level maps.
+        ledger.note_requested(EngineAgentSettings {
+            netshield_level: Some(EngineNetshield::AdultAndAdsAndMalwareFilter),
+            ..Default::default()
+        });
+        let wire = features_state_to_wire(&ledger);
+        assert!(
+            wire.applied.is_none(),
+            "a new request supersedes the applied set"
+        );
+        assert!(wire.refused.is_empty(), "superseded refusals clear");
+        assert_eq!(
+            wire.requested.netshield_level,
+            Some(NetshieldLevel::AdultAdsTrackersMalware)
+        );
+        // The remaining levels map (the full matrix).
+        for (engine, wire_level) in [
+            (EngineNetshield::None, NetshieldLevel::Off),
+            (EngineNetshield::MalwareFilter, NetshieldLevel::Malware),
+            (
+                EngineNetshield::AdsAndMalwareFilter,
+                NetshieldLevel::AdsTrackersMalware,
+            ),
+            (
+                EngineNetshield::AdultAndAdsAndMalwareFilter,
+                NetshieldLevel::AdultAdsTrackersMalware,
+            ),
+        ] {
+            ledger.note_requested(EngineAgentSettings {
+                netshield_level: Some(engine),
+                ..Default::default()
+            });
+            assert_eq!(
+                features_state_to_wire(&ledger).requested.netshield_level,
+                Some(wire_level),
+                "{engine:?}"
+            );
+        }
+    }
+
+    /// T-39's GetState shape: without an installed lane the features
+    /// block is ABSENT (the additive-optional wire rule), never a
+    /// fabricated empty set.
+    #[test]
+    fn m6_get_state_without_a_lane_omits_the_features_block() {
+        let (handler, _) = handler();
+        match handler.handle(&admin_ctx(), Request::GetState).unwrap() {
+            RequestResult::State { state } => {
+                assert!(state.features.is_none());
+            }
+            other => panic!("unexpected result: {other:?}"),
+        }
+    }
+
     /// M3 U6: the selection surface dispatches through the handler
     /// into the engine — an empty cache is the engine's typed
     /// no-catalog refusal (never core's NotImplemented wildcard), and
@@ -890,6 +1042,7 @@ mod tests {
                 network_integration: NetworkIntegration::Auto,
                 active_owner_uid: owner,
                 latest_event_seq: Some(0),
+                features: None,
             }
         }
 

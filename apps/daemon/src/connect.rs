@@ -319,6 +319,27 @@ impl ConnectionLane {
         self.state.lock().ok().and_then(|lane| lane.owner)
     }
 
+    /// A snapshot of the active connection's T-20 feature ledger
+    /// (requested vs applied vs refused — T-39's status source).
+    /// `None` when no connection is live. The lane guard is HELD
+    /// only to clone the slot Arc (no lock nesting: the slot locks
+    /// after the guard drops, the same discipline the pump's split
+    /// arms use).
+    pub fn reconciliation_snapshot(&self) -> Option<protonwire_protocol::FeatureReconciliation> {
+        let slot: ConnectionSlot = {
+            let lane = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            lane.active
+                .as_ref()
+                .map(|active| Arc::clone(&active.connection))?
+        };
+        slot.lock()
+            .ok()
+            .and_then(|guard| guard.as_ref().map(|connection| connection.reconciliation()))
+    }
+
     /// Starts one connection for `uid` (the IPC-authenticated peer).
     /// The facade rides in as a shared box; the pump thread drains the
     /// engine's events into the core state machine until the
