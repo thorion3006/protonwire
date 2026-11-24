@@ -315,6 +315,32 @@ mod tests {
         );
         assert_eq!(settings.split_tcp, Some(true));
 
+        // The FULL NetShield modifier matrix (the qa gate's mutation 1):
+        // every wire level maps to its exact engine level — a swap
+        // between Malware and AdsTrackersMalware must fail here, not
+        // ride the agent handshake as a wrong filtering level.
+        for (wire, engine) in [
+            (NetshieldLevel::Off, EngineNetshield::None),
+            (NetshieldLevel::Malware, EngineNetshield::MalwareFilter),
+            (
+                NetshieldLevel::AdsTrackersMalware,
+                EngineNetshield::AdsAndMalwareFilter,
+            ),
+            (
+                NetshieldLevel::AdultAdsTrackersMalware,
+                EngineNetshield::AdultAndAdsAndMalwareFilter,
+            ),
+        ] {
+            let settings = resolve(
+                base(),
+                Some(&modifier(Some(wire), None, None)),
+                DnsMode::Proton,
+                PortForwardingEntitlement::Unchecked,
+            )
+            .unwrap();
+            assert_eq!(settings.netshield_level, Some(engine), "{wire:?}");
+        }
+
         // No modifiers, an absent set, and an all-`None` set are the
         // configured posture, field for field.
         for modifiers in [None, Some(ConnectModifiers::default())] {

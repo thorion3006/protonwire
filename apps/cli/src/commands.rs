@@ -1301,6 +1301,68 @@ fn planned_milestone(command: &Command) -> &'static str {
 mod tests {
     use super::*;
 
+    /// M6 slice 2 (the qa gate's P1-b): the feature flags parse into
+    /// the exact ConnectModifiers the wire carries, invalid values
+    /// refuse naming the vocabulary, and dropped flags stay None.
+    #[test]
+    fn m6_feature_flags_parse_into_connect_modifiers() {
+        use clap::Parser;
+        use protonwire_frontend_api::{NatMode, NetshieldLevel};
+        let cli = crate::Cli::try_parse_from([
+            "protonwire",
+            "connect",
+            "fastest",
+            "--netshield",
+            "malware",
+            "--nat",
+            "moderate",
+            "--vpn-accelerator",
+            "off",
+        ])
+        .expect("the feature flags parse");
+        let Command::Connect {
+            netshield,
+            nat,
+            vpn_accelerator,
+            ..
+        } = cli.command
+        else {
+            panic!("expected Connect");
+        };
+        assert_eq!(
+            parse_netshield(netshield.as_deref().unwrap()).unwrap(),
+            NetshieldLevel::Malware
+        );
+        assert_eq!(
+            parse_nat(nat.as_deref().unwrap()).unwrap(),
+            NatMode::Moderate
+        );
+        assert_eq!(vpn_accelerator.as_deref(), Some("off"));
+
+        // The invalid values refuse naming their vocabulary.
+        let error = parse_netshield("everything").expect_err("unknown level refuses");
+        assert!(
+            error.to_string().contains("adult-ads-trackers-malware"),
+            "{error}"
+        );
+        let error = parse_nat("open").expect_err("unknown NAT mode refuses");
+        assert!(error.to_string().contains("strict or moderate"), "{error}");
+
+        // Dropped flags: every field None (the configured defaults win).
+        let cli = crate::Cli::try_parse_from(["protonwire", "connect", "fastest"])
+            .expect("bare connect parses");
+        let Command::Connect {
+            netshield,
+            nat,
+            vpn_accelerator,
+            ..
+        } = cli.command
+        else {
+            panic!("expected Connect");
+        };
+        assert!(netshield.is_none() && nat.is_none() && vpn_accelerator.is_none());
+    }
+
     /// Codex PR-9 round (P2, `group list --origin X --json`): the JSON
     /// document must carry the FILTERED groups — pre-fix the filter was
     /// display-only and the serialized catalog handed JSON consumers
@@ -1379,6 +1441,61 @@ mod tests {
         };
         let document: serde_json::Value = serde_json::from_str(&status_json(&owned)).unwrap();
         assert_eq!(document["active_owner_uid"], 1000);
+    }
+
+    /// M6 slice 2 (the qa gate's P1-c): the features block rides the
+    /// status document verbatim when present, stays ABSENT when None,
+    /// and refused settings render as their kebab-case identities.
+    #[test]
+    fn status_json_carries_the_features_block_when_present() {
+        use protonwire_frontend_api::{
+            AgentFeatures, FeatureSetting, FeaturesState, NetshieldLevel, VpnState,
+        };
+        let state = DaemonState {
+            protocol_version: 1,
+            daemon_version: "0.1.0".into(),
+            vpn_state: VpnState::Connected,
+            network_integration: protonwire_frontend_api::NetworkIntegration::Auto,
+            active_owner_uid: Some(1000),
+            latest_event_seq: Some(3),
+            features: Some(FeaturesState {
+                requested: AgentFeatures {
+                    netshield_level: Some(NetshieldLevel::AdsTrackersMalware),
+                    split_tcp: Some(true),
+                    port_forwarding: Some(true),
+                    ..Default::default()
+                },
+                applied: Some(AgentFeatures {
+                    netshield_level: Some(NetshieldLevel::AdsTrackersMalware),
+                    split_tcp: Some(true),
+                    ..Default::default()
+                }),
+                refused: vec![FeatureSetting::PortForwarding],
+            }),
+        };
+        let document: serde_json::Value = serde_json::from_str(&status_json(&state)).unwrap();
+        let features = &document["features"];
+        assert_eq!(
+            features["requested"]["netshield_level"],
+            "ads-trackers-malware"
+        );
+        assert_eq!(features["requested"]["split_tcp"], true);
+        assert_eq!(features["requested"]["port_forwarding"], true);
+        assert_eq!(
+            features["applied"]["netshield_level"],
+            "ads-trackers-malware"
+        );
+        assert!(
+            features["applied"].get("port_forwarding").is_none(),
+            "no preference is absent, never null"
+        );
+        assert_eq!(features["refused"], serde_json::json!(["port-forwarding"]));
+
+        // The None arm: absent from the document entirely.
+        let mut none = state.clone();
+        none.features = None;
+        let document: serde_json::Value = serde_json::from_str(&status_json(&none)).unwrap();
+        assert!(document.get("features").is_none());
     }
 
     /// The dispatch contract: `run` returns errors; it never exits the
