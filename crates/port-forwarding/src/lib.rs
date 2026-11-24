@@ -7,6 +7,7 @@
 //! LocalAgent integration; NAT-PMP itself with Milestone 6.
 
 mod lease;
+pub mod nat_pmp;
 
 pub use lease::{Action, LeaseFsm, LeaseState, Mapping};
 
