@@ -16,6 +16,10 @@ use protonwire_ipc::{EventBus, RequestHandler, SessionContext};
 use std::path::{Path, PathBuf};
 
 pub mod connect;
+/// M6 slice 2: the LocalAgent feature posture — the `features`
+/// config section as the agent request, the per-connection modifier
+/// overlay, and T-18's incompatibility rules on the effective set.
+pub mod features;
 /// M6 slice 1b: the daemon's net context — the startup-allocated
 /// bypass mark, the uplink survey, the kill-switch generation
 /// counter.
@@ -148,20 +152,24 @@ impl RequestHandler for DaemonHandler {
                 .selection
                 .resolve(&target, &modifiers)
                 .map(|result| RequestResult::Selected { result }),
-            // M6 1b: THE CONNECT COMPOSITION — selection resolves the
-            // target, the catalog join builds the tunnel params (the
-            // winner's online keyed physicals, Domains riding as
-            // server_name), and the lane composes engine ∘ net session
-            // (marks health-gated before the kill switch arms, IT-13).
-            // The IPC-authenticated UID is the lane's owner identity.
-            Request::Connect { target } => {
+            // M6 1b: THE CONNECT COMPOSITION — the effective feature
+            // request (M6 slice 2: the configured posture + the
+            // per-connect modifiers, T-18-validated first), selection
+            // resolves the target, the catalog join builds the tunnel
+            // params (the winner's online keyed physicals, Domains
+            // riding as server_name), and the lane composes engine ∘
+            // net session (marks health-gated before the kill switch
+            // arms, IT-13). The IPC-authenticated UID is the lane's
+            // owner identity.
+            Request::Connect { target, modifiers } => {
                 let lane = self.services.lane.current().ok_or_else(no_lane_installed)?;
+                let settings = self.effective_agent_settings(modifiers.as_ref())?;
                 let winner = self.services.selection.resolve(
                     &target,
                     &protonwire_frontend_api::SelectionModifiers::default(),
                 )?;
                 let params = self.services.selection.tunnel_params(&winner.winner.id)?;
-                lane.connect(ctx.peer.uid, &params)
+                lane.connect_with_settings(ctx.peer.uid, &params, settings)
                     .map_err(lane_error_to_rpc)?;
                 Ok(RequestResult::Acknowledged)
             }
@@ -303,6 +311,32 @@ impl RequestHandler for DaemonHandler {
 }
 
 impl DaemonHandler {
+    /// M6 slice 2: THIS connection's agent request — the configured
+    /// feature posture overlaid by the connect modifiers (PRD 9.3's
+    /// `--netshield` / `--nat` / `--vpn-accelerator`), validated on
+    /// the effective set (T-18). Runs BEFORE selection or the lane
+    /// compose: an impossible combination or an unproven entitlement
+    /// refuses typed and nothing starts.
+    ///
+    /// The port-forwarding entitlement is composed only when port
+    /// forwarding is effectively ON, so the default connect path never
+    /// waits on an entitlement read.
+    fn effective_agent_settings(
+        &self,
+        modifiers: Option<&protonwire_frontend_api::ConnectModifiers>,
+    ) -> Result<protonwire_protocol::engine::EngineAgentSettings, RpcError> {
+        use crate::features::PortForwardingEntitlement;
+        let config = &self.services.config;
+        let base = crate::features::posture(config).map_err(|error| error.to_rpc())?;
+        let port_forwarding = if base.port_forwarding == Some(true) {
+            self.services.selection.port_forwarding_entitlement()?
+        } else {
+            PortForwardingEntitlement::Unchecked
+        };
+        crate::features::resolve(base, modifiers, config.dns.mode, port_forwarding)
+            .map_err(|error| error.to_rpc())
+    }
+
     /// Runs `call` against the installed auth adapter — the login
     /// family's shared empty-cell guard: no adapter installed (the
     /// engine wiring is the session lane's) is the typed
@@ -716,6 +750,7 @@ mod tests {
                 &admin_ctx(),
                 Request::Connect {
                     target: protonwire_frontend_api::ConnectTarget::Fastest,
+                    modifiers: None,
                 },
             )
             .unwrap_err();
@@ -874,6 +909,86 @@ mod tests {
             }
             other => panic!("unexpected result: {other:?}"),
         }
+    }
+
+    /// M6 slice 2 (T-18): the handler's effective agent request — the
+    /// configured posture overlaid by the connect modifiers, validated
+    /// BEFORE anything composes (an impossible combination or an
+    /// unproven entitlement never reaches selection or the lane).
+    #[test]
+    fn m6_connect_modifiers_resolve_to_the_effective_agent_request() {
+        use crate::selection::tests::FakeEntitlements;
+        use protonwire_frontend_api::{ConnectModifiers, NatMode, NetshieldLevel};
+        use protonwire_protocol::engine::EngineNetshield;
+
+        // No modifiers: the configured posture (the shipped defaults).
+        let (handler, _) = handler();
+        let settings = handler.effective_agent_settings(None).unwrap();
+        assert_eq!(
+            settings.netshield_level,
+            Some(EngineNetshield::AdsAndMalwareFilter)
+        );
+        assert_eq!(settings.split_tcp, Some(true));
+        assert_eq!(settings.random_nat, Some(false));
+
+        // The modifiers override their own knobs.
+        let settings = handler
+            .effective_agent_settings(Some(&ConnectModifiers {
+                netshield: Some(NetshieldLevel::Off),
+                nat: Some(NatMode::Moderate),
+                vpn_accelerator: Some(false),
+            }))
+            .unwrap();
+        assert_eq!(settings.netshield_level, Some(EngineNetshield::None));
+        assert_eq!(settings.random_nat, Some(true));
+        assert_eq!(settings.split_tcp, Some(false));
+
+        // Port forwarding configured ON with NO entitlement adapter
+        // (the test handler installs none): fail closed.
+        let mut config = SystemConfig::default();
+        config.features.port_forwarding = true;
+        let (handler, _) = handler_with_config(config);
+        let error = handler.effective_agent_settings(None).unwrap_err();
+        assert_eq!(error.code, RpcErrorCode::EntitlementMissing);
+        assert!(error.message.contains("cannot be verified"), "{error}");
+
+        // `--nat moderate` against that config refuses on the
+        // COMBINATION (InvalidParams — the caller's parameters), and
+        // it refuses before any entitlement read is attempted.
+        let error = handler
+            .effective_agent_settings(Some(&ConnectModifiers {
+                nat: Some(NatMode::Moderate),
+                ..Default::default()
+            }))
+            .unwrap_err();
+        assert_eq!(error.code, RpcErrorCode::InvalidParams);
+
+        // A paid entitlement proves it; a free one refuses on the plan.
+        handler
+            .services
+            .selection
+            .entitlement()
+            .install(Arc::new(FakeEntitlements::paid()));
+        assert_eq!(
+            handler
+                .effective_agent_settings(None)
+                .unwrap()
+                .port_forwarding,
+            Some(true)
+        );
+        let (handler, _) = handler_with_config({
+            let mut config = SystemConfig::default();
+            config.features.port_forwarding = true;
+            config
+        });
+        handler
+            .services
+            .selection
+            .entitlement()
+            .install(Arc::new(FakeEntitlements::free()));
+        let error = handler.effective_agent_settings(None).unwrap_err();
+        assert_eq!(error.code, RpcErrorCode::EntitlementMissing);
+        assert!(error.message.contains("does not include"), "{error}");
     }
 
     /// M3 U6: the selection surface dispatches through the handler

@@ -98,6 +98,54 @@ pub enum SpecialClass {
     Tor,
 }
 
+/// The NAT mode (PRD 9.3's `--nat strict|moderate`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum NatMode {
+    /// Strict (symmetric) NAT.
+    Strict,
+    /// Moderate NAT; incompatible with port forwarding (T-18).
+    Moderate,
+}
+
+impl std::fmt::Display for NatMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Strict => "strict",
+            Self::Moderate => "moderate",
+        })
+    }
+}
+
+/// The connection-plane modifiers a [`Request::Connect`] carries (PRD
+/// 9.3: `--netshield`, `--nat`, `--vpn-accelerator`). These are the
+/// TUNNEL's, not selection's — [`SelectionModifiers`] deliberately
+/// excludes them (FR-23E's composition boundary). Each knob is a
+/// per-connection OVERRIDE of the configured default; `None` keeps
+/// the configured value. The daemon validates the EFFECTIVE set
+/// against T-18's incompatibility rules and refuses typed — never a
+/// silent change.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ConnectModifiers {
+    /// The NetShield level for this connection.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub netshield: Option<crate::state::NetshieldLevel>,
+    /// The NAT mode for this connection.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nat: Option<NatMode>,
+    /// VPN Accelerator (split TCP) for this connection.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vpn_accelerator: Option<bool>,
+}
+
+impl ConnectModifiers {
+    /// Whether no knob overrides anything (serializes as `{}`; the
+    /// SDK sends `None` instead).
+    pub fn is_empty(&self) -> bool {
+        self.netshield.is_none() && self.nat.is_none() && self.vpn_accelerator.is_none()
+    }
+}
+
 /// A client → daemon message.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", content = "data", rename_all = "kebab-case")]
@@ -183,8 +231,14 @@ pub enum Request {
     },
     /// Full-state snapshot (the resynchronization primitive).
     GetState,
-    /// Begin a connection. Refused until Milestone 4 wires the ProTUN engine.
-    Connect { target: ConnectTarget },
+    /// Begin a connection (the daemon composes selection → the tunnel).
+    /// `modifiers` are the connection-plane overrides (M6 slice 2);
+    /// additive-optional — absent means "the configured defaults".
+    Connect {
+        target: ConnectTarget,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        modifiers: Option<ConnectModifiers>,
+    },
     /// Tear down the active connection. Refused until Milestone 4.
     Disconnect,
     /// Stop the daemon. Requires administrator (UID 0) peer credentials.
@@ -1184,6 +1238,7 @@ fn serde_plain_code(code: &RpcErrorCode) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::NetshieldLevel;
 
     /// Recorded decision #1 (2026-08-17, docs/m2-plan.md): the request
     /// nesting is FLAT — `data: {id, method, params}`, not `data: {id,
@@ -1228,6 +1283,72 @@ mod tests {
             }
             other => panic!("unexpected message: {other:?}"),
         }
+    }
+
+    /// M6 slice 2: `connect` carries the connection-plane modifiers
+    /// (PRD 9.3's `--netshield` / `--nat` / `--vpn-accelerator`) as an
+    /// ADDITIVE-OPTIONAL field (the `latest_event_seq` rule on the
+    /// request side): the pre-modifier shape still parses (an old
+    /// client's bare target reads as "no modifiers"), and a request
+    /// without modifiers serializes EXACTLY as before — the field is
+    /// absent, never a null.
+    #[test]
+    fn connect_modifiers_are_additive_optional_on_the_wire() {
+        let legacy = serde_json::json!({
+            "method": "connect",
+            "params": { "target": { "kind": "fastest", "value": null } }
+        });
+        match serde_json::from_value::<Request>(legacy).unwrap() {
+            Request::Connect { target, modifiers } => {
+                assert_eq!(target, ConnectTarget::Fastest);
+                assert!(modifiers.is_none());
+            }
+            other => panic!("unexpected request: {other:?}"),
+        }
+        let bare = serde_json::to_value(Request::Connect {
+            target: ConnectTarget::Fastest,
+            modifiers: None,
+        })
+        .unwrap();
+        assert_eq!(
+            bare,
+            serde_json::json!({
+                "method": "connect",
+                "params": { "target": { "kind": "fastest" } }
+            })
+        );
+        // With modifiers: every knob in its PRD vocabulary.
+        let with = ConnectModifiers {
+            netshield: Some(NetshieldLevel::Malware),
+            nat: Some(NatMode::Moderate),
+            vpn_accelerator: Some(false),
+        };
+        let json = serde_json::to_value(Request::Connect {
+            target: ConnectTarget::Fastest,
+            modifiers: Some(with.clone()),
+        })
+        .unwrap();
+        assert_eq!(
+            json["params"]["modifiers"],
+            serde_json::json!({
+                "netshield": "malware",
+                "nat": "moderate",
+                "vpn_accelerator": false
+            })
+        );
+        match serde_json::from_value::<Request>(json).unwrap() {
+            Request::Connect { modifiers, .. } => assert_eq!(modifiers, Some(with)),
+            other => panic!("unexpected request: {other:?}"),
+        }
+        // Absent knobs are ABSENT (never null on the wire).
+        let partial = serde_json::to_value(ConnectModifiers {
+            netshield: Some(NetshieldLevel::Off),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(partial, serde_json::json!({ "netshield": "off" }));
+        let empty = serde_json::to_value(ConnectModifiers::default()).unwrap();
+        assert_eq!(empty, serde_json::json!({}));
     }
 
     /// Characterization pin (green-by-design, per the round-6

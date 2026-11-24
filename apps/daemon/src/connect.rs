@@ -340,11 +340,28 @@ impl ConnectionLane {
             .and_then(|guard| guard.as_ref().map(|connection| connection.reconciliation()))
     }
 
-    /// Starts one connection for `uid` (the IPC-authenticated peer).
+    /// Starts one connection for `uid` (the IPC-authenticated peer)
+    /// with the engine's configured agent request.
+    pub fn connect(&self, uid: u32, params: &TunnelParams) -> Result<(), LaneError> {
+        self.connect_with_settings(uid, params, self.engine.config().mode.agent_settings())
+    }
+
+    /// Starts one connection for `uid` with THIS connection's agent
+    /// request (M6 slice 2: the configured posture with the
+    /// per-connection modifiers resolved and validated by the caller —
+    /// the lane never re-validates, the daemon's feature resolver owns
+    /// T-18). The request opens the T-20 ledger and the initial agent
+    /// handshake with the same value.
+    ///
     /// The facade rides in as a shared box; the pump thread drains the
     /// engine's events into the core state machine until the
     /// connection dies.
-    pub fn connect(&self, uid: u32, params: &TunnelParams) -> Result<(), LaneError> {
+    pub fn connect_with_settings(
+        &self,
+        uid: u32,
+        params: &TunnelParams,
+        agent_settings: protonwire_protocol::engine::EngineAgentSettings,
+    ) -> Result<(), LaneError> {
         let mut lane = self
             .state
             .lock()
@@ -417,9 +434,10 @@ impl ConnectionLane {
         }
         lane.owner = None;
         drop(lane);
-        let connection = match self.engine.connect(
+        let connection = match self.engine.connect_with_agent_settings(
             params,
             Box::new(SharedFacadeCache(Arc::clone(&self.facade))),
+            agent_settings,
         ) {
             Ok(connection) => connection,
             Err(error) => {

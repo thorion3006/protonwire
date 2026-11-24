@@ -972,6 +972,30 @@ impl SelectionEngine {
         entitlements.map(|snapshot| snapshot.plan_tier == Some(PlanTier::Paid))
     }
 
+    /// M6 slice 2: the port-forwarding entitlement for the connect
+    /// path's feature validation (FR-7 / T-18) — the tri-state the
+    /// validator needs, never a guess. Composes the account snapshot
+    /// through the SAME single-flight, deadline-clamped composition
+    /// the selection gates use: `Known(paid)` when the snapshot
+    /// answered; `Unknown` when no adapter is installed (the
+    /// login-free surface proves nothing); a composition FAILURE
+    /// propagates typed (EntitlementMissing / NetworkUnavailable /
+    /// Internal — the selection gates' vocabulary). Only called when
+    /// port forwarding is effectively on, so the default connect path
+    /// never waits on an entitlement read.
+    pub fn port_forwarding_entitlement(
+        &self,
+    ) -> Result<crate::features::PortForwardingEntitlement, RpcError> {
+        let budget = std::time::Duration::from_millis(
+            self.config.server_selection.entitlement_fetch_budget_ms,
+        );
+        let snapshot = self.entitlement_composition(Instant::now() + budget)?;
+        Ok(match Self::pf_entitlement(snapshot.as_ref()) {
+            Some(paid) => crate::features::PortForwardingEntitlement::Known(paid),
+            None => crate::features::PortForwardingEntitlement::Unknown,
+        })
+    }
+
     /// The empty per-server PF capability composition (FR-87's honest
     /// TODAY): no per-server source exists until M6's NAT-PMP lane
     /// supplies one.
@@ -2688,7 +2712,7 @@ fn selection_error_to_rpc_explained(error: SelectionError, request: &SelectionRe
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use protonwire_frontend_api::SelectionFeature;
     use protonwire_frontend_api::SelectionProtocol;
@@ -3174,6 +3198,51 @@ mod tests {
             error.message.contains("p2p capability"),
             "the refusal names the capability: {error}"
         );
+    }
+
+    /// M6 slice 2: the connect path's PF entitlement (FR-7) is the
+    /// tri-state the feature validator needs — composed, or honestly
+    /// unknown, never guessed. No adapter installed → `Unknown`; a
+    /// paid snapshot → `Known(true)`; a free one → `Known(false)`; an
+    /// UNUSABLE snapshot (no VPN access) propagates the composition's
+    /// typed refusal instead of answering at all.
+    #[test]
+    fn port_forwarding_entitlement_is_composed_or_unknown_never_guessed() {
+        use crate::features::PortForwardingEntitlement;
+
+        let engine = default_engine();
+        assert_eq!(
+            engine.port_forwarding_entitlement().unwrap(),
+            PortForwardingEntitlement::Unknown,
+            "no adapter installed proves nothing"
+        );
+
+        let engine = default_engine();
+        engine
+            .entitlement()
+            .install(Arc::new(FakeEntitlements::paid()));
+        assert_eq!(
+            engine.port_forwarding_entitlement().unwrap(),
+            PortForwardingEntitlement::Known(true)
+        );
+
+        let engine = default_engine();
+        engine
+            .entitlement()
+            .install(Arc::new(FakeEntitlements::free()));
+        assert_eq!(
+            engine.port_forwarding_entitlement().unwrap(),
+            PortForwardingEntitlement::Known(false)
+        );
+
+        let engine = default_engine();
+        engine
+            .entitlement()
+            .install(Arc::new(FakeEntitlements::no_access()));
+        let error = engine
+            .port_forwarding_entitlement()
+            .expect_err("an unusable snapshot never answers");
+        assert_eq!(error.code, RpcErrorCode::EntitlementMissing);
     }
 
     /// The `--require` arm of the same gate.
@@ -6372,13 +6441,14 @@ mod tests {
     }
 
     /// A scripted entitlements adapter over the recorded contract's
-    /// shape (paid: MaxTier 3; free: MaxTier 0).
-    struct FakeEntitlements {
+    /// shape (paid: MaxTier 3; free: MaxTier 0). Crate-visible so the
+    /// handler's feature-composition tests install the same fixture.
+    pub(crate) struct FakeEntitlements {
         body: &'static str,
     }
 
     impl FakeEntitlements {
-        fn paid() -> Self {
+        pub(crate) fn paid() -> Self {
             Self {
                 body: r#"{
                     "Code": 1000, "Error": null, "Details": null,
@@ -6395,7 +6465,7 @@ mod tests {
             }
         }
 
-        fn free() -> Self {
+        pub(crate) fn free() -> Self {
             Self {
                 body: r#"{
                     "Code": 1000, "Error": null, "Details": null,
@@ -6413,7 +6483,7 @@ mod tests {
 
         /// An authoritative NO-ACCESS answer (wire `Status: 0`) that
         /// still carries a tier — the round-10 invalidation shape.
-        fn no_access() -> Self {
+        pub(crate) fn no_access() -> Self {
             Self {
                 body: r#"{
                     "Code": 1000, "Error": null, "Details": null,

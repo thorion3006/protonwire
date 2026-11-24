@@ -372,6 +372,7 @@ mod tests {
                 1000,
                 Request::Connect {
                     target: protonwire_frontend_api::ConnectTarget::Fastest,
+                    modifiers: None,
                 },
             )
             .unwrap_err();
@@ -388,6 +389,7 @@ mod tests {
                 2000,
                 Request::Connect {
                     target: protonwire_frontend_api::ConnectTarget::Fastest,
+                    modifiers: None,
                 },
             )
             .unwrap_err();

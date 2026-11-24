@@ -94,6 +94,7 @@ mod tests {
             Request::GetState,
             Request::Connect {
                 target: protonwire_frontend_api::ConnectTarget::Fastest,
+                modifiers: None,
             },
             Request::Disconnect,
         ] {

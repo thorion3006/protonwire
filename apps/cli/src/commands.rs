@@ -6,11 +6,41 @@ use std::path::Path;
 use clap::Subcommand;
 use protonwire_client::ClientError;
 use protonwire_frontend_api::{
-    DaemonState, PhysicalCountrySource, RpcError, RpcErrorCode, SelectionFeature,
-    SelectionModifiers, SelectionProtocol,
+    AgentFeatures, DaemonState, NatMode, NetshieldLevel, PhysicalCountrySource, RpcError,
+    RpcErrorCode, SelectionFeature, SelectionModifiers, SelectionProtocol,
 };
 
 use crate::{connect, target::ConnectTargetArgs};
+
+/// One line summarizing a feature set for the human status view:
+/// only the REQUESTED (Some) knobs appear — `None` is "no
+/// preference" and never reports as active (T-20's rule).
+fn features_summary(features: &AgentFeatures) -> String {
+    let mut parts = Vec::new();
+    if let Some(level) = features.netshield_level {
+        parts.push(format!("netshield={level}"));
+    }
+    if let Some(split_tcp) = features.split_tcp {
+        parts.push(format!("accelerator={split_tcp}"));
+    }
+    if let Some(random_nat) = features.random_nat {
+        parts.push(format!("moderate-nat={random_nat}"));
+    }
+    if let Some(port_forwarding) = features.port_forwarding {
+        parts.push(format!("port-forwarding={port_forwarding}"));
+    }
+    if let Some(soft_jail) = features.soft_jail {
+        parts.push(format!("safe-mode={soft_jail}"));
+    }
+    if let Some(circumvention) = features.circumvention_routing {
+        parts.push(format!("circumvention={circumvention}"));
+    }
+    if parts.is_empty() {
+        "no preferences".to_owned()
+    } else {
+        parts.join(" ")
+    }
+}
 
 /// Every top-level command from PRD 9.1. Arguments are the full §9.2–9.7
 /// grammar where the milestone implements it; otherwise the surface is
@@ -87,6 +117,21 @@ pub enum Command {
         /// Protocol override (smart|wireguard-udp|wireguard-tcp|stealth).
         #[arg(long)]
         protocol: Option<String>,
+
+        /// NetShield level for this connection (off|malware|
+        /// ads-trackers-malware|adult-ads-trackers-malware; PRD 9.3 —
+        /// overrides the configured default; T-18 conflicts refuse).
+        #[arg(long, value_parser = ["off", "malware", "ads-trackers-malware", "adult-ads-trackers-malware"])]
+        netshield: Option<String>,
+
+        /// NAT mode for this connection (strict|moderate; PRD 9.3 —
+        /// moderate is incompatible with port forwarding, T-18).
+        #[arg(long, value_parser = ["strict", "moderate"])]
+        nat: Option<String>,
+
+        /// VPN Accelerator for this connection (on|off; PRD 9.3).
+        #[arg(long, value_parser = ["on", "off"])]
+        vpn_accelerator: Option<String>,
 
         /// Secure Core entry country (PRD 9.5; `connect secure-core`
         /// only — refused on every other target).
@@ -321,6 +366,9 @@ pub fn run(command: &Command, socket: Option<&Path>, no_input: bool) -> RunResul
             exclude_exit_countries,
             require,
             protocol,
+            netshield,
+            nat,
+            vpn_accelerator,
             entry_country,
             exit_country,
             dry_run,
@@ -385,7 +433,28 @@ pub fn run(command: &Command, socket: Option<&Path>, no_input: bool) -> RunResul
                     ),
                 )));
             }
-            connect_command(socket, parsed_target)
+            // M6 slice 2: the connection-plane modifiers ride the
+            // connect request — the daemon resolves them against the
+            // configured posture and refuses T-18 conflicts typed.
+            connect_command_with_modifiers(
+                socket,
+                parsed_target,
+                protonwire_frontend_api::ConnectModifiers {
+                    netshield: netshield.as_deref().map(parse_netshield).transpose()?,
+                    nat: nat.as_deref().map(parse_nat).transpose()?,
+                    vpn_accelerator: vpn_accelerator
+                        .as_deref()
+                        .map(|value| match value {
+                            "on" => Ok(true),
+                            "off" => Ok(false),
+                            other => Err(ClientError::Rpc(RpcError::new(
+                                RpcErrorCode::InvalidParams,
+                                format!("--vpn-accelerator takes on|off, got {other:?}"),
+                            ))),
+                        })
+                        .transpose()?,
+                },
+            )
         }
         Command::Disconnect => {
             let mut client = connect(socket)?;
@@ -676,6 +745,36 @@ fn parse_protocol(value: Option<&str>) -> Result<Option<SelectionProtocol>, Clie
             format!(
                 "unknown protocol `{other}`: expected wireguard-udp, wireguard-tcp, or stealth"
             ),
+        ))),
+    }
+}
+
+/// PRD 9.3's `--netshield off|malware|ads-trackers-malware|
+/// adult-ads-trackers-malware` (M6 slice 2).
+fn parse_netshield(value: &str) -> Result<NetshieldLevel, ClientError> {
+    match value {
+        "off" => Ok(NetshieldLevel::Off),
+        "malware" => Ok(NetshieldLevel::Malware),
+        "ads-trackers-malware" => Ok(NetshieldLevel::AdsTrackersMalware),
+        "adult-ads-trackers-malware" => Ok(NetshieldLevel::AdultAdsTrackersMalware),
+        other => Err(ClientError::Rpc(RpcError::new(
+            RpcErrorCode::InvalidParams,
+            format!(
+                "unknown NetShield level `{other}`: expected off, malware, \
+                 ads-trackers-malware, or adult-ads-trackers-malware"
+            ),
+        ))),
+    }
+}
+
+/// PRD 9.3's `--nat strict|moderate` (M6 slice 2).
+fn parse_nat(value: &str) -> Result<NatMode, ClientError> {
+    match value {
+        "strict" => Ok(NatMode::Strict),
+        "moderate" => Ok(NatMode::Moderate),
+        other => Err(ClientError::Rpc(RpcError::new(
+            RpcErrorCode::InvalidParams,
+            format!("unknown NAT mode `{other}`: expected strict or moderate"),
         ))),
     }
 }
@@ -986,7 +1085,8 @@ fn status(socket: Option<&Path>, json: bool) -> RunResult {
 /// Milestone 1 exposes the disconnected-state subset: `state` and
 /// `network_integration` with daemon metadata. Server, tunnel, and feature
 /// sections join when the ProTUN engine lands (Milestone 4) — additive
-/// fields, minor protocol bump.
+/// fields, minor protocol bump. M6 slice 2: the `features` block rides
+/// the same additive rule (present only while a connection lives).
 pub(crate) fn status_json(state: &DaemonState) -> String {
     let mut document = serde_json::json!({
         "state": state.vpn_state,
@@ -996,6 +1096,9 @@ pub(crate) fn status_json(state: &DaemonState) -> String {
     });
     if let Some(owner) = state.active_owner_uid {
         document["active_owner_uid"] = serde_json::json!(owner);
+    }
+    if let Some(features) = &state.features {
+        document["features"] = serde_json::to_value(features).expect("features serialize");
     }
     serde_json::to_string_pretty(&document).expect("status document serializes")
 }
@@ -1008,6 +1111,26 @@ fn print_status_human(state: &DaemonState) {
     );
     if let Some(owner) = state.active_owner_uid {
         println!("Connection owner UID: {owner}");
+    }
+    if let Some(features) = &state.features {
+        println!(
+            "Features (requested): {}",
+            features_summary(&features.requested)
+        );
+        match &features.applied {
+            Some(applied) => {
+                println!("Features (applied):   {}", features_summary(applied));
+            }
+            None => println!("Features (applied):   negotiating…"),
+        }
+        if !features.refused.is_empty() {
+            let refused: Vec<String> = features
+                .refused
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect();
+            println!("Features (refused):   {}", refused.join(", "));
+        }
     }
     println!(
         "Daemon:               {} (protocol {})",
@@ -1040,12 +1163,13 @@ fn daemon(sub: &DaemonSub, socket: Option<&Path>) -> RunResult {
     }
 }
 
-fn connect_command(
+fn connect_command_with_modifiers(
     socket: Option<&Path>,
     target: protonwire_frontend_api::ConnectTarget,
+    modifiers: protonwire_frontend_api::ConnectModifiers,
 ) -> RunResult {
     let mut client = connect(socket)?;
-    client.connect_vpn(target)
+    client.connect_vpn_with_modifiers(target, modifiers)
 }
 
 /// The first unimplemented connect modifier, with its planned milestone
@@ -1408,6 +1532,9 @@ mod tests {
                     exclude_exit_countries: Vec::new(),
                     require: Vec::new(),
                     protocol: None,
+                    netshield: None,
+                    nat: None,
+                    vpn_accelerator: None,
                     entry_country: None,
                     exit_country: None,
                     dry_run: false,
@@ -1429,6 +1556,9 @@ mod tests {
                     exclude_exit_countries: Vec::new(),
                     require: Vec::new(),
                     protocol: Some("stealth".into()),
+                    netshield: None,
+                    nat: None,
+                    vpn_accelerator: None,
                     entry_country: None,
                     exit_country: None,
                     dry_run: false,
@@ -1501,6 +1631,9 @@ mod tests {
                 exclude_exit_countries: Vec::new(),
                 require: Vec::new(),
                 protocol: None,
+                netshield: None,
+                nat: None,
+                vpn_accelerator: None,
                 entry_country: None,
                 exit_country: None,
                 dry_run: true,
@@ -1592,6 +1725,9 @@ mod tests {
                 exclude_exit_countries: Vec::new(),
                 require: Vec::new(),
                 protocol: None,
+                netshield: None,
+                nat: None,
+                vpn_accelerator: None,
                 entry_country: None,
                 exit_country: None,
                 dry_run: false,
@@ -1609,6 +1745,9 @@ mod tests {
                 exclude_exit_countries: Vec::new(),
                 require: Vec::new(),
                 protocol: None,
+                netshield: None,
+                nat: None,
+                vpn_accelerator: None,
                 entry_country: None,
                 exit_country: None,
                 dry_run: false,
@@ -1721,6 +1860,9 @@ mod tests {
                     exclude_exit_countries: Vec::new(),
                     require: Vec::new(),
                     protocol: None,
+                    netshield: None,
+                    nat: None,
+                    vpn_accelerator: None,
                     entry_country: None,
                     exit_country: None,
                     dry_run: false,
@@ -1816,6 +1958,9 @@ mod tests {
             exclude_exit_countries: Vec::new(),
             require: Vec::new(),
             protocol: None,
+            netshield: None,
+            nat: None,
+            vpn_accelerator: None,
             entry_country: Some("CH".into()),
             exit_country: None,
             dry_run: false,
