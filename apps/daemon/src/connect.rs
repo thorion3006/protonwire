@@ -341,7 +341,12 @@ impl ConnectionLane {
     }
 
     /// Starts one connection for `uid` (the IPC-authenticated peer)
-    /// with the engine's configured agent request.
+    /// with the engine's configured agent request. Convenience form:
+    /// NO feature validation happens here — the T-18 front door is
+    /// `DaemonHandler::effective_agent_settings`, which production
+    /// dispatch runs before calling in. Prefer
+    /// [`Self::connect_with_settings`] with an already-validated
+    /// request.
     pub fn connect(&self, uid: u32, params: &TunnelParams) -> Result<(), LaneError> {
         self.connect_with_settings(uid, params, self.engine.config().mode.agent_settings())
     }

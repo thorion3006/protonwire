@@ -41,8 +41,11 @@ surfaced (requested vs applied vs refused + FR-55 counters);
 PF×Moderate-NAT and entitlement conflicts rejected (T-5/T-18).
 Files: daemon connect.rs (settings epoch), store sections validation,
 frontend-api state features block, cli config/connect flags.
-Tests: T-18 full, T-20 extended, T-39, IT-33 (mid-session feature
-change rides the reconcile epoch).
+Tests: T-18 full, T-20 extended, T-39. IT-33 (mid-session feature
+change rides the reconcile epoch) is RE-SLOTTED (2026-11-24, rust
+gate): it needs a live-session settings-change entry point — no
+config-write surface and no feature-change request exist yet — so
+it lands with slice 5's reconnect lane or the session-lane slice.
 Parity flips: dns.netshield-levels, dns.netshield-statistics,
 options.nat, options.vpn-accelerator.
 Gates: rust-reviewer, qa-engineer.

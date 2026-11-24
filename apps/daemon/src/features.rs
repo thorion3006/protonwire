@@ -151,12 +151,28 @@ pub fn resolve(
             effective.split_tcp = Some(vpn_accelerator);
         }
     }
+    // FAIL-CLOSED GUARD (the slice-2 rust gate's P3): the connect path
+    // must compose a real entitlement answer before an effective PF-on
+    // validates — `Unchecked` here would pass fail-OPEN through the
+    // permissive startup arm. ConnectModifiers carries no PF knob
+    // today, so this is unreachable; the assert pins the contract for
+    // the day one exists (the reviewer's exact scenario).
+    debug_assert!(
+        effective.port_forwarding != Some(true)
+            || port_forwarding != PortForwardingEntitlement::Unchecked,
+        "resolve() with PF-on requires a composed entitlement — never Unchecked"
+    );
     validate(&effective, dns_mode, port_forwarding)?;
     Ok(effective)
 }
 
 /// T-18 on an effective set. Pure over the three inputs the rules
 /// need — no I/O, no account reads.
+///
+/// The FAIL-CLOSED GUARD lives in [`resolve`], not here: `Unchecked`
+/// is lawful from [`posture`] (startup has no account to compose),
+/// but the connect path must present a composed answer whenever the
+/// effective set turns PF on — `resolve` debug-asserts that contract.
 fn validate(
     settings: &EngineAgentSettings,
     dns_mode: DnsMode,
