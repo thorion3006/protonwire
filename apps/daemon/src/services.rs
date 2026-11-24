@@ -99,6 +99,29 @@ impl AuthProvider {
     }
 }
 
+/// The connection-lane cell (M6 1b): the daemon constructs the lane
+/// at startup — AFTER the NetContext's mark allocation — and installs
+/// it here; until then the Connect/Disconnect family answers with the
+/// same typed NotImplemented the login family uses for its empty
+/// auth cell (the composition's owner-UID gate keys off the IPC
+/// peer's authenticated UID).
+#[derive(Default)]
+pub struct LaneProvider {
+    lane: RwLock<Option<std::sync::Arc<crate::connect::ConnectionLane>>>,
+}
+
+impl LaneProvider {
+    /// Installs the lane (startup, once).
+    pub fn install(&self, lane: std::sync::Arc<crate::connect::ConnectionLane>) {
+        *self.lane.write().expect("lane provider lock") = Some(lane);
+    }
+
+    /// The lane, if startup installed one.
+    pub fn current(&self) -> Option<std::sync::Arc<crate::connect::ConnectionLane>> {
+        self.lane.read().expect("lane provider lock").clone()
+    }
+}
+
 /// S9 obligation (c): the begin_login InvalidState guard, implemented as
 /// the daemon-side precondition CALL SEQUENCE (the work order's
 /// mandated shape — `auth.rs` belongs to the api lane): before any
@@ -395,6 +418,10 @@ pub struct DaemonServices {
     pub catalog: Arc<CatalogService>,
     /// The authentication adapter cell (the login family's provider).
     pub auth: AuthProvider,
+    /// The connection-lane cell (M6 1b: the Connect/Disconnect
+    /// family's provider — installed at startup after the mark
+    /// allocation).
+    pub lane: LaneProvider,
     /// The interactive credential store (`SubmitCredential`'s landing;
     /// the interactive source's provider backer).
     pub credentials: Arc<CredentialStore>,
@@ -491,6 +518,7 @@ impl DaemonServices {
             scheduler,
             catalog,
             auth: AuthProvider::default(),
+            lane: LaneProvider::default(),
             credentials,
             credential_input,
             config: Arc::clone(&config),

@@ -189,6 +189,9 @@ fn m4_exit_connect_disconnect_lifecycle() {
             tls: None,
             priority: 1,
             exit_label: Some("m4-exit".to_owned()),
+            // The mocked loopback peer has no certificate — a name
+            // here would make the agent path expect TLS identity.
+            server_name: None,
         }],
         protocol: Protocol::WireGuardUdp,
         network_available: true,
