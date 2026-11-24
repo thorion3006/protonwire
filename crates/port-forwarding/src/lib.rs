@@ -6,21 +6,9 @@
 //! LocalAgent-mediated communication path arrives with Milestone 4's
 //! LocalAgent integration; NAT-PMP itself with Milestone 6.
 
-/// State of a port-forwarding lease.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LeaseState {
-    /// No lease exists.
-    Inactive,
-    /// A lease was requested and is pending.
-    Requesting,
-    /// A port is forwarded and the lease is healthy.
-    Active {
-        /// Forwarded external port.
-        port: u16,
-    },
-    /// Renewal failed and the lease is expiring.
-    Expiring,
-}
+mod lease;
+
+pub use lease::{Action, LeaseFsm, LeaseState, Mapping};
 
 /// The port-forwarding surface core programs against (Milestone 6).
 pub trait PortForwardingService: Send + Sync {
@@ -40,15 +28,4 @@ pub enum PortForwardingError {
     /// The NAT-PMP exchange failed.
     #[error("NAT-PMP failure: {0}")]
     Transport(String),
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn lease_states_are_distinct() {
-        assert_ne!(LeaseState::Inactive, LeaseState::Requesting);
-        assert_ne!(LeaseState::Active { port: 12345 }, LeaseState::Expiring);
-    }
 }
