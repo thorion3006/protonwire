@@ -26,13 +26,17 @@ pub use event::{
 };
 pub use proto::{
     AccountStatus, ClientInfo, ClientMessage, ClientSurface, ConfirmationRequirement,
-    ConnectTarget, CredentialSourceStatus, CredentialStartupRead, Fido2ChallengeParams,
-    GroupAvailability, GroupDetails, GroupProvenance, GroupSummary, GroupsCatalog,
-    HardFiltersReport, HelloAck, HelloError, LoginBlockedReason, LoginOutcome, PROTOCOL_VERSION,
-    PersistenceHealth, PhysicalCountrySource, PhysicalCountryValue, Request, RequestResult,
-    ResolvedSelector, Response, RpcError, RpcErrorCode, SecretParam, SelectedServer,
-    SelectionCatalogProvenance, SelectionFeature, SelectionModifiers, SelectionProtocol,
-    SelectionResult, ServerMessage, ServersRefreshOutcome, ServersRefreshReport, SessionStatus,
-    SpecialClass, StageReport, WeightedBreakdownWire, WinnerSignals, WritableStoreStatus,
+    ConnectModifiers, ConnectTarget, CredentialSourceStatus, CredentialStartupRead,
+    Fido2ChallengeParams, GroupAvailability, GroupDetails, GroupProvenance, GroupSummary,
+    GroupsCatalog, HardFiltersReport, HelloAck, HelloError, LoginBlockedReason, LoginOutcome,
+    NatMode, PROTOCOL_VERSION, PersistenceHealth, PhysicalCountrySource, PhysicalCountryValue,
+    Request, RequestResult, ResolvedSelector, Response, RpcError, RpcErrorCode, SecretParam,
+    SelectedServer, SelectionCatalogProvenance, SelectionFeature, SelectionModifiers,
+    SelectionProtocol, SelectionResult, ServerMessage, ServersRefreshOutcome, ServersRefreshReport,
+    SessionStatus, SpecialClass, StageReport, WeightedBreakdownWire, WinnerSignals,
+    WritableStoreStatus,
 };
-pub use state::{DaemonState, NetworkIntegration, VpnState};
+pub use state::{
+    AgentFeatures, DaemonState, FeatureSetting, FeaturesState, NetshieldLevel, NetworkIntegration,
+    VpnState,
+};

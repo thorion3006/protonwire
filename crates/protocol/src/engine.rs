@@ -753,22 +753,51 @@ pub enum EngineError {
 /// The production mode composition (pure; FR-32A): `Some(LocalAgent
 /// …)` for the production engine, `None` for the agent-less test
 /// engine (whose mode `translate` already composed with the explicit
-/// key).
+/// key). Remains only as the pin target of
+/// `compose_mode_localagent_carries_the_request` — the connect path
+/// overrides via [`connect_with_agent_settings`] →
+/// [`local_agent_mode_with`].
+#[cfg_attr(not(test), allow(dead_code))]
 fn local_agent_mode(mode: &EngineMode) -> Option<ConnectionMode> {
+    local_agent_mode_with(mode, mode.agent_settings())
+}
+
+/// [`local_agent_mode`] with a CONNECT-TIME override of the agent
+/// request (M6 slice 2: PRD 9.3's per-connection modifiers). Only the
+/// request is replaced — the session identity (user agent, app
+/// version, muon env) is the engine's — so the override rides the
+/// INITIAL agent handshake rather than a post-connect flip through
+/// [`ActiveConnection::update_agent_settings`].
+fn local_agent_mode_with(
+    mode: &EngineMode,
+    settings: EngineAgentSettings,
+) -> Option<ConnectionMode> {
     match mode {
         EngineMode::LocalAgent {
             user_agent,
             app_version,
             muon_env,
-            settings,
+            ..
         } => Some(ConnectionMode::LocalAgent {
             user_agent: user_agent.clone(),
             app_version: app_version.clone(),
-            settings: settings_to_protun(*settings),
+            settings: settings_to_protun(settings),
             muon_env: muon_env_to_protun(muon_env.clone()),
             certificate_duration: None, // v3: the default cert lifetime (the engine's certificate refresh owns the value; None = upstream default)
         }),
         EngineMode::NoLocalAgent => None,
+    }
+}
+
+impl EngineMode {
+    /// The mode's configured agent request — the LocalAgent posture
+    /// (the daemon's `features` section at startup), or the empty
+    /// request for the agent-less engine (nothing to negotiate).
+    pub fn agent_settings(&self) -> EngineAgentSettings {
+        match self {
+            EngineMode::LocalAgent { settings, .. } => *settings,
+            EngineMode::NoLocalAgent => EngineAgentSettings::default(),
+        }
     }
 }
 
@@ -804,14 +833,33 @@ impl ConnectionEngine {
         &self.config
     }
 
-    /// Composes and starts one connection (FR-24/32A/32B/32D):
-    /// translate the params, compose the mode, create + hand off the
-    /// TUN descriptor, arm the mark callback, spawn ProTUN with
-    /// non-blocking forwarding callbacks, and return the live handle.
+    /// Composes and starts one connection with the engine's configured
+    /// agent request.
     pub fn connect(
         &self,
         params: &TunnelParams,
         cache: Box<dyn PersistentCache>,
+    ) -> Result<ActiveConnection, EngineError> {
+        self.connect_with_agent_settings(params, cache, self.config.mode.agent_settings())
+    }
+
+    /// Composes and starts one connection (FR-24/32A/32B/32D):
+    /// translate the params, compose the mode, create + hand off the
+    /// TUN descriptor, arm the mark callback, spawn ProTUN with
+    /// non-blocking forwarding callbacks, and return the live handle.
+    ///
+    /// `agent_settings` is THIS connection's LocalAgent request (M6
+    /// slice 2): the configured posture with the per-connection
+    /// modifiers already resolved and validated by the caller. It
+    /// opens the T-20 ledger AND the initial agent handshake with the
+    /// same value, so requested-vs-applied is judged against what was
+    /// actually asked. In the agent-less mode it only opens the
+    /// ledger (nothing negotiates — the request stays unconfirmed).
+    pub fn connect_with_agent_settings(
+        &self,
+        params: &TunnelParams,
+        cache: Box<dyn PersistentCache>,
+        agent_settings: EngineAgentSettings,
     ) -> Result<ActiveConnection, EngineError> {
         // The key policy follows the mode: production LocalAgent runs
         // keyless params (the cache holds the key, FR-32A); agent-less
@@ -826,7 +874,7 @@ impl ConnectionEngine {
         // agent-less test mode KEEPS translate's composition — the
         // decoded client key lives there and ConnectionMode is not
         // Clone, so the override must be conditional, not a rebuild.
-        if let Some(mode) = local_agent_mode(&self.config.mode) {
+        if let Some(mode) = local_agent_mode_with(&self.config.mode, agent_settings) {
             initial.connection_mode = mode;
         }
         let tun = TunHandle::create(&self.config.if_name)?;
@@ -847,10 +895,10 @@ impl ConnectionEngine {
         let (event_tx, event_rx) = std::sync::mpsc::sync_channel(EVENT_CHANNEL_BOUND);
         let drops = Arc::new(EventDrops::default());
         let latest = Arc::new(Mutex::new(None));
-        let reconciliation = Arc::new(Mutex::new(match &self.config.mode {
-            EngineMode::LocalAgent { settings, .. } => FeatureReconciliation::new(*settings),
-            EngineMode::NoLocalAgent => FeatureReconciliation::new(EngineAgentSettings::default()),
-        }));
+        // The ledger opens with THIS connection's request (the same
+        // value the initial agent handshake carries) — one source for
+        // what was asked.
+        let reconciliation = Arc::new(Mutex::new(FeatureReconciliation::new(agent_settings)));
         // The callbacks share the ledger's epoch handle (round-13).
         let epoch = reconciliation
             .lock()
@@ -1662,6 +1710,63 @@ mod tests {
         }
         // The agent-less test engine keeps translate's composition.
         assert!(local_agent_mode(&EngineMode::NoLocalAgent).is_none());
+    }
+
+    /// M6 slice 2: a connect-time settings override replaces ONLY the
+    /// agent request in the composed mode — the identity fields (user
+    /// agent, app version, muon env) stay the engine's — so PRD 9.3's
+    /// per-connection modifiers reach the INITIAL agent handshake, not
+    /// a post-connect flip. `agent_settings()` is the override-free
+    /// request (the configured posture); the agent-less mode still
+    /// composes nothing, whatever the override.
+    #[test]
+    fn a_connect_time_settings_override_rides_the_initial_mode() {
+        let configured = EngineAgentSettings {
+            netshield_level: Some(EngineNetshield::AdsAndMalwareFilter),
+            split_tcp: Some(true),
+            ..Default::default()
+        };
+        let mode = EngineMode::LocalAgent {
+            user_agent: "ProtonWire/0.1".to_owned(),
+            app_version: "0.1.0".to_owned(),
+            muon_env: EngineMuonEnv::Prod,
+            settings: configured,
+        };
+        assert_eq!(mode.agent_settings(), configured);
+
+        let override_settings = EngineAgentSettings {
+            netshield_level: Some(EngineNetshield::None),
+            split_tcp: Some(false),
+            random_nat: Some(true),
+            ..Default::default()
+        };
+        match local_agent_mode_with(&mode, override_settings).expect("LocalAgent composes") {
+            ConnectionMode::LocalAgent {
+                user_agent,
+                app_version,
+                settings,
+                muon_env,
+                ..
+            } => {
+                // The engine's identity survives the override…
+                assert_eq!(user_agent, "ProtonWire/0.1");
+                assert_eq!(app_version, "0.1.0");
+                assert!(matches!(muon_env, MuonEnv::Prod));
+                // …and the request is EXACTLY the override, field for
+                // field (an unspecified knob is "no preference", never
+                // the configured value leaking back in).
+                assert_eq!(settings_from_protun(settings), override_settings);
+            }
+            other => panic!("expected LocalAgent mode, got {other:?}"),
+        }
+        assert!(
+            local_agent_mode_with(&EngineMode::NoLocalAgent, override_settings).is_none(),
+            "the agent-less engine composes no agent session"
+        );
+        assert_eq!(
+            EngineMode::NoLocalAgent.agent_settings(),
+            EngineAgentSettings::default()
+        );
     }
 
     /// FR-7M: the agent wait/jail reason surfaces through the mirror

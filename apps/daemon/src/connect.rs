@@ -296,6 +296,7 @@ impl ConnectionLane {
         net: NetContext,
         user_agent: String,
         app_version: String,
+        settings: protonwire_protocol::engine::EngineAgentSettings,
         facade: Arc<PersistenceFacade>,
         core: Arc<CoreState>,
     ) -> Self {
@@ -305,7 +306,7 @@ impl ConnectionLane {
                 user_agent,
                 app_version,
                 muon_env: EngineMuonEnv::Prod,
-                settings: Default::default(),
+                settings,
             },
             facade,
             core,
@@ -318,11 +319,54 @@ impl ConnectionLane {
         self.state.lock().ok().and_then(|lane| lane.owner)
     }
 
-    /// Starts one connection for `uid` (the IPC-authenticated peer).
+    /// A snapshot of the active connection's T-20 feature ledger
+    /// (requested vs applied vs refused — T-39's status source).
+    /// `None` when no connection is live. The lane guard is HELD
+    /// only to clone the slot Arc (no lock nesting: the slot locks
+    /// after the guard drops, the same discipline the pump's split
+    /// arms use).
+    pub fn reconciliation_snapshot(&self) -> Option<protonwire_protocol::FeatureReconciliation> {
+        let slot: ConnectionSlot = {
+            let lane = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            lane.active
+                .as_ref()
+                .map(|active| Arc::clone(&active.connection))?
+        };
+        slot.lock()
+            .ok()
+            .and_then(|guard| guard.as_ref().map(|connection| connection.reconciliation()))
+    }
+
+    /// Starts one connection for `uid` (the IPC-authenticated peer)
+    /// with the engine's configured agent request. Convenience form:
+    /// NO feature validation happens here — the T-18 front door is
+    /// `DaemonHandler::effective_agent_settings`, which production
+    /// dispatch runs before calling in. Prefer
+    /// [`Self::connect_with_settings`] with an already-validated
+    /// request.
+    pub fn connect(&self, uid: u32, params: &TunnelParams) -> Result<(), LaneError> {
+        self.connect_with_settings(uid, params, self.engine.config().mode.agent_settings())
+    }
+
+    /// Starts one connection for `uid` with THIS connection's agent
+    /// request (M6 slice 2: the configured posture with the
+    /// per-connection modifiers resolved and validated by the caller —
+    /// the lane never re-validates, the daemon's feature resolver owns
+    /// T-18). The request opens the T-20 ledger and the initial agent
+    /// handshake with the same value.
+    ///
     /// The facade rides in as a shared box; the pump thread drains the
     /// engine's events into the core state machine until the
     /// connection dies.
-    pub fn connect(&self, uid: u32, params: &TunnelParams) -> Result<(), LaneError> {
+    pub fn connect_with_settings(
+        &self,
+        uid: u32,
+        params: &TunnelParams,
+        agent_settings: protonwire_protocol::engine::EngineAgentSettings,
+    ) -> Result<(), LaneError> {
         let mut lane = self
             .state
             .lock()
@@ -395,9 +439,10 @@ impl ConnectionLane {
         }
         lane.owner = None;
         drop(lane);
-        let connection = match self.engine.connect(
+        let connection = match self.engine.connect_with_agent_settings(
             params,
             Box::new(SharedFacadeCache(Arc::clone(&self.facade))),
+            agent_settings,
         ) {
             Ok(connection) => connection,
             Err(error) => {

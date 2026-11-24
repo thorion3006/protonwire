@@ -87,6 +87,58 @@
         "writable_store"
       ]
     },
+    "AgentFeatures": {
+      "description": "The LocalAgent feature request/applied set (the wire mirror of\nthe engine's agent settings for status rendering). `None` fields\nare \"no preference\" — never reported as active (T-20's rule).",
+      "type": "object",
+      "properties": {
+        "circumvention_routing": {
+          "description": "Censorship circumvention routing.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "netshield_level": {
+          "description": "The NetShield level.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/NetshieldLevel"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "port_forwarding": {
+          "description": "NAT-PMP port forwarding.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "random_nat": {
+          "description": "Moderate NAT.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "soft_jail": {
+          "description": "Safe mode (soft jail).",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "split_tcp": {
+          "description": "VPN Accelerator (split TCP).",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      }
+    },
     "CredentialSourceStatus": {
       "description": "The resolved credential input source (S5a's two arms).",
       "oneOf": [
@@ -212,6 +264,17 @@
           "description": "Daemon build version.",
           "type": "string"
         },
+        "features": {
+          "description": "The LocalAgent feature negotiation snapshot (T-39): requested\nvs applied vs refused. Present only while a connection exists\n— absent on the wire otherwise (the same additive-optional\nrule as `latest_event_seq` above: old and new documents\nround-trip without a protocol version bump).",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FeaturesState"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "latest_event_seq": {
           "description": "Sequence number of the newest event already reflected in this\nsnapshot. Daemons that predate the field omit it; clients treat\n`None` as \"sequence unknown\" and fall back to their gap event.\n\nThe resynchronization race this closes (Codex PR review round 2,\nfinding 1): `GetState` is a separate request, so events can be\npublished while it is in flight and the snapshot can reflect\nsequences newer than the gap event that triggered the resync.\nPairing the snapshot with its own sequence lets the SDK advance\nits cursor coherently instead of replaying older buffered events\nafter the newer snapshot.",
           "type": [
@@ -241,6 +304,78 @@
         "daemon_version",
         "vpn_state",
         "network_integration"
+      ]
+    },
+    "FeatureSetting": {
+      "description": "One refusable LocalAgent feature setting's identity.",
+      "oneOf": [
+        {
+          "description": "NetShield level.",
+          "type": "string",
+          "const": "netshield"
+        },
+        {
+          "description": "VPN Accelerator (split TCP).",
+          "type": "string",
+          "const": "split-tcp"
+        },
+        {
+          "description": "Moderate NAT.",
+          "type": "string",
+          "const": "random-nat"
+        },
+        {
+          "description": "NAT-PMP port forwarding.",
+          "type": "string",
+          "const": "port-forwarding"
+        },
+        {
+          "description": "Safe mode (soft jail).",
+          "type": "string",
+          "const": "safe-mode"
+        },
+        {
+          "description": "Censorship circumvention routing.",
+          "type": "string",
+          "const": "circumvention-routing"
+        },
+        {
+          "description": "Secure-Core bounce.",
+          "type": "string",
+          "const": "bouncing"
+        }
+      ]
+    },
+    "FeaturesState": {
+      "description": "T-39's status block: the requested set, what the server APPLIED\n(`None` = unconfirmed — the negotiation is still running or the\nconnection left the confirmed state), and the settings the server\nexplicitly REFUSED. Refusals and the applied set are\ncomplementary answers to the current request.",
+      "type": "object",
+      "properties": {
+        "applied": {
+          "description": "What the server applied, once confirmed.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AgentFeatures"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "refused": {
+          "description": "The settings the server explicitly refused.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/FeatureSetting"
+          }
+        },
+        "requested": {
+          "description": "What the daemon requested at connect.",
+          "$ref": "#/$defs/AgentFeatures"
+        }
+      },
+      "required": [
+        "requested",
+        "refused"
       ]
     },
     "Fido2ChallengeParams": {
@@ -624,6 +759,31 @@
             "step",
             "data"
           ]
+        }
+      ]
+    },
+    "NetshieldLevel": {
+      "description": "A NetShield filtering level (the wire mirror of the engine's\nenum, in the config section's vocabulary).",
+      "oneOf": [
+        {
+          "description": "No filtering.",
+          "type": "string",
+          "const": "off"
+        },
+        {
+          "description": "Malware only.",
+          "type": "string",
+          "const": "malware"
+        },
+        {
+          "description": "Ads, trackers, malware.",
+          "type": "string",
+          "const": "ads-trackers-malware"
+        },
+        {
+          "description": "Adult content plus ads, trackers, malware.",
+          "type": "string",
+          "const": "adult-ads-trackers-malware"
         }
       ]
     },

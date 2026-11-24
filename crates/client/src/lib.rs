@@ -11,8 +11,8 @@
 use std::path::{Path, PathBuf};
 
 use protonwire_frontend_api::{
-    ClientInfo, ClientSurface, ConnectTarget, DaemonState, EVENT_SEQ_RESYNC_NOW, EventEnvelope,
-    Request, RequestResult, RpcError, RpcErrorCode,
+    ClientInfo, ClientSurface, ConnectModifiers, ConnectTarget, DaemonState, EVENT_SEQ_RESYNC_NOW,
+    EventEnvelope, Request, RequestResult, RpcError, RpcErrorCode,
 };
 use protonwire_ipc::{ConnectError, IpcClient, RequestError, SecurityChecks};
 
@@ -262,9 +262,29 @@ impl ProtonwireClient {
         }
     }
 
-    /// Requests a connection (Milestone 4 implements it server-side).
+    /// Requests a connection with the configured feature defaults.
     pub fn connect_vpn(&mut self, target: ConnectTarget) -> Result<(), ClientError> {
-        self.ack(Request::Connect { target })
+        self.ack(Request::Connect {
+            target,
+            modifiers: None,
+        })
+    }
+
+    /// Requests a connection with per-connection feature overrides
+    /// (M6 slice 2: PRD 9.3's `--netshield` / `--nat` /
+    /// `--vpn-accelerator`). The daemon validates the EFFECTIVE set
+    /// against T-18's incompatibility rules and refuses typed — the
+    /// modifier never silently changes another knob. An all-`None`
+    /// set is no override: it is sent as absent.
+    pub fn connect_vpn_with_modifiers(
+        &mut self,
+        target: ConnectTarget,
+        modifiers: ConnectModifiers,
+    ) -> Result<(), ClientError> {
+        self.ack(Request::Connect {
+            target,
+            modifiers: (!modifiers.is_empty()).then_some(modifiers),
+        })
     }
 
     /// Requests a disconnect (Milestone 4 implements it server-side).
@@ -728,6 +748,7 @@ mod tests {
                         network_integration: NetworkIntegration::Auto,
                         active_owner_uid: None,
                         latest_event_seq: Some(self.seq.load(Ordering::SeqCst)),
+                        features: None,
                     },
                 }),
                 // Connect bumps the sequence twice but publishes only the
@@ -1506,6 +1527,7 @@ mod tests {
                         network_integration: NetworkIntegration::Auto,
                         active_owner_uid: None,
                         latest_event_seq: Some(self.stamp()),
+                        features: None,
                     },
                 }),
                 other => Err(RpcError::new(
@@ -1719,6 +1741,7 @@ mod tests {
                                 network_integration: NetworkIntegration::Auto,
                                 active_owner_uid: None,
                                 latest_event_seq: Some(self.seq.load(Ordering::SeqCst)),
+                                features: None,
                             },
                         })
                     }
@@ -1824,6 +1847,7 @@ mod tests {
                             active_owner_uid: None,
                             // The legacy wire shape: no stamp on the wire.
                             latest_event_seq: None,
+                            features: None,
                         },
                     }),
                     other => Err(RpcError::new(
@@ -1938,6 +1962,7 @@ mod tests {
                                 network_integration: NetworkIntegration::Auto,
                                 active_owner_uid: None,
                                 latest_event_seq: Some(2),
+                                features: None,
                             },
                         })
                     }
@@ -2123,6 +2148,83 @@ mod tests {
                 "wrong exit code for {code:?}"
             );
         }
+    }
+
+    /// M6 slice 2: the connect modifiers ride the request verbatim,
+    /// and a modifier-free connect sends NO modifiers field at all
+    /// (the additive-optional wire rule — never an empty object that
+    /// an older daemon would have to interpret).
+    #[test]
+    fn connect_modifiers_ride_the_request_verbatim() {
+        use protonwire_frontend_api::{ConnectModifiers, NatMode, NetshieldLevel};
+
+        #[derive(Default)]
+        struct RecordingHandler {
+            bus: EventBus,
+            seen: std::sync::Mutex<Vec<Request>>,
+        }
+        impl protonwire_ipc::RequestHandler for RecordingHandler {
+            fn daemon_version(&self) -> &str {
+                "recording-daemon"
+            }
+            fn latest_event_seq(&self) -> u64 {
+                0
+            }
+            fn handle(
+                &self,
+                _ctx: &protonwire_ipc::SessionContext,
+                request: Request,
+            ) -> Result<RequestResult, RpcError> {
+                match request {
+                    Request::Ping { nonce } => Ok(RequestResult::Pong { nonce }),
+                    Request::Connect { .. } => {
+                        self.seen.lock().unwrap().push(request);
+                        Ok(RequestResult::Acknowledged)
+                    }
+                    other => Err(RpcError::new(
+                        RpcErrorCode::NotImplemented,
+                        format!("{other:?}"),
+                    )),
+                }
+            }
+            fn event_bus(&self) -> &EventBus {
+                &self.bus
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let handler = Arc::new(RecordingHandler::default());
+        let server = protonwire_ipc::test_util::TestServer::start(
+            dir.path(),
+            "modifiers.sock",
+            Arc::clone(&handler),
+        )
+        .expect("test server binds");
+        let path = server.socket_path().to_owned();
+        let mut client = dev_client(&path);
+
+        let modifiers = ConnectModifiers {
+            netshield: Some(NetshieldLevel::Off),
+            nat: Some(NatMode::Moderate),
+            vpn_accelerator: Some(false),
+        };
+        client
+            .connect_vpn_with_modifiers(ConnectTarget::Fastest, modifiers.clone())
+            .unwrap();
+        client.connect_vpn(ConnectTarget::Fastest).unwrap();
+        // An all-`None` modifier set is NO override — sent as absent.
+        client
+            .connect_vpn_with_modifiers(ConnectTarget::Fastest, ConnectModifiers::default())
+            .unwrap();
+
+        let seen = handler.seen.lock().unwrap();
+        let modifiers_of = |request: &Request| match request {
+            Request::Connect { modifiers, .. } => modifiers.clone(),
+            other => panic!("expected Connect, got {other:?}"),
+        };
+        assert_eq!(modifiers_of(&seen[0]), Some(modifiers));
+        assert_eq!(modifiers_of(&seen[1]), None);
+        assert_eq!(modifiers_of(&seen[2]), None);
     }
 }
 

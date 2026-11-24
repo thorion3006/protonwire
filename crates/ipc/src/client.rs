@@ -622,6 +622,7 @@ mod tests {
                         network_integration: protonwire_frontend_api::NetworkIntegration::Auto,
                         active_owner_uid: None,
                         latest_event_seq: Some(self.seq.load(Ordering::SeqCst)),
+                        features: None,
                     },
                 }),
                 other => Err(RpcError::new(

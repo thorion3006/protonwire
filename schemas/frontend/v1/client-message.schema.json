@@ -91,7 +91,7 @@
               ]
             },
             {
-              "description": "Begin a connection. Refused until Milestone 4 wires the ProTUN engine.",
+              "description": "Begin a connection (the daemon composes selection → the tunnel).\n`modifiers` are the connection-plane overrides (M6 slice 2);\nadditive-optional — absent means \"the configured defaults\".",
               "type": "object",
               "properties": {
                 "method": {
@@ -101,6 +101,16 @@
                 "params": {
                   "type": "object",
                   "properties": {
+                    "modifiers": {
+                      "anyOf": [
+                        {
+                          "$ref": "#/$defs/ConnectModifiers"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
                     "target": {
                       "$ref": "#/$defs/ConnectTarget"
                     }
@@ -489,6 +499,41 @@
         }
       ]
     },
+    "ConnectModifiers": {
+      "description": "The connection-plane modifiers a [`Request::Connect`] carries (PRD\n9.3: `--netshield`, `--nat`, `--vpn-accelerator`). These are the\nTUNNEL's, not selection's — [`SelectionModifiers`] deliberately\nexcludes them (FR-23E's composition boundary). Each knob is a\nper-connection OVERRIDE of the configured default; `None` keeps\nthe configured value. The daemon validates the EFFECTIVE set\nagainst T-18's incompatibility rules and refuses typed — never a\nsilent change.",
+      "type": "object",
+      "properties": {
+        "nat": {
+          "description": "The NAT mode for this connection.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/NatMode"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "netshield": {
+          "description": "The NetShield level for this connection.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/NetshieldLevel"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "vpn_accelerator": {
+          "description": "VPN Accelerator (split TCP) for this connection.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      }
+    },
     "ConnectTarget": {
       "description": "The connection target grammar (PRD 9.2). The daemon validates and resolves\nit; clients only construct it.",
       "oneOf": [
@@ -748,6 +793,46 @@
             "kind",
             "value"
           ]
+        }
+      ]
+    },
+    "NatMode": {
+      "description": "The NAT mode (PRD 9.3's `--nat strict|moderate`).",
+      "oneOf": [
+        {
+          "description": "Strict (symmetric) NAT.",
+          "type": "string",
+          "const": "strict"
+        },
+        {
+          "description": "Moderate NAT; incompatible with port forwarding (T-18).",
+          "type": "string",
+          "const": "moderate"
+        }
+      ]
+    },
+    "NetshieldLevel": {
+      "description": "A NetShield filtering level (the wire mirror of the engine's\nenum, in the config section's vocabulary).",
+      "oneOf": [
+        {
+          "description": "No filtering.",
+          "type": "string",
+          "const": "off"
+        },
+        {
+          "description": "Malware only.",
+          "type": "string",
+          "const": "malware"
+        },
+        {
+          "description": "Ads, trackers, malware.",
+          "type": "string",
+          "const": "ads-trackers-malware"
+        },
+        {
+          "description": "Adult content plus ads, trackers, malware.",
+          "type": "string",
+          "const": "adult-ads-trackers-malware"
         }
       ]
     },

@@ -41,8 +41,11 @@ surfaced (requested vs applied vs refused + FR-55 counters);
 PF×Moderate-NAT and entitlement conflicts rejected (T-5/T-18).
 Files: daemon connect.rs (settings epoch), store sections validation,
 frontend-api state features block, cli config/connect flags.
-Tests: T-18 full, T-20 extended, T-39, IT-33 (mid-session feature
-change rides the reconcile epoch).
+Tests: T-18 full, T-20 extended, T-39. IT-33 (mid-session feature
+change rides the reconcile epoch) is RE-SLOTTED (2026-11-24, rust
+gate): it needs a live-session settings-change entry point — no
+config-write surface and no feature-change request exist yet — so
+it lands with slice 5's reconnect lane or the session-lane slice.
 Parity flips: dns.netshield-levels, dns.netshield-statistics,
 options.nat, options.vpn-accelerator.
 Gates: rust-reviewer, qa-engineer.
@@ -133,3 +136,20 @@ qa-engineer, doc-writer.
 3. **Privilege boundaries (slices 3, 6):** FR-94A root→user-file and
    FR-116C execute-as-user are sec-critical; adversarial ITs +
    sec-auditor gates on both PRs.
+
+## Plan amendments (2026-11-24, discovered during slice 2)
+
+- **`config set` is its own slice, NOT part of slice 2/5:** no
+  config-write surface exists anywhere yet, and building one is the
+  SEC-27/T-37 lane (field-level authority classes, per-UID overlays
+  as untrusted input, administrator floors, daemon-side
+  revalidation). Slotted after slice 4 (profiles need the same
+  authority machinery for imports). Until it lands, feature knobs
+  are startup-config + per-connect-modifiers only.
+- **Session-lane wiring is owner-visible and unstarted:** the
+  production daemon constructs NO MuonAuth/MuonCatalog/entitlements
+  adapters — the provider cells sit empty, so login, `servers
+  refresh`, and the connect path's entitlement composition answer
+  their typed empty-cell refusals. Slice 2's tests inject fakes.
+  The real adapters are the next gating item after the M6 feature
+  slices (or an interleaved slice of its own).

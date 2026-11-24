@@ -380,6 +380,12 @@ fn wire_production_lane(
     // gate's P1-2: extracted, testable, pinned in the tests below).
     let dns = dns_posture(config)?;
     let ipv6 = ipv6_posture(config);
+    // M6 slice 2: the LocalAgent feature request (T-18's config-level
+    // conflicts refuse startup here — the features module owns the
+    // rules; the connect path re-validates with the per-connect
+    // modifiers and the account's entitlement).
+    let features =
+        protonwire_daemon::features::posture(config).map_err(|error| error.to_string())?;
 
     // The encrypted cache beside the state file (its own keyfile
     // bootstrap; a wrong-size keyfile refuses, never re-keys).
@@ -407,6 +413,7 @@ fn wire_production_lane(
         net,
         "ProtonWire".to_owned(),
         env!("CARGO_PKG_VERSION").to_owned(),
+        features,
         Arc::new(facade),
         Arc::clone(core),
     );
@@ -527,6 +534,74 @@ mod tests {
                 ipv6_posture(&config),
                 Ipv6DesiredPosture::Blocked,
                 "{mode:?} blocks (FR-37's leak floor)"
+            );
+        }
+    }
+
+    /// M6 slice 2 (T-18): the feature posture maps every knob, and
+    /// the moderate-NAT × port-forwarding conflict REFUSES — never a
+    /// half-negotiated agent session.
+    #[test]
+    fn m6_features_posture_maps_and_refuses_the_nat_pf_conflict() {
+        use protonwire_daemon::features;
+        use protonwire_frontend_api::RpcErrorCode;
+        use protonwire_protocol::engine::EngineNetshield;
+        let mut config = SystemConfig::default();
+        // Defaults: NetShield ads+trackers+malware, accelerator ON,
+        // strict NAT, no PF (the FeaturesSection defaults).
+        let features = features::posture(&config).expect("the default posture");
+        assert_eq!(
+            features.netshield_level,
+            Some(EngineNetshield::AdsAndMalwareFilter)
+        );
+        assert_eq!(features.split_tcp, Some(true));
+        assert_eq!(features.random_nat, Some(false));
+        assert_eq!(features.port_forwarding, Some(false));
+        // The T-18 conflict: moderate NAT with port forwarding refuses.
+        config.features.nat = protonwire_store::config::NatMode::Moderate;
+        config.features.port_forwarding = true;
+        let error = features::posture(&config).expect_err("the conflict refuses");
+        assert_eq!(
+            error,
+            protonwire_daemon::features::FeaturesError::NatPortForwardingConflict
+        );
+        // Its wire code is InvalidParams (the caller's parameters).
+        assert_eq!(error.to_rpc().code, RpcErrorCode::InvalidParams);
+        // Either side alone is fine: moderate NAT alone maps
+        // random_nat; PF alone maps port_forwarding.
+        config.features.port_forwarding = false;
+        let features = features::posture(&config).expect("moderate alone");
+        assert_eq!(features.random_nat, Some(true));
+        assert_eq!(features.port_forwarding, Some(false));
+        config.features.nat = protonwire_store::config::NatMode::Strict;
+        config.features.port_forwarding = true;
+        let features = features::posture(&config).expect("pf alone");
+        assert_eq!(features.random_nat, Some(false));
+        assert_eq!(features.port_forwarding, Some(true));
+        // Every NetShield level maps.
+        for (config_level, engine_level) in [
+            (
+                protonwire_store::config::NetShieldLevel::Off,
+                EngineNetshield::None,
+            ),
+            (
+                protonwire_store::config::NetShieldLevel::Malware,
+                EngineNetshield::MalwareFilter,
+            ),
+            (
+                protonwire_store::config::NetShieldLevel::AdsTrackersMalware,
+                EngineNetshield::AdsAndMalwareFilter,
+            ),
+            (
+                protonwire_store::config::NetShieldLevel::AdultAdsTrackersMalware,
+                EngineNetshield::AdultAndAdsAndMalwareFilter,
+            ),
+        ] {
+            config.features.netshield = config_level;
+            assert_eq!(
+                features::posture(&config).unwrap().netshield_level,
+                Some(engine_level),
+                "{config_level:?}"
             );
         }
     }

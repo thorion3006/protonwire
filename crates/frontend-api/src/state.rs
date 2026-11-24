@@ -95,6 +95,115 @@ pub struct DaemonState {
     /// after the newer snapshot.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub latest_event_seq: Option<u64>,
+    /// The LocalAgent feature negotiation snapshot (T-39): requested
+    /// vs applied vs refused. Present only while a connection exists
+    /// — absent on the wire otherwise (the same additive-optional
+    /// rule as `latest_event_seq` above: old and new documents
+    /// round-trip without a protocol version bump).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub features: Option<FeaturesState>,
+}
+
+/// A NetShield filtering level (the wire mirror of the engine's
+/// enum, in the config section's vocabulary).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum NetshieldLevel {
+    /// No filtering.
+    Off,
+    /// Malware only.
+    Malware,
+    /// Ads, trackers, malware.
+    AdsTrackersMalware,
+    /// Adult content plus ads, trackers, malware.
+    AdultAdsTrackersMalware,
+}
+
+impl std::fmt::Display for NetshieldLevel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Off => "off",
+            Self::Malware => "malware",
+            Self::AdsTrackersMalware => "ads-trackers-malware",
+            Self::AdultAdsTrackersMalware => "adult-ads-trackers-malware",
+        })
+    }
+}
+
+/// One refusable LocalAgent feature setting's identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum FeatureSetting {
+    /// NetShield level.
+    Netshield,
+    /// VPN Accelerator (split TCP).
+    SplitTcp,
+    /// Moderate NAT.
+    RandomNat,
+    /// NAT-PMP port forwarding.
+    PortForwarding,
+    /// Safe mode (soft jail).
+    SafeMode,
+    /// Censorship circumvention routing.
+    CircumventionRouting,
+    /// Secure-Core bounce.
+    Bouncing,
+}
+
+impl std::fmt::Display for FeatureSetting {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Netshield => "netshield",
+            Self::SplitTcp => "split-tcp",
+            Self::RandomNat => "random-nat",
+            Self::PortForwarding => "port-forwarding",
+            Self::SafeMode => "safe-mode",
+            Self::CircumventionRouting => "circumvention-routing",
+            Self::Bouncing => "bouncing",
+        })
+    }
+}
+
+/// The LocalAgent feature request/applied set (the wire mirror of
+/// the engine's agent settings for status rendering). `None` fields
+/// are "no preference" — never reported as active (T-20's rule).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct AgentFeatures {
+    /// The NetShield level.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub netshield_level: Option<NetshieldLevel>,
+    /// VPN Accelerator (split TCP).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub split_tcp: Option<bool>,
+    /// Moderate NAT.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub random_nat: Option<bool>,
+    /// NAT-PMP port forwarding.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub port_forwarding: Option<bool>,
+    /// Safe mode (soft jail).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub soft_jail: Option<bool>,
+    /// Censorship circumvention routing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub circumvention_routing: Option<bool>,
+}
+
+/// T-39's status block: the requested set, what the server APPLIED
+/// (`None` = unconfirmed — the negotiation is still running or the
+/// connection left the confirmed state), and the settings the server
+/// explicitly REFUSED. Refusals and the applied set are
+/// complementary answers to the current request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct FeaturesState {
+    /// What the daemon requested at connect.
+    pub requested: AgentFeatures,
+    /// What the server applied, once confirmed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub applied: Option<AgentFeatures>,
+    /// The settings the server explicitly refused.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub refused: Vec<FeatureSetting>,
 }
 
 #[cfg(test)]
@@ -111,12 +220,14 @@ mod tests {
             network_integration: NetworkIntegration::Auto,
             active_owner_uid: None,
             latest_event_seq: None,
+            features: None,
         };
         let json = serde_json::to_value(&state).unwrap();
         assert_eq!(json["vpn_state"], "disconnected");
         assert_eq!(json["network_integration"], "auto");
         assert!(json.get("active_owner_uid").is_none());
         assert!(json.get("latest_event_seq").is_none());
+        assert!(json.get("features").is_none());
     }
 
     /// Codex PR review round 2, finding 1: the field is additive-optional —

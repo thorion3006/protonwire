@@ -186,6 +186,13 @@ impl FeatureReconciliation {
         &self.refused
     }
 
+    /// The applied set, once the server confirmed it (`None` while
+    /// the negotiation runs or after the connection left the
+    /// confirmed state). Refusals are complementary (retained).
+    pub fn applied(&self) -> Option<EngineAgentSettings> {
+        self.applied
+    }
+
     /// The requested-vs-applied table (T-20's deliverable). Every
     /// REQUESTED (Some) setting that the server did not apply with
     /// the same value is one entry; a request the server never
