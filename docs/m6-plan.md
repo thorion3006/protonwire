@@ -55,6 +55,14 @@ NAT-PMP lease lifecycle post-tunnel: request, renew-before-expiry,
 port-change event, atomic user-owned publication (FR-94A —
 pre-opened safe dirfd, symlink refusal), port show/watch,
 PF-capable-only server filter (FR-87).
+**SCOPE NOTE (2026-11-24):** the pinned upstream ships NO NAT-PMP
+client — protun v3.0.5 carries only the LocalAgent
+`port_forwarding: Option<bool>` setting (the server-side enable);
+the RFC-6886 gateway exchange is OURS to implement in
+`crates/port-forwarding` (a small UDP client against the VPN
+gateway per Proton's spec), exactly what this slice planned. FR-85's
+"through ProTUN LocalAgent" = the setting request; the mapping
+itself is the local client.
 Files: crates/port-forwarding/src/{lib,nat_pmp,lease}.rs
 (clock-injected FSM + traits for test doubles), daemon services.rs PF
 worker, frontend-api event+status, cli port family, selection filter.
